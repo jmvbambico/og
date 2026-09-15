@@ -116,7 +116,7 @@ rather than claiming the setup is verified end to end.
 
 ```
 install.sh                    interpreter resolution, then hands off
-installer/og-install          the installer (python3 + PyYAML)
+installer/og_install.py       the installer (python3 + PyYAML)
 installer/registry.json       agent catalog — add vendors HERE, not in code
 installer/templates/*.tmpl    orchestrator / coder / reviewer YAML
 bin/og                        control script (bash)
@@ -183,7 +183,7 @@ Always test into a sandbox, never your live `~/.omnigent`:
 
 ```bash
 S=$(mktemp -d)
-HOME="$S" OMNIGENT_HOME="$S/.omnigent" python3 installer/og-install --plan plan.json
+HOME="$S" OMNIGENT_HOME="$S/.omnigent" python3 installer/og_install.py --plan plan.json
 find "$S" -type f
 ```
 
@@ -196,6 +196,25 @@ from omnigent.runtime.workflow import _resolve_spec_model
 spec = parse(f"{S}/.omnigent/agents/dev-lead")
 [(s.name, _resolve_spec_model(s)) for s in spec.sub_agents]   # None = dead pin
 ```
+
+### Navigating the code
+
+This repo is indexed with CodeGraph. Reach for it before grep when you need to
+find or understand something:
+
+```bash
+codegraph explore "where does the model pin get written"
+codegraph index          # rebuild after a large change
+```
+
+It indexes the Python (`installer/og_install.py`, `policies/`); the bash in
+`bin/og` and `install.sh` it does not parse, so read those directly. The
+`.codegraph/` directory is machine-local — only its `.gitignore` is committed.
+
+**Documentation goes in `docs/`.** Anything generated or derived — architecture
+notes, analyses, guides produced while working on this repo — belongs there,
+not scattered at the root. `README.md` and `AGENTS.md` are the only two
+top-level docs.
 
 ### Conventions
 

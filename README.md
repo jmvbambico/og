@@ -1,4 +1,4 @@
-# og
+# OG
 
 A reproducible multi-agent coding setup on top of [Omnigent](https://omnigent.ai).
 
@@ -7,7 +7,7 @@ vendors* — implement in isolated git worktrees. A different-vendor reviewer
 judges the batched diff. Policies, not prompts, enforce what may be merged.
 
 `og` is the control script (server + ngrok tunnel + agent registration);
-`og-install` is the interactive installer that generates the agent bundle for
+`install.sh` is the interactive installer that generates the agent bundle for
 whichever CLIs you actually have.
 
 ```
@@ -76,7 +76,7 @@ repo carries its own `AGENTS.md` (the constitution) and optionally
 
 | Path | What |
 |---|---|
-| `~/.local/bin/og` | control script |
+| `<bin_dir>/og` | control script — you choose where (default: first of `~/.local/bin` / `~/bin` already on `PATH`) |
 | `~/.omnigent/agents/<name>/config.yaml` | orchestrator (generated) |
 | `~/.omnigent/agents/<name>/agents/*/config.yaml` | one per coder + reviewer (generated) |
 | `~/.omnigent/agents/<name>/skills/` | `fanout`, `cross-review`, `investigate`, `roster` |
@@ -155,9 +155,12 @@ actually reaches the CLI:
 
 ## Install
 
+Clone it wherever you keep repos — nothing depends on the location, and the
+checkout is not consulted again after installing.
+
 ```bash
-git clone git@github.com:jmvbambico/og.git ~/projects/og
-cd ~/projects/og
+git clone git@github.com:jmvbambico/og.git
+cd og
 ./install.sh --check      # what's present, what's missing
 ./install.sh              # pick agents, models, priority, reviewer
 ```
@@ -175,6 +178,10 @@ The installer will ask you to:
    (`CLAUDE_CONFIG_DIR`, e.g. `~/.claude-work`) so it is independent of your
    interactive login
 7. port, ngrok domain, max dispatches per turn
+8. **where the `og` command is installed** — defaults to a directory already on
+   your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
+   isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
+   or `"bin_dir"` in a plan.
 
 Then:
 
@@ -277,6 +284,16 @@ Two local policies ship here, registered via `policy_modules` in
 > `policy_modules` names. Without that key the policies load but never fire.
 
 ---
+
+## Working on this repo
+
+The repo is indexed with [CodeGraph](https://github.com/lethain/codegraph), so
+`codegraph explore "<symbol or question>"` answers "where does X happen"
+in one call instead of a grep loop. The index lives in `.codegraph/` and is
+local to each machine — only its `.gitignore` is committed. Rebuild with
+`codegraph index` after a large change.
+
+Generated and derived documentation belongs in `docs/`.
 
 ## Docs
 

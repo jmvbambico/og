@@ -29,7 +29,7 @@ from pathlib import Path
 try:
     import yaml
 except ImportError:  # pragma: no cover - install.sh resolves this first
-    sys.exit("og-install needs PyYAML. Run ./install.sh, which finds an interpreter that has it.")
+    sys.exit("og_install needs PyYAML. Run ./install.sh, which finds an interpreter that has it.")
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -329,6 +329,8 @@ def build_plan_interactive(state: dict) -> dict:
                  state.get("ngrok_domain", ""))
     max_dispatch = ask("Max worker dispatches per orchestrator turn",
                        str(state.get("max_dispatches", 4)))
+    bin_dir = ask("Install the `og` command where?",
+                  state.get("bin_dir") or str(default_bin_dir()))
 
     return {
         "version": 1,
@@ -340,6 +342,7 @@ def build_plan_interactive(state: dict) -> dict:
         "port": int(port),
         "ngrok_domain": domain,
         "max_dispatches": int(max_dispatch),
+        "bin_dir": bin_dir,
     }
 
 
@@ -766,10 +769,13 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # 4. global config + og.env + the og script
     changed = patch_global_config(plan)
     write_og_env(plan)
-    bindir = Path.home() / ".local" / "bin"
+    bindir = resolve_bin_dir(plan)
     bindir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPO / "bin" / "og", bindir / "og")
     (bindir / "og").chmod(0o755)
+    if str(bindir) not in os.environ.get("PATH", "").split(os.pathsep):
+        warn(f"{bindir} is not on your PATH — `og` will not be found. Add it:\n"
+             f"    export PATH=\"{bindir}:$PATH\"")
 
     # 5. state
     STATE.write_text(json.dumps(plan, indent=2) + "\n")
@@ -788,6 +794,28 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     say(f"{C['dim']}prompt: {len(shlex.quote(prompt))}/{PROMPT_CEILING} bytes shell-quoted{C['x']}")
     say()
     say(f"Next: {C['b']}og start{C['x']}   (from the repo you want as the default workspace)")
+
+
+def default_bin_dir() -> Path:
+    """Where `og` goes when the user expresses no preference.
+
+    Prefers a directory already on PATH so the install works without the user
+    editing their shell profile; falls back to ~/.local/bin, which is
+    conventional even when absent.
+    """
+    path = os.environ.get("PATH", "").split(os.pathsep)
+    for candidate in (Path.home() / ".local" / "bin", Path.home() / "bin"):
+        if str(candidate) in path:
+            return candidate
+    return Path.home() / ".local" / "bin"
+
+
+def resolve_bin_dir(plan: dict) -> Path:
+    """Precedence: plan value > OG_BIN_DIR env > default."""
+    raw = plan.get("bin_dir") or os.environ.get("OG_BIN_DIR") or ""
+    if raw:
+        return Path(os.path.expanduser(os.path.expandvars(raw))).resolve()
+    return default_bin_dir()
 
 
 def install_pth(pol_dir: Path) -> None:
@@ -844,6 +872,9 @@ def emit_questions() -> None:
              "ask": "Reserved ngrok domain? Blank means a new URL each start."},
             {"key": "max_dispatches", "type": "int", "default": 4,
              "ask": "Max worker dispatches per orchestrator turn?"},
+            {"key": "bin_dir", "type": "path", "default": str(default_bin_dir()),
+             "ask": "Which directory should the `og` command be installed into? "
+                    "It must be on the user's PATH."},
         ],
         "apply_with": "og-install --plan plan.json",
         "registry": REGISTRY["agents"],
@@ -868,13 +899,14 @@ def show(state: dict) -> None:
         say(f"{C['b']}account{C['x']}       {reg[aid]['label']} → {path}")
     say(f"{C['b']}port{C['x']}          {state['port']}")
     say(f"{C['b']}ngrok{C['x']}         {state.get('ngrok_domain') or '(ephemeral)'}")
+    say(f"{C['b']}og command{C['x']}    {resolve_bin_dir(state) / 'og'}")
     issues = validate(state)
     for level, msg in issues:
         (err if level == "error" else warn)(msg)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="og-install", description=__doc__,
+    p = argparse.ArgumentParser(prog="install.sh", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--show", action="store_true", help="print current config and exit")
     p.add_argument("--questions", action="store_true",

@@ -11,7 +11,7 @@ How the pieces fit, and why each one is where it is.
 │ CONTROL          bin/og                                      │
 │                  ngrok → server → register agent → pin project│
 ├──────────────────────────────────────────────────────────────┤
-│ CONFIGURATION    installer/og-install + registry.json         │
+│ CONFIGURATION    installer/og_install.py + registry.json         │
 │                  og-install.json ──renders──► agent bundles   │
 ├──────────────────────────────────────────────────────────────┤
 │ RUNTIME          Omnigent server + host daemon + runner       │
@@ -35,7 +35,7 @@ installed. That is what lets one global orchestrator serve every repo.
 
 ```
    registry.json ──┐
-                   ├──► og-install ──► og-install.json   (source of truth)
+                   ├──► og_install.py ─► og-install.json   (source of truth)
    your answers ───┘         │
                              ├──► ~/.omnigent/agents/<name>/config.yaml
                              ├──► ~/.omnigent/agents/<name>/agents/*/config.yaml
@@ -114,7 +114,7 @@ given agent can fill a given role:
 | tool relay | present / absent | absent ⇒ leaf worker: can implement, cannot dispatch |
 | model resolution | loud / silent | silent ⇒ a bad pin yields an empty transcript, not an error |
 
-`registry.json` records these per agent, and `og-install` refuses combinations
+`registry.json` records these per agent, and the installer refuses combinations
 that cannot work rather than writing a config that fails at launch.
 
 ---

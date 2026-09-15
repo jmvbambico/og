@@ -7,7 +7,7 @@
 #   ./install.sh --plan f.json  apply a plan non-interactively
 #
 # All this does itself is find a Python that can import yaml, then hand over to
-# installer/og-install. Omnigent ships PyYAML in its own venv, so that
+# installer/og_install.py. Omnigent ships PyYAML in its own venv, so that
 # interpreter is the reliable fallback when the system python3 lacks it.
 set -euo pipefail
 
@@ -49,4 +49,4 @@ if [[ -z "$PY" ]]; then
 fi
 
 info "using $PY"
-exec "$PY" "$HERE/installer/og-install" "$@"
+exec "$PY" "$HERE/installer/og_install.py" "$@"
