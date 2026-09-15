@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# og — one-word control for an Omnigent orchestrator agent + its ngrok tunnel.
+# og — one-word control for an Omnigent orchestrator agent.
 #
-#   og start [domain]   start ngrok, then the server with the orchestrator registered
+#   og start [local]    start on the LAN: server on 0.0.0.0, QR of your LAN IP
+#   og start tunneled [domain]
+#                       start ngrok first, then the server behind that origin
+#   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
 #   og chat [args...]   open an orchestrator session in this terminal (no picker)
 #   og attach           re-attach the host daemon to a running server
@@ -76,6 +79,21 @@ print_qr() {
 # default loopback port it ALSO registered in ~/.omnigent/local_server.pid and
 # `omnigent server status` can see it -- that is the fallback, and the only path
 # that finds a server someone brought up with plain `omnigent start`.
+# The address a phone on the same wifi can actually reach. macOS and Linux
+# expose this differently and neither is guaranteed, so try the specific
+# mechanisms first and fall back rather than guessing at an interface name.
+lan_ip() {
+  local ip="" iface
+  iface="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [[ -n "$iface" ]] && ip="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"
+  if [[ -z "$ip" ]]; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null \
+          | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+  [[ -z "$ip" ]] && ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [[ -n "$ip" ]] && printf '%s' "$ip"
+}
+
 og_server_pid() {
   [[ -f "$SERVER_PIDFILE" ]] || return 1
   local p; p="$(cat "$SERVER_PIDFILE" 2>/dev/null || true)"
@@ -182,7 +200,11 @@ show_access() {
   print_qr "$url"
   echo
   echo "    scan the code above, or open: $url"
-  echo "    local:  http://127.0.0.1:$PORT"
+  if [[ "${OG_MODE:-local}" == "local" ]]; then
+    echo "    same wifi only — this address is not reachable from outside your network"
+  else
+    echo "    loopback: http://127.0.0.1:$PORT"
+  fi
 }
 
 # --- session lifecycle -------------------------------------------------------
@@ -346,16 +368,44 @@ sys.exit(1)
 }
 
 cmd_start() {
-  local domain="${1:-${OG_NGROK_DOMAIN:-}}"
+  # `og start`            -> local  (LAN only; the safe default)
+  # `og start local`      -> same, explicit
+  # `og start tunneled`   -> ngrok, domain from og.env
+  # `og start tunneled X` -> ngrok on domain X
+  # `og start X`          -> back-compat: a bare argument that is not a mode is
+  #                          a domain, which only ever meant tunneled.
+  local mode="local" domain=""
+  case "${1:-}" in
+    local)    mode="local";    shift ;;
+    tunneled) mode="tunneled"; shift; domain="${1:-${OG_NGROK_DOMAIN:-}}" ;;
+    "")       mode="${OG_DEFAULT_MODE:-local}"
+              [[ "$mode" == "tunneled" ]] && domain="${OG_NGROK_DOMAIN:-}" ;;
+    -*)       die "unknown option: $1  (try: og help)" ;;
+    *)        mode="tunneled"; domain="$1"; shift
+              info "a bare argument is read as an ngrok domain; this is 'og start tunneled $domain'" ;;
+  esac
+  OG_MODE="$mode"
 
   if server_running; then
     omnigent server status 2>&1 | sed 's/^/    /'
     die "Omnigent is already running. Run 'og stop' first (this will end live sessions)."
   fi
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
-  command -v ngrok >/dev/null || die "ngrok is not installed (brew install ngrok)"
   command -v omnigent >/dev/null || die "omnigent is not on PATH"
+  [[ "$mode" == "tunneled" ]] && { command -v ngrok >/dev/null || die "ngrok is not installed (brew install ngrok)"; }
 
+  local url=""
+  if [[ "$mode" == "local" ]]; then
+    # No tunnel: the origin is this machine's LAN address. The server must
+    # therefore bind 0.0.0.0 (see server_args below) — a loopback bind would
+    # answer only on this box and the QR would lead nowhere.
+    local ip; ip="$(lan_ip || true)"
+    [[ -n "$ip" ]] || die "could not determine this machine's LAN IP.
+    Connect to a network, or use 'og start tunneled' for a public URL."
+    url="http://$ip:$PORT"
+    ok "local mode: $url"
+    info "reachable from devices on this network only"
+  else
   # ngrok v3 refuses to tunnel without an authtoken, and the failure is buried
   # in its log — check up front so the message is actionable.
   if ! ngrok config check >/dev/null 2>&1; then
@@ -376,7 +426,7 @@ cmd_start() {
   fi
 
   # Poll for the URL rather than sleeping a fixed amount: cold starts vary.
-  local url="" i
+  local i
   for i in $(seq 1 40); do
     url="$(tunnel_url || true)"
     [[ -n "$url" ]] && break
@@ -389,6 +439,7 @@ cmd_start() {
   done
   [[ -n "$url" ]] || { tail -15 "$NGROK_LOG" 2>/dev/null; die "timed out waiting for the ngrok URL"; }
   ok "tunnel up: $url"
+  fi
   # From here on the address is known, so guarantee it reaches the user no
   # matter how cmd_start ends.
   OG_PUBLIC_URL="$url"
@@ -469,12 +520,28 @@ cmd_start() {
   # explicit --port only when it is not the default. That exact combination is what
   # cli.py calls the *canonical* local server, and only the canonical path calls
   # register_local_server() -- which is what keeps `omnigent server status`,
-  # `omnigent stop`, and the host daemon's server-reuse logic working. Binding
-  # loopback instead of 0.0.0.0 costs nothing: ngrok forwards to 127.0.0.1.
+  # `omnigent stop`, and the host daemon's server-reuse logic working. In
+  # TUNNELED mode binding loopback costs nothing — ngrok forwards to
+  # 127.0.0.1. LOCAL mode is the exception and binds 0.0.0.0 below.
   mkdir -p "$SERVER_LOGDIR"
   local server_log="$SERVER_LOGDIR/server-$(date +%Y%m%d-%H%M%S)-og.log"
   local server_args=(server --agent "$AGENT_DIR")
   if [[ "$PORT" != "6767" ]]; then server_args+=(--port "$PORT"); fi
+  if [[ "$mode" == "local" ]]; then
+    # A loopback bind answers only on this machine, so the LAN URL in the QR
+    # would lead nowhere. Binding 0.0.0.0 is what makes local mode work.
+    #
+    # Cost, deliberately accepted: cli.py treats a non-loopback bind as NOT the
+    # "canonical local server", so this server does not register in
+    # ~/.omnigent/local_server.pid and `omnigent server status` / `omnigent stop`
+    # cannot see it. og tracks its own pid in $SERVER_PIDFILE and checks that
+    # first, so `og status` / `og stop` are unaffected.
+    #
+    # Auth is NOT weakened by the wider bind: OMNIGENT_AUTH_ENABLED=1 above pins
+    # accounts (login) mode explicitly, and _apply_bind_auth_defaults only fills
+    # in defaults when the operator set none. A LAN is still a network.
+    server_args+=(--host 0.0.0.0)
+  fi
 
   info "registering agent: $AGENT_DIR"
   # PYTHONUNBUFFERED so the registration line below is in the log by the time
@@ -578,6 +645,25 @@ cmd_start() {
   show_access
   echo "    log:    $server_log"
   echo "    stop:   og stop"
+}
+
+# Where og's own helpers live. The installer copies `og` to a bin dir that is
+# NOT the repo, so the scaffolder is located via OG_REPO (written into og.env at
+# install time) with a best-effort fallback to a sibling checkout.
+og_repo_dir() {
+  if [[ -n "${OG_REPO:-}" && -d "$OG_REPO/installer" ]]; then printf '%s' "$OG_REPO"; return 0; fi
+  local self; self="$(cd "$(dirname "$(readlink "$0" || echo "$0")")" && pwd)"
+  for c in "$self/.." "$HOME/projects/og" "$HOME/og"; do
+    [[ -d "$c/installer" ]] && { (cd "$c" && pwd); return 0; }
+  done
+  return 1
+}
+
+cmd_init() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_init.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  exec python3 "$repo/installer/og_init.py" "$@"
 }
 
 cmd_stop() {
@@ -802,6 +888,7 @@ cmd_logs() {
 
 case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
+  init)   shift; cmd_init "$@" ;;
   stop)   shift; cmd_stop ;;
   attach) shift; cmd_attach ;;
   login)  shift; cmd_login ;;
@@ -810,7 +897,7 @@ case "${1:-}" in
   url)    shift; cmd_url ;;
   logs)   shift; cmd_logs "$@" ;;
   ""|-h|--help|help)
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

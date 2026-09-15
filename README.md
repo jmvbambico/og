@@ -219,23 +219,65 @@ what to ask the user, the constraints to respect, and how to verify the result.
 ## Using it
 
 ```
-og start [domain]   start ngrok, then the server with the orchestrator registered
+og start            serve on your LAN — QR points at this machine's network IP
+og start tunneled   start ngrok first, then serve behind that public origin
+og init [path]      scaffold a repo's orchestration contract
 og stop             stop server, host daemons, tunnel
-og status           what is running, and the public URL
+og status           what is running, and the URL
 og chat             open an orchestrator session in this terminal
-og url              print the public URL (pipe-friendly)
+og url              print the URL (pipe-friendly)
 og logs [-f]        tail the server log
 og login            store server credentials in the Keychain (once)
 ```
 
-`og start` starts ngrok **first** — the server needs its public origin at boot,
-or the phone gets WebSocket 4403 and HTTP 403 on chat.
+### local vs tunneled
+
+**`og start` is local by default.** No tunnel, no ngrok account, nothing
+exposed to the internet: the server binds `0.0.0.0` and the QR encodes
+`http://<your-LAN-IP>:<port>`, which any device on the same wifi can open.
+Login is still required — a LAN is still a network.
+
+**`og start tunneled`** brings up ngrok first and serves behind that origin.
+The server needs its public origin *at boot*, which is why the tunnel starts
+first: otherwise the phone gets WebSocket 4403 and HTTP 403 on chat. Use this
+when you need to drive a run from outside your network. A reserved domain
+(`OG_NGROK_DOMAIN`) keeps invite links and cookies working across restarts.
+
+Flip the default for a bare `og start` with `OG_DEFAULT_MODE` in `og.env`. A
+bare argument is still read as an ngrok domain, so the old
+`og start my.ngrok.app` keeps working.
+
+One consequence worth knowing: a non-loopback bind is not the "canonical local
+server" as far as Omnigent is concerned, so `omnigent server status` and
+`omnigent stop` cannot see a local-mode server. `og status` and `og stop` track
+their own pid and are unaffected.
 
 ---
 
 ## Per-project setup
 
-Each repo the orchestrator works in should carry:
+Run `og init` inside a repo to scaffold both files:
+
+```bash
+cd ~/projects/your-repo
+og init             # writes .agents/orchestration.yaml (+ an AGENTS.md stub)
+og init --print     # see what it would write, change nothing
+```
+
+It reads *that* repo — toolchain, branch layout, branch-name conventions — and
+writes gates and branches from what it finds. Nothing is copied from another
+project. Where it cannot be sure it leaves a TODO and says why, because a gate
+command guessed wrong is worse than one absent: the orchestrator quotes the
+contract back and runs exactly what it says.
+
+It also flags what it could not verify — a `tests/integration/` directory that
+the blanket worker gate would run per-worktree, a `package.json` with no test
+script, a repo with no toolchain at all.
+
+`merge_policy.enabled` is written as `false`: every merge stays a human
+decision until you have watched the gates behave on real PRs.
+
+Each repo the orchestrator works in carries:
 
 - **`AGENTS.md`** — the constitution. Authoritative, always wins.
 - **`.agents/orchestration.yaml`** — optional, machine-readable:
