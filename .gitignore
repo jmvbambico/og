@@ -1,0 +1,8 @@
+# Nothing machine-local belongs here. Kept as a guard against accidental adds:
+# tokens, the cookie secret, host_id and chat.db all live under ~/.omnigent.
+*.bak
+__pycache__/
+*.pyc
+og-install.json
+auth_tokens.json
+.cookie-secret

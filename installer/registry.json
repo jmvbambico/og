@@ -1,0 +1,383 @@
+{
+  "$comment": [
+    "Catalog of coding agents og knows how to wire into Omnigent.",
+    "",
+    "Adding a vendor is a row here, not code. Fields:",
+    "  id            stable key used in og-install.json state",
+    "  label         what the picker shows",
+    "  harness       the Omnigent harness id this agent runs on",
+    "  binary        what `command -v` looks for during the scan",
+    "  kind          native      -> Omnigent has a first-class harness",
+    "                acp-builtin -> Omnigent ships an ACP row for it",
+    "                acp-user    -> needs an `acp.agents` entry in",
+    "                               ~/.omnigent/config.yaml (og writes it)",
+    "  acp_command   argv for acp-user kinds, e.g. 'cline --acp'",
+    "  roles         which slots it may fill",
+    "  vendor        model family, used for the cross-vendor review check.",
+    "                Two agents sharing a vendor cannot review each other.",
+    "  model.required  true when a dispatch MUST pin a model. Unpinned",
+    "                  workers inherit the ORCHESTRATOR's model id, which",
+    "                  most harnesses cannot resolve.",
+    "  model.pin_path  where the pin goes in the sub-agent spec. Always",
+    "                  executor.model \u2014 executor.config is a free-form dict",
+    "                  and a model placed there is silently ignored.",
+    "  relay         false when the agent runs without Omnigent's sys_* tool",
+    "                relay (leaf worker only; cannot orchestrate)",
+    "  silent_model_failure  true when a bad model id produces an empty",
+    "                        transcript instead of an error"
+  ],
+  "version": 1,
+  "agents": [
+    {
+      "id": "claude",
+      "label": "Claude Code",
+      "harness": "claude-native",
+      "binary": "claude",
+      "kind": "native",
+      "roles": [
+        "orchestrator",
+        "coder",
+        "reviewer"
+      ],
+      "vendor": "anthropic",
+      "relay": true,
+      "silent_model_failure": false,
+      "multi_account": {
+        "supported": true,
+        "env": "CLAUDE_CONFIG_DIR",
+        "default_dir": "$HOME/.claude-work",
+        "note": "claude-native honours $CLAUDE_CONFIG_DIR, so a second account can run the reviewer independently of your interactive Claude Code login. The in-process claude-sdk harness ignores it."
+      },
+      "model": {
+        "required": false,
+        "pin_path": "executor.model",
+        "note": "Subscription login picks the model. Pinning the ORCHESTRATOR also pins the family its workers route within, which strands non-Claude workers \u2014 leave it unset."
+      },
+      "install": {
+        "brew": "brew install --cask claude-code",
+        "npm": "npm i -g @anthropic-ai/claude-code"
+      },
+      "login": "claude",
+      "docs": "https://docs.claude.com/en/docs/claude-code",
+      "prompt_delivery": "argv"
+    },
+    {
+      "id": "opencode",
+      "label": "OpenCode (Zen)",
+      "harness": "opencode-native",
+      "binary": "opencode",
+      "kind": "native",
+      "roles": [
+        "orchestrator",
+        "coder"
+      ],
+      "vendor": "opencode-zen",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": true,
+        "pin_path": "executor.model",
+        "list_cmd": [
+          "opencode",
+          "models"
+        ],
+        "free_pattern": "-free$",
+        "prefer": "opencode/mimo-v2.5-free",
+        "note": "Zen's free lineup rotates; verify with `opencode models`. A paid id on a workspace with no payment method is a FAILED dispatch, not a slower one."
+      },
+      "install": {
+        "brew": "brew install sst/tap/opencode",
+        "npm": "npm i -g opencode-ai"
+      },
+      "login": "opencode auth login",
+      "docs": "https://opencode.ai/docs",
+      "reviewer_warning": "Zen's free lineup rotates, so review quality drifts run to run. Not recommended as a reviewer.",
+      "prompt_delivery": "per_turn"
+    },
+    {
+      "id": "antigravity",
+      "label": "Antigravity (Google)",
+      "harness": "antigravity-native",
+      "binary": "agy",
+      "kind": "native",
+      "roles": [
+        "coder",
+        "reviewer"
+      ],
+      "vendor": "google",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model",
+        "note": "Picks its own model from the signed-in Google account."
+      },
+      "install": {
+        "note": "Ships with the Antigravity editor; `agy` lands in ~/.local/bin."
+      },
+      "login": "agy",
+      "docs": "https://antigravity.google/docs",
+      "prompt_delivery": "none"
+    },
+    {
+      "id": "codex",
+      "label": "Codex (OpenAI)",
+      "harness": "codex-native",
+      "binary": "codex",
+      "kind": "native",
+      "roles": [
+        "orchestrator",
+        "coder",
+        "reviewer"
+      ],
+      "vendor": "openai",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model"
+      },
+      "install": {
+        "npm": "npm i -g @openai/codex",
+        "brew": "brew install codex"
+      },
+      "login": "codex login",
+      "docs": "https://developers.openai.com/codex/cli",
+      "prompt_delivery": "argv"
+    },
+    {
+      "id": "cline",
+      "label": "Cline",
+      "harness": "acp:cline",
+      "binary": "cline",
+      "kind": "acp-user",
+      "acp_command": "cline --acp",
+      "omnigent_mcp": false,
+      "roles": [
+        "coder"
+      ],
+      "vendor": "deepseek",
+      "relay": false,
+      "silent_model_failure": true,
+      "model": {
+        "required": true,
+        "pin_path": "executor.model",
+        "state_file": "$HOME/.cline/data/settings/providers.json",
+        "prefer": "deepseek/deepseek-v4-flash",
+        "note": "Cline ACCEPTS an ACP model switch it cannot serve instead of rejecting it. A wrong id yields 'completed' with an empty transcript and an untouched worktree \u2014 no error anywhere. Pin the id `cline auth` actually selected."
+      },
+      "install": {
+        "brew": "brew install cline",
+        "npm": "npm i -g cline"
+      },
+      "login": "cline auth",
+      "docs": "https://docs.cline.bot",
+      "prompt_delivery": "unknown"
+    },
+    {
+      "id": "kilo",
+      "label": "Kilo Code",
+      "harness": "acp:kilo",
+      "binary": "kilo",
+      "kind": "acp-user",
+      "acp_command": "kilo acp",
+      "omnigent_mcp": false,
+      "roles": [
+        "coder"
+      ],
+      "vendor": "kilo",
+      "relay": false,
+      "silent_model_failure": true,
+      "model": {
+        "required": true,
+        "pin_path": "executor.model",
+        "note": "Kilo brokers 500+ models at provider rates. Pin explicitly \u2014 an unpinned ACP worker inherits the orchestrator's id. Treat its silent-failure behaviour as Cline's until proven otherwise: verify the first dispatch produced a real commit."
+      },
+      "install": {
+        "npm": "npm i -g @kilocode/cli",
+        "brew": "brew install Kilo-Org/tap/kilo",
+        "curl": "curl -fsSL https://kilo.ai/cli/install | bash"
+      },
+      "login": "kilo auth",
+      "docs": "https://kilo.ai/docs/code-with-ai/platforms/cli-reference",
+      "unverified": true,
+      "prompt_delivery": "unknown"
+    },
+    {
+      "id": "kiro",
+      "label": "Kiro (AWS)",
+      "harness": "kiro-native",
+      "binary": "kiro-cli",
+      "kind": "native",
+      "alt_acp_command": "kiro-cli acp",
+      "roles": [
+        "coder",
+        "reviewer"
+      ],
+      "vendor": "aws-kiro",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model",
+        "note": "Free plan is 50 credits/month drawn from the shared Kiro pool \u2014 enough for occasional overflow, not a primary implementer."
+      },
+      "install": {
+        "curl": "curl -fsSL https://cli.kiro.dev/install | bash"
+      },
+      "login": "kiro-cli",
+      "docs": "https://kiro.dev/docs/cli/",
+      "unverified": true,
+      "prompt_delivery": "none"
+    },
+    {
+      "id": "cursor",
+      "label": "Cursor",
+      "harness": "cursor-native",
+      "binary": "cursor-agent",
+      "kind": "native",
+      "roles": [
+        "coder",
+        "reviewer"
+      ],
+      "vendor": "cursor",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model"
+      },
+      "install": {
+        "curl": "curl https://cursor.com/install -fsS | bash"
+      },
+      "login": "cursor-agent login",
+      "docs": "https://cursor.com/docs/cli",
+      "prompt_delivery": "none"
+    },
+    {
+      "id": "gemini",
+      "label": "Gemini CLI",
+      "harness": "qwen-native",
+      "binary": "gemini",
+      "kind": "native",
+      "roles": [
+        "coder"
+      ],
+      "vendor": "google",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model"
+      },
+      "install": {
+        "npm": "npm i -g @google/gemini-cli"
+      },
+      "login": "gemini",
+      "docs": "https://google-gemini.github.io/gemini-cli/",
+      "unverified": true,
+      "prompt_delivery": "none"
+    },
+    {
+      "id": "goose",
+      "label": "Goose",
+      "harness": "goose-native",
+      "binary": "goose",
+      "kind": "native",
+      "roles": [
+        "coder"
+      ],
+      "vendor": "goose",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model"
+      },
+      "install": {
+        "brew": "brew install block-goose-cli"
+      },
+      "login": "goose configure",
+      "docs": "https://block.github.io/goose/",
+      "prompt_delivery": "none"
+    },
+    {
+      "id": "hermes",
+      "label": "Hermes",
+      "harness": "hermes-native",
+      "binary": "hermes",
+      "kind": "native",
+      "roles": [
+        "coder",
+        "reviewer"
+      ],
+      "vendor": "hermes",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model"
+      },
+      "install": {
+        "note": "See the Hermes docs for your platform."
+      },
+      "login": "hermes model",
+      "docs": "https://hermes.ai/docs",
+      "prompt_delivery": "none"
+    },
+    {
+      "id": "grok",
+      "label": "Grok Build",
+      "harness": "grok",
+      "binary": "grok",
+      "kind": "acp-builtin",
+      "roles": [
+        "coder"
+      ],
+      "vendor": "xai",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model",
+        "note": "Omnigent's builtin ACP rows own their auth and model selection (OWN_AUTH); a model override is rejected up front rather than silently dropped."
+      },
+      "install": {
+        "npm": "npm i -g @xai/grok-cli"
+      },
+      "login": "grok",
+      "docs": "https://x.ai",
+      "prompt_delivery": "first_user"
+    },
+    {
+      "id": "devin",
+      "label": "Devin",
+      "harness": "devin",
+      "binary": "devin",
+      "kind": "acp-builtin",
+      "roles": [
+        "coder"
+      ],
+      "vendor": "cognition",
+      "relay": true,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model"
+      },
+      "install": {
+        "note": "See the Devin docs."
+      },
+      "login": "devin login",
+      "docs": "https://docs.devin.ai",
+      "prompt_delivery": "first_user"
+    }
+  ],
+  "$prompt_delivery": {
+    "argv": "Prompt is appended to the CLI argv at startup. Subject to the tmux command-string ceiling (PROMPT_CEILING).",
+    "per_turn": "Prompt is composed and sent per turn over the harness's own transport. No command-line ceiling.",
+    "first_user": "Prompt is prepended to the first user message.",
+    "none": "The harness NEVER receives the spec prompt. A worker on this harness only ever sees the dispatch text, so operating rules must be inlined into args.input by the orchestrator. Cannot be an orchestrator.",
+    "unknown": "Not declared by Omnigent (user-configured ACP). Assume the prompt may not arrive; inline critical rules in the dispatch."
+  }
+}

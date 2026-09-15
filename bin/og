@@ -1,0 +1,816 @@
+#!/usr/bin/env bash
+# og — one-word control for an Omnigent orchestrator agent + its ngrok tunnel.
+#
+#   og start [domain]   start ngrok, then the server with the orchestrator registered
+#   og stop             stop the server, host daemons, and the tunnel
+#   og chat [args...]   open an orchestrator session in this terminal (no picker)
+#   og attach           re-attach the host daemon to a running server
+#   og login            store server credentials in the Keychain (once)
+#   og status           what is running, and the public URL
+#   og url              print the public URL only (pipe-friendly)
+#   og logs [-f]        tail the server log
+#
+# Works from any directory: every path here is absolute.
+#
+# Why ngrok starts FIRST: the server needs its public origin at boot.
+# OMNIGENT_ACCOUNTS_BASE_URL and OMNIGENT_WS_ALLOWED_ORIGINS must match the
+# origin the browser actually uses, or the phone gets WebSocket close 4403 and
+# HTTP 403 on chat — which reads as a broken install rather than a config gap.
+# With an ephemeral tunnel the URL is not knowable until ngrok is up, so we
+# start it, read the URL from ngrok's local API, and only then boot the server.
+#
+# Why --agent matters: it pre-registers the agent bundle with the server.
+# Plain `omnigent start` registers nothing, so sessions open on the default
+# claude-native-ui shim — plain Claude Code, no delegation, no merge gate.
+set -euo pipefail
+
+OMNI_HOME="$HOME/.omnigent"
+# Which orchestrator bundle og drives. Set by the installer in og.env;
+# "dev-lead" is the stock name so an unconfigured install still works.
+AGENT_NAME="${OG_AGENT:-dev-lead}"
+AGENT_DIR="$OMNI_HOME/agents/$AGENT_NAME"
+NGROK_PIDFILE="$OMNI_HOME/og-ngrok.pid"
+NGROK_LOG="$OMNI_HOME/logs/ngrok.log"
+SECRET_FILE="$OMNI_HOME/.cookie-secret"
+CONF_FILE="$OMNI_HOME/og.env"
+SERVER_PIDFILE="$OMNI_HOME/og-server.pid"
+SERVER_LOGDIR="$OMNI_HOME/logs/server"
+
+# Optional overrides: OG_PORT, OG_NGROK_DOMAIN, OG_CLAUDE_CONFIG_DIR.
+# Written as an if, not `[[ ]] && source`: under `set -e` a bare failing test as
+# the last statement of an AND-list is an easy way to abort the script.
+# shellcheck disable=SC1090
+if [[ -f "$CONF_FILE" ]]; then source "$CONF_FILE"; fi
+
+PORT="${OG_PORT:-6767}"
+# The directory og was launched from becomes the default WORKSPACE for new
+# sessions in the pinned project. Without this the composer falls back to the
+# home directory, and an agent told to read "AGENTS.md at the repo root" finds
+# nothing — the exact failure this fixes. Captured before any cd.
+OG_LAUNCH_DIR="${OG_WORKSPACE:-$PWD}"
+NGROK_API="http://127.0.0.1:4040/api/tunnels"
+
+die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[0;36m→\033[0m %s\n' "$*"; }
+ok() { printf '\033[0;32m✓\033[0m %s\n' "$*"; }
+
+# Render the public URL as a scannable QR block. Optional by design: a missing
+# qrencode must never fail a start, so this degrades to printing nothing and
+# the URL line below it still carries the address.
+#   -m 1  one-module quiet zone; the default 4 makes it too tall for a terminal
+#   -s 1  smallest module size
+#   ANSIUTF8 packs two rows per line with half-blocks, so a v3 QR fits ~13 rows
+print_qr() {
+  local url="$1"
+  command -v qrencode >/dev/null 2>&1 || return 0
+  echo
+  qrencode -t ANSIUTF8 -m 1 -s 1 "$url" 2>/dev/null || return 0
+}
+
+# No pipe here on purpose: `... | grep -q` exits on first match, SIGPIPEs the
+# upstream command, and `pipefail` then reports 141 — so the check would say
+# "not running" while the server is up. Match the exact strings cli.py emits,
+# testing "not running" first since it also contains "running".
+# The server og starts is a plain foreground `omnigent server` that og detaches
+# itself (see cmd_start), so consult our own pidfile first. When it took the
+# default loopback port it ALSO registered in ~/.omnigent/local_server.pid and
+# `omnigent server status` can see it -- that is the fallback, and the only path
+# that finds a server someone brought up with plain `omnigent start`.
+og_server_pid() {
+  [[ -f "$SERVER_PIDFILE" ]] || return 1
+  local p; p="$(cat "$SERVER_PIDFILE" 2>/dev/null || true)"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+  return 1
+}
+
+server_running() {
+  og_server_pid >/dev/null && return 0
+  local out
+  out="$(omnigent server status 2>&1 || true)"
+  case "$out" in
+    *"not running"*) return 1 ;;
+    *"running at"*)  return 0 ;;
+    *)               return 1 ;;
+  esac
+}
+
+ngrok_pid() {
+  [[ -f "$NGROK_PIDFILE" ]] || return 1
+  local p; p="$(cat "$NGROK_PIDFILE" 2>/dev/null || true)"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+  return 1
+}
+
+# Ensure a project exists whose DEFAULT AGENT is the orchestrator, and echo its name.
+#
+# Why this is needed at all: the web composer's default is the first *harness*
+# entry (Claude Code), never a custom agent — and there is no ?agent= URL
+# parameter. Registering the agent makes it selectable, not selected. A project
+# default is the one supported way to pin it (docs: Project settings › Default
+# agent), so `og start` maintains one and points the URL at it.
+#
+# The config key is snake_case `agent_id`. The web bundle's TypeScript calls it
+# `agentId`; the server stores `agent_id`, and only the latter takes effect.
+ensure_project() {
+  local url="http://127.0.0.1:$PORT" name="${OG_PROJECT:-$AGENT_NAME}" tok
+  tok="$(python3 -c "import json;print(json.load(open('$OMNI_HOME/auth_tokens.json'))['$url']['token'])" 2>/dev/null)" || return 1
+  [[ -n "$tok" ]] || return 1
+
+  OG_URL="$url" OG_TOK="$tok" OG_NAME="$name" OG_AGENT_DIR="$AGENT_DIR" OG_AGENT_NAME="$AGENT_NAME" python3 <<'PYEOF'
+import json, os, sys, urllib.request, urllib.error
+
+url, tok, name = os.environ["OG_URL"], os.environ["OG_TOK"], os.environ["OG_NAME"]
+agent_name = os.environ["OG_AGENT_NAME"]
+H = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+
+def call(path, method="GET", body=None):
+    req = urllib.request.Request(
+        url + path, method=method, headers=H,
+        data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r) if r.status != 204 else {}
+
+try:
+    agents = call("/v1/agents").get("data", [])
+    dev = next((a for a in agents if a.get("name") == agent_name), None)
+    if dev is None:
+        print(f"{agent_name} is not registered on the server", file=sys.stderr); sys.exit(1)
+
+    projects = call("/v1/projects").get("data", [])
+    proj = next((p for p in projects if p.get("name") == name), None)
+    if proj is None:
+        proj = call("/v1/projects", "POST", {"name": name})
+
+    # Pin the workspace to og's launch directory and the local host, so a new
+    # session starts IN the repo you ran `og start` from rather than $HOME.
+    ws = os.environ.get("OG_WS") or ""
+    want = {"agent_id": dev["id"]}
+    if ws:
+        want["workspace"] = ws
+    try:
+        hosts = call("/v1/hosts").get("hosts", [])
+        online = next((h for h in hosts if h.get("status") == "online"), None)
+        if online:
+            want["host_id"] = online["host_id"]
+    except Exception:
+        pass  # a missing host is not fatal; the composer still asks for one
+
+    # Re-pin every start: the agent id changes if the bundle is re-registered,
+    # and a stale id silently falls back to the Claude Code shim.
+    cur = proj.get("config") or {}
+    if any(cur.get(k) != v for k, v in want.items()):
+        call(f"/v1/projects/{proj['id']}", "PATCH", {"config": {**cur, **want}})
+    print(name)
+except urllib.error.HTTPError as e:
+    print(f"project setup failed (HTTP {e.code})", file=sys.stderr); sys.exit(1)
+except Exception as e:
+    print(f"project setup failed: {e}", file=sys.stderr); sys.exit(1)
+PYEOF
+}
+
+# Print the QR + URL exactly once, on ANY exit path after the tunnel is up.
+# Installed as an EXIT trap rather than called at the end of cmd_start: the
+# happy path is not the only way out — a failed mint, a daemon that will not
+# attach, or a die() all leave a perfectly usable tunnel, and the address is
+# just as wanted then. The guard keeps a normal finish from printing twice.
+OG_ACCESS_SHOWN=0
+show_access() {
+  [[ "$OG_ACCESS_SHOWN" -eq 1 ]] && return 0
+  local url="${OG_PUBLIC_URL:-}"
+  [[ -n "$url" ]] || return 0
+  OG_ACCESS_SHOWN=1
+  print_qr "$url"
+  echo
+  echo "    scan the code above, or open: $url"
+  echo "    local:  http://127.0.0.1:$PORT"
+}
+
+# --- session lifecycle -------------------------------------------------------
+#
+# Policy: the login session is scoped to the SERVER's lifetime, not to a clock.
+# `og start` mints a brand-new token; `og stop` destroys it. Nothing is ever
+# reused across runs, so the "stale token 8 hours later" failure cannot happen —
+# a token only exists while the server that issued it is running.
+#
+# Credentials come from the macOS Keychain (`og login` stores them once), so a
+# fresh mint costs no typing. The Keychain is OS-protected; the alternative —
+# a password in og.env — would be plaintext on disk.
+KEYCHAIN_SERVICE="omnigent-og"
+
+keychain_get() {
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null
+}
+
+keychain_user() {
+  # The account name is stored alongside the password; read it back so `og
+  # start` does not need the username repeated in config.
+  security find-generic-password -s "$KEYCHAIN_SERVICE" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p' | head -1
+}
+
+# Mint a fresh session token and write it where the CLI and host daemon look.
+# Returns non-zero (with a reason on stderr) rather than dying, so callers can
+# decide whether a failure is fatal.
+mint_token() {
+  local user pass url="http://127.0.0.1:$PORT"
+  user="$(keychain_user)"
+  [[ -n "$user" ]] || { echo "no stored credentials (run: og login)" >&2; return 1; }
+  pass="$(keychain_get "$user")"
+  [[ -n "$pass" ]] || { echo "no password in Keychain for '$user' (run: og login)" >&2; return 1; }
+
+  OG_URL="$url" OG_USER="$user" OG_PASS="$pass" OG_TOKENS="$OMNI_HOME/auth_tokens.json" \
+  python3 <<'PYEOF'
+import json, os, sys, time, urllib.request, urllib.error
+
+url, user, pw = os.environ["OG_URL"], os.environ["OG_USER"], os.environ["OG_PASS"]
+req = urllib.request.Request(
+    url + "/auth/login",
+    data=json.dumps({"username": user, "password": pw}).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = json.load(r)
+except urllib.error.HTTPError as e:
+    detail = e.read().decode(errors="replace")[:200]
+    print(f"login rejected (HTTP {e.code}): {detail}", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f"login request failed: {e}", file=sys.stderr)
+    sys.exit(1)
+
+token = body.get("token")
+if not token:
+    print("login succeeded but returned no token", file=sys.stderr)
+    sys.exit(1)
+
+# Mirror the record shape omnigent's own `login` writes, so the CLI and the
+# host daemon read it through their normal path with no special-casing.
+path = os.environ["OG_TOKENS"]
+try:
+    with open(path) as fh:
+        store = json.load(fh)
+    if not isinstance(store, dict):
+        store = {}
+except Exception:
+    store = {}
+
+store[url] = {
+    "token": token,
+    "user_id": user,
+    "expires_at": int(time.time() + int(body.get("expires_in", 3600))),
+}
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as fh:
+    json.dump(store, fh, indent=2)
+print(int(body.get("expires_in", 3600)))
+PYEOF
+}
+
+# Drop the local server's token. The browser keeps its own cookie, so this logs
+# out the CLI and host daemon only — a phone already signed in stays signed in.
+destroy_token() {
+  OG_URL="http://127.0.0.1:$PORT" OG_TOKENS="$OMNI_HOME/auth_tokens.json" python3 <<'PYEOF' 2>/dev/null
+import json, os
+path, url = os.environ["OG_TOKENS"], os.environ["OG_URL"]
+try:
+    with open(path) as fh:
+        store = json.load(fh)
+except Exception:
+    raise SystemExit(0)
+if isinstance(store, dict) and store.pop(url, None) is not None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(store, fh, indent=2)
+    print("dropped")
+PYEOF
+}
+
+# Seconds remaining on the stored login session for the local server, or empty
+# when there is no token. Accounts mode (which OMNIGENT_AUTH_ENABLED turns on)
+# authenticates the HOST DAEMON with this bearer token; when it expires the
+# daemon's WebSocket tunnel is rejected with HTTP 403 and the UI ends up with an
+# agent it has nowhere to run.
+token_ttl_left() {
+  python3 - "$OMNI_HOME/auth_tokens.json" "http://127.0.0.1:$PORT" <<'PYEOF' 2>/dev/null
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+rec = d.get(sys.argv[2])
+if not isinstance(rec, dict) or "expires_at" not in rec:
+    sys.exit(1)
+print(int(rec["expires_at"] - time.time()))
+PYEOF
+}
+
+# The agent a new session opens with. Registering a bundle (--agent) only makes
+# it AVAILABLE in the picker; `default_agent` is what makes it the one you land
+# on. Miss it and og reports the agent registered while every session quietly
+# opens the claude-native-ui shim: plain Claude Code, no roster, no merge gate.
+#
+# Caveat: this reads the EFFECTIVE value, and a project-level
+# .omnigent/config.yaml in the cwd you launch from outranks the user-level one.
+# og can only assert what it sees from here.
+configured_default_agent() {
+  omnigent config list 2>/dev/null \
+    | sed -n 's/^[[:space:]]*default_agent=//p' \
+    | head -1
+}
+
+# Compare two paths by their resolved physical location, so a symlinked or
+# trailing-slash spelling does not read as a mismatch.
+same_path() {
+  local a b
+  a="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  b="$(cd "$2" 2>/dev/null && pwd -P)" || return 1
+  [[ "$a" == "$b" ]]
+}
+
+# Read the public https URL out of ngrok's local API.
+tunnel_url() {
+  curl -fsS --max-time 3 "$NGROK_API" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for t in d.get("tunnels", []):
+    u = t.get("public_url", "")
+    if u.startswith("https://"):
+        print(u); sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+
+cmd_start() {
+  local domain="${1:-${OG_NGROK_DOMAIN:-}}"
+
+  if server_running; then
+    omnigent server status 2>&1 | sed 's/^/    /'
+    die "Omnigent is already running. Run 'og stop' first (this will end live sessions)."
+  fi
+  [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
+  command -v ngrok >/dev/null || die "ngrok is not installed (brew install ngrok)"
+  command -v omnigent >/dev/null || die "omnigent is not on PATH"
+
+  # ngrok v3 refuses to tunnel without an authtoken, and the failure is buried
+  # in its log — check up front so the message is actionable.
+  if ! ngrok config check >/dev/null 2>&1; then
+    die "ngrok has no authtoken. Get yours at https://dashboard.ngrok.com/get-started/your-authtoken then run:
+    ngrok config add-authtoken <token>"
+  fi
+
+  mkdir -p "$(dirname "$NGROK_LOG")"
+
+  if ngrok_pid >/dev/null; then
+    info "reusing the ngrok tunnel already running (pid $(ngrok_pid))"
+  else
+    local args=(http "$PORT" --log=stdout --log-format=logfmt)
+    [[ -n "$domain" ]] && args+=(--domain "${domain#https://}")
+    info "starting ngrok on port $PORT${domain:+ (domain: ${domain#https://})}"
+    nohup ngrok "${args[@]}" >"$NGROK_LOG" 2>&1 &
+    echo $! > "$NGROK_PIDFILE"
+  fi
+
+  # Poll for the URL rather than sleeping a fixed amount: cold starts vary.
+  local url="" i
+  for i in $(seq 1 40); do
+    url="$(tunnel_url || true)"
+    [[ -n "$url" ]] && break
+    if ! ngrok_pid >/dev/null; then
+      printf '\n--- ngrok log ---\n'; tail -15 "$NGROK_LOG" 2>/dev/null
+      rm -f "$NGROK_PIDFILE"
+      die "ngrok exited during startup (see log above)"
+    fi
+    sleep 0.5
+  done
+  [[ -n "$url" ]] || { tail -15 "$NGROK_LOG" 2>/dev/null; die "timed out waiting for the ngrok URL"; }
+  ok "tunnel up: $url"
+  # From here on the address is known, so guarantee it reaches the user no
+  # matter how cmd_start ends.
+  OG_PUBLIC_URL="$url"
+  trap show_access EXIT
+
+  # Persist the cookie secret; regenerating it would sign everyone out.
+  # The server does bytes.fromhex() on this and requires >= 32 bytes, so it
+  # must be 64 hex chars -- a token_urlsafe/base64 value dies at startup.
+  if [[ -f "$SECRET_FILE" ]] && ! [[ "$(tr -d '\n' < "$SECRET_FILE")" =~ ^[0-9a-fA-F]{64,}$ ]]; then
+    info "$SECRET_FILE is not 64 hex chars; regenerating (everyone is signed out)"
+    rm -f "$SECRET_FILE"
+  fi
+  if [[ ! -f "$SECRET_FILE" ]]; then
+    ( umask 077 && python3 -c 'import secrets;print(secrets.token_hex(32))' > "$SECRET_FILE" )
+    info "generated $SECRET_FILE"
+  fi
+
+  # Scopes every claude-native sub-agent (the reviewer) to the work account,
+  # leaving Tier-1 Claude Code in your terminal on the personal one. Omnigent
+  # reads this from its own process env — there is no per-sub-agent override.
+  export CLAUDE_CONFIG_DIR="${OG_CLAUDE_CONFIG_DIR:-$HOME/.claude-work}"
+  # dev-lead can write code, push branches and merge to dev. A tunnel to the
+  # public internet must not front an anonymous UI.
+  export OMNIGENT_AUTH_ENABLED=1
+  export OMNIGENT_ACCOUNTS_COOKIE_SECRET="$(cat "$SECRET_FILE")"
+  export OMNIGENT_ACCOUNTS_BASE_URL="$url"
+  export OMNIGENT_WS_ALLOWED_ORIGINS="$url"
+  # One operator, one machine. `omnigent server --background` used to set this
+  # for us inside _spawn_local_server; starting the server directly means we own
+  # it.
+  #
+  # CORRECTION to what this comment used to claim: this does NOT authenticate
+  # the host daemon under accounts mode. OMNIGENT_LOCAL_SINGLE_USER is a
+  # HEADER-mode escape hatch — it makes an absent identity header resolve to the
+  # reserved "local" user. Setting OMNIGENT_AUTH_ENABLED=1 selects *accounts*
+  # mode instead, where that fallback is never consulted and a real bearer token
+  # is required. It still earns its place (it keeps host_id ownership stable),
+  # but the daemon's credentials come from auth_tokens.json, not from here.
+  export OMNIGENT_LOCAL_SINGLE_USER=1
+
+  # Accounts sessions default to 8 hours (OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS),
+  # which means a laptop left running overnight wakes up to a host daemon that
+  # cannot authenticate. For a single-operator server this is pure friction, so
+  # stretch it. Tradeoff: a leaked token stays valid for the whole window — the
+  # file is 0600 and the real exposure is the public URL plus password login,
+  # not this token, but lower it in og.env if you would rather re-login weekly.
+  export OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS="${OG_SESSION_TTL_HOURS:-720}"
+
+  # Scope the opencode/Zen worker to a bare harness. omnigent already spawns
+  # `opencode serve` with per-session XDG dirs, so the user's global
+  # ~/.config/opencode (plugins, skills, MCP) never reaches it — but the
+  # EXTERNAL skill scan reads ~/.claude/ and ~/.agents/ under $HOME, and HOME is
+  # on the harness's passthrough list. These two close that gap. `OPENCODE_` is
+  # an auto-passthrough prefix, so setting them here reaches the worker; there
+  # is no per-sub-agent env field in the omnigent schema (OSEnvSpec has no
+  # `env`), which is why this lives at the launching process.
+  #
+  # Deliberately NOT set: OPENCODE_PURE. It skips external plugins *entirely*,
+  # and omnigent registers its own bridge plugin in the synthesized
+  # opencode.json — PURE would disable the very channel the worker reports
+  # through. Use `opencode --pure` by hand for bare interactive testing instead.
+  export OPENCODE_DISABLE_CLAUDE_CODE=1
+  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+
+  info "account: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
+  # NOT `omnigent server --background`. That flag is handled first in cli.py --
+  # `if background: _run_background_server(); return` -- and _run_background_server
+  # takes no arguments, so every other flag on the line is silently dropped. It
+  # re-execs a hardcoded argv (`server --host 127.0.0.1 --port N --database-uri ...
+  # --artifact-location ...`) with no --agent at all. dev-lead then never becomes a
+  # template agent, GET /v1/agents returns only the built-ins, and the web UI's
+  # new-session picker has nothing to bind -- the exact "og start runs but there is
+  # no dev-lead" symptom. The same spawn also overwrites OMNIGENT_ACCOUNTS_BASE_URL
+  # with http://127.0.0.1:PORT, undoing the ngrok origin set above.
+  #
+  # So detach a plain foreground server here instead. The flags stay minimal on
+  # purpose: default host (127.0.0.1), default database, default artifacts, and an
+  # explicit --port only when it is not the default. That exact combination is what
+  # cli.py calls the *canonical* local server, and only the canonical path calls
+  # register_local_server() -- which is what keeps `omnigent server status`,
+  # `omnigent stop`, and the host daemon's server-reuse logic working. Binding
+  # loopback instead of 0.0.0.0 costs nothing: ngrok forwards to 127.0.0.1.
+  mkdir -p "$SERVER_LOGDIR"
+  local server_log="$SERVER_LOGDIR/server-$(date +%Y%m%d-%H%M%S)-og.log"
+  local server_args=(server --agent "$AGENT_DIR")
+  if [[ "$PORT" != "6767" ]]; then server_args+=(--port "$PORT"); fi
+
+  info "registering agent: $AGENT_DIR"
+  # PYTHONUNBUFFERED so the registration line below is in the log by the time
+  # /health answers; click.echo to a redirected stdout is otherwise block-buffered.
+  nohup env PYTHONUNBUFFERED=1 omnigent "${server_args[@]}" >"$server_log" 2>&1 &
+  echo $! > "$SERVER_PIDFILE"
+
+  info "waiting for the server on port $PORT"
+  local up=0
+  for _ in $(seq 1 60); do
+    if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then up=1; break; fi
+    if ! og_server_pid >/dev/null; then
+      printf '\n--- server log ---\n'; tail -20 "$server_log" 2>/dev/null
+      rm -f "$SERVER_PIDFILE"
+      die "the omnigent server exited during startup (see log above)"
+    fi
+    sleep 0.5
+  done
+  if [[ "$up" -ne 1 ]]; then
+    printf '\n--- server log ---\n'; tail -20 "$server_log" 2>/dev/null
+    die "timed out waiting for the server on http://127.0.0.1:$PORT"
+  fi
+
+  # Assert the registration rather than assume it. _preregister_agent echoes
+  # "  agent: <name> (from <path>)" on success and a "has no name, skipping"
+  # warning on a nameless bundle -- and an unregistered agent is invisible until
+  # someone opens the picker on their phone and finds only claude-native-ui.
+  if grep -q "agent: $AGENT_NAME" "$server_log"; then
+    ok "$AGENT_NAME registered as a template agent"
+  else
+    printf '\n--- server log ---\n'; tail -20 "$server_log" 2>/dev/null
+    die "the server is up but did not register $AGENT_NAME (see log above)"
+  fi
+
+  # Registration proves dev-lead is AVAILABLE; it does not make it the agent a
+  # new session opens with. If default_agent is unset, set it -- launching
+  # dev-lead is this script's entire purpose, so an unset default is an
+  # omission, not a preference. If it points somewhere ELSE, say so and leave
+  # it alone: that is a deliberate choice and silently overwriting it would be
+  # worse than the problem.
+  local cur_default; cur_default="$(configured_default_agent)"
+  if [[ -z "$cur_default" ]]; then
+    info "default_agent was unset; pointing it at $AGENT_NAME"
+    omnigent config set --global "default_agent=$AGENT_DIR" >/dev/null 2>&1 \
+      || info "could not set default_agent (sessions may open on the default shim)"
+  elif ! same_path "$cur_default" "$AGENT_DIR"; then
+    printf '\033[0;33m!\033[0m default_agent points elsewhere:\n' >&2
+    echo "    $cur_default" >&2
+    echo "    new sessions will NOT open on $AGENT_NAME. To change it:" >&2
+    echo "    omnigent config set --global default_agent=$AGENT_DIR" >&2
+  else
+    ok "default_agent resolves to $AGENT_NAME"
+  fi
+
+  # The server holds state and serves the UI; it does not run harnesses. That is
+  # the host daemon's job -- `omnigent start` is really `omnigent host
+  # --background`, and og, by starting only the server, left the UI with an empty
+  # host list. Started here rather than before the server so it finds ours healthy
+  # in local_server.pid and reuses it instead of spawning a second one, and so it
+  # inherits the CLAUDE_CONFIG_DIR / OPENCODE_* scoping exported above -- the
+  # daemon is the process that spawns the workers.
+  # Always mint a FRESH session. The token is scoped to this server's lifetime:
+  # `og stop` destroys it, so nothing is ever carried across runs and the
+  # "expired 8 hours later" failure is structurally impossible rather than
+  # merely unlikely. Done after the server is up because /auth/login is served
+  # by it.
+  info "minting a fresh login session"
+  local expires_in
+  if ! expires_in="$(mint_token)"; then
+    echo
+    echo "    The server and tunnel are up, but no session could be minted."
+    echo "    If you have not stored credentials yet:"
+    echo
+    echo "      og login"
+    echo
+    echo "    Then:  og attach"
+    exit 0
+  fi
+  ok "session minted (valid $(( expires_in / 3600 ))h)"
+
+  # Pin dev-lead as the project default and aim the public URL at it, so the
+  # composer opens ON dev-lead instead of the Claude Code shim.
+  local proj
+  if proj="$(ensure_project)"; then
+    ok "project '$proj' pinned to $AGENT_NAME"
+    OG_PUBLIC_URL="${OG_PUBLIC_URL%%\?*}/?project=$proj"
+  else
+    printf '\033[0;33m!\033[0m could not pin the project default; the composer will\n' >&2
+    echo "    open on Claude Code — pick $AGENT_NAME manually (the row with a tooltip)." >&2
+  fi
+
+  info "attaching the host daemon"
+  if ! omnigent host --background --server "" --non-interactive 2>&1 | sed 's/^/    /'; then
+    die "the host daemon did not attach. The server and $AGENT_NAME are up, so the
+    UI will list the agent but has nowhere to run it. If this says the account
+    cannot claim the host, run 'omnigent host reset-id' and 'og start' again."
+  fi
+
+  echo
+  ok "$AGENT_NAME is up"
+  show_access
+  echo "    log:    $server_log"
+  echo "    stop:   og stop"
+}
+
+cmd_stop() {
+  local stopped=0
+  if server_running; then
+    info "stopping omnigent (server + host daemons)"
+    omnigent stop >/dev/null 2>&1 || omnigent stop --force >/dev/null 2>&1 || true
+    # `omnigent stop` only knows the server recorded in local_server.pid. A server
+    # og started on a non-default port never registered there, so finish the job
+    # from our own pidfile.
+    if og_server_pid >/dev/null; then
+      local sp; sp="$(og_server_pid)"
+      info "stopping the og-started server (pid $sp)"
+      kill "$sp" 2>/dev/null || true
+      for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$sp" 2>/dev/null || break; sleep 0.3; done
+      kill -0 "$sp" 2>/dev/null && kill -9 "$sp" 2>/dev/null || true
+    fi
+    stopped=1
+  else
+    info "omnigent was not running"
+  fi
+
+  if ngrok_pid >/dev/null; then
+    local p; p="$(ngrok_pid)"
+    info "stopping ngrok (pid $p)"
+    kill "$p" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+    kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+    stopped=1
+  else
+    info "no ngrok tunnel started by og"
+  fi
+  # Destroy the session so nothing survives to go stale. Only the CLI/daemon
+  # token is dropped — a browser already signed in keeps its own cookie, so a
+  # phone mid-session is not kicked out by a laptop-side stop.
+  if [[ -n "$(destroy_token || true)" ]]; then
+    info "destroyed the login session"
+    stopped=1
+  fi
+
+  rm -f "$NGROK_PIDFILE" "$SERVER_PIDFILE"
+
+  # `omnigent stop` stops the host daemons and the background server, and the
+  # daemon reaps its own runners on exit. What it does NOT do is tear down the
+  # private tmux servers behind managed terminals: those are swept by
+  # reap_orphaned_terminals at the next RUNNER STARTUP, so anything whose owner
+  # died ungracefully lingers until then. On a laptop that is exactly the slow
+  # memory leak to avoid, so finish the job here.
+  local leftovers; leftovers="$(orphan_terminal_dirs)"
+  if [[ -n "$leftovers" ]]; then
+    local n; n="$(printf '%s\n' "$leftovers" | grep -c .)"
+    info "reaping $n orphaned terminal server(s)"
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
+      # Kill the tmux server by its own socket, not by name: these are private
+      # servers on isolated sockets, and a blanket `tmux kill-server` would also
+      # take down an unrelated tmux the user is sitting in.
+      local sock; sock="$(find "$d" -maxdepth 1 -type s 2>/dev/null | head -1)"
+      if [[ -n "$sock" ]]; then
+        tmux -S "$sock" kill-server >/dev/null 2>&1 || true
+      fi
+      local opid; opid="$(cat "$d/owner.pid" 2>/dev/null || true)"
+      if [[ -n "$opid" ]] && kill -0 "$opid" 2>/dev/null; then
+        kill "$opid" 2>/dev/null || true
+      fi
+      rm -rf "$d" 2>/dev/null || true
+    done <<< "$leftovers"
+    stopped=1
+  fi
+
+  # Last check: any omnigent-owned process still holding on. Reported, not
+  # killed — a surviving PID after a clean stop is a bug worth seeing, and
+  # silently SIGKILLing it would hide the thing you want to know about.
+  local stragglers
+  stragglers="$(pgrep -fl 'omnigent (server|host)' 2>/dev/null || true)"
+  if [[ -n "$stragglers" ]]; then
+    printf '\033[0;33m!\033[0m still running after stop:\n' >&2
+    printf '%s\n' "$stragglers" | sed 's/^/    /' >&2
+    echo "    (run 'og stop' again, or 'omnigent stop --force')" >&2
+  fi
+
+  [[ "$stopped" -eq 1 ]] && ok "stopped" || ok "nothing to stop"
+}
+
+cmd_status() {
+  if server_running; then
+    omnigent server status 2>&1 | sed 's/^/    /'
+    # On a non-default port the server is not in local_server.pid, so the line
+    # above reads "not running" while it is very much up. Say so explicitly.
+    if og_server_pid >/dev/null; then
+      echo "    og server: pid $(og_server_pid)  ($AGENT_NAME registered)"
+    fi
+  else
+    echo "    omnigent: not running"
+  fi
+  if ngrok_pid >/dev/null; then
+    echo "    ngrok:    pid $(ngrok_pid)  $(tunnel_url || echo '(no https tunnel yet)')"
+  else
+    echo "    ngrok:    not running"
+  fi
+  local ttl; ttl="$(token_ttl_left || true)"
+  if [[ -z "$ttl" ]]; then
+    echo "    session:  none — minted fresh by 'og start' (credentials: og login)"
+  elif [[ "$ttl" -le 0 ]]; then
+    echo "    session:  expired — 'og start' mints a fresh one; or 'og attach' now"
+  else
+    echo "    session:  valid for $((ttl/3600))h $(((ttl%3600)/60))m"
+  fi
+  if server_running; then
+    local pj; pj="$(ensure_project 2>/dev/null || true)"
+    [[ -n "$pj" ]] && echo "    project:  '$pj' → $AGENT_NAME (web composer default)" \
+                   || echo "    project:  not pinned — web composer opens on Claude Code"
+  fi
+  local d; d="$(configured_default_agent)"
+  if [[ -z "$d" ]]; then
+    echo "    agent:    default_agent UNSET — sessions open on the default shim"
+  elif same_path "$d" "$AGENT_DIR"; then
+    echo "    agent:    $AGENT_NAME (default)"
+  else
+    echo "    agent:    $d  (NOT $AGENT_NAME)"
+  fi
+}
+
+# Plain URL on stdout so `og url` stays pipe-friendly; the QR goes to stderr
+# so it is visible when a human runs it but never pollutes a pipeline.
+# Attach only the host daemon to an already-running server. The recovery step
+# after a lapsed login: `omnigent login` needs the server up, so og start leaves
+# it running and hands off to this rather than tearing everything down.
+# Store server credentials in the macOS Keychain, once. `og start` reads them
+# to mint a fresh session each run, so this is the only time a password is typed.
+cmd_login() {
+  local user pass confirm
+  read -r -p "omnigent username: " user
+  [[ -n "$user" ]] || die "username cannot be empty"
+  read -r -s -p "password: " pass; echo
+  [[ -n "$pass" ]] || die "password cannot be empty"
+  read -r -s -p "confirm:  " confirm; echo
+  [[ "$pass" == "$confirm" ]] || die "passwords did not match"
+
+  # -U updates in place when an entry already exists, so re-running this to
+  # change the password does not error on a duplicate.
+  security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$user" -w "$pass" \
+    || die "could not write to the Keychain"
+  ok "stored credentials for '$user' in the Keychain ($KEYCHAIN_SERVICE)"
+
+  if server_running; then
+    info "server is up — minting a session now"
+    if mint_token >/dev/null; then ok "session minted; run 'og attach' if the host is not attached"
+    else die "credentials stored, but login was rejected — check username/password"; fi
+  else
+    echo "    Run 'og start' to bring everything up."
+  fi
+}
+
+cmd_attach() {
+  server_running || die "the omnigent server is not running — use 'og start'"
+  local ttl; ttl="$(token_ttl_left || true)"
+  if [[ -z "$ttl" || "$ttl" -le 0 ]]; then
+    info "no valid session — minting a fresh one"
+    mint_token >/dev/null || die "could not mint a session. Run 'og login' to store credentials."
+  fi
+  # The daemon spawns the workers, so it needs the same scoping og start exports
+  # — without these the reviewer would run on the personal account and the Zen
+  # worker would pick up the user's global opencode config.
+  export CLAUDE_CONFIG_DIR="${OG_CLAUDE_CONFIG_DIR:-$HOME/.claude-work}"
+  export OMNIGENT_LOCAL_SINGLE_USER=1
+  export OPENCODE_DISABLE_CLAUDE_CODE=1
+  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  info "attaching the host daemon"
+  if ! omnigent host --background --server "" --non-interactive 2>&1 | sed 's/^/    /'; then
+    die "the host daemon did not attach. If it says the account cannot claim the
+    host, run 'omnigent host reset-id' and try again."
+  fi
+  ok "host attached — $AGENT_NAME can run"
+  local url; url="$(tunnel_url || true)"
+  [[ -n "$url" ]] && echo "    $url"
+  return 0
+}
+
+# Open a terminal session ON dev-lead against the running server, skipping the
+# web picker entirely. This is the answer to "which of the two Claude Code rows
+# is mine": with the agent named on the command line there is nothing to pick.
+#
+# `omnigent run <AGENT> --server <url>` binds the session to that bundle. The
+# bare form would also work (config's default_agent points here), but naming the
+# path makes the command self-describing and immune to a changed default.
+cmd_chat() {
+  server_running || die "the omnigent server is not running — run 'og start' first"
+  [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
+  # Same scoping the host daemon gets: without it a claude-native sub-agent
+  # (the reviewer) would run on the personal account instead of the work one.
+  export CLAUDE_CONFIG_DIR="${OG_CLAUDE_CONFIG_DIR:-$HOME/.claude-work}"
+  export OPENCODE_DISABLE_CLAUDE_CODE=1
+  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  info "starting a $AGENT_NAME session on http://127.0.0.1:$PORT"
+  exec omnigent run "$AGENT_DIR" --server "http://127.0.0.1:$PORT" "$@"
+}
+
+cmd_url() {
+  local url; url="$(tunnel_url)" || die "no ngrok tunnel is running"
+  echo "$url"
+  [[ -t 1 ]] && print_qr "$url" >&2
+  return 0
+}
+
+# Report omnigent-owned tmux servers still alive. Each managed terminal runs in
+# its own private tmux server under a temp dir named with this prefix, carrying
+# an owner.pid marker. Omnigent reaps strays via reap_orphaned_terminals — but
+# that sweep runs at RUNNER STARTUP, not at shutdown, so a terminal whose owner
+# died ungracefully survives a stop and is only cleared on the next start. That
+# is the leak worth watching, so surface it rather than assume a clean exit.
+orphan_terminal_dirs() {
+  find "${TMPDIR:-/tmp}" -maxdepth 2 -type d -name 'omnigent-terminal-*' 2>/dev/null
+}
+
+cmd_logs() {
+  local latest
+  latest="$(ls -t "$OMNI_HOME"/logs/server/server-*.log 2>/dev/null | head -1 || true)"
+  [[ -n "$latest" ]] || die "no server log found"
+  if [[ "${1:-}" == "-f" ]]; then tail -f "$latest"; else tail -60 "$latest"; fi
+}
+
+case "${1:-}" in
+  start)  shift; cmd_start "$@" ;;
+  stop)   shift; cmd_stop ;;
+  attach) shift; cmd_attach ;;
+  login)  shift; cmd_login ;;
+  chat)   shift; cmd_chat "$@" ;;
+  status) shift; cmd_status ;;
+  url)    shift; cmd_url ;;
+  logs)   shift; cmd_logs "$@" ;;
+  ""|-h|--help|help)
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command: $1  (try: og help)" ;;
+esac
