@@ -177,7 +177,8 @@ The installer will ask you to:
 6. for Claude, whether the reviewer runs on a **second account**
    (`CLAUDE_CONFIG_DIR`, e.g. `~/.claude-work`) so it is independent of your
    interactive login
-7. port, ngrok domain, max dispatches per turn
+7. port (checked for availability — suggests a free one if the default is
+   taken), ngrok domain, max dispatches per turn
 8. **where the `og` command is installed** — defaults to a directory already on
    your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
    isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
@@ -230,12 +231,26 @@ og logs [-f]        tail the server log
 og login            store server credentials in the Keychain (once)
 ```
 
+`og login` is rarely something you run yourself: `og start` calls it for you the
+first time there's no account to log into (see below).
+
 ### local vs tunneled
 
 **`og start` is local by default.** No tunnel, no ngrok account, nothing
 exposed to the internet: the server binds `0.0.0.0` and the QR encodes
 `http://<your-LAN-IP>:<port>`, which any device on the same wifi can open.
 Login is still required — a LAN is still a network.
+
+**First run.** Omnigent's own server would normally open your browser straight
+to the create-admin form, but only when it's bound to loopback — `og` always
+points it at the LAN/tunnel address instead, so that auto-open never fires. If
+no session can be minted yet, `og start` opens the browser itself, waits for
+you to pick a username + password there, then asks you to type the same two
+values in the terminal so it can store them in the Keychain (the browser's
+cookie session and `og`'s own CLI session are separate) — then carries on
+straight through to attaching the host daemon. This only happens when `og
+start` is run from an interactive terminal; a non-interactive run (e.g. from a
+script) falls back to printing `og login` as a manual next step.
 
 **`og start tunneled`** brings up ngrok first and serves behind that origin.
 The server needs its public origin *at boot*, which is why the tunnel starts

@@ -160,6 +160,113 @@ c = sqlite3.connect("file:~/.omnigent/chat.db?mode=ro", uri=True)
 
 ---
 
+## `error: agent bundle not found at ~/.omnigent/agents/dev-lead`
+
+You named the orchestrator something else during install (`og-install.json`
+has `"agent_name": "your-name"`, and `~/.omnigent/agents/your-name/` exists),
+but `og start` still looks for `dev-lead`.
+
+**Cause.** `bin/og` computed `AGENT_NAME="${OG_AGENT:-dev-lead}"` *before*
+sourcing `og.env` — the file that actually sets `OG_AGENT` to your configured
+name. The default always won because the override hadn't been read yet.
+
+**Fix.** Fixed in this repo's `bin/og` (`OG_AGENT` is read before `AGENT_NAME`
+is resolved now). If you're hitting this, update your installed copy:
+
+```bash
+cp /path/to/og/bin/og "$(command -v og)"
+```
+
+---
+
+## Server crashes on startup with a YAML `ScannerError` on `model: * ...`
+
+```
+yaml.scanner.ScannerError: while scanning an alias
+  in "<unicode string>", line 13, column 10:
+      model: * auto                 1.00x cre ...
+```
+
+**Cause.** A coder's `model` in `og-install.json` was captured from the
+vendor CLI's `--list-models` output verbatim. Most vendors print one bare id
+per line; some (kiro-cli observed) print a formatted table row instead — a
+`*` marker for the active model, then whitespace-padded columns. The whole
+row got stored as the "model id," and its leading `*` is YAML alias syntax,
+which blows up the moment it's templated unquoted into `config.yaml`.
+
+**Fix.** Fixed in `installer/og_install.py`: `list_models()` now takes only
+the first column of each line, and `model_block()` quotes the value via
+`json.dumps` regardless, so no future vendor output can do this again. If
+you're already stuck with a corrupted `og-install.json`:
+
+```bash
+# edit the bad "model" value for the affected coder, e.g. to "auto"
+python3 installer/og_install.py --plan ~/.omnigent/og-install.json --dry-run
+python3 installer/og_install.py --plan ~/.omnigent/og-install.json   # regenerate for real
+```
+
+(`--plan` needs a Python with PyYAML — Omnigent's own venv has it, e.g.
+`$(brew --prefix omnigent)/libexec/bin/python` on macOS/Homebrew.)
+
+---
+
+## `og start` dies with `[Errno 48] address already in use`
+
+```
+ERROR ... [Errno 48] error while attempting to bind on address ('0.0.0.0', 6767): address already in use
+error: the omnigent server exited during startup (see log above)
+```
+
+**Cause.** Something else on the machine is already listening on `OG_PORT`
+(default 6767) — it does not have to be a previous `og`/omnigent process.
+
+**Fix.** `og start` now checks the port before launching and names the
+process holding it:
+
+```
+error: port 6767 is already in use by jmanager- (pid 24800).
+    Set OG_PORT=<free port> in ~/.omnigent/og.env, or stop that process first.
+```
+
+Find a free port and set it in `~/.omnigent/og.env` (`OG_PORT=...`) and, to
+keep `og-install.json` consistent for the next `./install.sh` reconfigure,
+its `"port"` field too. `./install.sh` itself now checks port availability
+when it asks and suggests a free one if the default is taken.
+
+---
+
+## First run: `no stored credentials (run: og login)`
+
+```
+no stored credentials (run: og login)
+
+    The server and tunnel are up, but no session could be minted.
+    If you have not stored credentials yet:
+
+      og login
+```
+
+**Cause.** This is expected on a genuinely first install — no admin account
+exists on the server yet, and `og`'s own CLI session (Keychain-backed) is
+separate from creating that account. Omnigent's server normally auto-opens a
+browser to the create-admin form for you, but only when bound to loopback;
+`og` always binds the LAN/tunnel address instead, so that auto-open never
+fires, and older `og` builds just printed this message and stopped.
+
+**Fix.** Current `bin/og` handles this itself: when minting a session fails,
+it checks `GET /v1/info`'s `needs_setup`, opens the browser to the create-admin
+form, and prompts you in the terminal for the same username + password so it
+can store them in the Keychain — then continues straight through to attaching
+the host daemon. If you're on an older `og` (or running non-interactively,
+where there's no terminal to prompt), do it manually:
+
+```bash
+og login     # same username + password you set in the browser
+og attach
+```
+
+---
+
 ## `og start` succeeds but the UI only lists built-in agents
 
 **Cause.** `omnigent server --background` discards every other flag, including
