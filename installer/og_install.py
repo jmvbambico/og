@@ -106,6 +106,25 @@ def prereqs() -> list:
     return [(n, bool(p), why, how) for n, p, why, how in rows]
 
 
+def port_available(port: int) -> bool:
+    """True if nothing is already listening on this port."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
+def find_free_port(start: int, tries: int = 20) -> int | None:
+    for p in range(start, start + tries):
+        if port_available(p):
+            return p
+    return None
+
+
 def list_models(agent: dict) -> list:
     """Ask the vendor CLI what it can run. Empty list on any failure."""
     cmd = (agent.get("model") or {}).get("list_cmd")
@@ -117,7 +136,23 @@ def list_models(agent: dict) -> list:
         return []
     if out.returncode != 0:
         return []
-    return [l.strip() for l in out.stdout.splitlines() if l.strip()]
+    models = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Most vendor `--list-models` output is one bare id per line, but some
+        # (e.g. kiro-cli) print a formatted table: a "*" marker for the active
+        # model, then whitespace-padded columns (credits, description). Taking
+        # the whole line as the id let a row like
+        # "* auto      1.00x credits   Models chosen by task..." get stored
+        # verbatim — and its leading "*" then broke YAML parsing (alias
+        # syntax) once templated unquoted into config.yaml.
+        line = line.lstrip("*").strip()
+        model_id = re.split(r"\s{2,}", line)[0].strip()
+        if model_id:
+            models.append(model_id)
+    return models
 
 
 def free_models(agent: dict) -> list:
@@ -324,7 +359,23 @@ def build_plan_interactive(state: dict) -> dict:
     # --- runtime knobs ---
     say()
     say(f"{C['b']}Runtime{C['x']}")
-    port = ask("Omnigent server port", str(state.get("port", 6767)))
+    default_port = int(state.get("port", 6767))
+    if not port_available(default_port):
+        suggestion = find_free_port(default_port + 1)
+        if suggestion:
+            warn(f"port {default_port} is already in use — suggesting {suggestion} instead")
+            default_port = suggestion
+        else:
+            warn(f"port {default_port} is already in use and no free port was found nearby")
+    while True:
+        port = ask("Omnigent server port", str(default_port))
+        if not port.isdigit():
+            err("enter a port number")
+            continue
+        if port_available(int(port)):
+            break
+        if ask_yes(f"port {port} looks like it's already in use — use it anyway?", default=False):
+            break
     domain = ask("Reserved ngrok domain (blank = ephemeral URL each start)",
                  state.get("ngrok_domain", ""))
     max_dispatch = ask("Max worker dispatches per orchestrator turn",
@@ -610,7 +661,11 @@ def model_block(model: str | None) -> str:
     return (
         "  # Pinned at executor.model, NOT executor.config.model: the parser reads\n"
         "  # `executor.model` only, and a model under `config` is silently ignored.\n"
-        f"  model: {model}\n"
+        # Quoted via json.dumps (a valid YAML flow scalar) rather than
+        # interpolated bare: an unquoted value starting with a YAML indicator
+        # character (*, &, !, #, ...) or containing a colon breaks the parser,
+        # and a vendor CLI's model id/free-text is not guaranteed to avoid those.
+        f"  model: {json.dumps(model)}\n"
     )
 
 

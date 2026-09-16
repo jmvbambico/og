@@ -397,6 +397,22 @@ cmd_start() {
   command -v omnigent >/dev/null || die "omnigent is not on PATH"
   [[ "$mode" == "tunneled" ]] && { command -v ngrok >/dev/null || die "ngrok is not installed (brew install ngrok)"; }
 
+  # Fail fast and name the culprit: without this, a busy port surfaces only
+  # after ~30s of polling as a raw uvicorn traceback in the server log
+  # ("[Errno 48] address already in use"), which reads as an omnigent bug
+  # rather than the port collision it actually is.
+  if command -v lsof >/dev/null 2>&1; then
+    local holder
+    # `|| true`: lsof exits non-zero when nothing matches the filter, which is
+    # the common "port is free" case -- under pipefail that would otherwise
+    # abort the whole script here via set -e before a single line is printed.
+    holder="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (pid "$2")"}' || true)"
+    if [[ -n "$holder" ]]; then
+      die "port $PORT is already in use by $holder.
+    Set OG_PORT=<free port> in $CONF_FILE, or stop that process first."
+    fi
+  fi
+
   local url=""
   if [[ "$mode" == "local" ]]; then
     # No tunnel: the origin is this machine's LAN address. The server must
