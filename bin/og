@@ -28,10 +28,6 @@
 set -euo pipefail
 
 OMNI_HOME="$HOME/.omnigent"
-# Which orchestrator bundle og drives. Set by the installer in og.env;
-# "dev-lead" is the stock name so an unconfigured install still works.
-AGENT_NAME="${OG_AGENT:-dev-lead}"
-AGENT_DIR="$OMNI_HOME/agents/$AGENT_NAME"
 NGROK_PIDFILE="$OMNI_HOME/og-ngrok.pid"
 NGROK_LOG="$OMNI_HOME/logs/ngrok.log"
 SECRET_FILE="$OMNI_HOME/.cookie-secret"
@@ -39,11 +35,18 @@ CONF_FILE="$OMNI_HOME/og.env"
 SERVER_PIDFILE="$OMNI_HOME/og-server.pid"
 SERVER_LOGDIR="$OMNI_HOME/logs/server"
 
-# Optional overrides: OG_PORT, OG_NGROK_DOMAIN, OG_CLAUDE_CONFIG_DIR.
+# Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_CLAUDE_CONFIG_DIR.
 # Written as an if, not `[[ ]] && source`: under `set -e` a bare failing test as
 # the last statement of an AND-list is an easy way to abort the script.
+# Sourced BEFORE AGENT_NAME is resolved below, or the installer's OG_AGENT
+# in og.env would never be seen and every install would fall back to "dev-lead".
 # shellcheck disable=SC1090
 if [[ -f "$CONF_FILE" ]]; then source "$CONF_FILE"; fi
+
+# Which orchestrator bundle og drives. Set by the installer in og.env;
+# "dev-lead" is the stock name so an unconfigured install still works.
+AGENT_NAME="${OG_AGENT:-dev-lead}"
+AGENT_DIR="$OMNI_HOME/agents/$AGENT_NAME"
 
 PORT="${OG_PORT:-6767}"
 # The directory og was launched from becomes the default WORKSPACE for new
