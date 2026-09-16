@@ -123,14 +123,26 @@ until the next run.
 | Claude Code | `claude-native` | orch / coder / reviewer | optional | multi-account via `CLAUDE_CONFIG_DIR` |
 | OpenCode (Zen) | `opencode-native` | orch / coder | **required** | free `-free` lineup rotates; day-capped |
 | Codex | `codex-native` | orch / coder / reviewer | optional | |
-| Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model** |
+| Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model**; runs with `--auto-approve true` (see below) |
 | Kilo Code | `acp:kilo` | coder | **required** | via `kilo acp`; unverified here |
 | Kiro (AWS) | `kiro-native` | coder / reviewer | optional | 50 free credits/mo; unverified here |
 | Cursor | `cursor-native` | coder / reviewer | optional | |
 | Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
 | Goose, Hermes, Gemini, Grok, Devin | various | coder | optional | |
 
-### Two properties worth understanding
+### Three properties worth understanding
+
+**Cline runs with `--auto-approve true`.** Cline's ACP mode (used for editor
+integration, which is how it's invoked here) defaults tool auto-approval to
+`false` — so unlike this repo's other harnesses, it prompts for approval on
+every file edit and command by default, which drowns a headless worker in
+requests no one is present to answer. Omnigent's own policy layer (the merge
+gate, blast-radius guardrails) is what actually gates risky operations
+regardless of this setting, so disabling Cline's own redundant per-action
+prompt does not widen what a worker can get away with — it only removes
+friction Omnigent's own guardrails already cover. Set via `acp_command` in
+`installer/registry.json`, which the installer writes into
+`~/.omnigent/config.yaml`'s `acp.agents[].command`.
 
 **Model pin location.** A pin goes at `executor.model`. `executor.config` is a
 free-form dict, so a `model:` placed there is accepted without complaint and

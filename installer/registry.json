@@ -154,7 +154,7 @@
       "harness": "acp:cline",
       "binary": "cline",
       "kind": "acp-user",
-      "acp_command": "cline --acp",
+      "acp_command": "cline --acp --auto-approve true",
       "omnigent_mcp": false,
       "roles": [
         "coder"
