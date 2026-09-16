@@ -1,10 +1,19 @@
-# OG
+<h1><img src="assets/icon.png" height="32" valign="middle"> OG</h1>
 
 A reproducible multi-agent coding setup on top of [Omnigent](https://omnigent.ai).
+
+<p align="center">
+  <img src="assets/banner.png" alt="OG — orchestrate, generate, build" width="850">
+</p>
 
 One orchestrator plans and delegates. Several coding agents — from *different
 vendors* — implement in isolated git worktrees. A different-vendor reviewer
 judges the batched diff. Policies, not prompts, enforce what may be merged.
+
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Tests](https://github.com/jmvbambico/og/actions/workflows/tests.yml/badge.svg)](https://github.com/jmvbambico/og/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/github/v/release/jmvbambico/og)](https://github.com/jmvbambico/og/releases)
+[![License: WTFPL](https://img.shields.io/badge/license-WTFPL-blue.svg)](http://www.wtfpl.net/about/)
 
 `og` is the control script (server + ngrok tunnel + agent registration);
 `install.sh` is the interactive installer that generates the agent bundle for

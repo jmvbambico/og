@@ -3,6 +3,7 @@
 *.bak
 __pycache__/
 *.pyc
+.pytest_cache/
 og-install.json
 auth_tokens.json
 .cookie-secret
