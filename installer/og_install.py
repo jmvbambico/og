@@ -682,6 +682,15 @@ def render_coder(plan: dict, c: dict) -> str:
     if a.get("silent_model_failure"):
         notes.append("# Accepts a model id it cannot serve instead of rejecting it, so a wrong")
         notes.append("# pin yields an empty transcript and no error. Verify the first dispatch.")
+    permission_mode_block = ""
+    if a["kind"] == "acp-user":
+        notes.append("# permission_mode: bypassPermissions -- an acp-user CLI relays every tool call")
+        notes.append("# to Omnigent as session/request_permission; Omnigent's own default")
+        notes.append("# (HARNESS_ACP_PERMISSION_MODE=auto) parks a human approval card for anything")
+        notes.append("# no policy has an opinion on. bypassPermissions grants those instead, so a")
+        notes.append("# headless worker isn't stuck waiting on someone to click approve. Policies")
+        notes.append("# (below) still gate whatever they DO have an opinion on either way.")
+        permission_mode_block = "    permission_mode: bypassPermissions"
     s = tmpl("coder.yaml.tmpl")
     for k, v in {
         "{{NAME}}": worker_name(c["id"]),
@@ -691,6 +700,7 @@ def render_coder(plan: dict, c: dict) -> str:
         "{{ORCHESTRATOR}}": plan["agent_name"],
         "{{KIND_NOTE}}": "\n".join(notes) + ("\n" if notes else ""),
         "{{MODEL_BLOCK}}": model_block(c.get("model")),
+        "{{PERMISSION_MODE_BLOCK}}": permission_mode_block,
         "{{BLAST_RADIUS_HANDLER}}": "omnigent_local_policies.blast_radius_with_branch_cleanup",
     }.items():
         s = s.replace(k, v)
