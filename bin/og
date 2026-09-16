@@ -293,6 +293,29 @@ print(int(body.get("expires_in", 3600)))
 PYEOF
 }
 
+# True when the server has no admin account yet. Unauthed by design (it drives
+# the SPA's own first-run "Create admin" form) — see omnigent's server/app.py
+# GET /v1/info. Best-effort: any failure to reach it reads as "no", so a start
+# with a flaky loopback check falls back to the plain "og login" message
+# rather than looping on a browser prompt we cannot confirm is useful.
+needs_setup() {
+  local resp
+  resp="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/v1/info" 2>/dev/null || true)"
+  [[ -n "$resp" ]] && grep -Eq '"needs_setup"[[:space:]]*:[[:space:]]*true' <<<"$resp"
+}
+
+# Best-effort, backgrounded: a browser that fails to open (headless box, no
+# GUI session) must never fail `og start` over what is a convenience.
+open_in_browser() {
+  local url="$1"
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 &
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null || true
+}
+
 # Drop the local server's token. The browser keeps its own cookie, so this logs
 # out the CLI and host daemon only — a phone already signed in stays signed in.
 destroy_token() {
@@ -630,14 +653,30 @@ cmd_start() {
   info "minting a fresh login session"
   local expires_in
   if ! expires_in="$(mint_token)"; then
-    echo
-    echo "    The server and tunnel are up, but no session could be minted."
-    echo "    If you have not stored credentials yet:"
-    echo
-    echo "      og login"
-    echo
-    echo "    Then:  og attach"
-    exit 0
+    # First install, most likely: no admin account exists yet, and the server
+    # itself only auto-opens a browser for a LOOPBACK base_url (see omnigent's
+    # accounts_bootstrap.py) -- og always points OMNIGENT_ACCOUNTS_BASE_URL at
+    # the LAN/tunnel address instead, so that auto-open never fires here. Do
+    # it ourselves, then take the same credentials to store them where `og`
+    # itself reads from (the Keychain, not the browser's cookie session).
+    if [[ -t 0 ]] && needs_setup; then
+      echo
+      info "no account yet — opening $OG_PUBLIC_URL to create one"
+      open_in_browser "$OG_PUBLIC_URL"
+      echo "    Choose a username + password in the browser, then enter the same here:"
+      prompt_and_store_credentials
+      expires_in="$(mint_token)" \
+        || die "credentials stored, but a session still could not be minted. Run 'og login' to retry, then 'og attach'."
+    else
+      echo
+      echo "    The server and tunnel are up, but no session could be minted."
+      echo "    If you have not stored credentials yet:"
+      echo
+      echo "      og login"
+      echo
+      echo "    Then:  og attach"
+      exit 0
+    fi
   fi
   ok "session minted (valid $(( expires_in / 3600 ))h)"
 
@@ -813,7 +852,9 @@ cmd_status() {
 # it running and hands off to this rather than tearing everything down.
 # Store server credentials in the macOS Keychain, once. `og start` reads them
 # to mint a fresh session each run, so this is the only time a password is typed.
-cmd_login() {
+# Split out of cmd_login so the first-run flow in cmd_start (create the admin
+# account in the browser, then type the same credentials here) can reuse it.
+prompt_and_store_credentials() {
   local user pass confirm
   read -r -p "omnigent username: " user
   [[ -n "$user" ]] || die "username cannot be empty"
@@ -827,7 +868,10 @@ cmd_login() {
   security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$user" -w "$pass" \
     || die "could not write to the Keychain"
   ok "stored credentials for '$user' in the Keychain ($KEYCHAIN_SERVICE)"
+}
 
+cmd_login() {
+  prompt_and_store_credentials
   if server_running; then
     info "server is up — minting a session now"
     if mint_token >/dev/null; then ok "session minted; run 'og attach' if the host is not attached"
