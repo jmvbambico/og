@@ -882,6 +882,31 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     ok(f"state         {STATE}")
     say()
     say(f"{C['dim']}prompt: {len(shlex.quote(prompt))}/{PROMPT_CEILING} bytes shell-quoted{C['x']}")
+
+    # A coder is selectable here whether or not it's actually logged in —
+    # nothing above checks. Left unauthenticated, the first sign a worker was
+    # ever picked is a dispatch failing deep in a runner log ("You need to
+    # sign in to use this model"), not anything surfaced during install. This
+    # is a reminder, not a check: verifying login state is vendor-specific
+    # (a credential file, a `whoami`, a token expiry...) and not worth
+    # guessing at generically, so just list the command for each active
+    # worker and let the user confirm it themselves.
+    login_agents = [reg[plan["orchestrator"]]] + [reg[c["id"]] for c in plan["coders"]] \
+        + [reg[plan["reviewer"]["id"]]]
+    seen_ids = set()
+    login_lines = []
+    for a in login_agents:
+        if a["id"] in seen_ids or not a.get("login"):
+            continue
+        seen_ids.add(a["id"])
+        login_lines.append(f"  {a['login']:<20} {C['dim']}# {a['label']}{C['x']}")
+    if login_lines:
+        say()
+        say(f"{C['b']}Before your first `og start`, make sure each is logged in{C['x']} "
+            f"{C['dim']}(skip any already done):{C['x']}")
+        for line in login_lines:
+            say(line)
+
     say()
     say(f"Next: {C['b']}og start{C['x']}   (from the repo you want as the default workspace)")
 

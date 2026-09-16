@@ -325,6 +325,44 @@ empty, and the agent is in the picker with nowhere to run. Escape hatch:
 
 ---
 
+## `inner executor error: Internal error: You need to sign in to use this model.`
+
+```
+ERROR ... turn surfaced to UI as failed for <conversation-id> (harness=acp): {'code': 'runner_error', 'message': 'inner executor error: Internal error: You need to sign in to use this model.'}
+```
+
+A `WARN ... Sub-agent 'coder_X' not found under spec 'coder_X'; no workdir
+resolved` line right before this is the usual red herring above, not the
+cause — check it isn't distracting you from the real error on the next line.
+
+**Cause.** The coder's own CLI has no stored credentials for the model it was
+dispatched with. Nothing in `og`/the installer checks or enforces per-agent
+login during install — a coder is fully selectable into the active roster
+without ever having been logged in, and the first sign of that is a dispatch
+failing here, not anything surfaced earlier.
+
+**Find which coder:** the log line names `harness=acp` (or `=kiro-native`,
+etc.) and the conversation id; grep a few lines above it in the same runner
+log for `acp gateway routing: ... model=<id>` to see which coder that id
+belongs to (cross-reference `og-install.json`'s `coders` list).
+
+**Fix.** Run that coder's login command, then retry. `installer/registry.json`
+has one per agent (`"login"` key); as of this `og` version, `./install.sh`
+also prints the full checklist after every apply:
+
+```bash
+kilo auth login      # Kilo Code
+cline auth            # Cline
+opencode auth login   # OpenCode (Zen)
+kiro-cli               # Kiro (AWS) — run once interactively to authenticate
+# ...one per active coder + the orchestrator + the reviewer
+```
+
+`kilo auth list` (or the equivalent for another vendor) confirms whether
+credentials are actually stored before you retry.
+
+---
+
 ## `Sub-agent 'X' not found under spec 'X'; no workdir resolved`
 
 **Red herring.** This WARN fires for every sub-agent dispatch including
