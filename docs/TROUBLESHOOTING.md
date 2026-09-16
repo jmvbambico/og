@@ -267,6 +267,50 @@ og attach
 
 ---
 
+## "Models unavailable" in the composer, or `409 Conflict` on `model-options`
+
+```
+GET /v1/hosts/<id>/harnesses/claude-native/model-options HTTP/1.1" 409 Conflict
+GET /v1/hosts/<id>/filesystem?limit=1000 HTTP/1.1" 409 Conflict
+```
+
+`GET /v1/hosts` still returns 200 and shows the host as `"status": "online"`,
+which makes this confusing — the picker looks like it should work.
+
+**Cause.** `og` attached the host daemon with `omnigent host --background
+--server ""`. An empty `--server` doesn't mean "attach to the server og just
+started" — it means *local mode*, which tells Omnigent to start or reuse
+**its own** local server, tracked in `~/.omnigent/local_server.pid`. Since
+og's server binds `0.0.0.0` (so it's reachable from other devices) rather
+than loopback, it never satisfies Omnigent's own "is there already a local
+server?" check, so the daemon spawns a *second*, ephemeral, loopback-only
+server and tunnels to that instead. Both processes share the same
+`chat.db` — which is why `/v1/hosts` (a plain DB read) looks fine — but
+each has its own in-memory host registry, and the one your browser is
+actually talking to has no live tunnel for the host, so anything routed
+over that tunnel (model options, filesystem) 409s as "unreachable here."
+
+Check for the second process:
+
+```bash
+og status   # a "Background server: running at http://127.0.0.1:<other port>"
+            # line alongside the real "og server" line is the tell
+```
+
+**Fix.** Fixed in this repo's `bin/og`: the host attach now passes an
+explicit `--server "http://127.0.0.1:$PORT"` — og's own server's loopback
+address — instead of `""`, so the daemon's tunnel lands on the same process
+serving the UI. (`mint_token` already stores a matching entry in
+`auth_tokens.json` keyed to that exact URL, so this needs no extra auth
+plumbing.) If you're on an older `og`:
+
+```bash
+cp /path/to/og/bin/og "$(command -v og)"
+og stop && og start
+```
+
+---
+
 ## `og start` succeeds but the UI only lists built-in agents
 
 **Cause.** `omnigent server --background` discards every other flag, including

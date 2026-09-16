@@ -692,7 +692,17 @@ cmd_start() {
   fi
 
   info "attaching the host daemon"
-  if ! omnigent host --background --server "" --non-interactive 2>&1 | sed 's/^/    /'; then
+  # NOT --server "": that means "local mode" to omnigent, which spawns/reuses
+  # ITS OWN loopback-only server (~/.omnigent/local_server.pid) instead of
+  # attaching to the one we just started above. og's server binds 0.0.0.0, so
+  # it never satisfies that local-server auto-detection -- the daemon would
+  # tunnel to a second, different server process that shares our chat.db but
+  # not our in-memory host registry. Every host-tunnel round-trip (model
+  # options, filesystem) then 409s ("host ... connection lost" is a red
+  # herring; DB-only reads like GET /v1/hosts still succeed and look fine).
+  # Passing our own loopback URL targets this exact process, and mint_token
+  # above already stored a token in auth_tokens.json keyed to this same URL.
+  if ! omnigent host --background --server "http://127.0.0.1:$PORT" --non-interactive 2>&1 | sed 's/^/    /'; then
     die "the host daemon did not attach. The server and $AGENT_NAME are up, so the
     UI will list the agent but has nowhere to run it. If this says the account
     cannot claim the host, run 'omnigent host reset-id' and 'og start' again."
@@ -896,7 +906,10 @@ cmd_attach() {
   export OPENCODE_DISABLE_CLAUDE_CODE=1
   export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
   info "attaching the host daemon"
-  if ! omnigent host --background --server "" --non-interactive 2>&1 | sed 's/^/    /'; then
+  # See the matching comment in cmd_start: an explicit loopback URL, not "",
+  # or the daemon tunnels to a different (auto-spawned local-mode) server
+  # than the one og itself is running.
+  if ! omnigent host --background --server "http://127.0.0.1:$PORT" --non-interactive 2>&1 | sed 's/^/    /'; then
     die "the host daemon did not attach. If it says the account cannot claim the
     host, run 'omnigent host reset-id' and try again."
   fi
