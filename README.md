@@ -365,7 +365,7 @@ Two local policies ship here, registered via `policy_modules` in
 
 ## Working on this repo
 
-The repo is indexed with [CodeGraph](https://github.com/lethain/codegraph), so
+The repo is indexed with [CodeGraph](https://github.com/colbymchenry/codegraph), so
 `codegraph explore "<symbol or question>"` answers "where does X happen"
 in one call instead of a grep loop. The index lives in `.codegraph/` and is
 local to each machine — only its `.gitignore` is committed. Rebuild with
