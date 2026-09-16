@@ -24,7 +24,8 @@
     "  relay         false when the agent runs without Omnigent's sys_* tool",
     "                relay (leaf worker only; cannot orchestrate)",
     "  silent_model_failure  true when a bad model id produces an empty",
-    "                        transcript instead of an error"
+    "                        transcript instead of an error",
+    "  worker        sub-agent name in the bundle. Defaults to coder_<id>; set it explicitly to keep an established name stable across an id change."
   ],
   "version": 1,
   "agents": [
@@ -92,10 +93,11 @@
       "login": "opencode auth login",
       "docs": "https://opencode.ai/docs",
       "reviewer_warning": "Zen's free lineup rotates, so review quality drifts run to run. Not recommended as a reviewer.",
-      "prompt_delivery": "per_turn"
+      "prompt_delivery": "per_turn",
+      "worker": "coder_zen"
     },
     {
-      "id": "antigravity",
+      "id": "agy",
       "label": "Antigravity (Google)",
       "harness": "antigravity-native",
       "binary": "agy",
@@ -117,7 +119,8 @@
       },
       "login": "agy",
       "docs": "https://antigravity.google/docs",
-      "prompt_delivery": "none"
+      "prompt_delivery": "none",
+      "worker": "coder_agy"
     },
     {
       "id": "codex",
@@ -191,14 +194,20 @@
       "model": {
         "required": true,
         "pin_path": "executor.model",
-        "note": "Kilo brokers 500+ models at provider rates. Pin explicitly \u2014 an unpinned ACP worker inherits the orchestrator's id. Treat its silent-failure behaviour as Cline's until proven otherwise: verify the first dispatch produced a real commit."
+        "note": "Kilo has no bare `auto`; it has an auto-ROUTER family \u2014 kilo/kilo-auto/{free,efficient,small,balanced,frontier} \u2014 plus kilo/openrouter/auto. `free` keeps it inside the free tier; the others bill at provider rates. Requires `kilo auth` first: an unauthenticated ACP worker fails silently with an empty transcript.",
+        "prefer": "kilo/kilo-auto/free",
+        "list_cmd": [
+          "kilo",
+          "models"
+        ],
+        "free_pattern": "(kilo-auto/free|/free$)"
       },
       "install": {
         "npm": "npm i -g @kilocode/cli",
         "brew": "brew install Kilo-Org/tap/kilo",
         "curl": "curl -fsSL https://kilo.ai/cli/install | bash"
       },
-      "login": "kilo auth",
+      "login": "kilo auth login",
       "docs": "https://kilo.ai/docs/code-with-ai/platforms/cli-reference",
       "unverified": true,
       "prompt_delivery": "unknown"
@@ -220,7 +229,13 @@
       "model": {
         "required": false,
         "pin_path": "executor.model",
-        "note": "Free plan is 50 credits/month drawn from the shared Kiro pool \u2014 enough for occasional overflow, not a primary implementer."
+        "note": "`auto` is Kiro's own default router (1.00x credits, model chosen per task). The pin reaches `kiro-cli --model` via the session's model_override. Free plan is 50 credits/month from the shared Kiro pool \u2014 overflow capacity, not a primary implementer.",
+        "prefer": "auto",
+        "list_cmd": [
+          "kiro-cli",
+          "chat",
+          "--list-models"
+        ]
       },
       "install": {
         "curl": "curl -fsSL https://cli.kiro.dev/install | bash"

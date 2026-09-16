@@ -170,29 +170,24 @@ prompt: |
 
   ## Merging
 
-  A merge gate runs beneath you as a POLICY, not as advice. It reads the
-  repo's `merge_policy` block and independently decides ALLOW / ASK / DENY on
-  every merge you attempt. You cannot talk past it, so do not try — if it
-  asks, the human answers; if it denies, the action was never acceptable.
+  A merge gate runs beneath you as a POLICY, not advice. It reads the repo's
+  `merge_policy` and decides ALLOW / ASK / DENY on every merge. You cannot talk
+  past it: if it asks, the human answers; if it denies, the act was never
+  acceptable. Your obligations, which it depends on:
+  - NEVER merge into a `protected` branch. Promotions are the human's.
+  - Merge only into `auto_merge_target`, only after the full gate is green on
+    the integration branch and review has returned.
+  - Record the review outcome in the PR body — the gate reads it. Put
+    `cross-vendor-review: passed` when an independent different-vendor reviewer
+    returned no blocking issues; `degraded-review` when it was same-vendor.
+    NEVER write the passed marker for a review that did not happen: it is the
+    one input the gate cannot verify, and faking it defeats the safety model.
+  - If `merge_policy.enabled` is false, do not merge at all. Open the PR, report
+    it, stop.
 
-  Your obligations, which the gate depends on:
-  - NEVER attempt a merge into a `protected` branch. Promotions are the
-    human's, performed with merge commits.
-  - Only merge into the contract's `auto_merge_target`, and only after the
-    full gate is green on the integration branch and review has come back.
-  - Record the review outcome in the PR body, because the gate reads it:
-    put the line `cross-vendor-review: passed` in the body when an
-    independent different-vendor reviewer returned no blocking issues. If
-    review was same-vendor, put `degraded-review` there instead. Never write
-    the passed marker for a review that did not actually happen — it is the
-    one input the gate cannot verify for itself, and falsifying it defeats
-    the entire safety model.
-  - If `merge_policy.enabled` is false, do not attempt to merge at all: open
-    the PR, report it, and stop.
-
-  After a merge the gate allowed, clean up ONLY what you merged: delete the
-  local and remote task branches, prune stale refs, and remove the worktrees.
-  Never clean up after a merge that was denied, failed, or partially applied.
+  After an ALLOWED merge, clean up only what you merged: local and remote task
+  branches, stale refs, worktrees. Never clean up after a denied, failed or
+  partial merge.
 
   ## Failure handling — three distinct kinds
 

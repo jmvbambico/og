@@ -436,7 +436,13 @@ def tmpl(name: str) -> str:
 
 
 def worker_name(aid: str) -> str:
-    return f"coder_{aid}"
+    """The sub-agent's name in the bundle.
+
+    Defaults to ``coder_<id>``, but a registry row may pin `worker` explicitly
+    so an established name survives a change of agent id — renaming a worker
+    orphans its session history and every doc that refers to it.
+    """
+    return (agents_by_id().get(aid) or {}).get("worker") or f"coder_{aid}"
 
 
 def render_roster(plan: dict) -> str:
@@ -758,6 +764,17 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # 1. agent bundle
     (bundle / "agents").mkdir(parents=True, exist_ok=True)
     (bundle / "config.yaml").write_text(render_orchestrator(plan))
+
+    # Prune workers that are no longer in the roster. Without this, dropping or
+    # renaming a coder leaves an orphaned directory: unreachable (it is not in
+    # tools.agents) but indistinguishable on disk from a live worker, which is
+    # exactly the kind of stale state that makes a rerunnable installer
+    # untrustworthy.
+    keep = {worker_name(c["id"]) for c in plan["coders"]} | {"reviewer"}
+    for d in sorted((bundle / "agents").iterdir()):
+        if d.is_dir() and d.name not in keep:
+            shutil.rmtree(d)
+            say(f"{C['dim']}  pruned stale worker: {d.name}{C['x']}")
     for c in plan["coders"]:
         d = bundle / "agents" / worker_name(c["id"])
         d.mkdir(parents=True, exist_ok=True)
