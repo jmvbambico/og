@@ -390,6 +390,20 @@ def test_og_env_auto_update_defaults_on(tmp_path, monkeypatch):
     assert "OG_AUTO_UPDATE=1\n" in env
 
 
+def test_og_env_carries_a_version_stamp(tmp_path, monkeypatch):
+    # `og start` reads OG_VERSION to compare against the latest release tag;
+    # a missing stamp reads as "older than any release", so it must always be
+    # written -- even as "unknown" or a bare sha on a tagless checkout.
+    env = _og_env(tmp_path, monkeypatch, _base_plan())
+    line = next(l for l in env.splitlines() if l.startswith("OG_VERSION="))
+    assert line.split("=", 1)[1].strip()
+
+
+def test_installed_version_is_unknown_outside_a_checkout(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "REPO", tmp_path)
+    assert m.installed_version() == "unknown"
+
+
 def test_og_env_auto_update_off_is_zero_not_absent(tmp_path, monkeypatch):
     # og treats an unset OG_AUTO_UPDATE as off, but the file should still say
     # so explicitly -- the comment above the line is the user's only hint that

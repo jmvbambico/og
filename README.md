@@ -268,6 +268,7 @@ og url              print the URL (pipe-friendly)
 og logs [-f]        tail the server log
 og login            store server credentials in the Keychain (once)
 og update           pull the checkout and re-apply the install
+og version          print the installed version
 ```
 
 `og login` is rarely something you run yourself: `og start` calls it for you the
@@ -384,18 +385,31 @@ Two local policies ship here, registered via `policy_modules` in
 `og` is *copied* out of this checkout by the installer, so a `git pull` on its
 own changes nothing you run — and an outdated copy keeps starting fine, then
 fails later in ways that look like Omnigent bugs (a host attached to the wrong
-server, a workspace pin that never lands). `og start` therefore checks two
-things first: whether the checkout is behind its upstream (a capped fetch,
-skipped silently offline) and whether the installed script differs from
-`bin/og`.
+server, a workspace pin that never lands). So the first line of every
+`og start` is the version check, against **releases**, not commits:
 
-- **Auto-update on** (`OG_AUTO_UPDATE=1`, the installer's default): it pulls
-  (`--ff-only`, and only if the checkout is clean), re-applies your saved plan —
-  bundles, policies, `og.env`, the script — and re-runs the same command on the
-  new `og`.
-- **Off**: it prints what is stale, warns that og may not work correctly if
-  left outdated, and carries on. `og update` applies it when you're ready.
+```
+→ current version: v0.3.0 (up to date)
+```
+```
+! current version: v0.2.0 (latest release: v0.3.0)
+    og may not work correctly if left outdated — consider updating:  og update
+```
 
+"Current" is what the installer last applied (`OG_VERSION` in `og.env`, from
+`git describe --tags` at apply time); "latest" is the highest `vX.Y.Z` tag on
+`origin` (`git ls-remote`, capped at 10s, reported as *could not check
+releases* when offline). A checkout that is ahead of the last tag is not
+outdated — work in progress is not a release.
+
+- **Auto-update on** (`OG_AUTO_UPDATE=1`, the installer's default): when
+  behind, it pulls (`--ff-only`, and only if the checkout is clean), re-applies
+  your saved plan — bundles, policies, `og.env`, the script — and re-runs the
+  same command on the new `og`.
+- **Off**: it prints the notice and carries on. `og update` applies it when
+  you're ready.
+
+`og version` prints the installed version; `og status` shows it too.
 `OG_SKIP_UPDATE=1 og start` bypasses the check for one run. The switch lives in
 `og-install.json` (`"auto_update"`) — re-run the installer to flip it; editing
 `og.env` by hand is undone the next time the plan is re-applied.

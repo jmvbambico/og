@@ -13,6 +13,7 @@
 #   og url              print the public URL only (pipe-friendly)
 #   og logs [-f]        tail the server log
 #   og update           pull the checkout and re-apply the install
+#   og version          print the installed version
 #
 # Works from any directory: every path here is absolute.
 #
@@ -739,20 +740,24 @@ og_repo_dir() {
   return 1
 }
 
-# --- self-update --------------------------------------------------------------
+# --- version + self-update ------------------------------------------------------
 #
 # `og` is COPIED out of the checkout by the installer, so a `git pull` in the
 # repo changes nothing the user runs until the installer is re-applied. That
 # gap is invisible: an outdated copy keeps starting fine and fails later in
 # ways that look like omnigent bugs (a host attached to the wrong server, a
-# workspace pin that never lands). Two staleness signals, checked on every
-# `og start`:
-#   1. the checkout is behind its upstream (needs a fetch; skipped offline)
-#   2. the installed script differs from the checkout's bin/og (no network
-#      needed -- this is the one that bit hardest)
-# OG_AUTO_UPDATE (og.env, set by the installer) decides what happens: 1 pulls,
+# workspace pin that never lands). So every `og start` compares the INSTALLED
+# version against the latest RELEASE:
+#   installed  OG_VERSION in og.env, stamped by the installer from
+#              `git describe --tags` of the checkout it applied from
+#   latest     the highest vX.Y.Z tag on origin (`git ls-remote`, capped,
+#              silently skipped offline)
+# Releases, not commits: a checkout that is ahead of the last tag (work in
+# progress) is not "outdated", and a user is told about versions they can
+# read in the release notes rather than commit counts. OG_AUTO_UPDATE
+# (og.env, set by the installer) decides what happens when behind: 1 pulls,
 # re-applies the saved plan, and re-execs this same command on the new script;
-# anything else just warns. OG_SKIP_UPDATE=1 bypasses the check for one run.
+# anything else prints a notice. OG_SKIP_UPDATE=1 bypasses the check once.
 
 # Replace the installed script by rename, never in place: bash reads a script
 # as it runs, so truncating the inode `og update` is executing from corrupts
@@ -767,73 +772,108 @@ og_self_path() {
   python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}"
 }
 
-# Fetch with a wall-clock cap. macOS has no `timeout`, and a fetch that hangs
-# on a captive portal must not turn `og start` into a blank prompt.
-git_fetch_capped() {
-  local repo="$1" secs="${2:-10}" pid i
-  GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin >/dev/null 2>&1 &
+# Run a git network command with a wall-clock cap, capturing stdout. macOS has
+# no `timeout`, and a fetch that hangs on a captive portal must not turn
+# `og start` into a blank prompt. Prints the command's stdout on success.
+git_net_capped() {
+  local secs="$1" out pid i rc=1; shift
+  out="$(mktemp "${TMPDIR:-/tmp}/og-git.XXXXXX")"
+  GIT_TERMINAL_PROMPT=0 git "$@" >"$out" 2>/dev/null &
   pid=$!
   for ((i = 0; i < secs * 4; i++)); do
-    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return $?; }
+    if ! kill -0 "$pid" 2>/dev/null; then wait "$pid" 2>/dev/null && rc=0; break; fi
     sleep 0.25
   done
   kill "$pid" 2>/dev/null || true
-  return 1
+  [[ "$rc" -eq 0 ]] && cat "$out"
+  rm -f "$out"
+  return "$rc"
 }
 
-# Populate OG_UPD_REPO / OG_UPD_BEHIND / OG_UPD_STALE and return 0 when
-# anything is out of date. Never fails the caller: no checkout, no git, no
-# network all read as "nothing to report".
-OG_UPD_REPO="" OG_UPD_BEHIND=0 OG_UPD_STALE=0
+# "v0.2.0-3-gabc123-dirty" -> "v0.2.0": the release a build is based on.
+version_base() { printf '%s' "${1%%-*}"; }
+
+# True when $1 is a strictly older release than $2 (semver via sort -V).
+version_lt() {
+  local a b; a="$(version_base "$1")"; b="$(version_base "$2")"
+  [[ "$a" != "$b" && "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -1)" == "$a" ]]
+}
+
+# Highest vX.Y.Z tag on origin, or nothing (offline / no tags / no checkout).
+latest_release() {
+  local repo="$1"
+  git_net_capped 10 -C "$repo" ls-remote --tags --refs origin 'v[0-9]*' 2>/dev/null \
+    | sed -n 's|.*refs/tags/\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' \
+    | sort -V | tail -1
+}
+
+# Populate OG_UPD_REPO / OG_UPD_CURRENT / OG_UPD_LATEST / OG_UPD_OUTDATED.
+# Returns 0 when an update is available. Never fails the caller: no checkout,
+# no git, no network all read as "cannot tell" (OG_UPD_LATEST empty).
+OG_UPD_REPO="" OG_UPD_CURRENT="" OG_UPD_LATEST="" OG_UPD_OUTDATED=0
 update_available() {
-  OG_UPD_BEHIND=0 OG_UPD_STALE=0
+  OG_UPD_CURRENT="${OG_VERSION:-unknown}" OG_UPD_LATEST="" OG_UPD_OUTDATED=0
   OG_UPD_REPO="$(og_repo_dir 2>/dev/null)" || return 1
   command -v git >/dev/null 2>&1 || return 1
-  [[ -f "$OG_UPD_REPO/bin/og" ]] || return 1
-
-  if git -C "$OG_UPD_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-     && git -C "$OG_UPD_REPO" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
-    git_fetch_capped "$OG_UPD_REPO" 10 || true
-    OG_UPD_BEHIND="$(git -C "$OG_UPD_REPO" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
+  git -C "$OG_UPD_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  OG_UPD_LATEST="$(latest_release "$OG_UPD_REPO")"
+  [[ -n "$OG_UPD_LATEST" ]] || return 1
+  # An install with no stamp predates the stamp itself, so it is older than
+  # any release that carries one.
+  if [[ "$OG_UPD_CURRENT" == "unknown" ]] || version_lt "$OG_UPD_CURRENT" "$OG_UPD_LATEST"; then
+    OG_UPD_OUTDATED=1
   fi
-  local self; self="$(og_self_path)"
-  # Running straight from the checkout (bin/og itself) can't be a stale copy.
-  if [[ "$self" != "$OG_UPD_REPO/bin/og" ]] && ! cmp -s "$OG_UPD_REPO/bin/og" "$self"; then
-    OG_UPD_STALE=1
-  fi
-  [[ "$OG_UPD_BEHIND" -gt 0 || "$OG_UPD_STALE" -eq 1 ]]
+  [[ "$OG_UPD_OUTDATED" -eq 1 ]]
 }
 
-# One line per signal, so the user knows WHICH kind of stale this is.
-describe_update() {
-  [[ "$OG_UPD_BEHIND" -gt 0 ]] && echo "    checkout is $OG_UPD_BEHIND commit(s) behind origin ($OG_UPD_REPO)"
-  [[ "$OG_UPD_STALE" -eq 1 ]] && echo "    installed og ($(og_self_path)) differs from $OG_UPD_REPO/bin/og"
-  return 0
+# The one-line version status every `og start` prints, plus the notice when
+# behind. Cyan arrow when fine, yellow bang when something needs attention.
+show_version() {
+  local cur="$OG_UPD_CURRENT"
+  if [[ "$OG_UPD_OUTDATED" -eq 1 ]]; then
+    printf '\033[0;33m!\033[0m current version: %s (latest release: %s)\n' "$cur" "$OG_UPD_LATEST"
+    echo "    og may not work correctly if left outdated — consider updating:  og update"
+  elif [[ -n "$OG_UPD_LATEST" ]]; then
+    info "current version: $cur (up to date)"
+  elif [[ -z "$OG_UPD_REPO" ]]; then
+    info "current version: $cur (no og checkout found; set OG_REPO in $CONF_FILE to check releases)"
+  else
+    info "current version: $cur (could not check releases — offline?)"
+  fi
 }
 
 # Bring the checkout and the install up to date. Pull only when it is safe to
-# do so silently (clean tree, fast-forward); a dirty checkout is someone's
-# work in progress and is left alone with a note. Then re-apply the saved plan:
-# that regenerates the bundles, policies, og.env and copies bin/og -- the same
-# thing the installer does, so a new og never runs against old bundles. If the
-# installer refuses (a plan that no longer validates), the script alone is
-# still copied so the next start is at least on current code.
+# do so silently (clean tree, tracking branch, fast-forward); a dirty checkout
+# is someone's work in progress and is left alone with a note. Then re-apply
+# the saved plan: that regenerates the bundles, policies, og.env (with the new
+# OG_VERSION stamp) and copies bin/og -- the same thing the installer does, so
+# a new og never runs against old bundles. If the installer refuses (a plan
+# that no longer validates), the script alone is still copied so the next
+# start is at least on current code.
 apply_update() {
-  local repo="$1" self plan="$OMNI_HOME/og-install.json"
+  local repo="$1" self plan="$OMNI_HOME/og-install.json" behind=0
   self="$(og_self_path)"
-  if [[ "$OG_UPD_BEHIND" -gt 0 ]]; then
+  if git -C "$repo" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    git_net_capped 15 -C "$repo" fetch --quiet --tags origin >/dev/null || true
+    behind="$(git -C "$repo" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
+  fi
+  if [[ "$behind" -gt 0 ]]; then
     if [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]]; then
       printf '\033[0;33m!\033[0m %s\n' "$repo has uncommitted changes; not pulling. Commit or stash, then 'og update'." >&2
     elif GIT_TERMINAL_PROMPT=0 git -C "$repo" pull --ff-only --quiet 2>&1 | sed 's/^/    /'; then
-      ok "pulled $OG_UPD_BEHIND commit(s) into $repo"
+      ok "pulled $behind commit(s) into $repo"
     else
       printf '\033[0;33m!\033[0m %s\n' "git pull --ff-only failed in $repo; resolve it, then 'og update'." >&2
     fi
   fi
+  local head_ver; head_ver="$(git -C "$repo" describe --tags --always 2>/dev/null || echo unknown)"
+  if [[ -n "$OG_UPD_LATEST" ]] && version_lt "$head_ver" "$OG_UPD_LATEST"; then
+    printf '\033[0;33m!\033[0m %s\n' "checkout is at $head_ver, latest release is $OG_UPD_LATEST — the install below is from what is checked out" >&2
+  fi
   if [[ -f "$plan" ]]; then
     info "re-applying $plan"
     if "$repo/install.sh" --plan "$plan" 2>&1 | sed 's/^/    /'; then
-      ok "install re-applied"
+      ok "install re-applied ($head_ver)"
     else
       printf '\033[0;33m!\033[0m %s\n' "the installer did not re-apply cleanly (see above); copying bin/og only" >&2
       install_self_from "$repo/bin/og" "$self"
@@ -841,44 +881,44 @@ apply_update() {
   else
     # No saved plan (a hand-copied og): the script is all there is to update.
     install_self_from "$repo/bin/og" "$self"
-    ok "updated $self"
+    ok "updated $self ($head_ver)"
   fi
 }
 
-# Called first thing in `og start`. Warn-only unless OG_AUTO_UPDATE=1, in which
-# case the update is applied and this exact command is re-run on the new
-# script. OG_UPDATED guards the re-exec from checking (and looping) again.
+# Called first thing in `og start`: always prints the version line; when
+# behind, warns -- or, with OG_AUTO_UPDATE=1, applies the update and re-runs
+# this exact command on the new script. OG_UPDATED guards the re-exec from
+# checking (and looping) again.
 maybe_update() {
   [[ "${OG_SKIP_UPDATE:-0}" == "1" || "${OG_UPDATED:-0}" == "1" ]] && return 0
-  update_available || return 0
+  update_available || { show_version; return 0; }
   if [[ "${OG_AUTO_UPDATE:-0}" == "1" ]]; then
-    info "a newer og is available; auto-updating (OG_AUTO_UPDATE=1)"
-    describe_update
+    printf '\033[0;33m!\033[0m current version: %s (latest release: %s) — auto-updating\n' "$OG_UPD_CURRENT" "$OG_UPD_LATEST"
     apply_update "$OG_UPD_REPO"
     local self; self="$(og_self_path)"
     # ${arr[@]+"${arr[@]}"}: an empty array is "unbound" under set -u on bash 3.2.
     OG_UPDATED=1 exec "$self" ${OG_ARGV[@]+"${OG_ARGV[@]}"}
   fi
-  printf '\033[0;33m!\033[0m %s\n' "a newer og is available:" >&2
-  describe_update >&2
-  echo "    og may not work correctly if left outdated. Update with:  og update" >&2
-  echo "    (re-run the installer and answer yes to auto-update to do this on every start)" >&2
-  echo >&2
+  show_version
+  echo "    (re-run the installer and answer yes to auto-update to do this on every start)"
+  echo
 }
 
 cmd_update() {
   if update_available; then
-    describe_update
+    show_version
     apply_update "$OG_UPD_REPO"
   else
     [[ -n "$OG_UPD_REPO" ]] || die "cannot find the og checkout.
     Set OG_REPO=/path/to/og in $CONF_FILE."
-    ok "og is up to date ($OG_UPD_REPO)"
+    show_version
   fi
   if server_running; then
     echo "    omnigent is running on the previous og; 'og stop && og start' to pick it up."
   fi
 }
+
+cmd_version() { echo "${OG_VERSION:-unknown}"; }
 
 cmd_init() {
   local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
@@ -1006,6 +1046,8 @@ cmd_status() {
   else
     echo "    agent:    $d  (NOT $AGENT_NAME)"
   fi
+  # Installed stamp only -- no network round-trip from a status command.
+  echo "    version:  ${OG_VERSION:-unknown}  (og update checks for a newer release)"
 }
 
 # Plain URL on stdout so `og url` stays pipe-friendly; the QR goes to stderr
@@ -1126,8 +1168,9 @@ case "${1:-}" in
   url)    shift; cmd_url ;;
   logs)   shift; cmd_logs "$@" ;;
   update) shift; cmd_update ;;
+  version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

@@ -309,9 +309,10 @@ og update            # or: cp /path/to/og/bin/og "$(command -v og)"
 og stop && og start
 ```
 
-`og start` now warns (or auto-updates, see the README's *Updating* section)
-when the installed script differs from the checkout, so this class of
-"fixed in the repo, still broken on the machine" no longer goes unnoticed.
+`og start` now prints the installed version against the latest release (and
+auto-updates when `OG_AUTO_UPDATE=1`, see the README's *Updating* section), so
+this class of "fixed in the repo, still broken on the machine" no longer goes
+unnoticed.
 
 ---
 

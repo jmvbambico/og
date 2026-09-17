@@ -788,6 +788,26 @@ def patch_global_config(plan: dict) -> list:
     return changed
 
 
+def installed_version() -> str:
+    """The version stamp for this apply: ``git describe --tags`` of the checkout.
+
+    ``v0.2.0`` on a release, ``v0.2.0-3-gabc123`` past one, ``-dirty`` with
+    local edits, a bare sha on a checkout with no tags, ``unknown`` when not
+    a git checkout at all. `og start` compares the leading ``vX.Y.Z`` against
+    the newest release tag on origin, so this is what "current version" means.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO), "describe", "--tags", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if out.returncode != 0:
+        return "unknown"
+    return out.stdout.strip() or "unknown"
+
+
 def write_og_env(plan: dict) -> None:
     reg = agents_by_id()
     lines = [
@@ -800,12 +820,16 @@ def write_og_env(plan: dict) -> None:
         "# scaffolder, since `og` itself is copied out of the repo.",
         f"OG_REPO={REPO}",
         "",
+        "# What was installed, from `git describe --tags` at apply time. `og start`",
+        "# compares this against the latest release tag on origin.",
+        f"OG_VERSION={installed_version()}",
+        "",
         "# Default for a bare `og start`: local (LAN only) or tunneled (ngrok).",
         f"OG_DEFAULT_MODE={plan.get('default_mode', 'local')}",
         "",
-        "# 1: `og start` pulls the checkout, re-applies this install and re-runs",
-        "# itself on the new script. 0: it only warns when a newer og exists",
-        "# (`og update` applies it). OG_SKIP_UPDATE=1 bypasses the check once.",
+        "# 1: when a newer release exists, `og start` pulls the checkout, re-applies",
+        "# this install and re-runs itself on the new script. 0: it only prints the",
+        "# notice (`og update` applies it). OG_SKIP_UPDATE=1 bypasses the check once.",
         f"OG_AUTO_UPDATE={1 if plan.get('auto_update', True) else 0}",
     ]
     if plan.get("ngrok_domain"):
@@ -1066,6 +1090,7 @@ def show(state: dict) -> None:
     say(f"{C['b']}og command{C['x']}    {resolve_bin_dir(state) / 'og'}")
     say(f"{C['b']}og start{C['x']}      {state.get('default_mode', 'local')}")
     say(f"{C['b']}auto-update{C['x']}   {'on' if state.get('auto_update', True) else 'off (og start warns; og update applies)'}")
+    say(f"{C['b']}version{C['x']}       {installed_version()} (checkout; og.env holds what was last applied)")
     issues = validate(state)
     for level, msg in issues:
         (err if level == "error" else warn)(msg)
