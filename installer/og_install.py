@@ -390,6 +390,11 @@ def build_plan_interactive(state: dict) -> dict:
         [("local", "local — LAN only (recommended)", None),
          ("tunneled", "tunneled — start ngrok and expose a public URL", None)],
         state.get("default_mode", "local"))
+    say()
+    say(f"{C['dim']}  `og` is copied out of this checkout; a `git pull` here changes nothing{C['x']}")
+    say(f"{C['dim']}  until the install is re-applied. Auto-update does that on every `og start`;{C['x']}")
+    say(f"{C['dim']}  off, `og start` only warns and you run `og update` yourself.{C['x']}")
+    auto_update = ask_yes("Auto-update og on `og start`?", state.get("auto_update", True))
 
     return {
         "version": 1,
@@ -403,6 +408,7 @@ def build_plan_interactive(state: dict) -> dict:
         "max_dispatches": int(max_dispatch),
         "bin_dir": bin_dir,
         "default_mode": default_mode,
+        "auto_update": auto_update,
     }
 
 
@@ -749,8 +755,13 @@ def patch_global_config(plan: dict) -> list:
         cfg["policy_modules"] = mods
         changed.append("policy_modules += omnigent_local_policies")
 
-    # acp.agents entries for every acp-user coder we selected.
+    # acp.agents entries for every acp-user agent we selected -- the reviewer
+    # included. A missing row does not fail loudly: Omnigent resolves an
+    # unknown acp:<slug> to the FIRST configured row, so an ACP reviewer with
+    # no row of its own would silently run as whichever coder is listed first.
     want = [c for c in plan["coders"] if reg[c["id"]]["kind"] == "acp-user"]
+    if reg[plan["reviewer"]["id"]]["kind"] == "acp-user":
+        want.append(plan["reviewer"])
     if want:
         acp = cfg.get("acp") or {}
         rows = list(acp.get("agents") or [])
@@ -791,6 +802,11 @@ def write_og_env(plan: dict) -> None:
         "",
         "# Default for a bare `og start`: local (LAN only) or tunneled (ngrok).",
         f"OG_DEFAULT_MODE={plan.get('default_mode', 'local')}",
+        "",
+        "# 1: `og start` pulls the checkout, re-applies this install and re-runs",
+        "# itself on the new script. 0: it only warns when a newer og exists",
+        "# (`og update` applies it). OG_SKIP_UPDATE=1 bypasses the check once.",
+        f"OG_AUTO_UPDATE={1 if plan.get('auto_update', True) else 0}",
     ]
     if plan.get("ngrok_domain"):
         lines.append("")
@@ -807,6 +823,22 @@ def write_og_env(plan: dict) -> None:
             lines += ["", "# The reviewer runs on this account, separate from your interactive one.",
                       f"OG_CLAUDE_CONFIG_DIR={acct}"]
     (OMNI / "og.env").write_text("\n".join(lines) + "\n")
+
+
+def install_og_script(dest: Path) -> None:
+    """Copy bin/og to *dest* by writing a sibling and renaming over it.
+
+    `og update` runs this installer FROM the installed og, and bash reads a
+    script incrementally as it executes. Copying over the same inode
+    (shutil.copy2 truncates and rewrites in place) hands the still-running
+    shell a file whose bytes moved under it -- "syntax error near unexpected
+    token `esac'" on the next line it reads. A rename swaps the directory
+    entry and leaves the old inode intact for the process still reading it.
+    """
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.copy2(REPO / "bin" / "og", tmp)
+    tmp.chmod(0o755)
+    os.replace(tmp, dest)
 
 
 def apply(plan: dict, dry_run: bool = False) -> None:
@@ -871,8 +903,7 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     write_og_env(plan)
     bindir = resolve_bin_dir(plan)
     bindir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(REPO / "bin" / "og", bindir / "og")
-    (bindir / "og").chmod(0o755)
+    install_og_script(bindir / "og")
     if str(bindir) not in os.environ.get("PATH", "").split(os.pathsep):
         warn(f"{bindir} is not on your PATH — `og` will not be found. Add it:\n"
              f"    export PATH=\"{bindir}:$PATH\"")
@@ -1004,6 +1035,10 @@ def emit_questions() -> None:
             {"key": "bin_dir", "type": "path", "default": str(default_bin_dir()),
              "ask": "Which directory should the `og` command be installed into? "
                     "It must be on the user's PATH."},
+            {"key": "auto_update", "type": "bool", "default": True,
+             "ask": "Should `og start` auto-update (git pull the checkout and re-apply "
+                    "the install) before starting? If not, it only warns when a newer "
+                    "og exists and `og update` applies it."},
         ],
         "apply_with": "og-install --plan plan.json",
         "registry": REGISTRY["agents"],
@@ -1030,6 +1065,7 @@ def show(state: dict) -> None:
     say(f"{C['b']}ngrok{C['x']}         {state.get('ngrok_domain') or '(ephemeral)'}")
     say(f"{C['b']}og command{C['x']}    {resolve_bin_dir(state) / 'og'}")
     say(f"{C['b']}og start{C['x']}      {state.get('default_mode', 'local')}")
+    say(f"{C['b']}auto-update{C['x']}   {'on' if state.get('auto_update', True) else 'off (og start warns; og update applies)'}")
     issues = validate(state)
     for level, msg in issues:
         (err if level == "error" else warn)(msg)
@@ -1076,6 +1112,7 @@ def main() -> None:
     if args.plan:
         plan = json.loads(Path(args.plan).read_text())
         plan.setdefault("version", 1)
+        plan.setdefault("auto_update", True)
         for i, c in enumerate(plan.get("coders", []), 1):
             c.setdefault("priority", i)
         return apply(plan, dry_run=args.dry_run)

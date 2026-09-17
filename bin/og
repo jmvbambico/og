@@ -12,6 +12,7 @@
 #   og status           what is running, and the public URL
 #   og url              print the public URL only (pipe-friendly)
 #   og logs [-f]        tail the server log
+#   og update           pull the checkout and re-apply the install
 #
 # Works from any directory: every path here is absolute.
 #
@@ -35,7 +36,8 @@ CONF_FILE="$OMNI_HOME/og.env"
 SERVER_PIDFILE="$OMNI_HOME/og-server.pid"
 SERVER_LOGDIR="$OMNI_HOME/logs/server"
 
-# Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_CLAUDE_CONFIG_DIR.
+# Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_CLAUDE_CONFIG_DIR,
+# OG_AUTO_UPDATE (1 = `og start` pulls + re-applies the install first).
 # Written as an if, not `[[ ]] && source`: under `set -e` a bare failing test as
 # the last statement of an AND-list is an easy way to abort the script.
 # Sourced BEFORE AGENT_NAME is resolved below, or the installer's OG_AGENT
@@ -55,6 +57,8 @@ PORT="${OG_PORT:-6767}"
 # nothing — the exact failure this fixes. Captured before any cd.
 OG_LAUNCH_DIR="${OG_WORKSPACE:-$PWD}"
 NGROK_API="http://127.0.0.1:4040/api/tunnels"
+# The exact invocation, kept so a self-update can re-exec it unchanged.
+OG_ARGV=("$@")
 
 die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m→\033[0m %s\n' "$*"; }
@@ -137,7 +141,11 @@ ensure_project() {
   tok="$(python3 -c "import json;print(json.load(open('$OMNI_HOME/auth_tokens.json'))['$url']['token'])" 2>/dev/null)" || return 1
   [[ -n "$tok" ]] || return 1
 
-  OG_URL="$url" OG_TOK="$tok" OG_NAME="$name" OG_AGENT_DIR="$AGENT_DIR" OG_AGENT_NAME="$AGENT_NAME" python3 <<'PYEOF'
+  # OG_WS is what the Python below reads for the workspace pin. It was never
+  # passed for a long time, so the pin was silently skipped and every session
+  # opened wherever the composer last was (typically $HOME or ~/projects).
+  OG_URL="$url" OG_TOK="$tok" OG_NAME="$name" OG_WS="$OG_LAUNCH_DIR" \
+    OG_AGENT_DIR="$AGENT_DIR" OG_AGENT_NAME="$AGENT_NAME" python3 <<'PYEOF'
 import json, os, sys, urllib.request, urllib.error
 
 url, tok, name = os.environ["OG_URL"], os.environ["OG_TOK"], os.environ["OG_NAME"]
@@ -411,6 +419,10 @@ cmd_start() {
               info "a bare argument is read as an ngrok domain; this is 'og start tunneled $domain'" ;;
   esac
   OG_MODE="$mode"
+
+  # Before anything is started: with auto-update on, this re-execs the same
+  # command on the new script and never returns.
+  maybe_update
 
   if server_running; then
     omnigent server status 2>&1 | sed 's/^/    /'
@@ -727,6 +739,147 @@ og_repo_dir() {
   return 1
 }
 
+# --- self-update --------------------------------------------------------------
+#
+# `og` is COPIED out of the checkout by the installer, so a `git pull` in the
+# repo changes nothing the user runs until the installer is re-applied. That
+# gap is invisible: an outdated copy keeps starting fine and fails later in
+# ways that look like omnigent bugs (a host attached to the wrong server, a
+# workspace pin that never lands). Two staleness signals, checked on every
+# `og start`:
+#   1. the checkout is behind its upstream (needs a fetch; skipped offline)
+#   2. the installed script differs from the checkout's bin/og (no network
+#      needed -- this is the one that bit hardest)
+# OG_AUTO_UPDATE (og.env, set by the installer) decides what happens: 1 pulls,
+# re-applies the saved plan, and re-execs this same command on the new script;
+# anything else just warns. OG_SKIP_UPDATE=1 bypasses the check for one run.
+
+# Replace the installed script by rename, never in place: bash reads a script
+# as it runs, so truncating the inode `og update` is executing from corrupts
+# the rest of this very run. The installer does the same (install_og_script).
+install_self_from() {
+  local src="$1" dest="$2"
+  cp "$src" "$dest.tmp" && chmod 755 "$dest.tmp" && mv -f "$dest.tmp" "$dest"
+}
+
+# Absolute path of the script actually running, symlinks resolved.
+og_self_path() {
+  python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}"
+}
+
+# Fetch with a wall-clock cap. macOS has no `timeout`, and a fetch that hangs
+# on a captive portal must not turn `og start` into a blank prompt.
+git_fetch_capped() {
+  local repo="$1" secs="${2:-10}" pid i
+  GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin >/dev/null 2>&1 &
+  pid=$!
+  for ((i = 0; i < secs * 4; i++)); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return $?; }
+    sleep 0.25
+  done
+  kill "$pid" 2>/dev/null || true
+  return 1
+}
+
+# Populate OG_UPD_REPO / OG_UPD_BEHIND / OG_UPD_STALE and return 0 when
+# anything is out of date. Never fails the caller: no checkout, no git, no
+# network all read as "nothing to report".
+OG_UPD_REPO="" OG_UPD_BEHIND=0 OG_UPD_STALE=0
+update_available() {
+  OG_UPD_BEHIND=0 OG_UPD_STALE=0
+  OG_UPD_REPO="$(og_repo_dir 2>/dev/null)" || return 1
+  command -v git >/dev/null 2>&1 || return 1
+  [[ -f "$OG_UPD_REPO/bin/og" ]] || return 1
+
+  if git -C "$OG_UPD_REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+     && git -C "$OG_UPD_REPO" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    git_fetch_capped "$OG_UPD_REPO" 10 || true
+    OG_UPD_BEHIND="$(git -C "$OG_UPD_REPO" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
+  fi
+  local self; self="$(og_self_path)"
+  # Running straight from the checkout (bin/og itself) can't be a stale copy.
+  if [[ "$self" != "$OG_UPD_REPO/bin/og" ]] && ! cmp -s "$OG_UPD_REPO/bin/og" "$self"; then
+    OG_UPD_STALE=1
+  fi
+  [[ "$OG_UPD_BEHIND" -gt 0 || "$OG_UPD_STALE" -eq 1 ]]
+}
+
+# One line per signal, so the user knows WHICH kind of stale this is.
+describe_update() {
+  [[ "$OG_UPD_BEHIND" -gt 0 ]] && echo "    checkout is $OG_UPD_BEHIND commit(s) behind origin ($OG_UPD_REPO)"
+  [[ "$OG_UPD_STALE" -eq 1 ]] && echo "    installed og ($(og_self_path)) differs from $OG_UPD_REPO/bin/og"
+  return 0
+}
+
+# Bring the checkout and the install up to date. Pull only when it is safe to
+# do so silently (clean tree, fast-forward); a dirty checkout is someone's
+# work in progress and is left alone with a note. Then re-apply the saved plan:
+# that regenerates the bundles, policies, og.env and copies bin/og -- the same
+# thing the installer does, so a new og never runs against old bundles. If the
+# installer refuses (a plan that no longer validates), the script alone is
+# still copied so the next start is at least on current code.
+apply_update() {
+  local repo="$1" self plan="$OMNI_HOME/og-install.json"
+  self="$(og_self_path)"
+  if [[ "$OG_UPD_BEHIND" -gt 0 ]]; then
+    if [[ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]]; then
+      printf '\033[0;33m!\033[0m %s\n' "$repo has uncommitted changes; not pulling. Commit or stash, then 'og update'." >&2
+    elif GIT_TERMINAL_PROMPT=0 git -C "$repo" pull --ff-only --quiet 2>&1 | sed 's/^/    /'; then
+      ok "pulled $OG_UPD_BEHIND commit(s) into $repo"
+    else
+      printf '\033[0;33m!\033[0m %s\n' "git pull --ff-only failed in $repo; resolve it, then 'og update'." >&2
+    fi
+  fi
+  if [[ -f "$plan" ]]; then
+    info "re-applying $plan"
+    if "$repo/install.sh" --plan "$plan" 2>&1 | sed 's/^/    /'; then
+      ok "install re-applied"
+    else
+      printf '\033[0;33m!\033[0m %s\n' "the installer did not re-apply cleanly (see above); copying bin/og only" >&2
+      install_self_from "$repo/bin/og" "$self"
+    fi
+  else
+    # No saved plan (a hand-copied og): the script is all there is to update.
+    install_self_from "$repo/bin/og" "$self"
+    ok "updated $self"
+  fi
+}
+
+# Called first thing in `og start`. Warn-only unless OG_AUTO_UPDATE=1, in which
+# case the update is applied and this exact command is re-run on the new
+# script. OG_UPDATED guards the re-exec from checking (and looping) again.
+maybe_update() {
+  [[ "${OG_SKIP_UPDATE:-0}" == "1" || "${OG_UPDATED:-0}" == "1" ]] && return 0
+  update_available || return 0
+  if [[ "${OG_AUTO_UPDATE:-0}" == "1" ]]; then
+    info "a newer og is available; auto-updating (OG_AUTO_UPDATE=1)"
+    describe_update
+    apply_update "$OG_UPD_REPO"
+    local self; self="$(og_self_path)"
+    # ${arr[@]+"${arr[@]}"}: an empty array is "unbound" under set -u on bash 3.2.
+    OG_UPDATED=1 exec "$self" ${OG_ARGV[@]+"${OG_ARGV[@]}"}
+  fi
+  printf '\033[0;33m!\033[0m %s\n' "a newer og is available:" >&2
+  describe_update >&2
+  echo "    og may not work correctly if left outdated. Update with:  og update" >&2
+  echo "    (re-run the installer and answer yes to auto-update to do this on every start)" >&2
+  echo >&2
+}
+
+cmd_update() {
+  if update_available; then
+    describe_update
+    apply_update "$OG_UPD_REPO"
+  else
+    [[ -n "$OG_UPD_REPO" ]] || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE."
+    ok "og is up to date ($OG_UPD_REPO)"
+  fi
+  if server_running; then
+    echo "    omnigent is running on the previous og; 'og stop && og start' to pick it up."
+  fi
+}
+
 cmd_init() {
   local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
     Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_init.py directly."
@@ -972,8 +1125,9 @@ case "${1:-}" in
   status) shift; cmd_status ;;
   url)    shift; cmd_url ;;
   logs)   shift; cmd_logs "$@" ;;
+  update) shift; cmd_update ;;
   ""|-h|--help|help)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

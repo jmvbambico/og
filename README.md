@@ -91,7 +91,7 @@ repo carries its own `AGENTS.md` (the constitution) and optionally
 | `~/.omnigent/agents/<name>/skills/` | `fanout`, `cross-review`, `investigate`, `roster` |
 | `~/.omnigent/policies/omnigent_local_policies.py` | merge gate + branch-cleanup blast radius |
 | `~/.omnigent/config.yaml` | patched: `policy_modules`, `acp.agents`, `default_agent` |
-| `~/.omnigent/og.env` | `OG_AGENT`, `OG_PORT`, ngrok domain, reviewer account |
+| `~/.omnigent/og.env` | `OG_AGENT`, `OG_PORT`, ngrok domain, reviewer account, `OG_AUTO_UPDATE` |
 | `~/.omnigent/og-install.json` | **your choices — the source of truth** |
 
 The YAML bundles are *generated artifacts*. Edit `og-install.json` and re-run,
@@ -133,13 +133,13 @@ until the next run.
 | OpenCode (Zen) | `opencode-native` | orch / coder | **required** | free `-free` lineup rotates; day-capped |
 | Codex | `codex-native` | orch / coder / reviewer | optional | |
 | Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model**; runs with `--auto-approve true` (see below) |
-| Kilo Code | `acp:kilo` | coder | **required** | via `kilo acp`; unverified here |
-| Kiro (AWS) | `kiro-native` | coder / reviewer | optional | 50 free credits/mo; unverified here |
+| Kilo Code | `acp:kilo-code` | coder | **required** | via `kilo acp`; unverified here |
+| Kiro (AWS) | `acp:kiro-aws` | coder / reviewer | optional | via `kiro-cli acp --trust-all-tools` (see below); 50 free credits/mo; unverified here |
 | Cursor | `cursor-native` | coder / reviewer | optional | |
 | Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
 | Goose, Hermes, Gemini, Grok, Devin | various | coder | optional | |
 
-### Three properties worth understanding
+### Four properties worth understanding
 
 **Cline runs with `--auto-approve true`.** Cline's ACP mode (used for editor
 integration, which is how it's invoked here) defaults tool auto-approval to
@@ -152,6 +152,21 @@ prompt does not widen what a worker can get away with — it only removes
 friction Omnigent's own guardrails already cover. Set via `acp_command` in
 `installer/registry.json`, which the installer writes into
 `~/.omnigent/config.yaml`'s `acp.agents[].command`.
+
+**Kiro runs over ACP, not `kiro-native`, with `--trust-all-tools`.** Omnigent
+does have a first-class `kiro-native` harness, but its headless-worker seam —
+the one that hands Claude `--permission-mode`, Codex
+`--dangerously-bypass-approvals-and-sandbox`, Cursor `--yolo` — has no entry
+for Kiro. A native Kiro worker therefore asks for permission on every tool and
+leans on a tmux "permission mirror" that, in practice, fails to deliver the
+verdict (`permission prompt was not safely focused before verdict delivery`),
+so the worker just sits there. `kiro-cli acp --trust-all-tools` lets Kiro answer
+its own prompts, and the ACP worker's `permission_mode: bypassPermissions`
+covers whatever it relays; the same Omnigent policies gate the rest. The
+`acp:<slug>` harness id must be exactly what Omnigent derives from the row's
+name (`Kiro (AWS)` → `kiro-aws`, `Kilo Code` → `kilo-code`): a wrong slug does
+not error, it silently resolves to the *first* configured ACP row — a different
+vendor. A test pins this.
 
 **Model pin location.** A pin goes at `executor.model`. `executor.config` is a
 free-form dict, so a `model:` placed there is accepted without complaint and
@@ -204,6 +219,8 @@ The installer will ask you to:
    your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
    isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
    or `"bin_dir"` in a plan.
+9. whether `og start` should **auto-update** (default yes) — see
+   [Updating](#updating). Off, it only warns when a newer og exists.
 
 Then:
 
@@ -250,6 +267,7 @@ og chat             open an orchestrator session in this terminal
 og url              print the URL (pipe-friendly)
 og logs [-f]        tail the server log
 og login            store server credentials in the Keychain (once)
+og update           pull the checkout and re-apply the install
 ```
 
 `og login` is rarely something you run yourself: `og start` calls it for you the
@@ -360,6 +378,27 @@ Two local policies ship here, registered via `policy_modules` in
 > Being importable is not the same as being registered. Local handlers reach
 > the interpreter through a `.pth` file, but Omnigent only registers what
 > `policy_modules` names. Without that key the policies load but never fire.
+
+## Updating
+
+`og` is *copied* out of this checkout by the installer, so a `git pull` on its
+own changes nothing you run — and an outdated copy keeps starting fine, then
+fails later in ways that look like Omnigent bugs (a host attached to the wrong
+server, a workspace pin that never lands). `og start` therefore checks two
+things first: whether the checkout is behind its upstream (a capped fetch,
+skipped silently offline) and whether the installed script differs from
+`bin/og`.
+
+- **Auto-update on** (`OG_AUTO_UPDATE=1`, the installer's default): it pulls
+  (`--ff-only`, and only if the checkout is clean), re-applies your saved plan —
+  bundles, policies, `og.env`, the script — and re-runs the same command on the
+  new `og`.
+- **Off**: it prints what is stale, warns that og may not work correctly if
+  left outdated, and carries on. `og update` applies it when you're ready.
+
+`OG_SKIP_UPDATE=1 og start` bypasses the check for one run. The switch lives in
+`og-install.json` (`"auto_update"`) — re-run the installer to flip it; editing
+`og.env` by hand is undone the next time the plan is re-applied.
 
 ---
 

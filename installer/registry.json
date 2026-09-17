@@ -12,6 +12,10 @@
     "                acp-user    -> needs an `acp.agents` entry in",
     "                               ~/.omnigent/config.yaml (og writes it)",
     "  acp_command   argv for acp-user kinds, e.g. 'cline --acp'",
+    "                For acp-user kinds `harness` MUST be acp:<slug> where slug is",
+    "                Omnigent's slugify(label): lowercase, non-alphanumerics -> '-'.",
+    "                A wrong slug does not error — Omnigent silently falls back to",
+    "                the FIRST configured acp.agents row, i.e. a different vendor.",
     "  roles         which slots it may fill",
     "  vendor        model family, used for the cross-vendor review check.",
     "                Two agents sharing a vendor cannot review each other.",
@@ -180,7 +184,7 @@
     {
       "id": "kilo",
       "label": "Kilo Code",
-      "harness": "acp:kilo",
+      "harness": "acp:kilo-code",
       "binary": "kilo",
       "kind": "acp-user",
       "acp_command": "kilo acp",
@@ -215,21 +219,24 @@
     {
       "id": "kiro",
       "label": "Kiro (AWS)",
-      "harness": "kiro-native",
+      "harness": "acp:kiro-aws",
       "binary": "kiro-cli",
-      "kind": "native",
-      "alt_acp_command": "kiro-cli acp",
+      "kind": "acp-user",
+      "acp_command": "kiro-cli acp --trust-all-tools",
+      "omnigent_mcp": false,
+      "alt_native_harness": "kiro-native",
+      "kind_note": "ACP rather than kiro-native on purpose. Omnigent's headless-worker seam (_derive_terminal_launch_args_from_spec) maps claude/codex/cursor/kimi/agy to their no-prompt flags but has no kiro-native entry, so a native Kiro worker asks for permission on every tool and depends on a tmux permission mirror that fails ('permission prompt was not safely focused before verdict delivery'). Over ACP, Kiro's own --trust-all-tools answers its prompts and permission_mode: bypassPermissions (acp-user) covers what it relays. Revisit once Omnigent maps kiro-native.",
       "roles": [
         "coder",
         "reviewer"
       ],
       "vendor": "aws-kiro",
-      "relay": true,
+      "relay": false,
       "silent_model_failure": false,
       "model": {
         "required": false,
         "pin_path": "executor.model",
-        "note": "`auto` is Kiro's own default router (1.00x credits, model chosen per task). The pin reaches `kiro-cli --model` via the session's model_override. Free plan is 50 credits/month from the shared Kiro pool \u2014 overflow capacity, not a primary implementer.",
+        "note": "`auto` is Kiro's own default router (1.00x credits, model chosen per task). Over ACP the pin reaches Kiro as the session model (HARNESS_ACP_MODEL); unpinned uses Kiro's default, which is `auto` anyway. Free plan is 50 credits/month from the shared Kiro pool \u2014 overflow capacity, not a primary implementer.",
         "prefer": "auto",
         "list_cmd": [
           "kiro-cli",
@@ -243,7 +250,7 @@
       "login": "kiro-cli",
       "docs": "https://kiro.dev/docs/cli/",
       "unverified": true,
-      "prompt_delivery": "none"
+      "prompt_delivery": "unknown"
     },
     {
       "id": "cursor",

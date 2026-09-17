@@ -218,13 +218,14 @@ def test_validate_errors_when_orchestrator_cannot_relay():
 
 
 def test_validate_errors_when_orchestrator_prompt_not_delivered():
-    plan = _base_plan(orchestrator="kiro")
+    # cursor is prompt_delivery: none (kiro used to be, before it moved to ACP).
+    plan = _base_plan(orchestrator="cursor")
     issues = m.validate(plan)
     assert any(level == "error" and "never receives a spec prompt" in msg for level, msg in issues)
 
 
 def test_validate_warns_when_a_coder_never_receives_its_prompt():
-    plan = _base_plan(coders=[{"id": "kiro", "priority": 1, "model": "auto"}])
+    plan = _base_plan(coders=[{"id": "cursor", "priority": 1, "model": None}])
     issues = m.validate(plan)
     assert any("never receive their sub-agent prompt" in msg for _, msg in issues)
 
@@ -329,8 +330,97 @@ def test_apply_dry_run_refuses_an_invalid_plan(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# registry -- acp-user harness ids must be what Omnigent derives from the label
+# --------------------------------------------------------------------------
+def _omnigent_slugify(name: str) -> str:
+    # Verbatim copy of omnigent.onboarding.acp_auth.slugify. The row is looked
+    # up by acp:<slug>; a miss falls back to the FIRST configured row -- a
+    # different vendor -- with no error anywhere.
+    import re
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-") or "agent"
+
+
+def test_acp_user_harness_matches_omnigent_slug():
+    for a in m.REGISTRY["agents"]:
+        if a["kind"] != "acp-user":
+            continue
+        expected = f"acp:{_omnigent_slugify(a['label'])}"
+        assert a["harness"] == expected, (
+            f"{a['id']}: harness {a['harness']!r} will not resolve; "
+            f"Omnigent slugs {a['label']!r} to {expected!r}")
+        assert a.get("acp_command"), f"{a['id']}: acp-user rows need acp_command"
+
+
+def test_kiro_is_wired_over_acp_with_trust_all_tools():
+    # kiro-native has no headless no-prompt seam in Omnigent, so a native Kiro
+    # worker stalls on per-tool permission prompts. Keep it on ACP with Kiro's
+    # own auto-approve until that changes (see kind_note in the registry).
+    kiro = m.agents_by_id()["kiro"]
+    assert kiro["kind"] == "acp-user"
+    assert "--trust-all-tools" in kiro["acp_command"]
+
+
+def test_patch_global_config_writes_a_row_for_an_acp_reviewer(tmp_path, monkeypatch):
+    # Without its own row an ACP reviewer resolves to the first coder's row.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    (tmp_path / "config.yaml").write_text("{}\n")
+    plan = _base_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}],
+        reviewer={"id": "kiro", "model": None},
+    )
+    m.patch_global_config(plan)
+    cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    names = [r["name"] for r in cfg["acp"]["agents"]]
+    assert "Kiro (AWS)" in names
+
+
+# --------------------------------------------------------------------------
+# write_og_env -- the auto-update switch og reads at startup
+# --------------------------------------------------------------------------
+def _og_env(tmp_path, monkeypatch, plan):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    m.write_og_env(plan)
+    return (tmp_path / "og.env").read_text()
+
+
+def test_og_env_auto_update_defaults_on(tmp_path, monkeypatch):
+    # A plan written before the key existed must keep behaving like a fresh
+    # install: pull-and-reapply, not silent drift.
+    env = _og_env(tmp_path, monkeypatch, _base_plan())
+    assert "OG_AUTO_UPDATE=1\n" in env
+
+
+def test_og_env_auto_update_off_is_zero_not_absent(tmp_path, monkeypatch):
+    # og treats an unset OG_AUTO_UPDATE as off, but the file should still say
+    # so explicitly -- the comment above the line is the user's only hint that
+    # the switch exists.
+    env = _og_env(tmp_path, monkeypatch, _base_plan(auto_update=False))
+    assert "OG_AUTO_UPDATE=0\n" in env
+    assert "og update" in env
+
+
+# --------------------------------------------------------------------------
 # CLI smoke tests -- run the real script as a subprocess
 # --------------------------------------------------------------------------
+def test_cli_plan_defaults_auto_update_on(tmp_path):
+    # A --plan without the key (older AI-written plans) gets auto_update=True,
+    # matching the interactive default, and the dry run echoes it back.
+    plan = _base_plan()
+    plan.pop("auto_update", None)
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps(plan))
+    env = {"OMNIGENT_HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    result = subprocess.run(
+        [sys.executable, str(REPO / "installer" / "og_install.py"),
+         "--plan", str(plan_file), "--dry-run"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    echoed = json.loads(out[out.index("{"):])
+    assert echoed["auto_update"] is True
+
+
 def test_cli_questions_emits_valid_json(tmp_path):
     env = {"OMNIGENT_HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
     result = subprocess.run(

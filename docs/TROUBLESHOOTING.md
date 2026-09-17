@@ -305,9 +305,29 @@ serving the UI. (`mint_token` already stores a matching entry in
 plumbing.) If you're on an older `og`:
 
 ```bash
-cp /path/to/og/bin/og "$(command -v og)"
+og update            # or: cp /path/to/og/bin/og "$(command -v og)"
 og stop && og start
 ```
+
+`og start` now warns (or auto-updates, see the README's *Updating* section)
+when the installed script differs from the checkout, so this class of
+"fixed in the repo, still broken on the machine" no longer goes unnoticed.
+
+---
+
+## New sessions open in `~` or `~/projects`, not the directory `og start` ran from
+
+The composer's default workspace is the pinned project's `workspace`, which
+`og start` is meant to set to the directory it was launched from
+(`OG_LAUNCH_DIR`, or `OG_WORKSPACE` if set).
+
+**Cause.** Before this was fixed, `ensure_project` read the pin from an
+`OG_WS` variable that was never passed in, so the workspace was silently left
+unset and every session opened wherever the composer last was.
+
+**Fix.** Update `og` (`og update`), then `og stop && og start` **from the repo
+you want** — the pin is re-applied on every start, so launching from a
+different directory moves it. Setting `OG_WORKSPACE=/path` overrides `$PWD`.
 
 ---
 
@@ -360,6 +380,47 @@ kiro-cli               # Kiro (AWS) — run once interactively to authenticate
 
 `kilo auth list` (or the equivalent for another vendor) confirms whether
 credentials are actually stored before you retry.
+
+---
+
+## Kiro asks for permission on every tool, and approving does nothing
+
+Runner log:
+
+```
+ERROR kiro_native.permissions  failed to deliver kiro permission verdict for <id>
+RuntimeError: kiro-native permission prompt was not safely focused before verdict delivery
+```
+
+**Cause.** The worker is on the `kiro-native` harness. Omnigent's
+headless-worker seam maps Claude/Codex/Cursor/Kimi/Antigravity to their
+no-prompt flags but has no `kiro-native` entry, so Kiro launches in its default
+ask-every-time mode and relies on Omnigent mirroring each prompt to the web and
+typing the verdict back into the TUI over tmux — which is what is failing
+above. Nothing a policy or the orchestrator does changes this.
+
+**Fix.** og now wires Kiro over ACP as `kiro-cli acp --trust-all-tools`
+(`acp:kiro-aws`). Re-apply the install and restart:
+
+```bash
+og update            # or ./install.sh --plan ~/.omnigent/og-install.json
+og stop && og start
+```
+
+Check `~/.omnigent/agents/<name>/agents/coder_kiro/config.yaml` says
+`harness: acp:kiro-aws` and `~/.omnigent/config.yaml` has an `acp.agents` row
+named `Kiro (AWS)`.
+
+---
+
+## A Kilo (or any ACP) worker behaves like a different vendor
+
+`acp:<slug>` is resolved against `acp.agents[].name` slugified by Omnigent
+(lowercase, non-alphanumerics → `-`). A slug that matches no row does **not**
+error: Omnigent falls back to the first configured row. og's registry used to
+say `acp:kilo` for a row named `Kilo Code` (slug `kilo-code`), so Kilo
+dispatches silently ran on Cline. Fixed in the registry; `og update` re-applies
+it. `test_acp_user_harness_matches_omnigent_slug` guards every acp-user row.
 
 ---
 
