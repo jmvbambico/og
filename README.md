@@ -217,6 +217,9 @@ The installer will ask you to:
    first. Anything you've logged into with the CLI shows up: a DeepSeek key
    added via `opencode auth login` appears as `deepseek/…` next to Zen's
    `opencode/…` ids. Enter a number, or type a full id the list truncated.
+   A login that yields no models (typically an OAuth *subscription* session,
+   which OpenCode only routes through a vendor auth plugin) is called out with
+   the fix — see [Troubleshooting](docs/TROUBLESHOOTING.md#opencode-a-provider-i-logged-into-is-missing-from-the-installers-model-list).
 5. pick the **reviewer** — it warns if the reviewer shares a vendor with a
    coder. The vendor is read from the model pin where it says something
    (`opencode/claude-sonnet-5` is Anthropic, whoever bills for it), and from

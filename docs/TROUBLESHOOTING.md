@@ -288,6 +288,65 @@ og attach
 
 ---
 
+## OpenCode: a provider I logged into is missing from the installer's model list
+
+You ran `opencode auth login` (Anthropic, Google, OpenAI, DeepSeek, …), but
+`./install.sh` shows only `opencode/…` ids — or `opencode models` itself never
+prints that provider.
+
+**Cause.** The installer lists exactly what `opencode models` prints, and
+OpenCode builds that list from `~/.local/share/opencode/auth.json` by two
+different rules:
+
+- an **API key** login (`type: api` — DeepSeek, OpenRouter, Zen, …) becomes a
+  provider by itself;
+- an **OAuth session** login (`type: oauth` — a Claude, Google, or ChatGPT
+  subscription) becomes a provider **only through an auth plugin** for that
+  vendor. OpenAI (ChatGPT/Codex) and GitHub Copilot ship built in; Anthropic and
+  Google do not.
+
+So a subscription login sits in `auth.json` and contributes nothing until its
+plugin is loaded. `opencode auth list` still shows it as a credential, which is
+what makes this look like an installer bug.
+
+**What the installer does now.** It reads `auth.json` and, for every login that
+contributes no models, prints the reason and the fix next to the model list:
+
+```
+! anthropic: logged in (oauth) but not listed. OAuth session -- it surfaces only
+  through an auth plugin. Add "opencode-anthropic-auth" to the `plugin` list in
+  ~/.config/opencode/opencode.json
+! deepseek: logged in (api) but not listed. API key present but no deepseek/
+  models -- check `disabled_providers` in ~/.config/opencode/opencode.json, or
+  refresh the catalog: `opencode models --refresh`
+```
+
+**Fix.**
+
+- **OAuth (subscription) login, plugin not built in** — add the plugin and
+  re-run `opencode models` (the first run installs it):
+
+  ```json
+  { "plugin": ["opencode-anthropic-auth"] }        // ~/.config/opencode/opencode.json
+  ```
+
+  Google: `opencode-antigravity-auth`. Note that Anthropic has restricted use of
+  Claude subscription sessions outside Claude Code, so that route may stop
+  working regardless of the plugin. For a Claude subscription the dependable
+  path in og is the **Claude Code agent itself** (`claude`), which og supports
+  directly as orchestrator, coder, or reviewer — there is no need to go through
+  OpenCode.
+- **OAuth login, plugin built in (OpenAI, Copilot)** — the session has likely
+  expired: `opencode auth login` again.
+- **API-key login not listed** — it is either in `disabled_providers` in your
+  OpenCode config, or the models.dev catalog is stale: `opencode models --refresh`.
+- **`could not list models: opencode models timed out / exit N`** — the
+  installer now prints OpenCode's own stderr. A first run can take a while
+  (plugin install + catalog fetch); run `opencode models` once by hand and
+  re-run the installer.
+
+---
+
 ## "Models unavailable" in the composer, or `409 Conflict` on `model-options`
 
 ```

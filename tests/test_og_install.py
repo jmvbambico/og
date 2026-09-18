@@ -724,3 +724,80 @@ def test_zen_preflight_only_for_zen_pins():
     rendered = m.render_orchestrator(plan)
     assert "Zen model preflight" not in rendered
     assert "day-capped" not in rendered
+
+
+# --------------------------------------------------------------------------
+# logins that yield no models (OpenCode auth store cross-check)
+# --------------------------------------------------------------------------
+def _opencode_agent_with_auth(tmp_path, monkeypatch, entries: dict) -> dict:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    store = tmp_path / "opencode" / "auth.json"
+    store.parent.mkdir(parents=True)
+    store.write_text(json.dumps({k: {"type": v, "key": "x"} for k, v in entries.items()}))
+    return {"id": "opencode", "label": "OpenCode", "vendor": "opencode-zen",
+            "model": {"list_cmd": ["opencode", "models"], "free_pattern": "-free$",
+                      "auth_file": "$XDG_DATA_HOME/opencode/auth.json",
+                      "oauth_builtin": ["openai"],
+                      "oauth_plugins": {"anthropic": "opencode-anthropic-auth"}}}
+
+
+def test_auth_providers_reads_the_store_via_xdg(tmp_path, monkeypatch):
+    agent = _opencode_agent_with_auth(tmp_path, monkeypatch, {"deepseek": "api", "anthropic": "oauth"})
+    assert m.auth_providers(agent) == {"deepseek": "api", "anthropic": "oauth"}
+
+
+def test_auth_providers_empty_without_store_or_spec(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    assert m.auth_providers({"model": {"auth_file": "$XDG_DATA_HOME/opencode/auth.json"}}) == {}
+    assert m.auth_providers({"model": {}}) == {}
+
+
+def test_unlisted_logins_explains_each_idle_credential(tmp_path, monkeypatch):
+    """Reproduces the report: OAuth sessions in auth.json that `opencode
+    models` never lists. Each idle login gets the reason that matches how
+    OpenCode loads providers (API keys directly; OAuth only via a plugin)."""
+    agent = _opencode_agent_with_auth(tmp_path, monkeypatch, {
+        "opencode": "api",      # listed -> no note
+        "deepseek": "api",      # API key but absent -> disabled/stale catalog
+        "anthropic": "oauth",   # known plugin -> name it
+        "openai": "oauth",      # built-in plugin -> session expired
+        "google": "oauth",      # no plugin known -> say so
+    })
+    notes = {pid: (kind, why) for pid, kind, why in
+             m.unlisted_logins(agent, ["opencode/glm-5", "opencode/mimo-free"])}
+    assert "opencode" not in notes
+    assert notes["deepseek"][0] == "api" and "disabled_providers" in notes["deepseek"][1]
+    assert "opencode-anthropic-auth" in notes["anthropic"][1]
+    assert "auth login" in notes["openai"][1]
+    assert "none is built in" in notes["google"][1]
+
+
+def test_unlisted_logins_silent_when_everything_is_listed(tmp_path, monkeypatch):
+    agent = _opencode_agent_with_auth(tmp_path, monkeypatch, {"deepseek": "api"})
+    assert m.unlisted_logins(agent, ["deepseek/deepseek-chat"]) == []
+
+
+def test_pick_model_warns_about_idle_logins(tmp_path, monkeypatch):
+    agent = _opencode_agent_with_auth(tmp_path, monkeypatch, {"anthropic": "oauth"})
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("opencode/mimo-free\n"))
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: default)
+    warned = []
+    monkeypatch.setattr(m, "warn", lambda msg: warned.append(msg))
+    assert m.pick_model(agent, None) == "opencode/mimo-free"
+    assert any("anthropic: logged in (oauth)" in w for w in warned), warned
+
+
+def test_list_models_keeps_the_cli_error_for_the_warning(monkeypatch):
+    def failing(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom\nplugin install failed\n")
+    monkeypatch.setattr(m.subprocess, "run", failing)
+    assert m.list_models({"model": {"list_cmd": ["opencode", "models"]}}) == []
+    assert "exit 1" in m.LAST_LIST_ERROR and "plugin install failed" in m.LAST_LIST_ERROR
+
+
+def test_list_models_reports_a_timeout(monkeypatch):
+    def slow(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 0))
+    monkeypatch.setattr(m.subprocess, "run", slow)
+    assert m.list_models({"model": {"list_cmd": ["opencode", "models"]}}) == []
+    assert "timed out" in m.LAST_LIST_ERROR

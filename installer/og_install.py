@@ -164,16 +164,32 @@ def find_free_port(start: int, tries: int = 20) -> int | None:
     return None
 
 
+# Why the last list_models() came back empty, for the warning pick_model
+# prints. A silent [] reads as "this CLI has no models"; the real causes --
+# a plugin install that timed out on first run, a missing binary, a crash --
+# each have a different fix and the CLI's own stderr names it.
+LAST_LIST_ERROR = ""
+
+
 def list_models(agent: dict) -> list:
     """Ask the vendor CLI what it can run. Empty list on any failure."""
+    global LAST_LIST_ERROR
+    LAST_LIST_ERROR = ""
     cmd = (agent.get("model") or {}).get("list_cmd")
     if not cmd:
         return []
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
-    except (OSError, subprocess.SubprocessError):
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    except subprocess.TimeoutExpired:
+        LAST_LIST_ERROR = (f"timed out after 120s -- a first run installs plugins and fetches "
+                           f"the model catalog; run `{' '.join(cmd)}` once by hand, then retry")
+        return []
+    except (OSError, subprocess.SubprocessError) as e:
+        LAST_LIST_ERROR = str(e)
         return []
     if out.returncode != 0:
+        tail = [l for l in out.stderr.splitlines() if l.strip()][-3:]
+        LAST_LIST_ERROR = f"exit {out.returncode}" + (": " + " | ".join(tail) if tail else "")
         return []
     models = []
     for line in out.stdout.splitlines():
@@ -204,6 +220,65 @@ def filter_free(agent: dict, models: list) -> list:
 
 def free_models(agent: dict) -> list:
     return filter_free(agent, list_models(agent))
+
+
+def _expand_xdg(path: str) -> Path:
+    """`$XDG_DATA_HOME` with its spec default, then `~`."""
+    data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(os.path.expanduser(path.replace("$XDG_DATA_HOME", data_home)))
+
+
+def auth_providers(agent: dict) -> dict:
+    """{provider_id: 'api' | 'oauth'} from the CLI's own credential store
+    (registry `model.auth_file`), or {} when there is none to read."""
+    spec = agent.get("model") or {}
+    if not spec.get("auth_file"):
+        return {}
+    try:
+        data = json.loads(_expand_xdg(spec["auth_file"]).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: str(v.get("type", "")) for k, v in data.items() if isinstance(v, dict)}
+
+
+def unlisted_logins(agent: dict, models: list) -> list:
+    """Providers the user has logged into that contribute nothing to the
+    model listing, each with the reason and the fix.
+
+    A login that yields no models is the report "I logged in but og can't
+    see it". The CLI is not lying -- it lists exactly what it can route to
+    -- but it does not say WHY a credential is idle, and the two causes need
+    different fixes: an API key is a provider by itself (so its absence
+    means it is disabled, or the catalog is stale), while an OAuth session
+    only becomes a provider through an auth plugin for that vendor, some
+    bundled with the CLI and the rest installed by name.
+    """
+    spec = agent.get("model") or {}
+    listed = {m.split("/", 1)[0] for m in models if "/" in m}
+    builtin = set(spec.get("oauth_builtin") or [])
+    plugins = spec.get("oauth_plugins") or {}
+    cli = spec.get("list_cmd", ["?"])[0]
+    out = []
+    for pid, kind in sorted(auth_providers(agent).items()):
+        if pid in listed:
+            continue
+        if kind == "oauth":
+            if pid in builtin:
+                why = (f"OAuth session, plugin is built in -- the session may have expired: "
+                       f"`{cli} auth login` again")
+            elif pid in plugins:
+                why = (f"OAuth session -- it surfaces only through an auth plugin. Add "
+                       f"\"{plugins[pid]}\" to the `plugin` list in ~/.config/{cli}/{cli}.json")
+            else:
+                why = (f"OAuth session -- it surfaces only through an auth plugin for `{pid}`, "
+                       f"and none is built in or known here")
+        else:
+            why = (f"API key present but no {pid}/ models -- check `disabled_providers` in "
+                   f"~/.config/{cli}/{cli}.json, or refresh the catalog: `{cli} models --refresh`")
+        out.append((pid, kind, why))
+    return out
 
 
 # Multi-provider harnesses (OpenCode, Kilo) list every provider the user has
@@ -360,6 +435,8 @@ def pick_model(agent: dict, current: str | None) -> str | None:
         say(f"  {C['dim']}{spec['note']}{C['x']}")
 
     options = list_models(agent)
+    for pid, kind, why in unlisted_logins(agent, options):
+        warn(f"{pid}: logged in ({kind}) but not listed. {why}")
     if options:
         free = set(filter_free(agent, options)) if spec.get("free_pattern") else set()
         shown = []
@@ -390,7 +467,8 @@ def pick_model(agent: dict, current: str | None) -> str | None:
             err(f"enter 1-{len(shown)}, or a full model id")
 
     if spec.get("list_cmd"):
-        warn(f"could not list models ({' '.join(spec['list_cmd'])} failed) — type one manually")
+        warn(f"could not list models: `{' '.join(spec['list_cmd'])}` "
+             f"{LAST_LIST_ERROR or 'printed nothing'} — type one manually")
     default = current or spec.get("prefer") or ""
     got = ask("model id" + (" (REQUIRED)" if required else " (blank = harness default)"), default)
     if required and not got:
