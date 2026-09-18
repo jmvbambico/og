@@ -89,21 +89,60 @@ def scan() -> dict:
     return found
 
 
+def host_os() -> str:
+    """'macos', 'wsl', 'linux', or 'windows' -- for install hints only.
+
+    WSL is singled out because it is the supported way to run og on Windows
+    and its hints differ (apt, but no keyring; LAN needs mirrored networking).
+    Native Windows is reported so --check can say plainly that it is not
+    supported rather than listing seven missing tools.
+    """
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("win") or sys.platform == "cygwin" or os.name == "nt":
+        return "windows"
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return "wsl"
+    try:
+        if "microsoft" in Path("/proc/version").read_text().lower():
+            return "wsl"
+    except OSError:
+        pass
+    return "linux"
+
+
 def prereqs() -> list:
-    """(name, found, why-it-matters, how-to-get-it)."""
+    """(name, found, why-it-matters, how-to-get-it, required).
+
+    Required means og or Omnigent cannot start without it. The rest are
+    per-workflow: ngrok only for `og start tunneled`, gh only when the
+    project's delivery ends in a GitHub PR (the orchestrator opens it; the
+    merge gate reads the review marker from its body -- without gh the gate
+    just denies protected-branch merges, which is the safe side).
+    """
+    mac = host_os() == "macos"
+
+    def hint(brew: str, apt: str) -> str:
+        return brew if mac else apt
+
     rows = [
-        ("omnigent", shutil.which("omnigent"), "the runtime everything here configures",
-         "uv tool install omnigent"),
-        ("python3", shutil.which("python3"), "installer + og internals", "preinstalled on macOS"),
-        ("tmux", shutil.which("tmux"), "native agent terminals run inside it", "brew install tmux"),
-        ("git", shutil.which("git"), "worktrees for parallel workers", "xcode-select --install"),
-        ("ngrok", shutil.which("ngrok"), "public URL so you can drive it from a phone",
-         "brew install ngrok"),
-        ("gh", shutil.which("gh"), "the orchestrator opens PRs with it", "brew install gh"),
-        ("qrencode", shutil.which("qrencode"), "optional: QR for the tunnel URL",
-         "brew install qrencode"),
+        ("omnigent", "the runtime everything here configures",
+         "uv tool install omnigent", True),
+        ("python3", "installer + og internals",
+         hint("preinstalled on macOS", "sudo apt install python3"), True),
+        ("tmux", "native agent terminals run inside it",
+         hint("brew install tmux", "sudo apt install tmux"), True),
+        ("git", "worktrees for parallel workers",
+         hint("xcode-select --install", "sudo apt install git"), True),
+        ("ngrok", "optional: `og start tunneled` (drive a run from outside your network)",
+         hint("brew install ngrok", "https://ngrok.com/download"), False),
+        ("gh", "optional: GitHub-hosted projects only -- the orchestrator opens the PR, "
+               "the merge gate reads its body",
+         hint("brew install gh", "https://cli.github.com (apt: gh)"), False),
+        ("qrencode", "optional: QR for the tunnel URL",
+         hint("brew install qrencode", "sudo apt install qrencode"), False),
     ]
-    return [(n, bool(p), why, how) for n, p, why, how in rows]
+    return [(n, bool(shutil.which(n)), why, how, req) for n, why, how, req in rows]
 
 
 def port_available(port: int) -> bool:
@@ -155,13 +194,87 @@ def list_models(agent: dict) -> list:
     return models
 
 
-def free_models(agent: dict) -> list:
+def filter_free(agent: dict, models: list) -> list:
     pat = (agent.get("model") or {}).get("free_pattern")
-    models = list_models(agent)
     if not pat:
-        return models
+        return list(models)
     rx = re.compile(pat)
     return [m for m in models if rx.search(m)]
+
+
+def free_models(agent: dict) -> list:
+    return filter_free(agent, list_models(agent))
+
+
+# Multi-provider harnesses (OpenCode, Kilo) list every provider the user has
+# added with `<cli> auth login` under its own prefix: `deepseek/deepseek-chat`
+# next to `opencode/glm-5`. Group by that prefix so a second provider is
+# visible instead of buried under Zen's ~70 ids, and put the free-tier ids
+# first because they are what the roster is ordered around.
+MODELS_PER_PROVIDER = 12
+
+
+def grouped_models(agent: dict, models: list) -> list:
+    """[(provider, [ids])] -- free ids first within a provider, providers
+    that have free ids first overall, listing order otherwise."""
+    free = set(filter_free(agent, models)) if (agent.get("model") or {}).get("free_pattern") else set()
+    groups: dict = {}
+    for m in models:
+        provider = m.split("/", 1)[0] if "/" in m else ""
+        groups.setdefault(provider, []).append(m)
+    out = []
+    for provider, ids in groups.items():
+        ordered = [m for m in ids if m in free] + [m for m in ids if m not in free]
+        out.append((provider, ordered))
+    out.sort(key=lambda g: 0 if any(m in free for m in g[1]) else 1)
+    return out
+
+
+# The prefix of a `provider/model` id says who BILLS; for a reseller it says
+# nothing about who trained the model, which is what the cross-vendor review
+# rule is about. `opencode/claude-sonnet-5` reviewed by Claude Code is
+# same-vendor review however the invoice reads.
+AGGREGATOR_PROVIDERS = {"opencode", "openrouter", "kilo"}
+MODEL_FAMILIES = [
+    (r"claude", "anthropic"),
+    (r"gpt|codex|^o[1-9]\b", "openai"),
+    (r"gemini|gemma", "google"),
+    (r"deepseek", "deepseek"),
+    (r"glm", "zhipu"),
+    (r"kimi|moonshot", "moonshot"),
+    (r"qwen", "alibaba"),
+    (r"grok", "xai"),
+    (r"mistral|devstral|codestral|magistral", "mistral"),
+    (r"llama", "meta"),
+    (r"minimax", "minimax"),
+    (r"mimo", "xiaomi"),
+]
+
+
+def model_vendor(model_id: str | None) -> str | None:
+    """Vendor implied by a pinned model id, or None when it says nothing
+    (no provider prefix, or an aggregator's own router like kilo-auto)."""
+    if not model_id or "/" not in model_id:
+        return None
+    provider, name = model_id.split("/", 1)
+    if provider not in AGGREGATOR_PROVIDERS:
+        return provider
+    for pat, vendor in MODEL_FAMILIES:
+        if re.search(pat, name, re.IGNORECASE):
+            return vendor
+    return None
+
+
+def vendor_of(agent: dict, entry: dict) -> str:
+    """The registry vendor, refined by the plan entry's model pin when that
+    pin names a vendor. Falls back to the registry when it does not."""
+    return model_vendor(entry.get("model")) or agent["vendor"]
+
+
+def is_zen(model_id: str | None) -> bool:
+    """OpenCode Zen ids carry the `opencode/` prefix; anything else routed
+    through OpenCode is the user's own provider and its own bill."""
+    return bool(model_id) and model_id.startswith("opencode/")
 
 
 # --------------------------------------------------------------------------
@@ -246,19 +359,35 @@ def pick_model(agent: dict, current: str | None) -> str | None:
     if spec.get("note"):
         say(f"  {C['dim']}{spec['note']}{C['x']}")
 
-    options = free_models(agent) or list_models(agent)
+    options = list_models(agent)
     if options:
-        shown = options[:25]
-        for i, m in enumerate(shown, 1):
-            mark = f" {C['g']}(current){C['x']}" if m == current else ""
-            say(f"  {i}. {m}{mark}")
-        if len(options) > len(shown):
-            say(f"  {C['dim']}… {len(options)-len(shown)} more; type a full id instead{C['x']}")
-        default = current or spec.get("prefer") or shown[0]
-        got = ask("model id (number or full id)", default)
-        if got.isdigit() and 1 <= int(got) <= len(shown):
-            return shown[int(got) - 1]
-        return got
+        free = set(filter_free(agent, options)) if spec.get("free_pattern") else set()
+        shown = []
+        for provider, ids in grouped_models(agent, options):
+            if provider:
+                say(f"  {C['dim']}{provider}/{C['x']}")
+            for m in ids[:MODELS_PER_PROVIDER]:
+                shown.append(m)
+                tag = f" {C['g']}free{C['x']}" if m in free else ""
+                mark = f" {C['g']}(current){C['x']}" if m == current else ""
+                say(f"  {len(shown):2}. {m}{tag}{mark}")
+            if len(ids) > MODELS_PER_PROVIDER:
+                say(f"      {C['dim']}… {len(ids)-MODELS_PER_PROVIDER} more {provider}/ ids; "
+                    f"type a full id instead{C['x']}")
+        # A stale `prefer` (Zen rotates its free lineup) must not become the
+        # default just because it is written in the registry.
+        prefer = spec.get("prefer")
+        default = current or (prefer if prefer in options else None) \
+            or next((m for m in shown if m in free), None) or shown[0]
+        while True:
+            got = ask("model id (number or full id)", default)
+            if not got.isdigit():
+                return got
+            if 1 <= int(got) <= len(shown):
+                return shown[int(got) - 1]
+            # A bare number outside the menu is a typo, not a model id --
+            # storing "30" as the pin would fail at the first dispatch.
+            err(f"enter 1-{len(shown)}, or a full model id")
 
     if spec.get("list_cmd"):
         warn(f"could not list models ({' '.join(spec['list_cmd'])} failed) — type one manually")
@@ -433,9 +562,9 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "erroring. Verify the first dispatch produced a real commit — an "
                            "empty transcript means the pin is wrong, not that it refused."))
 
-    rev_vendor = reg[plan["reviewer"]["id"]]["vendor"]
+    rev_vendor = vendor_of(reg[plan["reviewer"]["id"]], plan["reviewer"])
     same = [reg[c["id"]]["label"] for c in plan["coders"]
-            if reg[c["id"]]["vendor"] == rev_vendor]
+            if vendor_of(reg[c["id"]], c) == rev_vendor]
     if same:
         issues.append(("warn",
                        f"reviewer ({reg[plan['reviewer']['id']]['label']}) shares a vendor with "
@@ -526,7 +655,7 @@ def render_roster(plan: dict) -> str:
         if a.get("silent_model_failure"):
             tags.append("FAILS SILENTLY on a bad model — empty transcript means "
                         "misconfig, not refusal; do not re-send")
-        if a["id"] == "opencode":
+        if a["id"] == "opencode" and is_zen(c.get("model")):
             tags.append("day-capped; when dry move down, do not retry")
         tag = f" {'; '.join(tags)}." if tags else ""
         lines.append(f"  - {names[i].ljust(width)}{ordinals[min(i, 5)]}: {a['label']} "
@@ -547,14 +676,14 @@ def render_vendor_map(plan: dict) -> str:
     vendors that drift the moment the roster is reconfigured) would.
     """
     reg = agents_by_id()
-    rv = reg[plan["reviewer"]["id"]]
+    rv = vendor_of(reg[plan["reviewer"]["id"]], plan["reviewer"])
     lines = []
     for c in plan["coders"]:
-        a = reg[c["id"]]
-        same = (f" — same vendor as `reviewer` ({rv['vendor']}); that pairing is "
-                "degraded-review" if a["vendor"] == rv["vendor"] else "")
-        lines.append(f"  - `{worker_name(c['id'])}` is {a['vendor']}{same}.")
-    lines.append(f"  - `reviewer` is {rv['vendor']}.")
+        cv = vendor_of(reg[c["id"]], c)
+        same = (f" — same vendor as `reviewer` ({rv}); that pairing is "
+                "degraded-review" if cv == rv else "")
+        lines.append(f"  - `{worker_name(c['id'])}` is {cv}{same}.")
+    lines.append(f"  - `reviewer` is {rv}.")
     return "\n".join(lines)
 
 
@@ -578,7 +707,7 @@ def render_roster_skill(plan: dict) -> str:
     for i, c in enumerate(plan["coders"], 1):
         a = reg[c["id"]]
         out += [f"## {i}. `{worker_name(c['id'])}` — {a['label']}", "",
-                f"- harness `{a['harness']}`, vendor `{a['vendor']}`",
+                f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
                 f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}"]
         if a.get("relay") is False:
             out.append("- **Leaf worker.** Runs without Omnigent's `sys_*` tool relay, so it "
@@ -604,7 +733,7 @@ def render_roster_skill(plan: dict) -> str:
         out.append("")
     rv = reg[plan["reviewer"]["id"]]
     out += [f"## `reviewer` — {rv['label']}", "",
-            f"- harness `{rv['harness']}`, vendor `{rv['vendor']}`",
+            f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, plan['reviewer'])}`",
             "- Reviews only; never edits, never gets a worktree.",
             "- Cross-vendor review is the point: never route a diff to a reviewer whose",
             "  vendor matches the implementer's. If that is unavoidable, say so and label",
@@ -662,7 +791,11 @@ def render_orchestrator(plan: dict) -> str:
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{PREFLIGHT_MAP}}": render_preflight_map(plan),
-        "{{OPENCODE_PREFLIGHT}}": OPENCODE_PREFLIGHT.format(name=worker_name("opencode")) if oc else "",
+        # The Zen preflight guards against a rotated free-tier id; a pin on a
+        # provider the user added (deepseek/..., anthropic/...) has no such
+        # rotation, so the check would only invite an `args.model` override.
+        "{{OPENCODE_PREFLIGHT}}": (OPENCODE_PREFLIGHT.format(name=worker_name("opencode"))
+                                   if oc and is_zen(oc.get("model")) else ""),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
         "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + 1),
@@ -1131,13 +1264,21 @@ def main() -> None:
         return emit_questions()
 
     if args.check:
-        say(f"{C['b']}Prerequisites{C['x']}")
+        host = host_os()
+        if host == "windows":
+            die("native Windows is not supported: og is a bash script and Omnigent's "
+                "native agent terminals need tmux. Install WSL2 (wsl --install), "
+                "then clone and run this inside the WSL shell.")
+        say(f"{C['b']}Prerequisites{C['x']}  {C['dim']}({host}){C['x']}")
+        if host == "wsl":
+            say(f"{C['dim']}WSL: credentials go to ~/.omnigent/og-credentials (0600) -- "
+                f"no keyring here; LAN access needs mirrored networking or "
+                f"`og start tunneled`.{C['x']}")
         missing_required = False
-        for name, present, why, how in prereqs():
-            optional = name == "qrencode"
+        for name, present, why, how, required in prereqs():
             if present:
                 ok(f"{name:10} {C['dim']}{why}{C['x']}")
-            elif optional:
+            elif not required:
                 warn(f"{name:10} {why} — {how}")
             else:
                 err(f"{name:10} {why} — {how}")

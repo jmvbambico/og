@@ -32,7 +32,7 @@ Ask the user, in this order. Each maps to a key in the plan JSON.
 | `agent_name` | Name for the orchestrator bundle. Default `dev-lead`. |
 | `orchestrator` | Which agent plans and delegates, and never writes product code. |
 | `coders` | Which agents implement, **in preference order** — first is tried first, later ones absorb overflow. |
-| `coders[].model` | Model to pin per coder. Required where `registry.model.required` is true. |
+| `coders[].model` | Model to pin per coder. Required where `registry.model.required` is true. For multi-provider CLIs (OpenCode, Kilo) run the registry's `model.list_cmd` (e.g. `opencode models`) and offer everything it prints, grouped by `provider/` prefix — a user with a DeepSeek or Anthropic login there wants `deepseek/…`, not only Zen's `opencode/…-free` ids. |
 | `reviewer` | Which agent reviews the batched diff. |
 | `accounts` | For agents with `multi_account.supported`, whether the reviewer runs on a second account, and its config dir. |
 | `port`, `ngrok_domain`, `max_dispatches` | Runtime knobs; defaults are fine. |
@@ -43,6 +43,8 @@ Ask the user, in this order. Each maps to a key in the plan JSON.
   it from the order they happened to name agents.
 - **The reviewer's vendor.** If the only reviewer available shares a vendor
   with a coder, say so plainly — review quality is the thing being traded.
+  Judge vendor by the model, not the bill: `opencode/claude-*` reviewed by
+  Claude Code is same-vendor. `--dry-run` applies this rule and warns.
 - **A second account.** Only offer it for agents where
   `multi_account.supported` is true. Explain that it isolates the reviewer from
   their interactive login rather than just asking "multiple accounts?".

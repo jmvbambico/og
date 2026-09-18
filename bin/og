@@ -8,7 +8,7 @@
 #   og stop             stop the server, host daemons, and the tunnel
 #   og chat [args...]   open an orchestrator session in this terminal (no picker)
 #   og attach           re-attach the host daemon to a running server
-#   og login            store server credentials in the Keychain (once)
+#   og login            store server credentials (Keychain / keyring / 0600 file), once
 #   og status           what is running, and the public URL
 #   og url              print the public URL only (pipe-friendly)
 #   og logs [-f]        tail the server log
@@ -214,6 +214,13 @@ show_access() {
   echo "    scan the code above, or open: $url"
   if [[ "${OG_MODE:-local}" == "local" ]]; then
     echo "    same wifi only — this address is not reachable from outside your network"
+    # WSL2 sits behind its own NAT: the address above is the VM's, and a phone
+    # on the wifi cannot route to it unless Windows is set to mirrored
+    # networking. Say so here, where the QR would otherwise just fail silently.
+    if is_wsl; then
+      echo "    WSL2: other devices can reach this only with networkingMode=mirrored in"
+      echo "    %UserProfile%\\.wslconfig (then 'wsl --shutdown'); otherwise use 'og start tunneled'"
+    fi
   else
     echo "    loopback: http://127.0.0.1:$PORT"
   fi
@@ -226,20 +233,133 @@ show_access() {
 # reused across runs, so the "stale token 8 hours later" failure cannot happen —
 # a token only exists while the server that issued it is running.
 #
-# Credentials come from the macOS Keychain (`og login` stores them once), so a
-# fresh mint costs no typing. The Keychain is OS-protected; the alternative —
-# a password in og.env — would be plaintext on disk.
+# Credentials are stored once by `og login`, so a fresh mint costs no typing.
+# Where they live depends on the OS -- best available first, never a password
+# in og.env:
+#   keychain     macOS Keychain via `security` (OS-protected, per-user)
+#   secret-tool  Linux Secret Service via libsecret (GNOME Keyring / KWallet)
+#   file         $OMNI_HOME/og-credentials, mode 0600. The fallback for WSL
+#                and headless Linux, where no keyring daemon is running. Same
+#                protection as auth_tokens.json beside it, which already holds
+#                a live session token -- so this is no new exposure.
+# OG_CRED_BACKEND=<keychain|secret-tool|file> forces one (og.env or the
+# environment). Reads always fall through to the file, so credentials that
+# landed there when a keyring was unavailable keep working.
 KEYCHAIN_SERVICE="omnigent-og"
+CRED_FILE="$OMNI_HOME/og-credentials"
 
-keychain_get() {
-  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null
+# WSL looks like Linux but has no Secret Service and no xdg-open target, so
+# both the credential store and the browser opener need to know.
+is_wsl() {
+  [[ -n "${WSL_DISTRO_NAME:-}" || -n "${WSL_INTEROP:-}" ]] && return 0
+  grep -qi microsoft /proc/version 2>/dev/null
 }
 
-keychain_user() {
-  # The account name is stored alongside the password; read it back so `og
-  # start` does not need the username repeated in config.
-  security find-generic-password -s "$KEYCHAIN_SERVICE" 2>/dev/null \
-    | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p' | head -1
+# Validated here, at top level: cred_backend runs inside $(...) where a die()
+# would only kill the subshell and hand callers an empty backend name.
+case "${OG_CRED_BACKEND:-}" in
+  ""|keychain|secret-tool|file) ;;
+  *) die "OG_CRED_BACKEND must be keychain, secret-tool, or file (got '$OG_CRED_BACKEND')" ;;
+esac
+
+cred_backend() {
+  if [[ -n "${OG_CRED_BACKEND:-}" ]]; then printf '%s' "$OG_CRED_BACKEND"; return 0; fi
+  if [[ "$(uname -s 2>/dev/null)" == Darwin ]] && command -v security >/dev/null 2>&1; then
+    printf keychain
+  elif ! is_wsl && command -v secret-tool >/dev/null 2>&1; then
+    printf secret-tool
+  else
+    printf file
+  fi
+}
+
+cred_file_user() { [[ -r "$CRED_FILE" ]] && sed -n 1p "$CRED_FILE"; }
+cred_file_get()  { [[ -r "$CRED_FILE" ]] && sed -n 2p "$CRED_FILE"; }
+
+# Username held by the keyring backend alone (empty for `file`). Split from
+# cred_user so cred_where can tell "in the keyring" from "fell through to the
+# file" -- the two look identical to a caller that only wants the name.
+cred_keyring_user() {
+  case "$(cred_backend)" in
+    keychain)
+      security find-generic-password -s "$KEYCHAIN_SERVICE" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p' | head -1 ;;
+    secret-tool)
+      secret-tool search service "$KEYCHAIN_SERVICE" 2>/dev/null \
+        | sed -n 's/^attribute\.account = //p' | head -1 ;;
+  esac
+}
+
+# The account name is stored alongside the password; read it back so `og
+# start` does not need the username repeated in config.
+cred_user() {
+  local u; u="$(cred_keyring_user || true)"
+  [[ -n "$u" ]] || u="$(cred_file_user || true)"
+  [[ -n "$u" ]] && printf '%s' "$u"
+}
+
+# Human-readable location for the messages `og login` and `og status` print:
+# where the credentials actually ARE, or where `og login` would put them.
+cred_where() {
+  local b; b="$(cred_backend)"
+  if [[ "$b" != file && -z "$(cred_keyring_user || true)" && -n "$(cred_file_user || true)" ]]; then
+    b=file
+  fi
+  case "$b" in
+    keychain)    echo "macOS Keychain ($KEYCHAIN_SERVICE)" ;;
+    secret-tool) echo "system keyring ($KEYCHAIN_SERVICE)" ;;
+    file)        echo "$CRED_FILE (mode 0600)" ;;
+  esac
+}
+
+cred_get() {
+  local p=""
+  case "$(cred_backend)" in
+    keychain)    p="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null)" ;;
+    secret-tool) p="$(secret-tool lookup service "$KEYCHAIN_SERVICE" account "$1" 2>/dev/null)" ;;
+  esac
+  if [[ -z "$p" && "$(cred_file_user || true)" == "$1" ]]; then p="$(cred_file_get || true)"; fi
+  [[ -n "$p" ]] && printf '%s' "$p"
+}
+
+# Two lines, username then password, created 0600 in a 0700 directory. Written
+# to a sibling and renamed so a crash mid-write never leaves a half file.
+cred_store_file() {
+  local user="$1" pass="$2"
+  mkdir -p "$OMNI_HOME"
+  ( umask 077 && printf '%s\n%s\n' "$user" "$pass" > "$CRED_FILE.tmp" ) \
+    && mv -f "$CRED_FILE.tmp" "$CRED_FILE" \
+    || die "could not write $CRED_FILE"
+}
+
+# Replace whatever is stored for this service: a changed USERNAME would
+# otherwise leave two entries and cred_user could pick the stale one.
+cred_store() {
+  local user="$1" pass="$2" backend; backend="$(cred_backend)"
+  case "$backend" in
+    keychain)
+      while security delete-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1; do :; done
+      security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$user" -w "$pass" \
+        || die "could not write to the macOS Keychain"
+      ;;
+    secret-tool)
+      secret-tool clear service "$KEYCHAIN_SERVICE" 2>/dev/null || true
+      if ! printf '%s' "$pass" | secret-tool store --label="$KEYCHAIN_SERVICE" \
+             service "$KEYCHAIN_SERVICE" account "$user" 2>/dev/null; then
+        info "no usable keyring (secret-tool store failed); falling back to a 0600 file"
+        backend=file
+      fi
+      ;;
+  esac
+  if [[ "$backend" == file ]]; then
+    cred_store_file "$user" "$pass"
+    ok "stored credentials for '$user' — $CRED_FILE (mode 0600)"
+  else
+    # A file left from an earlier fallback would shadow nothing (the keyring
+    # is consulted first) but would keep a stale password on disk.
+    rm -f "$CRED_FILE"
+    ok "stored credentials for '$user' — $(cred_where)"
+  fi
 }
 
 # Mint a fresh session token and write it where the CLI and host daemon look.
@@ -247,10 +367,10 @@ keychain_user() {
 # decide whether a failure is fatal.
 mint_token() {
   local user pass url="http://127.0.0.1:$PORT"
-  user="$(keychain_user)"
+  user="$(cred_user || true)"
   [[ -n "$user" ]] || { echo "no stored credentials (run: og login)" >&2; return 1; }
-  pass="$(keychain_get "$user")"
-  [[ -n "$pass" ]] || { echo "no password in Keychain for '$user' (run: og login)" >&2; return 1; }
+  pass="$(cred_get "$user" || true)"
+  [[ -n "$pass" ]] || { echo "no stored password for '$user' (run: og login)" >&2; return 1; }
 
   OG_URL="$url" OG_USER="$user" OG_PASS="$pass" OG_TOKENS="$OMNI_HOME/auth_tokens.json" \
   python3 <<'PYEOF'
@@ -315,9 +435,16 @@ needs_setup() {
 
 # Best-effort, backgrounded: a browser that fails to open (headless box, no
 # GUI session) must never fail `og start` over what is a convenience.
+# WSL is checked first: xdg-open may exist there yet have nothing to open with,
+# while the Windows side always has a browser -- wslview (from wslu, on stock
+# Ubuntu images) or a PowerShell Start-Process through interop reaches it.
 open_in_browser() {
   local url="$1"
-  if command -v open >/dev/null 2>&1; then
+  if is_wsl && command -v wslview >/dev/null 2>&1; then
+    wslview "$url" >/dev/null 2>&1 &
+  elif is_wsl && command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1 &
+  elif command -v open >/dev/null 2>&1; then
     open "$url" >/dev/null 2>&1 &
   elif command -v xdg-open >/dev/null 2>&1; then
     xdg-open "$url" >/dev/null 2>&1 &
@@ -431,7 +558,7 @@ cmd_start() {
   fi
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
   command -v omnigent >/dev/null || die "omnigent is not on PATH"
-  [[ "$mode" == "tunneled" ]] && { command -v ngrok >/dev/null || die "ngrok is not installed (brew install ngrok)"; }
+  [[ "$mode" == "tunneled" ]] && { command -v ngrok >/dev/null || die "ngrok is not installed (https://ngrok.com/download)"; }
 
   # Fail fast and name the culprit: without this, a busy port surfaces only
   # after ~30s of polling as a raw uvicorn traceback in the server log
@@ -679,7 +806,7 @@ cmd_start() {
     # accounts_bootstrap.py) -- og always points OMNIGENT_ACCOUNTS_BASE_URL at
     # the LAN/tunnel address instead, so that auto-open never fires here. Do
     # it ourselves, then take the same credentials to store them where `og`
-    # itself reads from (the Keychain, not the browser's cookie session).
+    # itself reads from (the credential store, not the browser's cookie session).
     if [[ -t 0 ]] && needs_setup; then
       echo
       info "no account yet — opening $OG_PUBLIC_URL to create one"
@@ -1034,6 +1161,12 @@ cmd_status() {
     echo "    ngrok:    not running"
   fi
   local ttl; ttl="$(token_ttl_left || true)"
+  local cu; cu="$(cred_user || true)"
+  if [[ -n "$cu" ]]; then
+    echo "    creds:    '$cu' — $(cred_where)"
+  else
+    echo "    creds:    none stored — run 'og login'  (store: $(cred_where))"
+  fi
   if [[ -z "$ttl" ]]; then
     echo "    session:  none — minted fresh by 'og start' (credentials: og login)"
   elif [[ "$ttl" -le 0 ]]; then
@@ -1063,8 +1196,9 @@ cmd_status() {
 # Attach only the host daemon to an already-running server. The recovery step
 # after a lapsed login: `omnigent login` needs the server up, so og start leaves
 # it running and hands off to this rather than tearing everything down.
-# Store server credentials in the macOS Keychain, once. `og start` reads them
-# to mint a fresh session each run, so this is the only time a password is typed.
+# Store server credentials once (see cred_backend for where). `og start` reads
+# them to mint a fresh session each run, so this is the only time a password is
+# typed.
 # Split out of cmd_login so the first-run flow in cmd_start (create the admin
 # account in the browser, then type the same credentials here) can reuse it.
 prompt_and_store_credentials() {
@@ -1076,11 +1210,7 @@ prompt_and_store_credentials() {
   read -r -s -p "confirm:  " confirm; echo
   [[ "$pass" == "$confirm" ]] || die "passwords did not match"
 
-  # -U updates in place when an entry already exists, so re-running this to
-  # change the password does not error on a duplicate.
-  security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$user" -w "$pass" \
-    || die "could not write to the Keychain"
-  ok "stored credentials for '$user' in the Keychain ($KEYCHAIN_SERVICE)"
+  cred_store "$user" "$pass"
 }
 
 cmd_login() {

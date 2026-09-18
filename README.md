@@ -102,21 +102,26 @@ until the next run.
 
 ## Requirements
 
+**Platforms.** macOS and Linux natively; **Windows via WSL2** (Ubuntu is the
+tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supported:
+`og` is a bash script and Omnigent's native agent terminals need `tmux`. See
+[Windows (WSL2)](#windows-wsl2) for the two things that differ there.
+
 **Required**
 
-| | Why | Get it |
-|---|---|---|
-| `omnigent` | the runtime this configures | `uv tool install omnigent` |
-| `python3` + PyYAML | installer; Omnigent's venv already has it | preinstalled / `pip3 install --user pyyaml` |
-| `tmux` | native agent terminals run inside it | `brew install tmux` |
-| `git` | worktrees for parallel workers | `xcode-select --install` |
-| `gh` | the orchestrator opens PRs | `brew install gh` |
+| | Why | macOS | Linux / WSL |
+|---|---|---|---|
+| `omnigent` | the runtime this configures | `uv tool install omnigent` | same |
+| `python3` + PyYAML | installer; Omnigent's venv already has it | preinstalled | `sudo apt install python3` |
+| `tmux` | native agent terminals run inside it | `brew install tmux` | `sudo apt install tmux` |
+| `git` | worktrees for parallel workers | `xcode-select --install` | `sudo apt install git` |
 
-**Recommended**
+**Per workflow** — `./install.sh --check` reports these but does not fail on them
 
 | | Why |
 |---|---|
-| `ngrok` | public URL, so you can drive a run from your phone. A *reserved domain* keeps invite links and session cookies working across restarts. |
+| `gh` | only for projects hosted on GitHub whose delivery ends in a PR: the orchestrator opens it, and the merge gate reads the review marker from its body. Without it the gate denies protected-branch merges (the safe side); everything else — dispatch, worktrees, review — runs as normal. |
+| `ngrok` | only for `og start tunneled`: a public URL so you can drive a run from outside your network. A *reserved domain* keeps invite links and session cookies working across restarts. |
 | `qrencode` | prints the tunnel URL as a QR block |
 
 **At least one coding CLI.** Run `./install.sh --check` to see what you have.
@@ -130,7 +135,7 @@ until the next run.
 | Agent | Harness | Roles | Model pin | Notes |
 |---|---|---|---|---|
 | Claude Code | `claude-native` | orch / coder / reviewer | optional | multi-account via `CLAUDE_CONFIG_DIR` |
-| OpenCode (Zen) | `opencode-native` | orch / coder | **required** | free `-free` lineup rotates; day-capped |
+| OpenCode (Zen) | `opencode-native` | orch / coder | **required** | lists every provider you've added with `opencode auth login` (Zen, DeepSeek, Anthropic, …); Zen's free `-free` lineup rotates and is day-capped |
 | Codex | `codex-native` | orch / coder / reviewer | optional | |
 | Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model**; runs with `--auto-approve true` (see below) |
 | Kilo Code | `acp:kilo-code` | coder | **required** | via `kilo acp`; unverified here |
@@ -207,9 +212,15 @@ The installer will ask you to:
 2. pick which agent **orchestrates**
 3. pick which agents **implement**, *in preference order* — the first is tried
    first, later ones absorb overflow
-4. pin a **model** per coder (free models are listed first where the CLI can
-   enumerate them)
-5. pick the **reviewer** — it warns if the reviewer shares a vendor with a coder
+4. pin a **model** per coder — the installer runs the CLI's own listing
+   (`opencode models`, `kilo models`), grouped by provider with free-tier ids
+   first. Anything you've logged into with the CLI shows up: a DeepSeek key
+   added via `opencode auth login` appears as `deepseek/…` next to Zen's
+   `opencode/…` ids. Enter a number, or type a full id the list truncated.
+5. pick the **reviewer** — it warns if the reviewer shares a vendor with a
+   coder. The vendor is read from the model pin where it says something
+   (`opencode/claude-sonnet-5` is Anthropic, whoever bills for it), and from
+   the registry otherwise
 6. for Claude, whether the reviewer runs on a **second account**
    (`CLAUDE_CONFIG_DIR`, e.g. `~/.claude-work`) so it is independent of your
    interactive login
@@ -266,13 +277,26 @@ og status           what is running, and the URL
 og chat             open an orchestrator session in this terminal
 og url              print the URL (pipe-friendly)
 og logs [-f]        tail the server log
-og login            store server credentials in the Keychain (once)
+og login            store server credentials (Keychain / keyring / 0600 file), once
 og update           pull the checkout and re-apply the install
 og version          print the installed version
 ```
 
 `og login` is rarely something you run yourself: `og start` calls it for you the
 first time there's no account to log into (see below).
+
+**Where credentials go** depends on what the OS offers, best first:
+
+| backend | when | where |
+|---|---|---|
+| `keychain` | macOS | the login Keychain, service `omnigent-og` |
+| `secret-tool` | Linux with a Secret Service (GNOME Keyring, KWallet) | the default keyring, via libsecret |
+| `file` | WSL, headless Linux, or a keyring that fails | `~/.omnigent/og-credentials`, mode `0600` |
+
+Auto-detected; force one with `OG_CRED_BACKEND=<name>` in `~/.omnigent/og.env`.
+The file backend is the floor, not a bug: it has the same protection as
+`auth_tokens.json` beside it, which already holds a live session token.
+`og status` shows which one is in use.
 
 ### local vs tunneled
 
@@ -286,8 +310,8 @@ to the create-admin form, but only when it's bound to loopback — `og` always
 points it at the LAN/tunnel address instead, so that auto-open never fires. If
 no session can be minted yet, `og start` opens the browser itself, waits for
 you to pick a username + password there, then asks you to type the same two
-values in the terminal so it can store them in the Keychain (the browser's
-cookie session and `og`'s own CLI session are separate) — then carries on
+values in the terminal so it can store them (the browser's cookie session and
+`og`'s own CLI session are separate) — then carries on
 straight through to attaching the host daemon. This only happens when `og
 start` is run from an interactive terminal; a non-interactive run (e.g. from a
 script) falls back to printing `og login` as a manual next step.
@@ -308,6 +332,32 @@ server" as far as Omnigent is concerned, so `omnigent server status` and
 their own pid and are unaffected.
 
 ---
+
+### Windows (WSL2)
+
+Everything runs inside the WSL shell: clone there, `./install.sh` there, run
+`og` there. Two things differ from macOS/Linux:
+
+- **Credentials** land in `~/.omnigent/og-credentials` (`0600`) — WSL has no
+  Keychain and no Secret Service daemon, so `og login` skips `secret-tool` even
+  if it is installed. Keep the file on the Linux filesystem (`~`, not
+  `/mnt/c/...`, where every file is world-readable).
+- **`og start` (local) is not reachable from your phone by default.** WSL2 sits
+  behind its own NAT, so the QR encodes the VM's address. Either use
+  `og start tunneled`, or switch WSL to mirrored networking — add to
+  `%UserProfile%\.wslconfig`:
+
+  ```ini
+  [wsl2]
+  networkingMode=mirrored
+  ```
+
+  then `wsl --shutdown` and reopen. `og start` prints this reminder when it
+  detects WSL.
+
+The browser opens on the Windows side through `wslview` (from `wslu`, present
+on stock Ubuntu images) or PowerShell interop; if neither is available, open the
+printed URL yourself.
 
 ## Per-project setup
 

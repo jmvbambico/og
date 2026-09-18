@@ -16,10 +16,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m→\033[0m %s\n' "$*"; }
 
+# Git Bash / MSYS / Cygwin can run this far, but og itself needs tmux and a
+# Unix-side Omnigent, so the supported route on Windows is WSL2. Say so here
+# rather than failing seven prerequisite checks one by one.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    die "native Windows is not supported: run this inside WSL2 (wsl --install), not Git Bash." ;;
+esac
+
 # Candidate interpreters, best first. The omnigent venv is last but surest:
 # if omnigent is installed at all, its python has yaml.
+# `python` is accepted only when it is a 3.10+ interpreter: distros where it
+# is still Python 2 are skipped by the version check below, not by name.
 candidates=()
-command -v python3 >/dev/null 2>&1 && candidates+=("$(command -v python3)")
+for name in python3 python; do
+  command -v "$name" >/dev/null 2>&1 && candidates+=("$(command -v "$name")")
+done
 for p in "$HOME"/.local/share/uv/tools/omnigent/bin/python3 \
          "$HOME"/.local/share/uv/tools/omnigent/bin/python; do
   [[ -x "$p" ]] && candidates+=("$p")
@@ -33,7 +45,9 @@ fi
 
 PY=""
 for c in "${candidates[@]}"; do
-  if "$c" -c 'import yaml' >/dev/null 2>&1; then PY="$c"; break; fi
+  if "$c" -c 'import sys, yaml; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    PY="$c"; break
+  fi
 done
 
 if [[ -z "$PY" ]]; then

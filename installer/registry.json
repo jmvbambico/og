@@ -88,7 +88,7 @@
         ],
         "free_pattern": "-free$",
         "prefer": "opencode/mimo-v2.5-free",
-        "note": "Zen's free lineup rotates; verify with `opencode models`. A paid id on a workspace with no payment method is a FAILED dispatch, not a slower one."
+        "note": "`opencode models` lists every provider you have added with `opencode auth login` (e.g. deepseek/..., anthropic/...), not just Zen; those bill at the provider's rates. Zen's free `opencode/*-free` lineup rotates, and a paid Zen id on a workspace with no payment method is a FAILED dispatch, not a slower one."
       },
       "install": {
         "brew": "brew install sst/tap/opencode",

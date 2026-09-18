@@ -460,3 +460,267 @@ def test_cli_plan_dry_run_end_to_end(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "dry run" in result.stdout
     assert not (tmp_path / "agents").exists()
+
+
+# --------------------------------------------------------------------------
+# platform detection + hints
+# --------------------------------------------------------------------------
+def test_host_os_reports_wsl_from_env(monkeypatch):
+    monkeypatch.setattr(m.sys, "platform", "linux")
+    monkeypatch.setattr(m.os, "name", "posix")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    assert m.host_os() == "wsl"
+
+
+def test_host_os_reports_plain_linux(monkeypatch, tmp_path):
+    monkeypatch.setattr(m.sys, "platform", "linux")
+    monkeypatch.setattr(m.os, "name", "posix")
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    monkeypatch.delenv("WSL_INTEROP", raising=False)
+    # /proc/version is read only for the "microsoft" marker; on a non-Linux
+    # host it does not exist and the OSError branch must still say linux.
+    assert m.host_os() in ("linux", "wsl")
+
+
+def test_host_os_reports_windows(monkeypatch):
+    monkeypatch.setattr(m.sys, "platform", "win32")
+    assert m.host_os() == "windows"
+
+
+def test_prereq_hints_are_brew_on_macos(monkeypatch):
+    monkeypatch.setattr(m, "host_os", lambda: "macos")
+    hints = {n: how for n, _, _, how, _ in m.prereqs()}
+    assert hints["tmux"] == "brew install tmux"
+    assert "brew" not in hints["omnigent"]
+
+
+def test_only_runtime_tools_are_required_prereqs():
+    """gh and ngrok are per-workflow (GitHub PRs, tunnelled access), not
+    something og or Omnigent need to start -- --check must not exit 1 on them."""
+    required = {n for n, _, _, _, req in m.prereqs() if req}
+    assert required == {"omnigent", "python3", "tmux", "git"}
+
+
+def test_check_exits_zero_without_gh_and_ngrok(tmp_path):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name in ("omnigent", "tmux", "git", "claude"):
+        (fake / name).write_text("#!/bin/sh\nexit 0\n")
+        (fake / name).chmod(0o755)
+    # python3 must resolve too: point at the interpreter running the tests.
+    (fake / "python3").symlink_to(sys.executable)
+    env = {"OMNIGENT_HOME": str(tmp_path), "PATH": str(fake), "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, str(REPO / "installer" / "og_install.py"), "--check"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "gh" in result.stdout and "optional" in result.stdout
+
+
+def test_prereq_hints_are_apt_on_linux_and_wsl(monkeypatch):
+    for host in ("linux", "wsl"):
+        monkeypatch.setattr(m, "host_os", lambda h=host: h)
+        hints = {n: how for n, _, _, how, _ in m.prereqs()}
+        assert "brew" not in " ".join(hints.values()), host
+        assert hints["tmux"] == "sudo apt install tmux"
+        assert "ngrok.com" in hints["ngrok"]
+
+
+# --------------------------------------------------------------------------
+# bin/og credential store (the `file` backend is the cross-platform floor)
+# --------------------------------------------------------------------------
+OG = REPO / "bin" / "og"
+
+
+def _og(args, home, stdin="", **env):
+    """Run bin/og against a throwaway HOME. `omnigent` is deliberately absent
+    from PATH so server_running() reports "not running" and login stops short
+    of minting a session."""
+    full_env = {"HOME": str(home), "PATH": "/usr/bin:/bin", **env}
+    return subprocess.run(
+        ["bash", str(OG), *args], input=stdin, capture_output=True, text=True,
+        timeout=30, env=full_env,
+    )
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_login_file_backend_writes_0600_file(tmp_path):
+    r = _og(["login"], tmp_path, stdin="kunerrrs\nhunter2\nhunter2\n",
+            OG_CRED_BACKEND="file")
+    assert r.returncode == 0, r.stderr
+    cred = tmp_path / ".omnigent" / "og-credentials"
+    assert cred.read_text() == "kunerrrs\nhunter2\n"
+    assert cred.stat().st_mode & 0o777 == 0o600
+    assert "security:" not in r.stderr  # the macOS-only tool must never be called
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_login_file_backend_is_chosen_on_wsl_without_override(tmp_path):
+    # A fake uname says Linux and the WSL marker is set: the store must land
+    # in the file even if a secret-tool happens to be on PATH, since WSL has
+    # no Secret Service daemon for it to talk to.
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "uname").write_text("#!/bin/sh\necho Linux\n")
+    (fake / "secret-tool").write_text("#!/bin/sh\necho called >&2; exit 1\n")
+    for f in fake.iterdir():
+        f.chmod(0o755)
+    r = _og(["login"], tmp_path, stdin="u\np\np\n",
+            PATH=f"{fake}:/usr/bin:/bin", WSL_DISTRO_NAME="Ubuntu")
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / ".omnigent" / "og-credentials").read_text() == "u\np\n"
+    assert "called" not in r.stderr
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_login_falls_back_to_file_when_keyring_store_fails(tmp_path):
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "uname").write_text("#!/bin/sh\necho Linux\n")
+    (fake / "secret-tool").write_text("#!/bin/sh\nexit 1\n")
+    for f in fake.iterdir():
+        f.chmod(0o755)
+    r = _og(["login"], tmp_path, stdin="u\np\np\n", PATH=f"{fake}:/usr/bin:/bin")
+    assert r.returncode == 0, r.stderr
+    assert "falling back to a 0600 file" in r.stdout
+    assert (tmp_path / ".omnigent" / "og-credentials").read_text() == "u\np\n"
+    # status must report where the credentials actually are, not the backend
+    # it would have preferred.
+    s = _og(["status"], tmp_path, PATH=f"{fake}:/usr/bin:/bin")
+    assert "creds:    'u' — " in s.stdout and "og-credentials" in s.stdout
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_rejects_unknown_cred_backend(tmp_path):
+    r = _og(["status"], tmp_path, OG_CRED_BACKEND="vault")
+    assert r.returncode == 1
+    assert "OG_CRED_BACKEND must be" in r.stderr
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_login_mints_a_session_from_file_credentials(tmp_path):
+    """The read side: with the server 'up' (a stub /auth/login behind og's own
+    pidfile), `og login` must read the file-backed credentials back and write
+    auth_tokens.json in omnigent's record shape."""
+    import http.server
+    import threading
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        seen = {}
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            Stub.seen = json.loads(self.rfile.read(n))
+            body = json.dumps({"token": "tok-123", "expires_in": 60}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        omni = tmp_path / ".omnigent"
+        omni.mkdir()
+        # og's own pidfile is consulted before `omnigent server status`; this
+        # process is alive, so server_running() says yes without omnigent.
+        (omni / "og-server.pid").write_text(str(__import__("os").getpid()))
+        r = _og(["login"], tmp_path, stdin="kunerrrs\nhunter2\nhunter2\n",
+                OG_CRED_BACKEND="file", OG_PORT=str(port))
+        assert r.returncode == 0, r.stderr + r.stdout
+        assert "session minted" in r.stdout
+        assert Stub.seen == {"username": "kunerrrs", "password": "hunter2"}
+        store = json.loads((omni / "auth_tokens.json").read_text())
+        assert store[f"http://127.0.0.1:{port}"]["token"] == "tok-123"
+    finally:
+        srv.shutdown()
+
+
+# --------------------------------------------------------------------------
+# multi-provider model listing + model-derived vendor
+# --------------------------------------------------------------------------
+OPENCODE_AGENT = {"id": "opencode", "label": "OpenCode", "vendor": "opencode-zen",
+                  "model": {"list_cmd": ["opencode", "models"], "free_pattern": "-free$",
+                            "prefer": "opencode/mimo-v2.5-free", "required": True}}
+
+
+def test_grouped_models_shows_every_provider_free_first():
+    """A DeepSeek key added with `opencode auth login` shows up as its own
+    provider group instead of being hidden by the free-only filter."""
+    models = ["opencode/glm-5", "opencode/mimo-v2.5-free", "deepseek/deepseek-chat",
+              "deepseek/deepseek-reasoner", "opencode/gpt-5.4"]
+    groups = m.grouped_models(OPENCODE_AGENT, models)
+    assert [g[0] for g in groups] == ["opencode", "deepseek"]
+    assert groups[0][1][0] == "opencode/mimo-v2.5-free"
+    assert groups[1][1] == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+
+
+def test_pick_model_offers_other_providers_by_number(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(
+        "opencode/mimo-v2.5-free\nopencode/glm-5\ndeepseek/deepseek-chat\n"))
+    answers = iter(["99", "3"])  # out-of-range number is rejected, not stored
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
+    assert m.pick_model(OPENCODE_AGENT, None) == "deepseek/deepseek-chat"
+
+
+def test_pick_model_default_ignores_a_rotated_prefer(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(
+        "opencode/glm-5\nopencode/nemotron-free\n"))
+    seen = {}
+
+    def fake_ask(prompt, default=None):
+        seen["default"] = default
+        return default
+
+    monkeypatch.setattr(m, "ask", fake_ask)
+    assert m.pick_model(OPENCODE_AGENT, None) == "opencode/nemotron-free"
+    assert seen["default"] == "opencode/nemotron-free"
+
+
+@pytest.mark.parametrize("model_id,vendor", [
+    ("deepseek/deepseek-chat", "deepseek"),
+    ("anthropic/claude-opus-5", "anthropic"),
+    ("opencode/claude-sonnet-5", "anthropic"),
+    ("opencode/mimo-v2.5-free", "xiaomi"),
+    ("opencode/big-pickle", None),
+    ("kilo/kilo-auto/free", None),
+    ("gpt-5.3-codex", None),
+    (None, None),
+])
+def test_model_vendor(model_id, vendor):
+    assert m.model_vendor(model_id) == vendor
+
+
+def test_vendor_of_falls_back_to_registry():
+    assert m.vendor_of(OPENCODE_AGENT, {"id": "opencode", "model": "opencode/big-pickle"}) == "opencode-zen"
+    assert m.vendor_of(OPENCODE_AGENT, {"id": "opencode", "model": "deepseek/deepseek-chat"}) == "deepseek"
+
+
+def test_validate_flags_same_vendor_through_a_reseller():
+    """Zen's Claude reviewed by Claude Code is same-vendor review, however
+    the bill reads."""
+    plan = _rendering_plan()
+    plan["coders"] = [{"id": "opencode", "priority": 1, "model": "opencode/claude-sonnet-5"}]
+    plan["reviewer"] = {"id": "claude", "model": None}
+    msgs = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert any("shares a vendor" in msg for msg in msgs), msgs
+    plan["coders"][0]["model"] = "deepseek/deepseek-chat"
+    msgs = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert not any("shares a vendor" in msg for msg in msgs), msgs
+
+
+def test_zen_preflight_only_for_zen_pins():
+    plan = _rendering_plan()
+    plan["coders"] = [{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}]
+    assert "Zen model preflight" in m.render_orchestrator(plan)
+    plan["coders"][0]["model"] = "deepseek/deepseek-chat"
+    rendered = m.render_orchestrator(plan)
+    assert "Zen model preflight" not in rendered
+    assert "day-capped" not in rendered

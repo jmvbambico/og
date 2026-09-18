@@ -235,6 +235,26 @@ when it asks and suggests a free one if the default is taken.
 
 ---
 
+## `og login` fails with `security: command not found`
+
+```
+/home/you/.local/bin/og: line 1081: security: command not found
+error: could not write to the Keychain
+```
+
+**Cause.** Older `og` builds stored credentials only in the macOS Keychain via
+the `security` tool, which does not exist on Linux or WSL.
+
+**Fix.** Update (`og update`, or re-run `./install.sh` from a fresh checkout).
+Current `bin/og` picks a store per platform — macOS Keychain, Linux Secret
+Service via `secret-tool`, or `~/.omnigent/og-credentials` (mode `0600`) on
+WSL and headless Linux — and `og status` reports which one holds your
+credentials. Force one with `OG_CRED_BACKEND=keychain|secret-tool|file` in
+`~/.omnigent/og.env` if the detection picks wrong (for example a Linux desktop
+whose keyring is locked: set `file`).
+
+---
+
 ## First run: `no stored credentials (run: og login)`
 
 ```
@@ -247,8 +267,9 @@ no stored credentials (run: og login)
 ```
 
 **Cause.** This is expected on a genuinely first install — no admin account
-exists on the server yet, and `og`'s own CLI session (Keychain-backed) is
-separate from creating that account. Omnigent's server normally auto-opens a
+exists on the server yet, and `og`'s own CLI session (backed by the stored
+credentials — see `og login` in the README) is separate from creating that
+account. Omnigent's server normally auto-opens a
 browser to the create-admin form for you, but only when bound to loopback;
 `og` always binds the LAN/tunnel address instead, so that auto-open never
 fires, and older `og` builds just printed this message and stopped.
@@ -256,7 +277,7 @@ fires, and older `og` builds just printed this message and stopped.
 **Fix.** Current `bin/og` handles this itself: when minting a session fails,
 it checks `GET /v1/info`'s `needs_setup`, opens the browser to the create-admin
 form, and prompts you in the terminal for the same username + password so it
-can store them in the Keychain — then continues straight through to attaching
+can store them — then continues straight through to attaching
 the host daemon. If you're on an older `og` (or running non-interactively,
 where there's no terminal to prompt), do it manually:
 
