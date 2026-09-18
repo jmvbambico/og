@@ -567,7 +567,7 @@ cmd_start() {
   export OPENCODE_DISABLE_CLAUDE_CODE=1
   export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
 
-  info "account: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
+  info "account: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-(unset — Claude Code default ~/.claude)}"
   # NOT `omnigent server --background`. That flag is handled first in cli.py --
   # `if background: _run_background_server(); return` -- and _run_background_server
   # takes no arguments, so every other flag on the line is silently dropped. It
