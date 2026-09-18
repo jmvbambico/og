@@ -512,10 +512,18 @@ cmd_start() {
     info "generated $SECRET_FILE"
   fi
 
-  # Scopes every claude-native sub-agent (the reviewer) to the work account,
-  # leaving Tier-1 Claude Code in your terminal on the personal one. Omnigent
-  # reads this from its own process env — there is no per-sub-agent override.
-  export CLAUDE_CONFIG_DIR="${OG_CLAUDE_CONFIG_DIR:-$HOME/.claude-work}"
+  # Scopes every claude-native sub-agent (orchestrator AND reviewer alike --
+  # Omnigent reads this from its own process env, so there is no
+  # per-sub-agent override) to a second account. Unset (no account
+  # configured in the install plan) must NOT default to some made-up path
+  # like ~/.claude-work: that directory is never created by the installer,
+  # so an unconditional export would silently break every claude-native
+  # sub-agent's login. Leaving CLAUDE_CONFIG_DIR unset here instead falls
+  # through to Claude Code's own default (~/.claude / $HOME/.claude.json --
+  # the account your interactive `claude` uses).
+  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
+    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
+  fi
   # dev-lead can write code, push branches and merge to dev. A tunnel to the
   # public internet must not front an anonymous UI.
   export OMNIGENT_AUTH_ENABLED=1
@@ -1094,9 +1102,13 @@ cmd_attach() {
     mint_token >/dev/null || die "could not mint a session. Run 'og login' to store credentials."
   fi
   # The daemon spawns the workers, so it needs the same scoping og start exports
-  # — without these the reviewer would run on the personal account and the Zen
-  # worker would pick up the user's global opencode config.
-  export CLAUDE_CONFIG_DIR="${OG_CLAUDE_CONFIG_DIR:-$HOME/.claude-work}"
+  # — without these a claude-native sub-agent would run on the wrong account and
+  # the Zen worker would pick up the user's global opencode config. See the
+  # matching comment in cmd_start: unset stays unset, it does not fall back to
+  # a made-up ~/.claude-work.
+  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
+    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
+  fi
   export OMNIGENT_LOCAL_SINGLE_USER=1
   export OPENCODE_DISABLE_CLAUDE_CODE=1
   export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
@@ -1124,9 +1136,11 @@ cmd_attach() {
 cmd_chat() {
   server_running || die "the omnigent server is not running — run 'og start' first"
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
-  # Same scoping the host daemon gets: without it a claude-native sub-agent
-  # (the reviewer) would run on the personal account instead of the work one.
-  export CLAUDE_CONFIG_DIR="${OG_CLAUDE_CONFIG_DIR:-$HOME/.claude-work}"
+  # Same scoping the host daemon gets. See the matching comment in cmd_start:
+  # unset stays unset rather than falling back to a made-up ~/.claude-work.
+  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
+    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
+  fi
   export OPENCODE_DISABLE_CLAUDE_CODE=1
   export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
   info "starting a $AGENT_NAME session on http://127.0.0.1:$PORT"

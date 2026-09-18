@@ -539,6 +539,25 @@ def render_roster(plan: dict) -> str:
     return "\n".join(lines)
 
 
+def render_vendor_map(plan: dict) -> str:
+    """One line per worker naming its vendor, for the Review rules section.
+
+    Generated from the actual plan rather than hand-written, so it can never
+    go stale the way a hardcoded example (naming specific workers and
+    vendors that drift the moment the roster is reconfigured) would.
+    """
+    reg = agents_by_id()
+    rv = reg[plan["reviewer"]["id"]]
+    lines = []
+    for c in plan["coders"]:
+        a = reg[c["id"]]
+        same = (f" — same vendor as `reviewer` ({rv['vendor']}); that pairing is "
+                "degraded-review" if a["vendor"] == rv["vendor"] else "")
+        lines.append(f"  - `{worker_name(c['id'])}` is {a['vendor']}{same}.")
+    lines.append(f"  - `reviewer` is {rv['vendor']}.")
+    return "\n".join(lines)
+
+
 def render_roster_skill(plan: dict) -> str:
     """The long-form roster notes, as a skill file rather than prompt bytes."""
     reg = agents_by_id()
@@ -641,6 +660,7 @@ def render_orchestrator(plan: dict) -> str:
         "{{AGENT_NAME}}": plan["agent_name"],
         "{{ORCHESTRATOR_HARNESS}}": reg[plan["orchestrator"]]["harness"],
         "{{ROSTER_BULLETS}}": render_roster(plan),
+        "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{PREFLIGHT_MAP}}": render_preflight_map(plan),
         "{{OPENCODE_PREFLIGHT}}": OPENCODE_PREFLIGHT.format(name=worker_name("opencode")) if oc else "",
         "{{AGENT_LIST}}": agent_list,
