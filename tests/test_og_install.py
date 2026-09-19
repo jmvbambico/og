@@ -63,7 +63,7 @@ def test_find_free_port_gives_up_after_tries(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# list_models / free_models
+# list_models / search_models
 # --------------------------------------------------------------------------
 def _fake_run(stdout, returncode=0):
     def _run(cmd, capture_output, text, timeout, check):
@@ -107,18 +107,11 @@ def test_list_models_empty_without_list_cmd():
     assert m.list_models({}) == []
 
 
-def test_free_models_filters_by_pattern(monkeypatch):
-    monkeypatch.setattr(
-        m.subprocess, "run",
-        _fake_run("kilo/kilo-auto/free\nkilo/kilo-pro\nkilo/other/free\n"),
-    )
-    agent = {"model": {"list_cmd": ["kilo", "models"], "free_pattern": r"(kilo-auto/free|/free$)"}}
-    assert m.free_models(agent) == ["kilo/kilo-auto/free", "kilo/other/free"]
-
-
-def test_free_models_without_pattern_returns_all(monkeypatch):
-    monkeypatch.setattr(m.subprocess, "run", _fake_run("a\nb\n"))
-    assert m.free_models({"model": {"list_cmd": ["x"]}}) == ["a", "b"]
+def test_search_models_is_case_insensitive_substring():
+    models = ["opencode/mimo-v2.5-free", "anthropic/claude-sonnet-5", "deepseek/deepseek-chat"]
+    assert m.search_models(models, "CLAUDE") == ["anthropic/claude-sonnet-5"]
+    assert m.search_models(models, "deep") == ["deepseek/deepseek-chat"]
+    assert m.search_models(models, "nope") == []
 
 
 # --------------------------------------------------------------------------
@@ -733,19 +726,36 @@ def test_og_login_mints_a_session_from_file_credentials(tmp_path):
 # multi-provider model listing + model-derived vendor
 # --------------------------------------------------------------------------
 OPENCODE_AGENT = {"id": "opencode", "label": "OpenCode", "vendor": "opencode-zen",
-                  "model": {"list_cmd": ["opencode", "models"], "free_pattern": "-free$",
+                  "model": {"list_cmd": ["opencode", "models"],
                             "prefer": "opencode/mimo-v2.5-free", "required": True}}
 
 
-def test_grouped_models_shows_every_provider_free_first():
+def test_grouped_models_features_auto_and_free_but_hides_nothing():
     """A DeepSeek key added with `opencode auth login` shows up as its own
-    provider group instead of being hidden by the free-only filter."""
-    models = ["opencode/glm-5", "opencode/mimo-v2.5-free", "deepseek/deepseek-chat",
-              "deepseek/deepseek-reasoner", "opencode/gpt-5.4"]
+    provider group. Router (`auto`) and free-tier ids float to the top of
+    their group and such groups come first -- placement only; every paid id
+    is still listed, in the tool's own order, for a subscriber to pin."""
+    models = ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner", "opencode/glm-5",
+              "opencode/mimo-v2.5-free", "opencode/gpt-5.4", "kilo/kilo-auto/free",
+              "kilo/anthropic/claude-sonnet-5"]
     groups = m.grouped_models(OPENCODE_AGENT, models)
-    assert [g[0] for g in groups] == ["opencode", "deepseek"]
-    assert groups[0][1][0] == "opencode/mimo-v2.5-free"
-    assert groups[1][1] == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+    assert [g[0] for g in groups] == ["opencode", "kilo", "deepseek"]
+    assert groups[0][1] == ["opencode/mimo-v2.5-free", "opencode/glm-5", "opencode/gpt-5.4"]
+    assert groups[1][1] == ["kilo/kilo-auto/free", "kilo/anthropic/claude-sonnet-5"]
+    assert groups[2][1] == ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+    assert sum(len(g[1]) for g in groups) == len(models)
+
+
+def test_zen_preflight_only_for_a_free_zen_pin():
+    # The preflight tells the orchestrator to substitute a `-free` id when the
+    # pin rotates out. A paid Zen pin (a subscriber) or a user-added provider
+    # never rotates, so the section must be absent -- it would only invite an
+    # `args.model` override.
+    free = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}])
+    paid = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": "opencode/claude-sonnet-5"}])
+    assert "Zen model preflight" in m.render_orchestrator(free)
+    assert "Zen model preflight" not in m.render_orchestrator(paid)
+    assert "day-capped" in m.render_roster(free) and "day-capped" not in m.render_roster(paid)
 
 
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
@@ -766,8 +776,24 @@ def test_pick_model_default_ignores_a_rotated_prefer(monkeypatch):
         return default
 
     monkeypatch.setattr(m, "ask", fake_ask)
-    assert m.pick_model(OPENCODE_AGENT, None) == "opencode/nemotron-free"
-    assert seen["default"] == "opencode/nemotron-free"
+    # The registry's `prefer` (mimo) is not in the list, so the default is the
+    # tool's first id -- no tier is promoted over another.
+    assert m.pick_model(OPENCODE_AGENT, None) == "opencode/glm-5"
+    assert seen["default"] == "opencode/glm-5"
+
+
+def test_pick_model_search_narrows_then_picks(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(
+        "opencode/glm-5\nopencode/claude-sonnet-5\ndeepseek/deepseek-chat\n"))
+    answers = iter(["claude", "1"])
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
+    assert m.pick_model(OPENCODE_AGENT, None) == "opencode/claude-sonnet-5"
+
+
+def test_pick_model_accepts_a_full_id_the_tool_listed(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("a/x\nb/y\n"))
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "b/y")
+    assert m.pick_model(OPENCODE_AGENT, None) == "b/y"
 
 
 @pytest.mark.parametrize("model_id,vendor", [
@@ -821,7 +847,7 @@ def _opencode_agent_with_auth(tmp_path, monkeypatch, entries: dict) -> dict:
     store.parent.mkdir(parents=True)
     store.write_text(json.dumps({k: {"type": v, "key": "x"} for k, v in entries.items()}))
     return {"id": "opencode", "label": "OpenCode", "vendor": "opencode-zen",
-            "model": {"list_cmd": ["opencode", "models"], "free_pattern": "-free$",
+            "model": {"list_cmd": ["opencode", "models"],
                       "auth_file": "$XDG_DATA_HOME/opencode/auth.json",
                       "oauth_builtin": ["openai"],
                       "oauth_plugins": {"anthropic": "opencode-anthropic-auth"}}}

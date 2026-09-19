@@ -86,7 +86,6 @@
           "opencode",
           "models"
         ],
-        "free_pattern": "-free$",
         "auth_file": "$XDG_DATA_HOME/opencode/auth.json",
         "oauth_builtin": [
           "openai",
@@ -213,8 +212,7 @@
         "list_cmd": [
           "kilo",
           "models"
-        ],
-        "free_pattern": "(kilo-auto/free|/free$)"
+        ]
       },
       "install": {
         "npm": "npm i -g @kilocode/cli",

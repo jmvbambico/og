@@ -39,8 +39,10 @@ Ask the user, in this order. Each maps to a key in the plan JSON.
 
 **Ask, don't assume, about:**
 
-- **Preference order.** People care which free tier burns first. Do not infer
+- **Preference order.** People care which quota burns first. Do not infer
   it from the order they happened to name agents.
+- **The model.** Offer everything the CLI lists, paid ids included; a user
+  with a subscription wants it used. Never filter to free tiers.
 - **The reviewer's vendor.** If the only reviewer available shares a vendor
   with a coder, say so plainly — review quality is the thing being traded.
   Judge vendor by the model, not the bill: `opencode/claude-*` reviewed by

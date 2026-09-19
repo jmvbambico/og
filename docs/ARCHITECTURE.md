@@ -126,9 +126,10 @@ The installer warns when the roster forces a same-vendor pairing, and the
 orchestrator labels such PRs `degraded-review` rather than letting it pass
 silently.
 
-**Preference order.** Free tiers are day-capped or credit-capped. Ordering
-workers means the cheapest capacity burns first and the run degrades gracefully
-down the list instead of failing when one vendor runs dry.
+**Preference order.** Capacity is capped somewhere on every plan — a daily
+free quota, a subscription's rate limit, a credit balance. Ordering workers
+means the capacity you want spent first burns first, and the run degrades
+gracefully down the list instead of failing when one vendor runs dry.
 
 ---
 

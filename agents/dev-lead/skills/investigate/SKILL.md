@@ -26,10 +26,10 @@ context on work a fresh worker does better.
 ## Choosing the worker
 
 Explores are read-only and cheap to verify, so follow the roster's preference
-order and spend the free tiers first. Reach for a stronger worker only when a
-question genuinely needs deeper reasoning or a larger context window. Where
-independent perspectives matter, send the same question to two vendors and
-compare.
+order — the human ordered it by which quota to spend first. Reach for a
+stronger worker only when a question genuinely needs deeper reasoning or a
+larger context window. Where independent perspectives matter, send the same
+question to two vendors and compare.
 
 ## Reporting
 

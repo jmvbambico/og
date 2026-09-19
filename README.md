@@ -34,8 +34,8 @@ Omnigent gives you the runtime. This repo is the *opinionated setup on top*:
   never the same model family, because same-vendor review shares blind spots.
 - **Mechanism over prompt.** "Never merge to `main`" is a policy that returns
   DENY, not a sentence in a system prompt a model can reason past.
-- **Free tiers first.** Workers are ordered by preference so day-capped free
-  models get used before paid ones.
+- **Your order, your models.** Workers run in the preference order you set,
+  and each pins any model its CLI offers — free tier or subscription alike.
 - **Reproducible.** Every choice lives in one JSON file. Re-running the
   installer on another machine reproduces the setup.
 
@@ -215,8 +215,9 @@ The installer will ask you to:
 3. pick which agents **implement**, *in preference order* — the first is tried
    first, later ones absorb overflow
 4. pin a **model** per coder — the installer runs the CLI's own listing
-   (`opencode models`, `kilo models`), grouped by provider with free-tier ids
-   first. Anything you've logged into with the CLI shows up: a DeepSeek key
+   (`opencode models`, `kilo models`, `cursor-agent models`), grouped by
+   provider in the tool's own order; type part of a name to search a long
+   list. Anything you've logged into with the CLI shows up: a DeepSeek key
    added via `opencode auth login` appears as `deepseek/…` next to Zen's
    `opencode/…` ids. Enter a number, or type a full id the list truncated.
    A login that yields no models (typically an OAuth *subscription* session,

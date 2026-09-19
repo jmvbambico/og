@@ -213,18 +213,6 @@ def list_models(agent: dict) -> list:
     return models
 
 
-def filter_free(agent: dict, models: list) -> list:
-    pat = (agent.get("model") or {}).get("free_pattern")
-    if not pat:
-        return list(models)
-    rx = re.compile(pat)
-    return [m for m in models if rx.search(m)]
-
-
-def free_models(agent: dict) -> list:
-    return filter_free(agent, list_models(agent))
-
-
 def _expand_xdg(path: str) -> Path:
     """`$XDG_DATA_HOME` with its spec default, then `~`."""
     data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
@@ -287,25 +275,36 @@ def unlisted_logins(agent: dict, models: list) -> list:
 # Multi-provider harnesses (OpenCode, Kilo) list every provider the user has
 # added with `<cli> auth login` under its own prefix: `deepseek/deepseek-chat`
 # next to `opencode/glm-5`. Group by that prefix so a second provider is
-# visible instead of buried under Zen's ~70 ids, and put the free-tier ids
-# first because they are what the roster is ordered around.
+# visible instead of buried under Zen's ~70 ids. Every id the tool offers is
+# shown and any may be pinned -- a subscriber picks a paid id exactly like a
+# free one. Placement only: ids that are a router (`auto`) or a free tier
+# (`free`) go to the top of their group, and groups holding one come first,
+# because those are the ones people look for by name in a 300-line list.
 MODELS_PER_PROVIDER = 12
+FEATURED = re.compile(r"auto|free", re.IGNORECASE)
 
 
 def grouped_models(agent: dict, models: list) -> list:
-    """[(provider, [ids])] -- free ids first within a provider, providers
-    that have free ids first overall, listing order otherwise."""
-    free = set(filter_free(agent, models)) if (agent.get("model") or {}).get("free_pattern") else set()
+    """[(provider, [ids])] one group per `provider/` prefix; featured ids
+    (auto / free) first within a group and groups with one first overall,
+    the tool's own order otherwise."""
     groups: dict = {}
     for m in models:
         provider = m.split("/", 1)[0] if "/" in m else ""
         groups.setdefault(provider, []).append(m)
-    out = []
-    for provider, ids in groups.items():
-        ordered = [m for m in ids if m in free] + [m for m in ids if m not in free]
-        out.append((provider, ordered))
-    out.sort(key=lambda g: 0 if any(m in free for m in g[1]) else 1)
+    def rank(m: str) -> int:
+        # routers (`auto`) first, then free tiers, then the rest; stable
+        # within each band so the tool's own order still shows through.
+        return 0 if re.search(r"auto", m, re.IGNORECASE) else 1 if re.search(r"free", m, re.IGNORECASE) else 2
+    out = [(provider, sorted(ids, key=rank)) for provider, ids in groups.items()]
+    out.sort(key=lambda g: 0 if FEATURED.search(" ".join(g[1])) else 1)
     return out
+
+
+def search_models(models: list, needle: str) -> list:
+    """Case-insensitive substring match; the picker's answer to a long list."""
+    n = needle.lower()
+    return [m for m in models if n in m.lower()]
 
 
 # The prefix of a `provider/model` id says who BILLS; for a reseller it says
@@ -353,6 +352,12 @@ def is_zen(model_id: str | None) -> bool:
     """OpenCode Zen ids carry the `opencode/` prefix; anything else routed
     through OpenCode is the user's own provider and its own bill."""
     return bool(model_id) and model_id.startswith("opencode/")
+
+
+def is_zen_free(model_id: str | None) -> bool:
+    """A Zen free-tier id (`opencode/*-free`). Only these rotate out of the
+    lineup and only these are day-capped; a paid Zen pin is a normal model."""
+    return is_zen(model_id) and model_id.endswith("-free")
 
 
 # --------------------------------------------------------------------------
@@ -441,33 +446,43 @@ def pick_model(agent: dict, current: str | None) -> str | None:
     for pid, kind, why in unlisted_logins(agent, options):
         warn(f"{pid}: logged in ({kind}) but not listed. {why}")
     if options:
-        free = set(filter_free(agent, options)) if spec.get("free_pattern") else set()
-        shown = []
-        for provider, ids in grouped_models(agent, options):
-            if provider:
-                say(f"  {C['dim']}{provider}/{C['x']}")
-            for m in ids[:MODELS_PER_PROVIDER]:
-                shown.append(m)
-                tag = f" {C['g']}free{C['x']}" if m in free else ""
-                mark = f" {C['g']}(current){C['x']}" if m == current else ""
-                say(f"  {len(shown):2}. {m}{tag}{mark}")
-            if len(ids) > MODELS_PER_PROVIDER:
-                say(f"      {C['dim']}… {len(ids)-MODELS_PER_PROVIDER} more {provider}/ ids; "
-                    f"type a full id instead{C['x']}")
-        # A stale `prefer` (Zen rotates its free lineup) must not become the
-        # default just because it is written in the registry.
+        # A stale `prefer` (Zen rotates its lineup) must not become the default
+        # just because it is written in the registry.
         prefer = spec.get("prefer")
-        default = current or (prefer if prefer in options else None) \
-            or next((m for m in shown if m in free), None) or shown[0]
+        default = current or (prefer if prefer in options else None) or options[0]
+        pool = options
         while True:
-            got = ask("model id (number or full id)", default)
-            if not got.isdigit():
+            shown = []
+            for provider, ids in grouped_models(agent, pool):
+                if provider:
+                    say(f"  {C['dim']}{provider}/{C['x']}")
+                for m in ids[:MODELS_PER_PROVIDER]:
+                    shown.append(m)
+                    mark = f" {C['g']}(current){C['x']}" if m == current else ""
+                    say(f"  {len(shown):2}. {m}{mark}")
+                if len(ids) > MODELS_PER_PROVIDER:
+                    say(f"      {C['dim']}… {len(ids)-MODELS_PER_PROVIDER} more {provider}/ ids; "
+                        f"type part of a name to search, or a full id{C['x']}")
+            got = ask("model id (number, full id, or text to search)", default)
+            if got in options:
                 return got
-            if 1 <= int(got) <= len(shown):
-                return shown[int(got) - 1]
-            # A bare number outside the menu is a typo, not a model id --
-            # storing "30" as the pin would fail at the first dispatch.
-            err(f"enter 1-{len(shown)}, or a full model id")
+            if got.isdigit():
+                if 1 <= int(got) <= len(shown):
+                    return shown[int(got) - 1]
+                # A bare number outside the menu is a typo, not a model id --
+                # storing "30" as the pin would fail at the first dispatch.
+                err(f"enter 1-{len(shown)}, or a full model id")
+                continue
+            # Anything else narrows the menu. No match: accept it verbatim only
+            # if the user insists, since the tool did not list it.
+            hits = search_models(options, got)
+            if hits:
+                pool = hits
+                say(f"  {C['dim']}{len(hits)} match(es) for {got!r}{C['x']}")
+                continue
+            if ask_yes(f"{got!r} is not in the list; pin it anyway?", default=False):
+                return got
+            pool = options
 
     if spec.get("list_cmd"):
         warn(f"could not list models: `{' '.join(spec['list_cmd'])}` "
@@ -736,7 +751,7 @@ def render_roster(plan: dict) -> str:
         if a.get("silent_model_failure"):
             tags.append("FAILS SILENTLY on a bad model — empty transcript means "
                         "misconfig, not refusal; do not re-send")
-        if a["id"] == "opencode" and is_zen(c.get("model")):
+        if a["id"] == "opencode" and is_zen_free(c.get("model")):
             tags.append("day-capped; when dry move down, do not retry")
         tag = f" {'; '.join(tags)}." if tags else ""
         lines.append(f"  - {names[i].ljust(width)}{ordinals[min(i, 5)]}: {a['label']} "
@@ -867,11 +882,11 @@ def render_orchestrator(plan: dict) -> str:
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{PREFLIGHT_MAP}}": render_preflight_map(plan),
-        # The Zen preflight guards against a rotated free-tier id; a pin on a
-        # provider the user added (deepseek/..., anthropic/...) has no such
-        # rotation, so the check would only invite an `args.model` override.
+        # The Zen preflight guards against a rotated FREE-tier id; a paid Zen
+        # pin or a provider the user added (deepseek/..., anthropic/...) has no
+        # such rotation, so the check would only invite an `args.model` override.
         "{{OPENCODE_PREFLIGHT}}": (OPENCODE_PREFLIGHT.format(name=worker_name("opencode"))
-                                   if oc and is_zen(oc.get("model")) else ""),
+                                   if oc and is_zen_free(oc.get("model")) else ""),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
         "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + 1),
