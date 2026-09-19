@@ -9,11 +9,10 @@ Use when the goal decomposes into tasks that can proceed independently. If the
 tasks depend on each other, do them sequentially instead — fanning out
 dependent work produces conflicting diffs and wasted quota.
 
-**Preference order is not exclusivity.** The roster lists workers in preference
-order (`coder_zen`, then `coder_cline`, then `coder`), but that order decides
-who gets the FIRST task and who absorbs a single task's overflow — it does not
-mean queueing everything onto `coder_zen`. When you have N independent tasks,
-spread them across N distinct workers so they run concurrently.
+**Preference order is not exclusivity.** The roster order decides who gets the
+FIRST task and who absorbs overflow — it does not mean queueing everything onto
+the first worker. With N independent tasks and N available workers, spread
+them so they run concurrently.
 
 ## 1. Decompose
 
@@ -32,13 +31,18 @@ crisp contract, the task is not scoped well enough to delegate yet.
 
 ## 2. Create a worktree per task
 
-One worktree per task, branched from the configured `integration_base`:
+Worktrees live OUTSIDE the repo, in a `.worktrees/` directory beside it, one
+subdirectory per repo (`~/projects/.worktrees/<repo>/<task>` for a repo at
+`~/projects/<repo>`). Branches are `feature/<task-slug>` — the prefix the
+branch-cleanup policy allows you to delete after a merge; `task/` is not.
 
 ```bash
-git worktree add ../wt-<task-slug> -b task/<task-slug> <integration_base>
+WT=$(dirname "$REPO")/.worktrees/$(basename "$REPO")
+git -C "$REPO" worktree add "$WT/<task-slug>" -b feature/<task-slug> <integration_base>
 ```
 
-Never let two workers share a worktree.
+One worktree per task; never let two workers share one. Pass the absolute
+worktree path in the dispatch — the worker must never touch the main checkout.
 
 A worktree does not inherit the repo's code-intelligence index. If the repo
 root has one (the owner opted in — e.g. a `.codegraph/` directory), build the
@@ -49,14 +53,10 @@ index, do nothing: indexing is the owner's decision, not yours or the worker's.
 ## 3. Dispatch
 
 Dispatch all implementers in the SAME turn so they run concurrently, then end
-your turn. Each `sys_session_send` sets:
-- `title` — names the WORK, not the vendor (`fix-sse-retry`, not `coder`)
-- `args.purpose` — `implement`
-- `args.input` — the task plus its acceptance contract plus its worktree path
-- `args.model` — **omit it.** Every worker pins its own model in its spec, and
-  `args.model` silently overrides that pin. Pass it only in the one case the
-  Zen model preflight names: `coder_zen`'s pinned id has dropped out of the
-  free lineup and you are substituting a replacement for this run.
+your turn. Each `sys_session_send` sets `title` (the WORK, not the vendor),
+`args.purpose: implement`, and `args.input` — the task, its acceptance
+contract, and its worktree path. Never pass `args.model`: every worker pins
+its own, and the only exception is the model preflight in your prompt.
 
 Two lines belong in EVERY `args.input`, because some harnesses never see
 their spec prompt and only read what you send:
@@ -76,11 +76,9 @@ them in waves rather than trying to exceed it.
 
 ## 4. Collect
 
-Wait via the inbox. Do not poll. When a worker reports:
-- Verify its claims against the worktree yourself — read the diff, and do not
-  trust a reported gate result you did not see.
-- On failure, classify it (boot / task / quota) and respond per the
-  orchestrator's failure rules.
+Wait via the inbox. When a worker reports, verify its claims against the
+worktree yourself — read the diff; do not trust a gate result you did not see.
+On failure, classify it (boot / task / quota) per your prompt's failure rules.
 
 ## 5. Batch
 
@@ -88,23 +86,19 @@ Once ALL workers are done, create the integration branch and land each
 worktree's commits onto it:
 
 ```bash
-git worktree add ../wt-integration -b integration/<goal-slug> <integration_base>
-# then merge or cherry-pick each task branch, preserving attribution
+git -C "$REPO" worktree add "$WT/integration-<goal-slug>" -b integration/<goal-slug> <integration_base>
+# then merge or cherry-pick each feature/<task-slug>, preserving attribution
 ```
 
-**Keep each worker's commits separate and attributed.** If the batch fails its
-gate you must be able to identify which worker caused it. Squashing here
-destroys exactly the information you will need.
+Keep each worker's commits separate and attributed — squashing destroys the
+information you need when the batch fails.
 
 ## 6. Gate once
 
-Run the FULL gate on the integration branch — every gate in
-`.agents/orchestration.yaml`, including those with no `scope`. This is the only
-place the integration suite runs.
-
-If the batch fails, bisect by task branch rather than re-running everything:
-the per-worker commits tell you where to look. Re-dispatch only the failing
-task, in a clean worktree.
+Run the FULL gate on the integration branch — every gate in the contract,
+including those with no `scope`. If it fails, bisect by task branch rather
+than re-running everything, and re-dispatch only the failing task in a clean
+worktree.
 
 ## 7. Hand off to review
 
@@ -113,10 +107,12 @@ task contracts, to the `cross-review` skill.
 
 ## Cleanup
 
-Remove worktrees once their work is landed and the batch is green:
+Remove worktrees once their work is landed and the batch is green, then
+prune the registry so a deleted directory is not still listed:
 
 ```bash
-git worktree remove ../wt-<task-slug>
+git -C "$REPO" worktree remove "$WT/<task-slug>"
+git -C "$REPO" worktree prune
 ```
 
 Leaving stale worktrees behind confuses the next run's branch state.

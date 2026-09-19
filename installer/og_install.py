@@ -741,8 +741,6 @@ def render_roster(plan: dict) -> str:
     rv = reg[plan["reviewer"]["id"]]
     lines.append(f"  - {names[-1].ljust(width)}{rv['label']} (`{rv['harness']}`). "
                  "Reviews only; never edits.")
-    lines.append("")
-    lines.append("  Per-worker detail (quotas, failure shapes, auth) is in the `roster` skill.")
     return "\n".join(lines)
 
 
@@ -778,9 +776,8 @@ def render_roster_skill(plan: dict) -> str:
         "# Roster", "",
         "Workers are listed in preference order. Take the earliest one with capacity;",
         "go down only when the one above is unavailable, out of quota, or has already",
-        "failed this run. **Every worker pins its own model in its spec — never pass",
-        "`args.model`.** A pin lives at `executor.model`; a model placed under",
-        "`executor.config` is silently ignored by the spec parser.", "",
+        "failed this run. Every worker pins its own model in its spec — never pass",
+        "`args.model`.", "",
     ]
     for i, c in enumerate(plan["coders"], 1):
         a = reg[c["id"]]
@@ -845,17 +842,15 @@ def render_preflight_map(plan: dict) -> str:
 
 
 OPENCODE_PREFLIGHT = """  ### Zen model preflight (once per run, only if dispatching {name})
-  A CHECK, not a choice. `args.model` overrides the spec pin, replacing a
-  verified free model with a per-run guess — that is how a paid model gets
-  picked and hits OpenCode's "No payment method" wall. Call `sys_list_models`
-  once and confirm the pinned id is still listed:
-  - Listed, or query failed -> dispatch with no `args.model`. Say nothing.
-  - Gone (Zen rotates its lineup) -> pick the strongest replacement ending in
-    `-free`, pass it as `args.model` this run only, and tell the human the spec
-    pin needs updating. A non-`-free` id is a failed dispatch, not a slower one.
+  A CHECK, not a choice: `args.model` replaces a verified free pin with a
+  guess, which is how a paid model hits OpenCode's "No payment method" wall.
+  Call `sys_list_models` once. Pinned id listed, or query failed -> dispatch
+  with no `args.model`, say nothing. Gone (Zen rotates its lineup) -> pick the
+  strongest replacement ending in `-free`, pass it as `args.model` this run
+  only, and tell the human the pin needs updating. A non-`-free` id is a
+  failed dispatch, not a slower one.
 
 """
-
 
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()

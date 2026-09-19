@@ -26,11 +26,10 @@ context on work a fresh worker does better.
 ## Choosing the worker
 
 Explores are read-only and cheap to verify, so follow the roster's preference
-order — `coder_zen`, then `coder_cline`, then `coder` — and spend the free
-tiers first. Reach for `coder` when a question genuinely needs stronger
-reasoning or a larger context window, not as a default. For a question where
-independent perspectives matter, dispatch the same question to two different
-vendors and compare.
+order and spend the free tiers first. Reach for a stronger worker only when a
+question genuinely needs deeper reasoning or a larger context window. Where
+independent perspectives matter, send the same question to two vendors and
+compare.
 
 ## Reporting
 
@@ -44,6 +43,5 @@ have actually looked is a legitimate answer; guessing is not.
 
 ## Never dead-end
 
-If you lack knowledge or a tool, dispatch a sub-agent to find out in the same
-turn you notice the gap. Your workers are full coding harnesses with tools and
-context you do not have, so a gap of yours is rarely a gap of theirs.
+Your workers are full coding harnesses with tools and context you do not
+have, so a gap of yours is rarely a gap of theirs — dispatch, do not guess.

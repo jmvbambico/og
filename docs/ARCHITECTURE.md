@@ -89,6 +89,7 @@ interactive account.
    │
    ├─ one git worktree per task      ~/projects/.worktrees/<repo>/<task>
    │    └─ feature/<slug> branched from the integration base
+   │       (the `fanout` skill is the canonical statement of both)
    │
    ├─ dispatch coders in parallel (bounded by max_dispatches_per_turn)
    │    └─ each runs ONLY gates marked `scope: worker`

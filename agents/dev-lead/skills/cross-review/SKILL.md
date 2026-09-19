@@ -11,17 +11,16 @@ vendor than whoever implemented.
 
 ## Rules
 
-1. **Different vendor, always.** `coder` is Google; `reviewer` is Anthropic;
-   `coder_zen` is neither. Never route a diff to a reviewer of the same family
-   as its implementer.
-2. **Never use `coder_zen` as a reviewer.** Its free model lineup rotates, so
-   its judgement quality varies run to run — and unlike implementation, review
-   has no gate behind it to catch a bad result.
-3. **Diff and contract only.** Pass the combined diff and the acceptance
-   contracts as TEXT. Never point the reviewer at a worktree. A reviewer with
-   filesystem access becomes an implementer, and its stray edits can reach the
-   deliverable.
-4. **The reviewer never edits.** It reports; you route.
+1. **Different vendor, always.** Vendors are listed in your prompt's Review
+   rules (and the `roster` skill). Never route a diff to a reviewer of the
+   same family as its implementer.
+2. **Only `reviewer` reviews.** A coder's lineup may rotate and its judgement
+   vary run to run — and unlike implementation, review has no gate behind it
+   to catch a bad result.
+3. **Diff and contract only, as TEXT.** Never point the reviewer at a
+   worktree: a reviewer with filesystem access becomes an implementer, and its
+   stray edits can reach the deliverable. It never edits; it reports, you
+   route.
 
 ## Dispatch
 
@@ -49,13 +48,10 @@ question for the human — not as an approval.
 
 ## When cross-vendor review is impossible
 
-If the only available workers are the same vendor, you may proceed with
-same-vendor review ONLY if you:
-1. say so explicitly in chat, before dispatching, and
-2. label the PR body `degraded-review`.
-
-Never let a degraded review pass silently. If no reviewer is available at all,
-stop and hand the batch to the human unreviewed — clearly labelled as such.
+Same-vendor review is allowed ONLY after saying so in chat before dispatching,
+and the PR body must carry `degraded-review` (your prompt's Merging rules).
+If no reviewer is available at all, stop and hand the batch to the human
+unreviewed — clearly labelled as such.
 
 ## Then
 
