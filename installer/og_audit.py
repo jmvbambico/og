@@ -98,6 +98,32 @@ def hook_waits() -> dict[str, list[tuple[str, float]]]:
     return out
 
 
+def rate_limit_hint(since: int | None) -> str | None:
+    """Explain the stall Omnigent 0.13 cannot: an OpenCode worker whose model
+    call was rate-limited. opencode logs `stream error ... Rate limit exceeded`
+    and disables retries under Omnigent, but the forwarder gets no
+    `session.error`, so the turn never completes and the orchestrator --
+    inbox-driven by design -- is never woken. Only the worker's own log says why.
+    """
+    if not since:
+        return None
+    hits = 0
+    for log in (OMNI / "opencode-native").glob("*/xdg-data/opencode/log/opencode.log"):
+        try:
+            if log.stat().st_mtime < since - 60:
+                continue
+            text = log.read_text(errors="replace")
+        except OSError:
+            continue
+        if "stream error" in text and ("Rate limit" in text or "rate limit" in text):
+            hits += 1
+    if hits:
+        return ("an OpenCode worker log from this run says `Rate limit exceeded` — the "
+                "pinned model is over its quota; Omnigent does not surface this, so the run "
+                "stalls until you cancel it and re-pin (og setup) or wait for the reset")
+    return None
+
+
 def analyse(rows: list[tuple]) -> dict:
     calls: Counter = Counter()
     asks = invalid = user_turns = out_chars = 0
@@ -164,6 +190,9 @@ def show(con: sqlite3.Connection, root: bytes, full: bool) -> None:
         # that produced neither tool calls nor a report never acted.
         if not a["calls"] and parent is not None and not a["report"]:
             flags.append("NO TOOL CALLS — never acted (boot failure or silent model failure?)")
+            hint = rate_limit_hint(a["first"])
+            if hint:
+                flags.append(hint)
         print(f"       output  {a['out_chars'] // 1000}k chars"
               + (f"   ⚠ {'; '.join(flags)}" if flags else ""))
         if parent is not None and a["report"]:

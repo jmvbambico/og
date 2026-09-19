@@ -596,6 +596,27 @@ tested and committed their tasks in about a minute each.
 
 ---
 
+## An OpenCode worker never starts, and the orchestrator waits forever
+
+`og audit` shows the worker with **NO TOOL CALLS**, no report, and a `Rate
+limit exceeded` hint; the orchestrator's last message is the dispatch. Nothing
+is running, nothing is failing, nothing wakes up.
+
+**Cause.** The pinned model (a Zen free id, typically) is over its daily
+quota. opencode logs `stream error … Rate limit exceeded`; Omnigent launches
+it with retries disabled and its forwarder (0.13) maps only `session.error`
+to a failed turn, which this is not — so the worker's turn never completes,
+no inbox message is produced, and the orchestrator, which rightly waits on the
+inbox instead of polling, sleeps. This is a quota, not a bug in the CLI: the
+same pin implemented tasks reliably earlier the same day.
+
+**Fix.** Cancel the run (`og stop`, or stop the session in the UI), then pin
+a model with headroom — `og setup` lists everything the CLI offers, paid ids
+included — or wait for the quota to reset. The worker's own log is at
+`~/.omnigent/opencode-native/<hash>/xdg-data/opencode/log/opencode.log`.
+
+---
+
 ## Kilo dies with `Add credits to continue, or switch to a free model`
 
 Runner log:
