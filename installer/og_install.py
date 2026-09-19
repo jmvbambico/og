@@ -205,7 +205,10 @@ def list_models(agent: dict) -> list:
         # syntax) once templated unquoted into config.yaml.
         line = line.lstrip("*").strip()
         model_id = re.split(r"\s{2,}", line)[0].strip()
-        if model_id:
+        # cursor-agent prints "id - Display Name (tags)" with single spaces, and
+        # a heading line. Take the id before " - "; drop lines with no id shape.
+        model_id = model_id.split(" - ", 1)[0].strip()
+        if model_id and " " not in model_id:
             models.append(model_id)
     return models
 
@@ -964,6 +967,33 @@ def render_reviewer(plan: dict) -> str:
 # --------------------------------------------------------------------------
 # apply
 # --------------------------------------------------------------------------
+def acp_command(agent: dict, model: str | None) -> str:
+    """The ACP launch command, with the model pin baked in where the CLI needs it.
+
+    Omnigent's generic ACP executor never delivers a model pin to the agent:
+    `executor.model` lands in HARNESS_ACP_MODEL, which the executor documents
+    as inert unless `send_model` is set -- and that only adds a non-standard
+    `model` field to `session/new`, which Cline ignores. `session/set_config_option`
+    is used for interactive `/model` picks only. Traced on the wire
+    (initialize, session/new, session/prompt -- nothing else), so a Cline
+    worker always started on Cline's hard-coded default, `anthropic/claude-sonnet-5`
+    on usage-billing, and with no credits behind it Cline answers `end_turn`
+    with no content: the "completed with no output" signature.
+
+    Cline's ACP `newSession` reads the model from `CLINE_MODEL` (and the
+    provider from CLINE_PROVIDER); a registry row names that variable as
+    `model_env`. The executor exec's the argv directly (no shell, no $VAR), but
+    `env` is a real binary, so `env CLINE_MODEL=<pin> cline --acp ...` sets it
+    for exactly that process. Agents without such a variable (Kilo) take their
+    default from their own config file instead -- see the registry note.
+    """
+    cmd = agent["acp_command"]
+    var = agent.get("model_env")
+    if var and model:
+        return f"env {var}={shlex.quote(model)} {cmd}"
+    return cmd
+
+
 def patch_global_config(plan: dict) -> list:
     """Merge og's required keys into ~/.omnigent/config.yaml, preserving the rest."""
     reg = agents_by_id()
@@ -994,13 +1024,13 @@ def patch_global_config(plan: dict) -> list:
         by_name = {r.get("name"): r for r in rows if isinstance(r, dict)}
         for c in want:
             a = reg[c["id"]]
-            row = {"command": a["acp_command"], "name": a["label"],
+            row = {"command": acp_command(a, c.get("model")), "name": a["label"],
                    "omnigent_mcp": a.get("omnigent_mcp", False)}
             if c.get("model"):
                 row["model"] = c["model"]
             if by_name.get(a["label"]) != row:
                 rows = [r for r in rows if r.get("name") != a["label"]] + [row]
-                changed.append(f"acp.agents[{a['label']}] = {a['acp_command']}")
+                changed.append(f"acp.agents[{a['label']}] = {row['command']}")
         acp["agents"] = rows
         cfg["acp"] = acp
 

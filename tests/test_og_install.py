@@ -360,6 +360,28 @@ def test_kiro_is_wired_over_acp_with_trust_all_tools():
     assert "--trust-all-tools" in kiro["acp_command"]
 
 
+def test_acp_command_bakes_the_pin_into_env_where_the_cli_reads_it():
+    # Omnigent never delivers an ACP model pin (traced: initialize, session/new,
+    # session/prompt only). Cline reads CLINE_MODEL at newSession; without it
+    # every worker ran on claude-sonnet-5 usage-billing and returned an empty
+    # turn. Kilo has no such variable and keeps its plain command.
+    reg = m.agents_by_id()
+    assert m.acp_command(reg["cline"], "deepseek/deepseek-v4-flash") == \
+        "env CLINE_MODEL=deepseek/deepseek-v4-flash cline --acp --auto-approve true"
+    assert m.acp_command(reg["cline"], None) == "cline --acp --auto-approve true"
+    assert m.acp_command(reg["kilo"], "kilo/kilo-auto/free") == "kilo acp"
+
+
+def test_patch_global_config_renders_the_env_prefixed_cline_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    (tmp_path / "config.yaml").write_text("{}\n")
+    plan = _base_plan(coders=[{"id": "cline", "priority": 1, "model": "deepseek/deepseek-v4-flash"}])
+    m.patch_global_config(plan)
+    cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    row = next(r for r in cfg["acp"]["agents"] if r["name"] == "Cline")
+    assert row["command"].startswith("env CLINE_MODEL=deepseek/deepseek-v4-flash cline --acp")
+
+
 def test_patch_global_config_writes_a_row_for_an_acp_reviewer(tmp_path, monkeypatch):
     # Without its own row an ACP reviewer resolves to the first coder's row.
     monkeypatch.setattr(m, "OMNI", tmp_path)

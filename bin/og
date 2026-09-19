@@ -14,6 +14,7 @@
 #   og status           what is running, and the public URL
 #   og url              print the public URL only (pipe-friendly)
 #   og logs [-f]        tail the server log
+#   og audit [id]       what happened in the latest run: per-worker tools, stalls, reports
 #   og update           pull the checkout and re-apply the install
 #   og version          print the installed version
 #
@@ -37,6 +38,8 @@ NGROK_LOG="$OMNI_HOME/logs/ngrok.log"
 SECRET_FILE="$OMNI_HOME/.cookie-secret"
 CONF_FILE="$OMNI_HOME/og.env"
 SERVER_PIDFILE="$OMNI_HOME/og-server.pid"
+HOST_PIDFILE="$OMNI_HOME/og-host.pid"
+HOST_LOGDIR="$OMNI_HOME/logs/host"
 SERVER_LOGDIR="$OMNI_HOME/logs/server"
 
 # Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_CLAUDE_CONFIG_DIR,
@@ -139,6 +142,20 @@ ngrok_pid() {
 #
 # The config key is snake_case `agent_id`. The web bundle's TypeScript calls it
 # `agentId`; the server stores `agent_id`, and only the latter takes effect.
+# True when the server lists a host with status online (the daemon's tunnel
+# is up). Read by cmd_start to pin the project onto that host.
+host_online() {
+  local url="http://127.0.0.1:$PORT" tok
+  tok="$(python3 -c "import json;print(json.load(open('$OMNI_HOME/auth_tokens.json'))['$url']['token'])" 2>/dev/null)" || return 1
+  OG_URL="$url" OG_TOK="$tok" python3 - <<'PYEOF' 2>/dev/null
+import json, os, sys, urllib.request
+req = urllib.request.Request(os.environ["OG_URL"] + "/v1/hosts", headers={"Authorization": "Bearer " + os.environ["OG_TOK"]})
+with urllib.request.urlopen(req, timeout=5) as r:
+    hosts = json.load(r).get("hosts", [])
+sys.exit(0 if any(h.get("status") == "online" for h in hosts) else 1)
+PYEOF
+}
+
 ensure_project() {
   local url="http://127.0.0.1:$PORT" name="${OG_PROJECT:-$AGENT_NAME}" tok
   tok="$(python3 -c "import json;print(json.load(open('$OMNI_HOME/auth_tokens.json'))['$url']['token'])" 2>/dev/null)" || return 1
@@ -531,6 +548,47 @@ sys.exit(1)
 ' 2>/dev/null
 }
 
+og_host_pid() {
+  [[ -f "$HOST_PIDFILE" ]] || return 1
+  local p; p="$(cat "$HOST_PIDFILE" 2>/dev/null || true)"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+  return 1
+}
+
+# Start the host daemon in the FOREGROUND under nohup, not with --background.
+#
+# `omnigent host --background --server URL` spawns the daemon through
+# _build_host_daemon_env (cli.py), which in --server mode keeps only process
+# essentials plus DATABRICKS_/OTEL_ prefixes. It does keep
+# OMNIGENT_RUNNER_ENV_PASSTHROUGH -- but not the variables that list NAMES, so
+# the daemon never had CLAUDE_CONFIG_DIR / OPENCODE_* / OPENCODE_CONFIG_DIR to
+# forward, and export_worker_scoping was a no-op one hop earlier than the hop
+# it was written for (verified: the daemon's env carried none of them). A
+# foreground `omnigent host` runs the daemon in-process with og's full
+# environment; the daemon->runner hop (_build_runner_env) then honours the
+# passthrough list, and the runner passes OPENCODE_* through by prefix.
+#
+# Same shape as the server launch above: detached with nohup, pid in a file
+# og owns, so `og stop` can end it (omnigent's own registry records it as a
+# foreground daemon that `omnigent stop` does not necessarily reap).
+start_host_daemon() {
+  mkdir -p "$HOST_LOGDIR"
+  local log="$HOST_LOGDIR/host-$(date +%Y%m%d-%H%M%S)-og.log"
+  nohup env PYTHONUNBUFFERED=1 omnigent host --server "http://127.0.0.1:$PORT" --non-interactive \
+    >"$log" 2>&1 &
+  echo $! > "$HOST_PIDFILE"
+  local i
+  for i in $(seq 1 40); do
+    host_online && { ok "host attached (pid $(cat "$HOST_PIDFILE"))"; echo "    log:    $log"; return 0; }
+    if ! og_host_pid >/dev/null; then
+      printf '\n--- host log ---\n'; tail -20 "$log" 2>/dev/null; rm -f "$HOST_PIDFILE"; return 1
+    fi
+    sleep 0.5
+  done
+  printf '\033[0;33m!\033[0m the host daemon is running (pid %s) but not online yet; see %s\n' "$(cat "$HOST_PIDFILE")" "$log" >&2
+  return 0
+}
+
 # Scope the WORKERS, which the host daemon spawns via a runner:
 #
 #   og start/attach -> omnigent host -> runner -> claude / opencode serve / ...
@@ -863,17 +921,6 @@ cmd_start() {
   fi
   ok "session minted (valid $(( expires_in / 3600 ))h)"
 
-  # Pin dev-lead as the project default and aim the public URL at it, so the
-  # composer opens ON dev-lead instead of the Claude Code shim.
-  local proj
-  if proj="$(ensure_project)"; then
-    ok "project '$proj' pinned to $AGENT_NAME"
-    OG_PUBLIC_URL="${OG_PUBLIC_URL%%\?*}/?project=$proj"
-  else
-    printf '\033[0;33m!\033[0m could not pin the project default; the composer will\n' >&2
-    echo "    open on Claude Code — pick $AGENT_NAME manually (the row with a tooltip)." >&2
-  fi
-
   info "attaching the host daemon"
   # NOT --server "": that means "local mode" to omnigent, which spawns/reuses
   # ITS OWN loopback-only server (~/.omnigent/local_server.pid) instead of
@@ -885,10 +932,28 @@ cmd_start() {
   # herring; DB-only reads like GET /v1/hosts still succeed and look fine).
   # Passing our own loopback URL targets this exact process, and mint_token
   # above already stored a token in auth_tokens.json keyed to this same URL.
-  if ! omnigent host --background --server "http://127.0.0.1:$PORT" --non-interactive 2>&1 | sed 's/^/    /'; then
+  if ! start_host_daemon; then
     die "the host daemon did not attach. The server and $AGENT_NAME are up, so the
-    UI will list the agent but has nowhere to run it. If this says the account
+    UI will list the agent but has nowhere to run it. If the log says the account
     cannot claim the host, run 'omnigent host reset-id' and 'og start' again."
+  fi
+
+  # Pin the project AFTER the host is attached, not before. ensure_project
+  # records the online host in the project config, and that host_id is what a
+  # new session launches its runner on. Pinned before the attach, no host is
+  # online yet, so the id was silently skipped: the web composer covered it by
+  # asking you to pick a host, but a session created any other way (API, a
+  # composer that did not ask) got no runner at all -- "The runner for this
+  # session is not available". The daemon registers its tunnel a moment after
+  # returning, so give it a few seconds to show up as online.
+  local proj
+  host_online || printf '\033[0;33m!\033[0m the host has not come online yet; pinning without it\n' >&2
+  if proj="$(ensure_project)"; then
+    ok "project '$proj' pinned to $AGENT_NAME$(host_online && echo " on this host")"
+    OG_PUBLIC_URL="${OG_PUBLIC_URL%%\?*}/?project=$proj"
+  else
+    printf '\033[0;33m!\033[0m could not pin the project default; the composer will\n' >&2
+    echo "    open on Claude Code — pick $AGENT_NAME manually (the row with a tooltip)." >&2
   fi
 
   echo
@@ -1097,6 +1162,13 @@ cmd_init() {
   exec python3 "$repo/installer/og_init.py" "$@"
 }
 
+cmd_audit() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_audit.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  exec python3 "$repo/installer/og_audit.py" "$@"
+}
+
 cmd_stop() {
   local stopped=0
   if server_running; then
@@ -1105,6 +1177,13 @@ cmd_stop() {
     # `omnigent stop` only knows the server recorded in local_server.pid. A server
     # og started on a non-default port never registered there, so finish the job
     # from our own pidfile.
+    if og_host_pid >/dev/null; then
+      local hp; hp="$(og_host_pid)"
+      info "stopping the og-started host (pid $hp)"
+      kill "$hp" 2>/dev/null || true
+      for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$hp" 2>/dev/null || break; sleep 0.3; done
+      kill -0 "$hp" 2>/dev/null && kill -9 "$hp" 2>/dev/null || true
+    fi
     if og_server_pid >/dev/null; then
       local sp; sp="$(og_server_pid)"
       info "stopping the og-started server (pid $sp)"
@@ -1135,7 +1214,7 @@ cmd_stop() {
     stopped=1
   fi
 
-  rm -f "$NGROK_PIDFILE" "$SERVER_PIDFILE"
+  rm -f "$NGROK_PIDFILE" "$SERVER_PIDFILE" "$HOST_PIDFILE"
 
   # `omnigent stop` stops the host daemons and the background server, and the
   # daemon reaps its own runners on exit. What it does NOT do is tear down the
@@ -1213,6 +1292,9 @@ cmd_status() {
     # above reads "not running" while it is very much up. Say so explicitly.
     if og_server_pid >/dev/null; then
       echo "    og server: pid $(og_server_pid)  ($AGENT_NAME registered)"
+    fi
+    if og_host_pid >/dev/null; then
+      echo "    og host:   pid $(og_host_pid)  $(host_online && echo online || echo 'not online')"
     fi
   else
     echo "    omnigent: not running"
@@ -1302,11 +1384,16 @@ cmd_attach() {
   # See the matching comment in cmd_start: an explicit loopback URL, not "",
   # or the daemon tunnels to a different (auto-spawned local-mode) server
   # than the one og itself is running.
-  if ! omnigent host --background --server "http://127.0.0.1:$PORT" --non-interactive 2>&1 | sed 's/^/    /'; then
-    die "the host daemon did not attach. If it says the account cannot claim the
+  if og_host_pid >/dev/null; then
+    info "stopping the previous og host (pid $(og_host_pid))"
+    kill "$(og_host_pid)" 2>/dev/null || true; sleep 1
+  fi
+  if ! start_host_daemon; then
+    die "the host daemon did not attach. If the log says the account cannot claim the
     host, run 'omnigent host reset-id' and try again."
   fi
-  ok "host attached — $AGENT_NAME can run"
+  # Same reason as in cmd_start: the project pin must name the online host.
+  ensure_project >/dev/null 2>&1 || true
   local url; url="$(tunnel_url || true)"
   [[ -n "$url" ]] && echo "    $url"
   return 0
@@ -1364,10 +1451,11 @@ case "${1:-}" in
   status) shift; cmd_status ;;
   url)    shift; cmd_url ;;
   logs)   shift; cmd_logs "$@" ;;
+  audit)  shift; cmd_audit "$@" ;;
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

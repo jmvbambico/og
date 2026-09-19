@@ -532,6 +532,100 @@ named `Kiro (AWS)`.
 
 ---
 
+## A Cline worker "completes" instantly with no output
+
+`og audit` shows the worker with **NO TOOL CALLS**, one user turn, and no
+report; the orchestrator says "completed with no output — the roster's
+silent-failure signature". No error in any log.
+
+**Cause.** Omnigent's generic ACP executor never delivers the model pin.
+Traced on the wire, it sends exactly `initialize`, `session/new`,
+`session/prompt` — `HARNESS_ACP_MODEL` is documented as inert unless
+`send_model` is set (which only adds a non-standard `model` field to
+`session/new`, and Cline ignores it), and `session/set_config_option` is used
+for interactive `/model` picks only. Cline's ACP `newSession` therefore falls
+back to its hard-coded default, `anthropic/claude-sonnet-5` on Cline
+usage-billing, and with no credits behind it Cline answers `end_turn` with no
+content. `cline -m`, Cline's saved settings, and `session/new.model` are all
+ignored in ACP mode; the session model comes from **`CLINE_MODEL`** (provider
+from `CLINE_PROVIDER`).
+
+**Fix.** The registry row declares `model_env: CLINE_MODEL` and the installer
+renders the `acp.agents` command as
+`env CLINE_MODEL=<pin> cline --acp --auto-approve true` — Omnigent exec's the
+argv directly, and `env` is a real binary. Re-apply and restart:
+
+```bash
+./install.sh --plan ~/.omnigent/og-install.json   # or: og setup
+og restart
+```
+
+`~/.omnigent/config.yaml` should show the `env CLINE_MODEL=...` prefix on the
+Cline row. Verified: two Cline workers then implemented, tested and committed
+their tasks in ~2 minutes each.
+
+---
+
+## Every Cursor worker dies in 2 seconds with `Harness stream connection error`
+
+Runner log, per dispatch:
+
+```
+tmux capture-pane probe failed for terminal cursor:main: ... no server running on .../tmux.sock
+tmux unavailable after 3 consecutive probes for terminal cursor:main
+turn surfaced to UI as failed ... (harness=cursor-native): {'code': 'ReadError', 'message': 'Harness stream connection error.'}
+```
+
+The orchestrator retries, every retry dies identically, and it hard-blocks.
+`cursor-agent` launched by hand in tmux works fine.
+
+**Cause.** Omnigent always launches `cursor-agent --yolo --approve-mcps
+--model <id>`, where `<id>` is `launch_config.model_override or <spec model>`.
+With no pin on the Cursor spec, the id that arrives is the **orchestrator's**
+(`claude-opus-5[1m]`); cursor-agent rejects it — `Cannot use this model:
+claude-opus-5[1m]. Available models: auto, gpt-5.3-codex, …` — and exits 1,
+the pane's only process is gone, the tmux server follows, and the probes see
+no server. Captured by pointing `OMNIGENT_CURSOR_PATH` at a wrapper that logs
+argv and stderr. Same family as *A worker dies instantly with `Model not
+found: <orchestrator's model>`* above, one harness further down.
+
+**Fix.** The registry row for Cursor is `model.required: true` with `auto`
+preferred, so the installer always pins a valid id (`cursor-agent models`
+lists them). Re-apply and restart. Verified: two Cursor workers implemented,
+tested and committed their tasks in about a minute each.
+
+---
+
+## Kilo dies with `Add credits to continue, or switch to a free model`
+
+Runner log:
+
+```
+turn surfaced to UI as failed for <id> (harness=acp): {'code': 'runner_error',
+ 'message': 'inner executor error: Internal error: Add credits to continue, or switch to a free model'}
+```
+
+**Cause.** Not a missing free tier — `kilo/kilo-auto/free` exists and works.
+A Kilo ACP session starts on Kilo's *own* default model (its last-used one;
+`kilo/google/gemini-3-pro-image` on the day this was seen), and only moves to
+the pinned id when Omnigent's `session/set_config_option` lands. If that
+switch is skipped or rejected, the first prompt runs on a paid model with no
+credits behind it. Verified by driving `kilo acp` directly: the identical
+error without the switch, a correct answer with it.
+
+**Fix.** Make the free router Kilo's own default, so the pin is a
+confirmation rather than the only guard:
+
+```jsonc
+// ~/.config/kilo/kilo.jsonc
+{ "$schema": "https://app.kilo.ai/config.json", "model": "kilo/kilo-auto/free" }
+```
+
+`og audit` shows the failed dispatch as a worker with no tool calls; the
+runner log carries the message above.
+
+---
+
 ## A Kilo (or any ACP) worker behaves like a different vendor
 
 `acp:<slug>` is resolved against `acp.agents[].name` slugified by Omnigent
@@ -600,10 +694,18 @@ claude_native.status_file  claude status file resolved: path=/Users/me/.claude/s
 daemon. The same gap meant `OPENCODE_DISABLE_EXTERNAL_SKILLS` never reached
 the Zen worker either.
 
-**Fix.** og now names them in `OMNIGENT_RUNNER_ENV_PASSTHROUGH` (the one
-operator-controlled forward, and itself allowlisted) from `og start`, `og
-attach` and `og chat`. Re-apply (`./install.sh --plan ~/.omnigent/og-install.json`
-or `og setup`), then `og restart`. Verify on the next reviewer dispatch: the
+**Fix — two hops, both needed.** (1) og names them in
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH` (the operator-controlled daemon→runner
+forward, itself allowlisted). (2) That alone did nothing: `omnigent host
+--background --server …` builds the *daemon's* env from a second allowlist
+(`cli.py`, `_build_host_daemon_env`) that keeps the passthrough list but
+strips the variables it names — verified by reading the daemon's environment:
+none of og's exports were there. og now runs the host in the foreground under
+`nohup` with its own pidfile (`~/.omnigent/og-host.pid`, the pattern the
+server already used), so the daemon inherits og's full environment and hop (1)
+has something to forward. Re-apply (`./install.sh --plan
+~/.omnigent/og-install.json` or `og setup`), then `og restart`; `og status`
+shows `og host: pid N online`. Verify on the next reviewer dispatch: the
 status-file line should resolve under the second account's dir.
 
 ---
@@ -642,6 +744,10 @@ healthy ones. It is not the cause of whatever you are chasing.
 ---
 
 ## Where to look
+
+Start with `og audit` (latest run) or `og audit <session-id>`: per worker it
+prints harness, tool mix, `ASKED` / `parked` stalls, malformed tool calls,
+"NO TOOL CALLS" for a worker that never acted, and its final report. Then:
 
 | Symptom | File |
 |---|---|

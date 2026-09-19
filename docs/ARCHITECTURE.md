@@ -72,11 +72,15 @@ og start ──export──► omnigent host ──allowlist──► runner ─
                                                          └─inherit─► claude
 ```
 
-The daemon→runner hop is an **allowlist**, not inheritance: `CLAUDE_CONFIG_DIR`
-and `OPENCODE_*` are dropped unless named in `OMNIGENT_RUNNER_ENV_PASSTHROUGH`.
-`og start`, `og attach` and `og chat` set that list (see `export_worker_scoping`
-in `bin/og`). Before they did, the second-account reviewer silently ran on the
-interactive account.
+Both hops are **allowlists**, not inheritance. The daemon→runner hop drops
+`CLAUDE_CONFIG_DIR` and `OPENCODE_*` unless named in
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH`; `og start`, `og attach` and `og chat` set
+that list (`export_worker_scoping` in `bin/og`). The CLI→daemon hop
+(`omnigent host --background`) keeps that list but strips the variables it
+names, so og runs the host in the **foreground** under `nohup` with its own
+pidfile instead — the daemon then inherits og's environment. Before both were
+in place, the second-account reviewer silently ran on the interactive account
+and the OpenCode `question`-tool override never reached a worker.
 
 ---
 

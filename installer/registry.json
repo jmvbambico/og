@@ -23,7 +23,7 @@
     "                  workers inherit the ORCHESTRATOR's model id, which",
     "                  most harnesses cannot resolve.",
     "  model.pin_path  where the pin goes in the sub-agent spec. Always",
-    "                  executor.model \u2014 executor.config is a free-form dict",
+    "                  executor.model — executor.config is a free-form dict",
     "                  and a model placed there is silently ignored.",
     "  relay         false when the agent runs without Omnigent's sys_* tool",
     "                relay (leaf worker only; cannot orchestrate)",
@@ -56,7 +56,7 @@
       "model": {
         "required": false,
         "pin_path": "executor.model",
-        "note": "Subscription login picks the model. Pinning the ORCHESTRATOR also pins the family its workers route within, which strands non-Claude workers \u2014 leave it unset."
+        "note": "Subscription login picks the model. Pinning the ORCHESTRATOR also pins the family its workers route within, which strands non-Claude workers — leave it unset."
       },
       "install": {
         "brew": "brew install --cask claude-code",
@@ -88,7 +88,10 @@
         ],
         "free_pattern": "-free$",
         "auth_file": "$XDG_DATA_HOME/opencode/auth.json",
-        "oauth_builtin": ["openai", "github-copilot"],
+        "oauth_builtin": [
+          "openai",
+          "github-copilot"
+        ],
         "oauth_plugins": {
           "anthropic": "opencode-anthropic-auth",
           "google": "opencode-antigravity-auth"
@@ -165,6 +168,7 @@
       "binary": "cline",
       "kind": "acp-user",
       "acp_command": "cline --acp --auto-approve true",
+      "model_env": "CLINE_MODEL",
       "omnigent_mcp": false,
       "roles": [
         "coder"
@@ -177,7 +181,7 @@
         "pin_path": "executor.model",
         "state_file": "$HOME/.cline/data/settings/providers.json",
         "prefer": "deepseek/deepseek-v4-flash",
-        "note": "Cline ACCEPTS an ACP model switch it cannot serve instead of rejecting it. A wrong id yields 'completed' with an empty transcript and an untouched worktree \u2014 no error anywhere. Pin the id `cline auth` actually selected."
+        "note": "Cline ACCEPTS an ACP model switch it cannot serve instead of rejecting it. A wrong id yields 'completed' with an empty transcript and an untouched worktree — no error anywhere. Pin the id `cline auth` actually selected."
       },
       "install": {
         "brew": "brew install cline",
@@ -204,7 +208,7 @@
       "model": {
         "required": true,
         "pin_path": "executor.model",
-        "note": "Kilo has no bare `auto`; it has an auto-ROUTER family \u2014 kilo/kilo-auto/{free,efficient,small,balanced,frontier} \u2014 plus kilo/openrouter/auto. `free` keeps it inside the free tier; the others bill at provider rates. Requires `kilo auth` first: an unauthenticated ACP worker fails silently with an empty transcript.",
+        "note": "Kilo has no bare `auto`; it has an auto-ROUTER family — kilo/kilo-auto/{free,efficient,small,balanced,frontier} — plus kilo/openrouter/auto. `free` keeps it inside the free tier; the others bill at provider rates. Requires `kilo auth` first: an unauthenticated ACP worker fails silently with an empty transcript. An ACP session starts on Kilo's OWN default model (its last-used one, often paid) until the pin is applied; `Add credits to continue, or switch to a free model` means the pin never landed. Put `\"model\": \"kilo/kilo-auto/free\"` in ~/.config/kilo/kilo.jsonc so even an unpinned session is free.",
         "prefer": "kilo/kilo-auto/free",
         "list_cmd": [
           "kilo",
@@ -242,7 +246,7 @@
       "model": {
         "required": false,
         "pin_path": "executor.model",
-        "note": "`auto` is Kiro's own default router (1.00x credits, model chosen per task). Over ACP the pin reaches Kiro as the session model (HARNESS_ACP_MODEL); unpinned uses Kiro's default, which is `auto` anyway. Free plan is 50 credits/month from the shared Kiro pool \u2014 overflow capacity, not a primary implementer.",
+        "note": "`auto` is Kiro's own default router (1.00x credits, model chosen per task). Over ACP the pin reaches Kiro as the session model (HARNESS_ACP_MODEL); unpinned uses Kiro's default, which is `auto` anyway. Free plan is 50 credits/month from the shared Kiro pool — overflow capacity, not a primary implementer.",
         "prefer": "auto",
         "list_cmd": [
           "kiro-cli",
@@ -272,8 +276,14 @@
       "relay": true,
       "silent_model_failure": false,
       "model": {
-        "required": false,
-        "pin_path": "executor.model"
+        "required": true,
+        "pin_path": "executor.model",
+        "prefer": "auto",
+        "list_cmd": [
+          "cursor-agent",
+          "models"
+        ],
+        "note": "Omnigent always launches `cursor-agent --model <id>`; with no pin the id is the ORCHESTRATOR's (e.g. claude-opus-5[1m]), which cursor-agent rejects (`Cannot use this model`) and exits 1 -- the pane dies before the first prompt and every dispatch reports `Harness stream connection error`. `auto` is Cursor's own router; `cursor-agent models` lists the rest."
       },
       "install": {
         "curl": "curl https://cursor.com/install -fsS | bash"
