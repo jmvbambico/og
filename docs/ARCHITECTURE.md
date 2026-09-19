@@ -41,6 +41,7 @@ installed. That is what lets one global orchestrator serve every repo.
                              ├──► ~/.omnigent/agents/<name>/agents/*/config.yaml
                              ├──► ~/.omnigent/agents/<name>/skills/roster/SKILL.md
                              ├──► ~/.omnigent/config.yaml   (merged, not replaced)
+                             ├──► ~/.omnigent/opencode/opencode.json  (worker overrides)
                              └──► ~/.omnigent/og.env
 ```
 
@@ -51,6 +52,31 @@ the generated YAML.
 
 `~/.omnigent/config.yaml` is *merged*, never overwritten — it also holds
 machine-local values (`host.host_id`) that must not travel between machines.
+
+`~/.omnigent/opencode/opencode.json` exists only when OpenCode is a coder and
+not the orchestrator. Omnigent synthesizes its own per-session OpenCode config
+(model, MCP relay, `permission: ask` so every tool call routes through the
+policy engine) under an isolated `XDG_CONFIG_HOME`, which also hides the
+user's global `~/.config/opencode`. This file is the one channel og has into
+that session: OpenCode merges `$OPENCODE_CONFIG_DIR/opencode.json` *after* the
+synthesized config, and `og start` exports the variable. It carries
+`question: deny` — so a worker cannot park the run on a "which design do you
+prefer?" card — and, when the CLI is on PATH at install time, a
+code-intelligence MCP server (stdio, no Docker) the worker can query instead of
+grepping. Everything else stays on the policy route.
+
+## How env reaches a worker
+
+```
+og start ──export──► omnigent host ──allowlist──► runner ──prefix──► opencode serve
+                                                         └─inherit─► claude
+```
+
+The daemon→runner hop is an **allowlist**, not inheritance: `CLAUDE_CONFIG_DIR`
+and `OPENCODE_*` are dropped unless named in `OMNIGENT_RUNNER_ENV_PASSTHROUGH`.
+`og start`, `og attach` and `og chat` set that list (see `export_worker_scoping`
+in `bin/og`). Before they did, the second-account reviewer silently ran on the
+interactive account.
 
 ---
 

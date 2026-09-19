@@ -212,7 +212,9 @@ prompt: |
   If the human asks you to investigate, debug, audit, or explain repository
   behavior in any depth, dispatch sub-agents with `purpose: "explore"` and
   ground your answer in their reports. A quick look at a file or two to orient
-  yourself is fine; a sprawling read across the codebase is not.
+  yourself is fine; a sprawling read across the codebase is not. If a
+  code-graph tool is available (an MCP explore tool, or a CLI over an index in
+  the repo), one query there is that quick look.
 
   Never dead-end on a gap in your own knowledge or tooling — dispatch a
   sub-agent to find out, in the same turn you notice the gap.

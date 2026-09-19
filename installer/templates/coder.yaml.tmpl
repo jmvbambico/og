@@ -43,6 +43,32 @@ prompt: |
   EXPLORE / SEARCH — read-only:
   - Read only what you need; edit nothing. Answer with file:line evidence.
 
+  UNATTENDED — nobody is watching this session:
+  - Never stop to ask. Do not call a question / ask-user tool, and never end
+    a turn on "should I…?". A pending question parks a card that waits for a
+    human who may be hours away, and the whole run stalls behind it.
+  - When the task leaves a choice open, take the option most consistent with
+    the task contract and AGENTS.md, keep going, and put the assumption in
+    your final report. The orchestrator and reviewer catch a wrong-but-stated
+    guess; they cannot catch a worker that is silently waiting.
+
+  CODEBASE INTELLIGENCE — check once, before your first grep:
+  - Look for a code-intelligence tool before exploring by hand: an MCP tool
+    that explores or queries an indexed code graph, a CLI on PATH that does
+    the same, or such a tool's index directory at the worktree root. One query
+    there returns the relevant symbols' source plus their callers and callees,
+    replacing a grep-then-read loop across a dozen files.
+  - If the tool answers that this worktree has no index, do not build one —
+    indexing is the repo owner's decision, and the orchestrator seeds it when
+    the repo has opted in. Grep and read as usual.
+  - If nothing of the kind is present, do not install anything.
+  - Read each file ONCE. After an edit, the tool result already shows the
+    change — do not re-read the whole file to confirm. Re-read only the region
+    you are about to edit next. Re-reading the same file dozens of times is
+    the single biggest token sink in worker transcripts.
+  - Stage files by name; never `git add -A`. A tool's index or cache directory
+    must never land in a commit.
+
   Return a structured result: for IMPLEMENT, what changed (file:line) and how
   you verified it; for EXPLORE, your findings. Always state clearly anything
   that did not fit the task, and never claim a gate passed that you did not run.

@@ -414,6 +414,70 @@ def test_og_env_auto_update_off_is_zero_not_absent(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# OpenCode worker config -- the `question` tool must not be able to park a run
+# --------------------------------------------------------------------------
+def test_opencode_worker_config_written_for_an_opencode_coder(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    d = m.write_opencode_worker_config(_base_plan())
+    assert d == tmp_path / "opencode"
+    cfg = json.loads((d / "opencode.json").read_text())
+    # `*: ask` FIRST, `question: deny` AFTER: OpenCode is last-match-wins, so
+    # this order is what actually removes the tool while every other tool
+    # stays on Omnigent's policy-engine route. Pin the order, not just the keys.
+    assert list(cfg["permission"].items()) == [("*", "ask"), ("question", "deny")]
+    assert "tools" not in cfg  # the `tools: {question: false}` form does not work
+
+
+def test_opencode_worker_config_wires_code_intel_mcp_only_when_installed(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    monkeypatch.setattr(m.shutil, "which", lambda name: None)
+    cfg = json.loads((m.write_opencode_worker_config(_base_plan()) / "opencode.json").read_text())
+    assert "mcp" not in cfg
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/local/bin/" + name)
+    cfg = json.loads((m.write_opencode_worker_config(_base_plan()) / "opencode.json").read_text())
+    assert cfg["mcp"]["codegraph"]["command"] == ["codegraph", "serve", "--mcp"]
+    assert all(s["type"] == "local" for s in cfg["mcp"].values())  # stdio, never docker
+
+
+def test_opencode_worker_config_skipped_when_opencode_orchestrates(tmp_path, monkeypatch):
+    # The dir applies to EVERY OpenCode session og launches; an OpenCode
+    # orchestrator needs `question` for its plan gate.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    plan = _base_plan(orchestrator="opencode")
+    assert m.write_opencode_worker_config(plan) is None
+    assert not (tmp_path / "opencode" / "opencode.json").exists()
+
+
+def test_opencode_worker_config_removed_when_opencode_leaves_the_roster(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    m.write_opencode_worker_config(_base_plan())
+    plan = _base_plan(coders=[{"id": "cline", "priority": 1, "model": "x"}])
+    assert m.write_opencode_worker_config(plan) is None
+    assert not (tmp_path / "opencode" / "opencode.json").exists()
+
+
+def test_og_env_points_at_the_opencode_worker_config(tmp_path, monkeypatch):
+    env = _og_env(tmp_path, monkeypatch, _base_plan())
+    assert f"OG_OPENCODE_CONFIG_DIR={tmp_path / 'opencode'}\n" in env
+    env = _og_env(tmp_path, monkeypatch, _base_plan(orchestrator="opencode"))
+    assert "OG_OPENCODE_CONFIG_DIR" not in env
+
+
+def test_coder_prompt_carries_the_unattended_and_orientation_rules():
+    # Both rules exist because of one session: a free-tier worker parked the
+    # run twice on `question`, and re-read the same test file 50 times.
+    plan = _rendering_plan()
+    prompt = yaml.safe_load(m.render_coder(plan, plan["coders"][0]))["prompt"]
+    assert "Never stop to ask" in prompt
+    assert "code-intelligence tool" in prompt
+    # Tool-agnostic (other users run GitNexus etc.) and never assumes one exists.
+    assert "codegraph" not in prompt.lower()
+    assert "do not install anything" in prompt
+    # Workers never index a worktree themselves (the orchestrator seeds it).
+    assert "do not build one" in prompt
+
+
+# --------------------------------------------------------------------------
 # CLI smoke tests -- run the real script as a subprocess
 # --------------------------------------------------------------------------
 def test_cli_plan_defaults_auto_update_on(tmp_path):
@@ -801,3 +865,68 @@ def test_list_models_reports_a_timeout(monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", slow)
     assert m.list_models({"model": {"list_cmd": ["opencode", "models"]}}) == []
     assert "timed out" in m.LAST_LIST_ERROR
+
+
+# --------------------------------------------------------------------------
+# install_pth targets omnigent's interpreter, not the installer's
+# --------------------------------------------------------------------------
+@pytest.fixture
+def fake_omnigent_venv(tmp_path, monkeypatch):
+    """A real venv standing in for omnigent's, with an `omnigent` entry point
+    whose shebang names the venv python -- the shape uv tool / pipx / pip
+    --user all produce. PATH holds only that entry point's directory plus
+    the system dirs, and `uv` is absent, so resolution must go via the
+    shebang."""
+    import venv
+    root = tmp_path / "tools" / "omnigent"
+    venv.create(root, with_pip=False, symlinks=True)
+    py = root / "bin" / "python"
+    binroot = tmp_path / "bin"
+    binroot.mkdir()
+    entry = binroot / "omnigent"
+    entry.write_text(f"#!{py}\nimport sys\nprint('fake omnigent')\n")
+    entry.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binroot}:/usr/bin:/bin")
+    monkeypatch.setattr(m.shutil, "which", lambda n: str(entry) if n == "omnigent" else None)
+    return py
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="posix venv layout")
+def test_omnigent_python_follows_the_entry_point_shebang(fake_omnigent_venv):
+    assert m.omnigent_python() == fake_omnigent_venv
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="posix venv layout")
+def test_install_pth_lands_in_omnigent_site_packages_and_imports(fake_omnigent_venv, tmp_path):
+    """Regression for the deny-everything install: the .pth used to go to
+    site.getsitepackages() of the INSTALLER's interpreter. Here the test
+    interpreter and the fake omnigent venv differ, so only a fix that asks
+    omnigent's python for its site-packages can pass."""
+    pol_dir = tmp_path / "policies"
+    pol_dir.mkdir()
+    (pol_dir / "omnigent_local_policies.py").write_text("merge_gate = lambda **kw: None\n")
+    m.install_pth(pol_dir)
+    purelib = subprocess.run(
+        [str(fake_omnigent_venv), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    pth = Path(purelib) / "omnigent-local-policies.pth"
+    assert pth.read_text() == str(pol_dir) + "\n"
+    assert str(tmp_path) in purelib  # the fake venv, not this interpreter's
+    out = subprocess.run([str(fake_omnigent_venv), "-c",
+                          "import omnigent_local_policies as x; print(x.__file__)"],
+                         capture_output=True, text=True, check=True).stdout
+    assert str(pol_dir) in out
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="posix venv layout")
+def test_install_pth_dies_when_the_module_cannot_import(fake_omnigent_venv, tmp_path):
+    pol_dir = tmp_path / "policies"
+    pol_dir.mkdir()  # no module file inside -> import must fail -> die
+    with pytest.raises(SystemExit):
+        m.install_pth(pol_dir)
+
+
+def test_install_pth_dies_without_an_omnigent_interpreter(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "omnigent_python", lambda: None)
+    with pytest.raises(SystemExit):
+        m.install_pth(tmp_path)

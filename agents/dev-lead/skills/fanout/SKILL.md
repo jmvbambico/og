@@ -40,6 +40,12 @@ git worktree add ../wt-<task-slug> -b task/<task-slug> <integration_base>
 
 Never let two workers share a worktree.
 
+A worktree does not inherit the repo's code-intelligence index. If the repo
+root has one (the owner opted in — e.g. a `.codegraph/` directory), build the
+worktree's own with that tool's init command right after `worktree add`; it
+takes seconds and lets the worker query instead of grep. If the repo has no
+index, do nothing: indexing is the owner's decision, not yours or the worker's.
+
 ## 3. Dispatch
 
 Dispatch all implementers in the SAME turn so they run concurrently, then end
@@ -51,6 +57,19 @@ your turn. Each `sys_session_send` sets:
   `args.model` silently overrides that pin. Pass it only in the one case the
   Zen model preflight names: `coder_zen`'s pinned id has dropped out of the
   free lineup and you are substituting a replacement for this run.
+
+Two lines belong in EVERY `args.input`, because some harnesses never see
+their spec prompt and only read what you send:
+
+- **Unattended.** "Nobody is watching: never call a question / ask-user tool
+  or end a turn on a question. When the task leaves a choice open, take the
+  option most consistent with the contract and AGENTS.md, continue, and state
+  the assumption in your report." A worker parked on a question blocks the
+  whole run until a human happens to look.
+- **Orient cheaply.** "If a code-intelligence tool is available — an MCP tool
+  or CLI that queries an indexed code graph — use it before grepping; read
+  each file once and do not re-read whole files after edits." Name no
+  specific tool: the worker checks what is actually present.
 
 Respect the per-turn dispatch cap. If you have more tasks than the cap, run
 them in waves rather than trying to exceed it.

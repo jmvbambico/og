@@ -90,7 +90,9 @@ repo carries its own `AGENTS.md` (the constitution) and optionally
 | `~/.omnigent/agents/<name>/agents/*/config.yaml` | one per coder + reviewer (generated) |
 | `~/.omnigent/agents/<name>/skills/` | `fanout`, `cross-review`, `investigate`, `roster` |
 | `~/.omnigent/policies/omnigent_local_policies.py` | merge gate + branch-cleanup blast radius |
+| `<omnigent venv>/site-packages/omnigent-local-policies.pth` | puts that directory on **omnigent's** `sys.path` (resolved from the `omnigent` entry point, verified by importing) |
 | `~/.omnigent/config.yaml` | patched: `policy_modules`, `acp.agents`, `default_agent` |
+| `~/.omnigent/opencode/opencode.json` | OpenCode worker overrides: drops the blocking `question` tool; wires a code-intelligence MCP (e.g. CodeGraph) when its CLI is on PATH. Only when OpenCode is a coder, not the orchestrator |
 | `~/.omnigent/og.env` | `OG_AGENT`, `OG_PORT`, ngrok domain, reviewer account, `OG_AUTO_UPDATE` |
 | `~/.omnigent/og-install.json` | **your choices — the source of truth** |
 
@@ -249,12 +251,14 @@ Re-running is the supported way to change anything — orchestrator, a new coder
 a model, priority order, the reviewer:
 
 ```bash
+og setup                # same as ./install.sh, from anywhere
 ./install.sh            # shows current config, then walks the same questions
 ./install.sh --show     # print current config, change nothing
 ```
 
 Your previous answers are the defaults, so changing one thing means pressing
-Enter through the rest.
+Enter through the rest. A running server keeps the old bundles until
+`og restart`.
 
 ## Let an AI install it
 
@@ -276,6 +280,8 @@ og start            serve on your LAN — QR points at this machine's network IP
 og start tunneled   start ngrok first, then serve behind that public origin
 og init [path]      scaffold a repo's orchestration contract
 og stop             stop server, host daemons, tunnel
+og restart [mode]   og stop, then og start — same arguments as start
+og setup            re-run the installer: agents, models, reviewer, accounts
 og status           what is running, and the URL
 og chat             open an orchestrator session in this terminal
 og url              print the URL (pipe-friendly)

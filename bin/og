@@ -6,6 +6,8 @@
 #                       start ngrok first, then the server behind that origin
 #   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
+#   og restart [mode]   og stop, then og start with the same arguments
+#   og setup            re-run the installer (change agents, models, reviewer)
 #   og chat [args...]   open an orchestrator session in this terminal (no picker)
 #   og attach           re-attach the host daemon to a running server
 #   og login            store server credentials (Keychain / keyring / 0600 file), once
@@ -529,6 +531,64 @@ sys.exit(1)
 ' 2>/dev/null
 }
 
+# Scope the WORKERS, which the host daemon spawns via a runner:
+#
+#   og start/attach -> omnigent host -> runner -> claude / opencode serve / ...
+#
+# Two facts decide how this must be done, both verified against omnigent 0.13:
+#
+# 1. The daemon builds the runner's env from an ALLOWLIST (host/connect.py,
+#    _build_runner_env), not from its own environment. CLAUDE_CONFIG_DIR and
+#    OPENCODE_* are not on it. A plain `export` here therefore never reached a
+#    worker: the reviewer ran on ~/.claude (its status files resolved there in
+#    the runner log), not on the second account the install plan named. The
+#    one operator-controlled escape is OMNIGENT_RUNNER_ENV_PASSTHROUGH, a
+#    comma-separated list of extra names to forward -- and that var itself IS
+#    allowlisted, so setting it here is enough.
+# 2. From the runner on, the OpenCode harness passes `OPENCODE_*` through to
+#    `opencode serve` by prefix (only OPENCODE_CONFIG / _CONFIG_CONTENT are
+#    dropped), and the claude terminal inherits the runner's env. So once the
+#    names cross the daemon->runner hop, they arrive.
+#
+# CLAUDE_CONFIG_DIR: scopes every claude-native sub-agent (orchestrator AND
+# reviewer alike -- there is no per-sub-agent override) to a second account.
+# Unset (no account in the plan) must NOT default to a made-up path like
+# ~/.claude-work: the installer never creates it, so exporting it blind would
+# break every claude-native login. Unset falls through to Claude Code's own
+# default (~/.claude), the account your interactive `claude` uses.
+#
+# OPENCODE_DISABLE_*: omnigent already spawns `opencode serve` with per-session
+# XDG dirs, so the user's global ~/.config/opencode never reaches it -- but the
+# EXTERNAL skill scan reads ~/.claude/ and ~/.agents/ under $HOME, and HOME is
+# passed through. These two close that gap. OPENCODE_CONFIG_DIR: the worker
+# overrides the installer wrote (drops the blocking `question` tool); OpenCode
+# merges that file AFTER omnigent's synthesized per-session config.
+#
+# Deliberately NOT set: OPENCODE_PURE. It skips external plugins *entirely*,
+# and omnigent registers its own policy-bridge plugin in the synthesized
+# opencode.json -- PURE would disable the very channel the worker reports
+# through. Use `opencode --pure` by hand for bare interactive testing instead.
+export_worker_scoping() {
+  local names="OPENCODE_DISABLE_CLAUDE_CODE,OPENCODE_DISABLE_EXTERNAL_SKILLS"
+  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
+    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
+    names="CLAUDE_CONFIG_DIR,$names"
+  fi
+  export OPENCODE_DISABLE_CLAUDE_CODE=1
+  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  if [[ -n "${OG_OPENCODE_CONFIG_DIR:-}" && -f "$OG_OPENCODE_CONFIG_DIR/opencode.json" ]]; then
+    export OPENCODE_CONFIG_DIR="$OG_OPENCODE_CONFIG_DIR"
+    names="$names,OPENCODE_CONFIG_DIR"
+  fi
+  # Append to, never replace, a list the operator already set in og.env or
+  # their shell for their own provider wiring.
+  if [[ -n "${OMNIGENT_RUNNER_ENV_PASSTHROUGH:-}" ]]; then
+    export OMNIGENT_RUNNER_ENV_PASSTHROUGH="$OMNIGENT_RUNNER_ENV_PASSTHROUGH,$names"
+  else
+    export OMNIGENT_RUNNER_ENV_PASSTHROUGH="$names"
+  fi
+}
+
 cmd_start() {
   # `og start`            -> local  (LAN only; the safe default)
   # `og start local`      -> same, explicit
@@ -639,18 +699,8 @@ cmd_start() {
     info "generated $SECRET_FILE"
   fi
 
-  # Scopes every claude-native sub-agent (orchestrator AND reviewer alike --
-  # Omnigent reads this from its own process env, so there is no
-  # per-sub-agent override) to a second account. Unset (no account
-  # configured in the install plan) must NOT default to some made-up path
-  # like ~/.claude-work: that directory is never created by the installer,
-  # so an unconditional export would silently break every claude-native
-  # sub-agent's login. Leaving CLAUDE_CONFIG_DIR unset here instead falls
-  # through to Claude Code's own default (~/.claude / $HOME/.claude.json --
-  # the account your interactive `claude` uses).
-  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
-    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
-  fi
+  # See export_worker_scoping for what reaches the workers and how.
+  export_worker_scoping
   # dev-lead can write code, push branches and merge to dev. A tunnel to the
   # public internet must not front an anonymous UI.
   export OMNIGENT_AUTH_ENABLED=1
@@ -678,23 +728,8 @@ cmd_start() {
   # not this token, but lower it in og.env if you would rather re-login weekly.
   export OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS="${OG_SESSION_TTL_HOURS:-720}"
 
-  # Scope the opencode/Zen worker to a bare harness. omnigent already spawns
-  # `opencode serve` with per-session XDG dirs, so the user's global
-  # ~/.config/opencode (plugins, skills, MCP) never reaches it — but the
-  # EXTERNAL skill scan reads ~/.claude/ and ~/.agents/ under $HOME, and HOME is
-  # on the harness's passthrough list. These two close that gap. `OPENCODE_` is
-  # an auto-passthrough prefix, so setting them here reaches the worker; there
-  # is no per-sub-agent env field in the omnigent schema (OSEnvSpec has no
-  # `env`), which is why this lives at the launching process.
-  #
-  # Deliberately NOT set: OPENCODE_PURE. It skips external plugins *entirely*,
-  # and omnigent registers its own bridge plugin in the synthesized
-  # opencode.json — PURE would disable the very channel the worker reports
-  # through. Use `opencode --pure` by hand for bare interactive testing instead.
-  export OPENCODE_DISABLE_CLAUDE_CODE=1
-  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
-
   info "account: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-(unset — Claude Code default ~/.claude)}"
+  [[ -n "${OPENCODE_CONFIG_DIR:-}" ]] && info "opencode workers: $OPENCODE_CONFIG_DIR (question tool off)"
   # NOT `omnigent server --background`. That flag is handled first in cli.py --
   # `if background: _run_background_server(); return` -- and _run_background_server
   # takes no arguments, so every other flag on the line is silently dropped. It
@@ -791,8 +826,8 @@ cmd_start() {
   # --background`, and og, by starting only the server, left the UI with an empty
   # host list. Started here rather than before the server so it finds ours healthy
   # in local_server.pid and reuses it instead of spawning a second one, and so it
-  # inherits the CLAUDE_CONFIG_DIR / OPENCODE_* scoping exported above -- the
-  # daemon is the process that spawns the workers.
+  # inherits the worker scoping from export_worker_scoping above -- the daemon
+  # is the process that spawns the workers.
   # Always mint a FRESH session. The token is scoped to this server's lifetime:
   # `og stop` destroys it, so nothing is ever carried across runs and the
   # "expired 8 hours later" failure is structurally impossible rather than
@@ -1144,6 +1179,33 @@ cmd_stop() {
   [[ "$stopped" -eq 1 ]] && ok "stopped" || ok "nothing to stop"
 }
 
+# `og stop && og start` as one word. Arguments go to start unchanged, so
+# `og restart tunneled` does what `og start tunneled` would. cmd_stop is
+# deliberately not skipped when nothing runs: it also reaps orphaned terminal
+# servers and clears stale pidfiles, which is exactly what a restart is for.
+cmd_restart() {
+  cmd_stop
+  echo
+  cmd_start "$@"
+}
+
+# Re-run the installer: change the orchestrator, add or reorder coders, pin a
+# different model, swap the reviewer. The installer shows the current config
+# and uses it as the defaults, so changing one thing is Enter through the
+# rest. Not exec'd, because a running server keeps the OLD bundles until it is
+# restarted and that is worth saying afterwards.
+cmd_setup() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run ./install.sh from the checkout."
+  # Under set -e a refused install exits here with the installer's status,
+  # which is right: there is nothing to restart into.
+  "$repo/install.sh" "$@"
+  if server_running; then
+    echo
+    info "omnigent is running on the previous configuration; 'og restart' to apply it."
+  fi
+}
+
 cmd_status() {
   if server_running; then
     omnigent server status 2>&1 | sed 's/^/    /'
@@ -1231,17 +1293,11 @@ cmd_attach() {
     info "no valid session — minting a fresh one"
     mint_token >/dev/null || die "could not mint a session. Run 'og login' to store credentials."
   fi
-  # The daemon spawns the workers, so it needs the same scoping og start exports
-  # — without these a claude-native sub-agent would run on the wrong account and
-  # the Zen worker would pick up the user's global opencode config. See the
-  # matching comment in cmd_start: unset stays unset, it does not fall back to
-  # a made-up ~/.claude-work.
-  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
-    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
-  fi
+  # The daemon spawns the workers, so it needs the same scoping og start
+  # exports (see export_worker_scoping) -- without it a claude-native sub-agent
+  # runs on the wrong account and an OpenCode worker keeps its `question` tool.
+  export_worker_scoping
   export OMNIGENT_LOCAL_SINGLE_USER=1
-  export OPENCODE_DISABLE_CLAUDE_CODE=1
-  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
   info "attaching the host daemon"
   # See the matching comment in cmd_start: an explicit loopback URL, not "",
   # or the daemon tunnels to a different (auto-spawned local-mode) server
@@ -1266,13 +1322,8 @@ cmd_attach() {
 cmd_chat() {
   server_running || die "the omnigent server is not running — run 'og start' first"
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
-  # Same scoping the host daemon gets. See the matching comment in cmd_start:
-  # unset stays unset rather than falling back to a made-up ~/.claude-work.
-  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
-    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
-  fi
-  export OPENCODE_DISABLE_CLAUDE_CODE=1
-  export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+  # Same scoping the host daemon gets (see export_worker_scoping).
+  export_worker_scoping
   info "starting a $AGENT_NAME session on http://127.0.0.1:$PORT"
   exec omnigent run "$AGENT_DIR" --server "http://127.0.0.1:$PORT" "$@"
 }
@@ -1305,6 +1356,8 @@ case "${1:-}" in
   start)  shift; cmd_start "$@" ;;
   init)   shift; cmd_init "$@" ;;
   stop)   shift; cmd_stop ;;
+  restart) shift; cmd_restart "$@" ;;
+  setup)  shift; cmd_setup "$@" ;;
   attach) shift; cmd_attach ;;
   login)  shift; cmd_login ;;
   chat)   shift; cmd_chat "$@" ;;
@@ -1314,7 +1367,7 @@ case "${1:-}" in
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

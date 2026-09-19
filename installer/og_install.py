@@ -1019,6 +1019,79 @@ def patch_global_config(plan: dict) -> list:
     return changed
 
 
+# OpenCode's `question` tool blocks the turn until a human answers. Omnigent
+# mirrors it to a web approval card and waits up to a day (the hook timeout is
+# hard-coded server-side, not a spec knob), so a worker that "just checks"
+# which of two designs you prefer parks the whole run until someone happens to
+# look -- observed twice in one session, ~10 minutes each, both on a free-tier
+# model that likes to ask. The coder prompt says never to ask; this makes the
+# tool unavailable so the prompt is not the only guard.
+#
+# Delivery: OpenCode merges `$OPENCODE_CONFIG_DIR/opencode.json` AFTER the
+# per-session config Omnigent synthesizes, and Omnigent passes `OPENCODE_*`
+# env through to `opencode serve` (only OPENCODE_CONFIG / _CONFIG_CONTENT are
+# denylisted). `og start` exports the var, and forwards it host->runner via
+# OMNIGENT_RUNNER_ENV_PASSTHROUGH.
+#
+# Why `permission` and not `tools: {question: false}`: the `tools` form is
+# rewritten into a `question: deny` rule that lands BEFORE Omnigent's `*: ask`
+# rule, and OpenCode's last-match-wins evaluation lets `*: ask` win -- the tool
+# stays visible (verified against 1.18.30 over `opencode serve`). Spelling out
+# `*: ask` first and `question: deny` after it keeps every other tool on the
+# policy-engine route Omnigent depends on and drops only `question`.
+OPENCODE_WORKER_CONFIG = {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {"*": "ask", "question": "deny"},
+}
+
+# Code-intelligence MCP servers a worker may tap, keyed by the CLI that must be
+# on PATH. Each is a plain stdio process (no Docker). Wired only when the CLI
+# is present at install time: the user's global opencode.json is invisible to
+# workers, so this is the only way the tool reaches them, and a tool the model
+# can SEE in its list gets used where a prompt hint about "a CLI on PATH" does
+# not (free-tier models especially). The worker prompt stays tool-agnostic;
+# whatever is wired here is what it finds.
+CODE_INTEL_MCP = {
+    "codegraph": {"type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": True},
+}
+
+
+def opencode_worker_config() -> dict:
+    cfg = json.loads(json.dumps(OPENCODE_WORKER_CONFIG))
+    mcp = {name: srv for name, srv in CODE_INTEL_MCP.items() if shutil.which(name)}
+    if mcp:
+        cfg["mcp"] = mcp
+    return cfg
+
+
+def opencode_worker_config_dir(plan: dict) -> Path | None:
+    """Where og's OpenCode worker overrides live, or None when they must not.
+
+    Only when OpenCode is a coder and NOT the orchestrator: the config applies
+    to every OpenCode session og launches, and an OpenCode orchestrator needs
+    `question` for its plan gate.
+    """
+    is_coder = any(c["id"] == "opencode" for c in plan["coders"])
+    if not is_coder or plan["orchestrator"] == "opencode":
+        return None
+    return OMNI / "opencode"
+
+
+def write_opencode_worker_config(plan: dict) -> Path | None:
+    """Write (or remove) the OpenCode worker config dir; returns it if written."""
+    d = opencode_worker_config_dir(plan)
+    stale = OMNI / "opencode" / "opencode.json"
+    if d is None:
+        # Rerunnable: a roster that no longer qualifies must not leave a config
+        # behind that og.env stops pointing at but a hand-set env could reach.
+        if stale.exists():
+            stale.unlink()
+        return None
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "opencode.json").write_text(json.dumps(opencode_worker_config(), indent=2) + "\n")
+    return d
+
+
 def installed_version() -> str:
     """The version stamp for this apply: ``git describe --tags`` of the checkout.
 
@@ -1077,6 +1150,11 @@ def write_og_env(plan: dict) -> None:
         if env == "CLAUDE_CONFIG_DIR":
             lines += ["", "# The reviewer runs on this account, separate from your interactive one.",
                       f"OG_CLAUDE_CONFIG_DIR={acct}"]
+    ocd = opencode_worker_config_dir(plan)
+    if ocd:
+        lines += ["", "# OpenCode worker overrides (drops the blocking `question` tool). og start",
+                  "# exports this as OPENCODE_CONFIG_DIR and forwards it to the workers.",
+                  f"OG_OPENCODE_CONFIG_DIR={ocd}"]
     (OMNI / "og.env").write_text("\n".join(lines) + "\n")
 
 
@@ -1155,6 +1233,7 @@ def apply(plan: dict, dry_run: bool = False) -> None:
 
     # 4. global config + og.env + the og script
     changed = patch_global_config(plan)
+    ocd = write_opencode_worker_config(plan)
     write_og_env(plan)
     bindir = resolve_bin_dir(plan)
     bindir.mkdir(parents=True, exist_ok=True)
@@ -1174,6 +1253,12 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     ok(f"reviewer      {reg[plan['reviewer']['id']]['label']}")
     for line in changed:
         ok(f"config.yaml   {line}")
+    if ocd:
+        wired = ", ".join(sorted(opencode_worker_config().get("mcp", {}))) or "none found"
+        ok(f"opencode      {ocd/'opencode.json'} (question tool off; code-intel MCP: {wired})")
+    elif any(c["id"] == "opencode" for c in plan["coders"]):
+        warn("OpenCode is the orchestrator AND a coder: its `question` tool stays on for "
+             "both, so a coder that asks will park the run until you answer.")
     ok(f"og            {bindir/'og'}")
     ok(f"state         {STATE}")
     say()
@@ -1229,19 +1314,121 @@ def resolve_bin_dir(plan: dict) -> Path:
     return default_bin_dir()
 
 
-def install_pth(pol_dir: Path) -> None:
-    """Put the policies dir on the omnigent interpreter's sys.path."""
+POLICY_MODULE = "omnigent_local_policies"
+POLICY_HANDLERS = [f"{POLICY_MODULE}.merge_gate",
+                   f"{POLICY_MODULE}.blast_radius_with_branch_cleanup"]
+
+
+def _shebang(path: Path) -> Path | None:
     try:
-        import site
-        targets = [Path(p) for p in site.getsitepackages()]
-    except Exception:
-        targets = []
-    for t in targets:
-        if t.is_dir() and os.access(t, os.W_OK):
-            (t / "omnigent-local-policies.pth").write_text(str(pol_dir) + "\n")
-            return
-    warn(f"could not write a .pth into site-packages; add {pol_dir} to PYTHONPATH "
-         "or the local policies will not import.")
+        with path.open("rb") as fh:
+            first = fh.readline(512).decode(errors="replace").strip()
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    parts = first[2:].split()
+    if not parts:
+        return None
+    if Path(parts[0]).name == "env" and len(parts) > 1:
+        found = shutil.which(parts[1])
+        return Path(found) if found else None
+    return Path(parts[0])
+
+
+def omnigent_python() -> Path | None:
+    """The interpreter omnigent itself runs under -- NOT the one running this
+    installer. `uv tool`, pipx, `pip install --user` and Homebrew all give it
+    its own venv; the entry point's shebang names that venv's python, which
+    is the one whose site-packages a .pth must land in."""
+    exe = shutil.which("omnigent")
+    if exe:
+        real = Path(os.path.realpath(exe))
+        py = _shebang(real)
+        if py and py.is_file():
+            return py
+        for name in ("python3", "python"):
+            if (real.parent / name).is_file():
+                return real.parent / name
+    # No entry point on PATH (or a launcher without a shebang): the venvs the
+    # supported installers create, by convention.
+    uv = shutil.which("uv")
+    if uv:
+        try:
+            out = subprocess.run([uv, "tool", "dir"], capture_output=True, text=True,
+                                 timeout=15, check=False)
+            if out.returncode == 0 and out.stdout.strip():
+                for name in ("python3", "python"):
+                    cand = Path(out.stdout.strip()) / "omnigent" / "bin" / name
+                    if cand.is_file():
+                        return cand
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for cand in (Path.home() / ".local" / "pipx" / "venvs" / "omnigent" / "bin" / "python",
+                 Path.home() / ".local" / "share" / "uv" / "tools" / "omnigent" / "bin" / "python"):
+        if cand.is_file():
+            return cand
+    # Last resort: this interpreter, but only if omnigent actually imports here.
+    probe = subprocess.run([sys.executable, "-c", "import omnigent"], capture_output=True,
+                           text=True, timeout=30, check=False)
+    return Path(sys.executable) if probe.returncode == 0 else None
+
+
+def _run_py(py: Path, code: str) -> subprocess.CompletedProcess:
+    return subprocess.run([str(py), "-c", code], capture_output=True, text=True,
+                          timeout=60, check=False)
+
+
+def install_pth(pol_dir: Path) -> None:
+    """Put the policies dir on the OMNIGENT interpreter's sys.path, and prove it.
+
+    config.yaml names `omnigent_local_policies` in `policy_modules`, so a
+    server that cannot import it does not degrade -- every policy evaluation
+    raises and the failure mode is deny-everything, with nothing in the chat
+    error pointing back here. That makes a missing .pth a broken install, not
+    a warning: this dies with the exact remediation.
+
+    `site.getsitepackages()` was the previous approach; it answers for the
+    interpreter running THIS script (install.sh's system python3 on Linux,
+    whose site-packages are root-owned), never for omnigent's venv.
+    """
+    py = omnigent_python()
+    if py is None:
+        die("could not find the interpreter omnigent runs under (is `omnigent` on PATH?).\n"
+            f"    The local policies must be importable by it. Install omnigent first:\n"
+            "      uv tool install omnigent")
+    out = _run_py(py, "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+    site_dir = Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
+    pth_line = str(pol_dir) + "\n"
+    manual = (f"    Write it yourself:\n"
+              f"      echo '{pol_dir}' > <omnigent site-packages>/{POLICY_MODULE.replace('_', '-')}.pth\n"
+              f"    (site-packages of {py})")
+    if site_dir is None or not site_dir.is_dir():
+        die(f"could not resolve site-packages for {py}:\n    {out.stderr.strip()}\n{manual}")
+    pth = site_dir / "omnigent-local-policies.pth"
+    try:
+        pth.write_text(pth_line)
+    except OSError as e:
+        die(f"could not write {pth}: {e}\n{manual}")
+
+    # Prove it, in the interpreter that matters: a fresh process reads the
+    # .pth at startup, so this is exactly what the server will see.
+    check = _run_py(py, f"import {POLICY_MODULE} as m; print(m.__file__)")
+    if check.returncode != 0 or str(pol_dir) not in check.stdout:
+        die(f"wrote {pth} but `{POLICY_MODULE}` still does not import under {py}:\n"
+            f"    {check.stderr.strip() or check.stdout.strip()}\n"
+            "    The server would deny every action with 'policy evaluation error'.")
+    # Handler registration through omnigent's own registry, when this build
+    # exposes it. Best-effort: a registry API change must not fail installs.
+    reg = _run_py(py, (
+        "from omnigent.policies.registry import load_registry, is_registered_handler\n"
+        f"load_registry(extra_modules=['{POLICY_MODULE}'])\n"
+        f"missing = [h for h in {POLICY_HANDLERS!r} if not is_registered_handler(h)]\n"
+        "print(' '.join(missing))"))
+    if reg.returncode == 0 and reg.stdout.strip():
+        die(f"policies import but these handlers are not registered: {reg.stdout.strip()}\n"
+            f"    ({pol_dir / (POLICY_MODULE + '.py')} may be stale or edited)")
+    ok(f"policies        {pth} -> {pol_dir}  (verified under {py})")
 
 
 # --------------------------------------------------------------------------

@@ -134,6 +134,44 @@ prefix and leaves force-push, `--mirror`, `--prune`, protected refs and the
 
 ---
 
+## Every message is `[Denied by policy: Denied by policy (policy evaluation error).]`
+
+The server starts, then denies **everything** — chat, terminal startup. The
+server log says:
+
+```
+Input policy evaluation failed ...: No module named 'omnigent_local_policies'
+```
+
+**Cause.** `~/.omnigent/config.yaml` names `omnigent_local_policies` in
+`policy_modules`, but the interpreter omnigent runs under cannot import it —
+the `.pth` that puts `~/.omnigent/policies` on its `sys.path` is missing from
+*that* interpreter's site-packages. Omnigent does not degrade here: every
+evaluation raises, and a raise is a deny.
+
+og ≤ 0.5.1 wrote the `.pth` into the site-packages of the interpreter running
+the *installer* (`install.sh` picks the system `python3` when it has PyYAML),
+not omnigent's own venv. On Linux those are root-owned, the write was skipped
+with a `warn(...)` that scrolled past, and the install finished "successfully"
+into this state.
+
+**Fix.** Update og and re-apply: `og update` (or `./install.sh` from a pulled
+checkout). The installer now resolves the interpreter behind the `omnigent`
+entry point (uv tool / pipx / Homebrew), writes the `.pth` into *its*
+site-packages, imports the module under it, and checks both handlers are
+registered — and it **fails the install** with the remediation if any step
+does not hold. By hand, if you are stuck on an older og:
+
+```bash
+PY="$(head -1 "$(readlink -f "$(command -v omnigent)")" | sed 's/^#!//')"   # omnigent's python
+SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+echo "$HOME/.omnigent/policies" > "$SITE/omnigent-local-policies.pth"
+"$PY" -c 'import omnigent_local_policies as m; print(m.__file__)'          # must print the path
+og stop && og start
+```
+
+---
+
 ## A policy is configured but never fires
 
 **Cause.** Being importable is not the same as being registered. Local handlers
@@ -502,6 +540,97 @@ error: Omnigent falls back to the first configured row. og's registry used to
 say `acp:kilo` for a row named `Kilo Code` (slug `kilo-code`), so Kilo
 dispatches silently ran on Cline. Fixed in the registry; `og update` re-applies
 it. `test_acp_user_harness_matches_omnigent_slug` guards every acp-user row.
+
+---
+
+## An OpenCode worker sits on a question card until someone answers
+
+You left a run overnight; in the morning a coder session shows a card like
+"B3 scope — Full voucher PDF / Email-only / Defer", and nothing has moved since
+it appeared. Server log:
+
+```
+POST /v1/sessions/<coder>/hooks/native-permission-request HTTP/1.1" 200 OK 594252.2ms
+```
+
+**Cause.** Not a permission. The model called OpenCode's `question` tool
+(free-tier models are fond of it), and Omnigent mirrors that as a web card and
+waits — up to a day, hard-coded in the server hook. Your global
+`~/.config/opencode/opencode.json` cannot help: Omnigent runs each worker under
+an isolated `XDG_CONFIG_HOME` and carries over only `provider`, `plugin` and
+`model` from your file. The permission engine was never the problem: every
+other tool call was auto-allowed by policy in the same session.
+
+**Fix.** The installer now writes `~/.omnigent/opencode/opencode.json` with
+`permission: {"*": "ask", "question": "deny"}` and og exports it as
+`OPENCODE_CONFIG_DIR` (merged *after* Omnigent's per-session config). The
+coder prompt also says to decide, note the assumption, and keep going. Then:
+
+```bash
+./install.sh --plan ~/.omnigent/og-install.json   # or: og setup
+og restart
+```
+
+(`og update` only re-applies when a newer *release tag* exists; with
+auto-update on, `og start` does that by itself.) Check `og start` prints
+`opencode workers: ~/.omnigent/opencode (question tool off)`. If it does not, OpenCode is either not a coder or is the orchestrator
+(which needs `question` for its plan gate — the installer warns about that
+pairing).
+
+Why `permission` and not `tools: {question: false}`: OpenCode rewrites the
+`tools` form into a `question: deny` rule placed *before* Omnigent's `*: ask`,
+and its last-match-wins evaluation keeps the tool visible. Verified on 1.18.30
+over `opencode serve` — the form the installer writes removes `question` from
+the model's tool list; the `tools` form does not.
+
+---
+
+## The reviewer runs on my main Claude account, not the second one
+
+`og-install.json` names `accounts.claude: ~/.claude-work`, `og start` prints
+`account: CLAUDE_CONFIG_DIR=~/.claude-work`, and yet the runner log says:
+
+```
+claude_native.status_file  claude status file resolved: path=/Users/me/.claude/sessions/72881.json
+```
+
+**Cause.** The host daemon builds each runner's environment from an allowlist
+(`omnigent/host/connect.py`, `_build_runner_env`), not from its own. Neither
+`CLAUDE_CONFIG_DIR` nor `OPENCODE_*` is on it, so og's exports stopped at the
+daemon. The same gap meant `OPENCODE_DISABLE_EXTERNAL_SKILLS` never reached
+the Zen worker either.
+
+**Fix.** og now names them in `OMNIGENT_RUNNER_ENV_PASSTHROUGH` (the one
+operator-controlled forward, and itself allowlisted) from `og start`, `og
+attach` and `og chat`. Re-apply (`./install.sh --plan ~/.omnigent/og-install.json`
+or `og setup`), then `og restart`. Verify on the next reviewer dispatch: the
+status-file line should resolve under the second account's dir.
+
+---
+
+## Workers burn tokens re-reading the codebase
+
+A coder transcript shows the same file read forty or fifty times and a hundred
+`grep` shells before a small change. Two causes, both addressed in the coder
+prompt and the `fanout` skill:
+
+- **No orientation tool.** The coder prompt now says: if a code-intelligence
+  tool is present — an MCP tool or CLI over an indexed code graph — query it
+  first; it returns the relevant symbols plus callers/callees in one call. The
+  prompt names no tool (you may run CodeGraph, GitNexus, or nothing), and
+  installs nothing. What makes it *findable* for a weak model is the tool
+  showing up in its list: when the installer sees the `codegraph` CLI on PATH
+  it wires `codegraph serve --mcp` (a plain stdio process) into the worker's
+  `opencode.json`, since your global OpenCode config never reaches workers.
+  Index the target repo once yourself (and add the index dir to its
+  `.gitignore`). Worktrees the orchestrator cuts do not inherit the index, so
+  the `fanout` skill has the orchestrator build each worktree's own right after
+  `worktree add` — only when the repo root already has one. Workers never
+  index: the tool's own no-index message tells agents that is the owner's call.
+- **Re-reading after every edit.** The prompt now says read once, trust the
+  edit result, re-read only the next region. This is a strong default, not a
+  guarantee; a weak model may still do it, and the roster's preference order
+  is the lever if one model is much worse than another here.
 
 ---
 
