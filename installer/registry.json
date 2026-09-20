@@ -407,6 +407,34 @@
       "login": "devin login",
       "docs": "https://docs.devin.ai",
       "prompt_delivery": "first_user"
+    },
+    {
+      "id": "freebuff",
+      "label": "Freebuff",
+      "harness": "acp:freebuff",
+      "binary": "blink",
+      "kind": "acp-user",
+      "acp_command": "blink",
+      "omnigent_mcp": false,
+      "kind_note": "`blink` (github.com/jmvbambico/bufflink) is an ACP bridge that drives the freebuff TUI in a PTY. One blink process = one freebuff launch = 5 of the free tier's 25 daily Freebucks, so a worker session is kept alive across turns. freebuff writes its transcript only at turn end: nothing streams while it thinks, so long turns sit silent against HARNESS_ACP_PROMPT_TIMEOUT_S (300 s default). Omnigent's inject_system_prompt (default on) pastes the whole spec prompt into freebuff's input box on the first turn; set `inject_system_prompt: false` on the acp.agents row if that turns out to misbehave.",
+      "roles": [
+        "coder"
+      ],
+      "vendor": "z-ai",
+      "relay": false,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model",
+        "note": "The model is chosen inside freebuff (default GLM 5.3 Flash on the free tier); blink accepts the model splash's default and does not switch models. A pin is ignored."
+      },
+      "install": {
+        "cargo": "cargo install --git https://github.com/jmvbambico/bufflink"
+      },
+      "login": "freebuff login",
+      "docs": "https://github.com/jmvbambico/bufflink",
+      "unverified": true,
+      "prompt_delivery": "unknown"
     }
   ],
   "$prompt_delivery": {
