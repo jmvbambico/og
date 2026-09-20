@@ -416,7 +416,7 @@
       "kind": "acp-user",
       "acp_command": "blink",
       "omnigent_mcp": false,
-      "kind_note": "`blink` (github.com/jmvbambico/bufflink) is an ACP bridge that drives the freebuff TUI in a PTY. One blink process = one freebuff launch = 5 of the free tier's 25 daily Freebucks, so a worker session is kept alive across turns. freebuff writes its transcript only at turn end: nothing streams while it thinks, so long turns sit silent against HARNESS_ACP_PROMPT_TIMEOUT_S (300 s default). Omnigent's inject_system_prompt (default on) pastes the whole spec prompt into freebuff's input box on the first turn; set `inject_system_prompt: false` on the acp.agents row if that turns out to misbehave.",
+      "kind_note": "`blink` (github.com/jmvbambico/bufflink, >= the paste-chip fix / v0.1.1) is an ACP bridge that drives the freebuff TUI in a PTY. Verified 2026-09-20: one dispatch produced a real commit (og-sandbox T5). Facts that matter: one blink process = one freebuff launch = 5 of the free tier's 25 daily Freebucks, and the process (with its single-instance lock) lives as long as the sub-agent SESSION - close finished sessions (sys_session_close) to release it. freebuff writes its transcript only at turn end, so nothing streams while it thinks; long turns sit silent against HARNESS_ACP_PROMPT_TIMEOUT_S (300 s default) - keep tasks small. omnigent's injected system prompt (~5 kB) arrives as a collapsed 'Pasted text' chip, which blink handles; leave inject_system_prompt on. freebuff resolves RELATIVE paths against the cwd omnigent passed (the workspace, not the worktree): the first run edited the main checkout by mistake and self-corrected - dispatch text should say 'use absolute worktree paths'. freebuff writes a `.freebuff/project-id` file into the cwd; add `.freebuff/` to the project's .gitignore. No approval gate: freebuff runs commands unattended.",
       "roles": [
         "coder"
       ],
@@ -433,7 +433,7 @@
       },
       "login": "freebuff login",
       "docs": "https://github.com/jmvbambico/bufflink",
-      "unverified": true,
+      "unverified": false,
       "prompt_delivery": "unknown"
     }
   ],

@@ -143,6 +143,7 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | Kilo Code | `acp:kilo-code` | coder | **required** | via `kilo acp`; unverified here |
 | Kiro (AWS) | `acp:kiro-aws` | coder / reviewer | optional | via `kiro-cli acp --trust-all-tools` (see below); 50 free credits/mo; unverified here |
 | Cursor | `cursor-native` | coder / reviewer | optional | |
+| Freebuff | `acp:freebuff` | coder | none (chosen inside freebuff) | via [`blink`](https://github.com/jmvbambico/bufflink), an ACP bridge over freebuff's TUI; 5 of 25 daily Freebucks per launch; silent until the turn ends; **verified** (1 dispatch → 1 commit) |
 | Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
 | Goose, Hermes, Gemini, Grok, Devin | various | coder | optional | |
 
