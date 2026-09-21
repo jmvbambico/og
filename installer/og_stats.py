@@ -266,10 +266,9 @@ def build_rows(entries: list[dict], state_path: Path, *, no_probe: bool,
             recs[aid] = q.unknown_record(e["note"] or "no quota probe configured")
     if not no_probe and requests:
         # run_probes applies marks and the 30 min cache fallback per record
+        # for the view, and stashes the UNMARKED probe records in
+        # state["agents"]; save persists those, never a mark overlay.
         recs.update(q.run_probes(requests, _ctx_from(now), state))
-        # persist fresh results; marks stay authoritative via merge_view below
-        state.setdefault("agents", {}).update(
-            {k: v for k, v in recs.items()})
         q.save_state(state, state_path)
     # merged view: re-apply marks over everything shown
     merged = q.merge_view({"agents": recs, "marks": state.get("marks") or {}},

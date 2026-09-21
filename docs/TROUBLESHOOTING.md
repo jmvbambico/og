@@ -566,14 +566,15 @@ their tasks in ~2 minutes each.
 
 If the pin is correct and the worker still returns an empty turn, it is out
 of credits rather than misconfigured — mark it dry and move down the roster
-instead of re-sending it:
+instead of re-sending it (`coder_<id>` is the conversation/sub-agent name;
+`og stats` takes the registry `<id>`):
 
 ```bash
-og stats --mark coder_cline dry --until +1h --reason "end_turn with no content"
+og stats --mark cline dry --until +1h --reason "end_turn with no content"
 ```
 
 Re-dispatch from a CLEAN worktree to the next worker, and re-run
-`og stats --agent coder_cline --json` before using it again — an expired mark or
+`og stats --agent cline --json` before using it again — an expired mark or
 a measured `ok` puts it back. See docs/STATS.md.
 
 ---
@@ -619,11 +620,11 @@ daily cap. Mark the worker dry and move down the roster rather than re-sending
 it:
 
 ```bash
-og stats --mark coder_zen dry --until +1h --reason "Rate limit exceeded"
+og stats --mark opencode dry --until +1h --reason "Rate limit exceeded"
 ```
 
 Then re-dispatch from a CLEAN worktree to the next worker, and re-run
-`og stats --agent coder_zen --json` before using it again — an expired mark or
+`og stats --agent opencode --json` before using it again — an expired mark or
 a measured `ok` puts it back. See docs/STATS.md.
 
 **Cause.** The pinned model (a Zen free id, typically) is over its daily
@@ -671,12 +672,12 @@ runner log carries the message above. It is a quota failure, so mark the
 worker dry and move on rather than re-sending it:
 
 ```bash
-og stats --mark coder_kilo dry --until +1h \
+og stats --mark kilo dry --until +1h \
     --reason "Add credits to continue, or switch to a free model"
 ```
 
 Re-dispatch from a CLEAN worktree to the next worker, and re-run
-`og stats --agent coder_kilo --json` before using it again — an expired mark or
+`og stats --agent kilo --json` before using it again — an expired mark or
 a measured `ok` puts it back. See docs/STATS.md.
 
 ---

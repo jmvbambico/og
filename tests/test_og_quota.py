@@ -392,25 +392,42 @@ def _chatdb(path: Path, rows: list[tuple[str, int]]):
     con.close()
 
 
-def test_launch_budget_counts_today_only(tmp_path, monkeypatch):
+def test_launch_budget_counts_only_this_agent_today(tmp_path, monkeypatch):
     monkeypatch.setattr(q, "OMNI_STATE", tmp_path / "og-quota.json")
     db = tmp_path / "chat.db"
     today = int(NOW.timestamp())
     yesterday = int((NOW - timedelta(days=1)).timestamp())
     _chatdb(db, [
-        ("coder_opencode: implement x", today - 60),
-        ("coder_opencode: implement y", today - 30),
-        ("coder_claude: review", today - 20),
+        ("coder_freebuff: task one", today - 60),
+        ("coder_freebuff: task two", today - 30),
+        ("coder_kilo: other worker", today - 20),
         ("orchestrator run", today - 10),        # not coder_*
-        ("coder_opencode: yesterday", yesterday),  # not today
+        ("coder_freebuff: yesterday", yesterday),  # not today
     ])
-    rec = q._probe_launch_budget({"daily": 10, "per_launch": 0.5},
-                                 ctx(now=lambda: NOW))
+    rec = q._probe_launch_budget(
+        {"daily": 25, "per_launch": 5, "agent_id": "freebuff"},
+        ctx(now=lambda: NOW))
     assert rec["tier"] == "inferred"
-    assert rec["remaining"] == pytest.approx(10 - 3 * 0.5)
-    assert rec["unit"] == "launches"
+    assert rec["remaining"] == pytest.approx(25 - 2 * 5)
+    assert rec["unit"] == "freebucks"
     assert rec["state"] == "ok"
+    assert rec["detail"] == "2 launch(es) today"
     assert rec["reset_at"]  # next local midnight
+
+
+def test_run_probes_injects_agent_id(tmp_path, monkeypatch):
+    seen = {}
+
+    def stub(params, c):
+        seen.update(params)
+        return q.make_record("ok", "measured", 1, 2, "x", [], None,
+                             "stub-id-probe", q._iso(NOW), "fine")
+
+    monkeypatch.setitem(q.PROBES, "stub-id-probe", stub)
+    q.run_probes({"freebuff": {"probe": "stub-id-probe", "daily": 25}},
+                 ctx(now=lambda: NOW),
+                 {"version": 1, "agents": {}, "marks": {}})
+    assert seen["agent_id"] == "freebuff"
 
 
 def test_launch_budget_exhausted_is_dry(tmp_path, monkeypatch):
@@ -418,7 +435,7 @@ def test_launch_budget_exhausted_is_dry(tmp_path, monkeypatch):
     db = tmp_path / "chat.db"
     _chatdb(db, [(f"coder_a: run {i}", int(NOW.timestamp()) - i - 1)
                  for i in range(4)])
-    rec = q._probe_launch_budget({"daily": 2, "per_launch": 1},
+    rec = q._probe_launch_budget({"daily": 2, "per_launch": 1, "agent_id": "a"},
                                  ctx(now=lambda: NOW))
     assert rec["state"] == "dry" and rec["remaining"] == pytest.approx(-2)
 
@@ -480,6 +497,74 @@ def test_expired_mark_ignored_and_pruned(tmp_path):
     state_path = tmp_path / "state.json"
     q.save_state(state, state_path)
     assert "a" not in q.load_state(state_path)["marks"]  # pruned on write
+
+
+def test_probe_run_persists_raw_record_not_mark(tmp_path, monkeypatch):
+    monkeypatch.setitem(q.PROBES, "stub-ok",
+                        lambda params, c: q.make_record(
+                            "ok", "measured", 80, 100, "percent", [], None,
+                            "stub-ok", q._iso(NOW), "fine"))
+    good = q.make_record("ok", "measured", 80, 100, "percent", [], None,
+                         "stub-ok", q._iso(NOW), "fine")
+    state = {"version": 1, "agents": {"a": good},
+             "marks": {"a": {"state": "dry", "until": None,
+                             "reason": "hold", "at": q._iso(NOW)}}}
+    out = q.run_probes({"a": {"probe": "stub-ok"}},
+                       ctx(now=lambda: NOW), state)
+    # the rendered view shows the mark, but the stored record stays raw
+    assert out["a"]["state"] == "dry" and out["a"]["source"] == "mark"
+    raw = state["agents"]["a"]
+    assert raw["state"] == "ok" and raw["source"] == "stub-ok"
+
+
+def test_mark_clear_no_probe_restores_probe_record(tmp_path):
+    state_path = tmp_path / "og-quota.json"
+    good = q.make_record("ok", "measured", 60, 100, "percent", [], None,
+                         "anthropic-oauth", q._iso(NOW), "fine")
+    q.save_state(
+        {"version": 1, "agents": {"claude": good},
+         "marks": {"claude": {"state": "dry", "until": None,
+                              "reason": "hold", "at": q._iso(NOW)}}},
+        state_path)
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    _write_install(inst)
+    _write_registry(reg, {"claude": {"probe": "anthropic-oauth"}})
+    rows = st.build_rows(st.lineup(inst, reg), state_path,
+                         no_probe=True, only=None)
+    marked = [r for r in rows if r["agent"] == "claude"][0]["rec"]
+    assert marked["state"] == "dry" and marked["source"] == "mark"
+    state = q.load_state(state_path)
+    state.get("marks", {}).pop("claude", None)
+    q.save_state(state, state_path)
+    rows = st.build_rows(st.lineup(inst, reg), state_path,
+                         no_probe=True, only=None)
+    rec = [r for r in rows if r["agent"] == "claude"][0]["rec"]
+    assert rec["state"] == "ok" and rec["source"] == "anthropic-oauth"
+
+
+def test_cached_fallback_survives_mark(tmp_path, monkeypatch):
+    good = q.make_record("ok", "measured", 80, 100, "percent", [], None,
+                         "anthropic-oauth", q._iso(NOW), "fine")
+    state = {"version": 1, "agents": {"a": good},
+             "marks": {"a": {"state": "dry", "until": None,
+                             "reason": "hold", "at": q._iso(NOW)}}}
+
+    def boom(*a, **k):
+        raise RuntimeError("down")
+
+    monkeypatch.setitem(q.PROBES, "anthropic-oauth", boom)
+    out = q.run_probes({"a": {"probe": "anthropic-oauth"}},
+                       ctx(now=lambda: NOW), state)
+    # view still shows the mark, but the stored record is the cached probe
+    # result, never a mark overlay
+    assert out["a"]["state"] == "dry" and out["a"]["source"] == "mark"
+    assert state["agents"]["a"]["source"] == "anthropic-oauth (cached)"
+    # once the mark is cleared the cached record is reachable again
+    state["marks"].pop("a")
+    out = q.run_probes({"a": {"probe": "anthropic-oauth"}},
+                       ctx(now=lambda: NOW), state)
+    assert out["a"]["source"] == "anthropic-oauth (cached)"
 
 
 def test_state_atomic_and_versioned(tmp_path):
