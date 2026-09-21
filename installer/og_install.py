@@ -431,7 +431,11 @@ def pick_model(agent: dict, current: str | None) -> str | None:
     """Resolve the model pin for one agent."""
     spec = agent.get("model") or {}
     required = spec.get("required", False)
-    if not required and not spec.get("list_cmd"):
+    # Required=false rows with no live model listing AND no static `choices`
+    # are not pinnable: offer nothing and keep whatever is already set. A row
+    # with `choices` (e.g. freebuff/blink's splash models) IS pinnable, so fall
+    # through to the menu below -- for required=false and required=true alike.
+    if not required and not spec.get("list_cmd") and not spec.get("choices"):
         note = spec.get("note")
         if note:
             say(f"  {C['dim']}{agent['label']}: {note}{C['x']}")
@@ -443,6 +447,10 @@ def pick_model(agent: dict, current: str | None) -> str | None:
         say(f"  {C['dim']}{spec['note']}{C['x']}")
 
     options = list_models(agent)
+    # No live listing? Use the registry's static `choices` so the same picker
+    # menu serves both live (`list_cmd`) and fixed lineups.
+    if not options and spec.get("choices"):
+        options = spec["choices"]
     for pid, kind, why in unlisted_logins(agent, options):
         warn(f"{pid}: logged in ({kind}) but not listed. {why}")
     if options:
@@ -1001,9 +1009,13 @@ def acp_command(agent: dict, model: str | None) -> str:
     `env` is a real binary, so `env CLINE_MODEL=<pin> cline --acp ...` sets it
     for exactly that process. Agents without such a variable (Kilo) take their
     default from their own config file instead -- see the registry note.
+
+    Newer rows name the variable inline as `model.env_var` (e.g. a freebuff/blink
+    pin must reach `BLINK_MODEL`). Read it from there first, then the legacy
+    top-level `model_env` -- never hardcode an agent name.
     """
     cmd = agent["acp_command"]
-    var = agent.get("model_env")
+    var = (agent.get("model") or {}).get("env_var") or agent.get("model_env")
     if var and model:
         return f"env {var}={shlex.quote(model)} {cmd}"
     return cmd
@@ -1494,7 +1506,10 @@ def emit_questions() -> None:
                          if a["id"] in found and "coder" in a["roles"]],
              "ask": "Which agents implement code, in preference order (first is tried first)?",
              "per_item": {"model": "Model id to pin. REQUIRED for agents where "
-                                   "registry.model.required is true."}},
+                                  "registry.model.required is true.",
+                          "choices": {a["id"]: a.get("model", {}).get("choices")
+                                      for a in REGISTRY["agents"]
+                                      if (a.get("model") or {}).get("choices")}}},
             {"key": "reviewer", "type": "choice",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "reviewer" in a["roles"]],
