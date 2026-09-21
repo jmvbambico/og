@@ -407,6 +407,34 @@
       "login": "devin login",
       "docs": "https://docs.devin.ai",
       "prompt_delivery": "first_user"
+    },
+    {
+      "id": "freebuff",
+      "label": "Freebuff",
+      "harness": "acp:freebuff",
+      "binary": "blink",
+      "kind": "acp-user",
+      "acp_command": "blink",
+      "omnigent_mcp": false,
+      "kind_note": "`blink` (github.com/jmvbambico/bufflink, >= v0.1.2) is an ACP bridge that drives the freebuff TUI in a PTY. Verified 2026-09-20/21 in og-sandbox: five backlog tasks (small to larger, incl. new modules and e2e tests), 3 of 3 first-try since v0.1.2; every commit in scope, gates green. Facts that matter: one blink process = one freebuff launch = 5 of the free tier's 25 daily Freebucks, and the process lives as long as the sub-agent SESSION. Omnigent's sys_session_close does NOT end it (observed 2026-09-21): after closing a finished session, `pgrep -x blink` and SIGTERM it - blink exits cleanly within ~5 s and releases freebuff's single-instance lock; verify with `pgrep -fl manicode/freebuff` before the next launch. freebuff writes its transcript only at turn end, so nothing streams while it thinks; all trial turns finished well inside HARNESS_ACP_PROMPT_TIMEOUT_S (300 s), but keep tasks single-purpose. Omnigent's injected system prompt (~5 kB) arrives as a collapsed 'Pasted text' chip, which blink handles; leave inject_system_prompt on. freebuff resolves RELATIVE paths against the cwd omnigent passed (the workspace, not the worktree): dispatch text must use absolute worktree paths and name the gate commands with `cd`. freebuff writes `.freebuff/project-id` into its cwd; gitignore `.freebuff/`. No approval gate: freebuff runs commands unattended - the worktree is the blast radius.",
+      "roles": [
+        "coder"
+      ],
+      "vendor": "z-ai",
+      "relay": false,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model",
+        "note": "The model is chosen inside freebuff (default GLM 5.3 Flash on the free tier); blink accepts the model splash's default and does not switch models. A pin is ignored."
+      },
+      "install": {
+        "cargo": "cargo install --git https://github.com/jmvbambico/bufflink --tag v0.1.2"
+      },
+      "login": "freebuff login",
+      "docs": "https://github.com/jmvbambico/bufflink",
+      "unverified": false,
+      "prompt_delivery": "unknown"
     }
   ],
   "$prompt_delivery": {
