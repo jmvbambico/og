@@ -515,11 +515,16 @@ def _probe_deepseek_balance(params: dict, ctx: Ctx) -> dict:
 def _probe_launch_budget(params: dict, ctx: Ctx) -> dict:
     daily = float(params.get("daily") or 0)
     per_launch = float(params.get("per_launch") or 0)
+    # identity scope, injected by _one_agent for every probe: charge this
+    # agent only for its own launches (title "coder_<id>: ..."), never for
+    # every coder's. Absent only in direct unit calls, which keep the legacy
+    # all-coder count.
+    who = params.get("agent_id")
+    prefix = f"coder_{who}:" if who else "coder_"
     if daily <= 0:
         return unknown_record("no daily budget configured in registry quota block")
     db = OMNI_STATE.parent / "chat.db"
     launches = 0
-    per_agent: dict[str, int] = {}
     try:
         # read-only, same precedent as og_audit.py
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -527,14 +532,12 @@ def _probe_launch_budget(params: dict, ctx: Ctx) -> dict:
             today = ctx.now().date()
             for title, created in con.execute(
                     "select title, created_at from conversations"):
-                if not title or not title.startswith("coder_"):
+                if not title or not title.startswith(prefix):
                     continue
-                agent_id = title[6:].split(":", 1)[0]
                 # created_at is epoch seconds (chat.db convention, og_audit.py)
                 when = datetime.fromtimestamp(created).astimezone()
                 if when.date() == today:
                     launches += 1
-                    per_agent[agent_id] = per_agent.get(agent_id, 0) + 1
         finally:
             con.close()
     except FileNotFoundError:
@@ -547,8 +550,8 @@ def _probe_launch_budget(params: dict, ctx: Ctx) -> dict:
     midnight = ctx.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     return make_record(
         "ok" if remaining > 0 else "dry", "inferred", remaining, daily,
-        "launches", [], midnight.isoformat(), "launch-budget", _iso(ctx.now()),
-        f"{launches} launch(es) today" + (f"; {per_agent}" if per_agent else ""))
+        "freebucks", [], midnight.isoformat(), "launch-budget", _iso(ctx.now()),
+        f"{launches} launch(es) today")
 
 
 class _RateLimited(Exception):
@@ -623,37 +626,49 @@ def _mark_active(mark: dict, now: datetime) -> bool:
 def run_probes(requests: dict[str, dict], ctx: Ctx,
                state: dict | None = None) -> dict[str, dict]:
     """requests: agent_id -> {"probe": name, **params}. Returns agent_id ->
-    merged record (marks applied, cache fallback on failure/429)."""
+    merged record (marks applied, cache fallback on failure/429).
+
+    Side effect: the UNMARKED probe records are written back into
+    state["agents"], so the state file keeps the last-good measurement for
+    --no-probe and the cached fallback; marks render on top and are never
+    persisted as records."""
     state = state or {"version": STATE_VERSION, "agents": {}, "marks": {}}
     prev = state.get("agents") or {}
     marks = state.get("marks") or {}
 
-    def one(agent_id: str, req: dict) -> tuple[str, dict]:
-        return agent_id, _one_agent(agent_id, req, ctx, prev, marks)
+    def one(agent_id: str, req: dict) -> tuple[str, dict, dict]:
+        return agent_id, *_one_agent(agent_id, req, ctx, prev, marks)
 
     # Probes are independent (network + keystore); run them concurrently so a
     # slow endpoint cannot stretch the whole table past its 8 s-per-probe
     # budget. ThreadPoolExecutor over urllib is the stdlib-only way to get it.
     out: dict[str, dict] = {}
+    raws: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(requests)))) as ex:
-        for agent_id, rec in ex.map(lambda kv: one(*kv), requests.items()):
-            out[agent_id] = rec
+        for agent_id, view, raw in ex.map(lambda kv: one(*kv), requests.items()):
+            out[agent_id] = view
+            raws[agent_id] = raw
+    state.setdefault("agents", {}).update(raws)
     return out
 
 
 def _one_agent(agent_id: str, req: dict, ctx: Ctx, prev: dict,
-               marks: dict) -> dict:
+               marks: dict) -> tuple[dict, dict]:
+    """(view record, raw record). The view has the active mark applied for
+    rendering; the raw is the unmarked probe result for persistence."""
     probe_name = req.get("probe")
     params = {k: v for k, v in req.items() if k != "probe"}
-    rec = _run_one_probe(probe_name, params, ctx, prev)
-    if rec is not None:
-        return _apply_mark(agent_id, rec, marks, ctx)
-    # probe absent: keep showing the last stored record (marks still apply);
-    # tier unknown with the registry's quota.note only when never probed.
-    base = (prev or {}).get(agent_id)
-    rec = dict(base) if base is not None else \
-        unknown_record(str(req.get("note") or "no quota probe configured"))
-    return _apply_mark(agent_id, rec, marks, ctx)
+    # identity scope for every probe: a probe that reads shared state
+    # (chat.db today, a shared dashboard tomorrow) filters to this agent.
+    params["agent_id"] = agent_id
+    raw = _run_one_probe(probe_name, params, ctx, prev)
+    if raw is None:
+        # probe absent: keep showing the last stored record (marks still apply);
+        # tier unknown with the registry's quota.note only when never probed.
+        base = (prev or {}).get(agent_id)
+        raw = dict(base) if base is not None else \
+            unknown_record(str(req.get("note") or "no quota probe configured"))
+    return _apply_mark(agent_id, raw, marks, ctx), raw
 
 
 def _run_one_probe(probe_name: str | None, params: dict, ctx: Ctx,
