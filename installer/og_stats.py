@@ -96,7 +96,9 @@ def _parse_until(s: str | None, now: datetime) -> str | None:
         return (now + delta).isoformat()
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt.astimezone().isoformat() if dt.tzinfo else dt.isoformat()
+        # astimezone() on a naive dt assumes local time, so this also fixes
+        # the zone for naive input (do_mark compares against an aware now).
+        return dt.astimezone().isoformat()
     except ValueError:
         raise SystemExit(f"--until: not ISO8601 or +Nh/+Nm/+Nd/+Ns: {s!r}")
 
@@ -160,8 +162,8 @@ def _fmt_reset(rec: dict, now: datetime) -> str:
     dt = q._parse_iso(s)
     if not dt:
         return s
-    if dt.tzinfo is None:
-        dt = dt.astimezone()
+    # normalize both clocks: tests pass naive datetimes, production aware.
+    dt, now = q._aware(dt), q._aware(now)
     local = dt.astimezone()
     delta = dt - now
     secs = delta.total_seconds()
@@ -177,6 +179,8 @@ def _fmt_reset(rec: dict, now: datetime) -> str:
 
 
 def _fmt_age(rec: dict, now: datetime) -> str:
+    now = q._aware(now)
+
     class _C:  # minimal shim: _age_s only calls ctx.now, and the render clock
         now = staticmethod(lambda: now)  # must be the same one used for reset
     age = q._age_s(rec.get("checked_at"), _C())

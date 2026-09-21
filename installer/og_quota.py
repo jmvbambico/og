@@ -101,6 +101,15 @@ def _parse_iso(s: str) -> datetime | None:
         return None
 
 
+def _aware(dt: datetime) -> datetime:
+    """Attach the local zone to a naive clock so aware/naive mixes compare.
+
+    Tests pass naive datetimes, production passes aware ones; assume local
+    time either way (every timestamp here is produced by .astimezone()).
+    """
+    return dt if dt.tzinfo else dt.astimezone()
+
+
 def _pct(x: Any) -> float | None:
     """Normalize a utilization to 0-100.
 
@@ -180,8 +189,10 @@ def _probe_anthropic_oauth(params: dict, ctx: Ctx) -> dict:
                         "reset_at": w.get("resets_at")})
     if not windows:
         return unknown_record(f"unrecognized response shape: {list(d)}")
-    # five_hour governs dispatch capacity; surface the tighter of the two.
-    binding = min(windows, key=lambda w: 100 - w["used_percent"])
+    # five_hour governs dispatch capacity: it is listed first and binds even
+    # when seven_day shows less remaining (a far-off weekly reset must not
+    # mask an imminent five-hour block).
+    binding = windows[0]
     remaining = 100 - binding["used_percent"]
     return make_record(
         _state_from_windows("ok", windows, remaining), "measured",
@@ -205,7 +216,11 @@ def _anthropic_token(ctx: Ctx) -> tuple[str | None, str]:
             tok = (d.get("claudeAiOauth") or {}).get("accessToken")
             exp = (d.get("claudeAiOauth") or {}).get("expiresAt")
             if tok and (exp is None or exp > ctx.now().timestamp() * 1000):
-                if tok.startswith("sk-ant-"):
+                # Only sk-ant-api* is a long-lived API key. Genuine Claude
+                # Code OAuth access tokens are sk-ant-oat01-* (with an
+                # sk-ant-ort01-* refresh token beside them), so rejecting the
+                # whole sk-ant- prefix would lock out real OAuth logins.
+                if str(tok).startswith("sk-ant-api"):
                     return None, "sk-ant- API key in Keychain is not an OAuth token"
                 return tok, "keychain"
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError,
@@ -216,7 +231,7 @@ def _anthropic_token(ctx: Ctx) -> tuple[str | None, str]:
         d = ctx.read_json(cred)
         oauth = d.get("claudeAiOauth") or {}
         tok, exp = oauth.get("accessToken"), oauth.get("expiresAt")
-        if tok and not str(tok).startswith("sk-ant-") and \
+        if tok and not str(tok).startswith("sk-ant-api") and \
                 (exp is None or exp > ctx.now().timestamp() * 1000):
             return tok, "file"
         return None, "no OAuth token"
@@ -226,7 +241,9 @@ def _anthropic_token(ctx: Ctx) -> tuple[str | None, str]:
 
 def _probe_codex_wham(params: dict, ctx: Ctx) -> dict:
     auth = _codex_token(ctx)
-    if not auth:
+    # _codex_token returns a (token, account_id) pair; a missing token is
+    # (None, None), which is truthy as a tuple, so check the token itself.
+    if not auth or not auth[0]:
         return unknown_record("no codex/openai OAuth token")
     token, account_id = auth
     headers = {"Authorization": f"Bearer {token}"}
@@ -256,7 +273,9 @@ def _probe_codex_wham(params: dict, ctx: Ctx) -> dict:
                         "reset_at": ra})
     if not windows:
         return unknown_record(f"unrecognized response shape: {list(d)}")
-    binding = min(windows, key=lambda w: 100 - w["used_percent"])
+    # primary governs dispatch capacity: it binds even when the secondary
+    # window shows less remaining (same first-window rule as anthropic-oauth).
+    binding = windows[0]
     remaining = 100 - binding["used_percent"]
     credits = d.get("credits") or {}
     detail = f"{len(windows)} window(s); {binding['name']} binding"
@@ -351,6 +370,8 @@ def _probe_antigravity(params: dict, ctx: Ctx) -> dict:
         return unknown_record("no cachedQuota data in accounts")
     fam = min(families, key=families.get)
     remaining = families[fam]
+    # worst first: the binding family heads the table row's window list.
+    windows.sort(key=lambda w: w.get("used_percent", 0), reverse=True)
     return make_record(
         _state_from_windows("ok", windows, remaining), "measured",
         remaining, 100, "percent", windows, _reset_of(windows, fam),
@@ -566,7 +587,7 @@ def save_state(state: dict, path: Path | None = None) -> None:
     p = path or OMNI_STATE
     p.parent.mkdir(parents=True, exist_ok=True)
     # prune expired marks on write (schema pin) and dead agent entries
-    now = datetime.now()
+    now = datetime.now().astimezone()
     marks = {k: v for k, v in (state.get("marks") or {}).items() if _mark_active(v, now)}
     state = {"version": STATE_VERSION, "agents": state.get("agents") or {},
              "marks": marks}
@@ -586,7 +607,10 @@ def save_state(state: dict, path: Path | None = None) -> None:
 
 def _mark_active(mark: dict, now: datetime) -> bool:
     until = mark.get("until")
-    return until is None or _parse_iso(until) is None or _parse_iso(until) > now
+    parsed = _parse_iso(until) if until else None
+    # None until (or an unparseable one) means no expiry; normalize zones so
+    # naive test clocks and aware production clocks compare.
+    return parsed is None or _aware(parsed) > _aware(now)
 
 
 # ---------------------------------------------------------------------------
@@ -621,8 +645,11 @@ def _one_agent(agent_id: str, req: dict, ctx: Ctx, prev: dict,
     rec = _run_one_probe(probe_name, params, ctx, prev)
     if rec is not None:
         return _apply_mark(agent_id, rec, marks, ctx)
-    # probe absent: tier unknown; detail is the registry's quota.note if any
-    rec = unknown_record(str(req.get("note") or "no quota probe configured"))
+    # probe absent: keep showing the last stored record (marks still apply);
+    # tier unknown with the registry's quota.note only when never probed.
+    base = (prev or {}).get(agent_id)
+    rec = dict(base) if base is not None else \
+        unknown_record(str(req.get("note") or "no quota probe configured"))
     return _apply_mark(agent_id, rec, marks, ctx)
 
 
@@ -667,10 +694,7 @@ def _age_s(iso: str | None, ctx: Ctx) -> float | None:
     dt = _parse_iso(iso) if iso else None
     if dt is None:
         return None
-    now = ctx.now()
-    if dt.tzinfo is None:
-        dt = dt.astimezone()
-    return (now - dt).total_seconds()
+    return (_aware(ctx.now()) - _aware(dt)).total_seconds()
 
 
 def _apply_mark(agent_id: str, rec: dict, marks: dict, ctx: Ctx) -> dict:
@@ -690,9 +714,8 @@ def _apply_mark(agent_id: str, rec: dict, marks: dict, ctx: Ctx) -> dict:
 def merge_view(state: dict, ctx: Ctx) -> dict:
     """agents dict as stored: active marks re-applied over stored probe
     records, so readers of the state file see the same thing `og stats` does."""
-    now = ctx.now()
     marks = state.get("marks") or {}
     out = {}
     for aid, rec in (state.get("agents") or {}).items():
-        out[aid] = _apply_mark(aid, rec, marks, now)
+        out[aid] = _apply_mark(aid, rec, marks, ctx)
     return out

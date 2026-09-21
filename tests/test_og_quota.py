@@ -129,10 +129,20 @@ def test_anthropic_uses_cache_on_429(tmp_path, monkeypatch):
     q.save_state({"version": 1, "agents": {"a": good}, "marks": {}}, state_path)
     prev = q.load_state(state_path)
 
+    # hermetic keychain: the probe must reach HTTP for the 429 path to run,
+    # independent of whatever credential this machine happens to hold.
+    def run(cmd, **kw):
+        r = type("R", (), {})()
+        r.returncode, r.stdout = 0, json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok",
+                               "expiresAt": 9999999999999}})
+        return r
+
     def http(method, url, headers, body, timeout):
         return 429, "{}"
 
-    rec = q._run_one_probe("anthropic-oauth", {}, ctx(http=http, now=lambda: NOW),
+    rec = q._run_one_probe("anthropic-oauth", {},
+                           ctx(http=http, now=lambda: NOW, run=run),
                            prev.get("agents") or {})
     assert rec["source"] == "anthropic-oauth (cached)"
     assert rec["remaining"] == 60
@@ -142,10 +152,18 @@ def test_anthropic_uses_cache_on_429(tmp_path, monkeypatch):
 def test_anthropic_429_without_cache_is_unknown(tmp_path, monkeypatch):
     fake_home(tmp_path, monkeypatch)
 
+    def run(cmd, **kw):
+        r = type("R", (), {})()
+        r.returncode, r.stdout = 0, json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok",
+                               "expiresAt": 9999999999999}})
+        return r
+
     def http(method, url, headers, body, timeout):
         return 429, "{}"
 
-    rec = q._run_one_probe("anthropic-oauth", {}, ctx(http=http, now=lambda: NOW), {})
+    rec = q._run_one_probe("anthropic-oauth", {},
+                           ctx(http=http, now=lambda: NOW, run=run), {})
     assert rec["state"] == "unknown" and "429" in rec["detail"]
 
 
@@ -535,7 +553,10 @@ def test_cli_mark_and_clear(tmp_path, monkeypatch, capsys):
     assert "mark opencode" in capsys.readouterr().out
     state = q.load_state(state_path)
     until = q._parse_iso(state["marks"]["opencode"]["until"])
-    assert timedelta(0) < until - NOW.replace(tzinfo=until.tzinfo) <= \
+    # +2h is relative to the wall clock at mark time, not the fixed NOW the
+    # probe tests use (do_mark reads the real clock via st._now()).
+    live_now = datetime.now().astimezone()
+    assert timedelta(0) < until - live_now <= \
         timedelta(hours=2, minutes=1)
     st.main(["--clear", "opencode"])
     assert "opencode" not in q.load_state(state_path)["marks"]
