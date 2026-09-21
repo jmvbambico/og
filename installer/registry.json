@@ -64,7 +64,10 @@
       },
       "login": "claude",
       "docs": "https://docs.claude.com/en/docs/claude-code",
-      "prompt_delivery": "argv"
+      "prompt_delivery": "argv",
+      "quota": {
+        "probe": "anthropic-oauth"
+      }
     },
     {
       "id": "opencode",
@@ -106,7 +109,11 @@
       "docs": "https://opencode.ai/docs",
       "reviewer_warning": "Zen's free lineup rotates, so review quality drifts run to run. Not recommended as a reviewer.",
       "prompt_delivery": "per_turn",
-      "worker": "coder_zen"
+      "worker": "coder_zen",
+      "quota": {
+        "probe": null,
+        "note": "Zen free tier is enforced server-side with no queryable balance; failures show as 'Rate limit exceeded' in the opencode log (see og audit)."
+      }
     },
     {
       "id": "agy",
@@ -132,7 +139,10 @@
       "login": "agy",
       "docs": "https://antigravity.google/docs",
       "prompt_delivery": "none",
-      "worker": "coder_agy"
+      "worker": "coder_agy",
+      "quota": {
+        "probe": "antigravity"
+      }
     },
     {
       "id": "codex",
@@ -158,7 +168,10 @@
       },
       "login": "codex login",
       "docs": "https://developers.openai.com/codex/cli",
-      "prompt_delivery": "argv"
+      "prompt_delivery": "argv",
+      "quota": {
+        "probe": "codex-wham"
+      }
     },
     {
       "id": "cline",
@@ -188,7 +201,11 @@
       },
       "login": "cline auth",
       "docs": "https://docs.cline.bot",
-      "prompt_delivery": "unknown"
+      "prompt_delivery": "unknown",
+      "quota": {
+        "probe": "deepseek-balance",
+        "note": "Only meaningful with a DeepSeek API key in $DEEPSEEK_API_KEY; a Cline-account login has no public balance endpoint yet, so og stats reports unknown."
+      }
     },
     {
       "id": "kilo",
@@ -222,7 +239,10 @@
       "login": "kilo auth login",
       "docs": "https://kilo.ai/docs/code-with-ai/platforms/cli-reference",
       "unverified": true,
-      "prompt_delivery": "unknown"
+      "prompt_delivery": "unknown",
+      "quota": {
+        "probe": "kilo-profile"
+      }
     },
     {
       "id": "kiro",
@@ -258,7 +278,11 @@
       "login": "kiro-cli",
       "docs": "https://kiro.dev/docs/cli/",
       "unverified": true,
-      "prompt_delivery": "unknown"
+      "prompt_delivery": "unknown",
+      "quota": {
+        "probe": null,
+        "note": "50 credits/month on the free plan; no public remaining-credit endpoint found."
+      }
     },
     {
       "id": "cursor",
@@ -288,7 +312,10 @@
       },
       "login": "cursor-agent login",
       "docs": "https://cursor.com/docs/cli",
-      "prompt_delivery": "none"
+      "prompt_delivery": "none",
+      "quota": {
+        "probe": "cursor-dashboard"
+      }
     },
     {
       "id": "gemini",
@@ -426,7 +453,14 @@
       "model": {
         "required": false,
         "pin_path": "executor.model",
-        "note": "The model is chosen inside freebuff (default GLM 5.3 Flash on the free tier); blink accepts the model splash's default and does not switch models. A pin is ignored."
+        "note": "The model is chosen inside freebuff (default GLM 5.3 Flash on the free tier); blink accepts the model splash's default and does not switch models. A pin is ignored. These are the models freebuff's own splash offers (from its binary). Pinning one records the choice and exports BLINK_MODEL=<id> into the worker env; a blink that honours BLINK_MODEL selects it on the splash, older blink accepts the default (GLM 5.3 Flash). Vendor follows the model: a deepseek/* pick makes Freebuff same-vendor with Cline for review purposes.",
+        "choices": [
+          "z-ai/glm-5.3-flash",
+          "deepseek/deepseek-v4-flash",
+          "deepseek/deepseek-v4-pro"
+        ],
+        "prefer": "z-ai/glm-5.3-flash",
+        "env_var": "BLINK_MODEL"
       },
       "install": {
         "cargo": "cargo install --git https://github.com/jmvbambico/bufflink --tag v0.1.2"
@@ -434,7 +468,13 @@
       "login": "freebuff login",
       "docs": "https://github.com/jmvbambico/bufflink",
       "unverified": false,
-      "prompt_delivery": "unknown"
+      "prompt_delivery": "unknown",
+      "quota": {
+        "probe": "launch-budget",
+        "daily": 25,
+        "per_launch": 5,
+        "note": "freebuff.com exposes no usable quota API (the subscription endpoint returns the SPA); og infers from launches counted in chat.db. blink fails fast with 'not enough Freebucks' when the pool is empty."
+      }
     }
   ],
   "$prompt_delivery": {
@@ -443,5 +483,22 @@
     "first_user": "Prompt is prepended to the first user message.",
     "none": "The harness NEVER receives the spec prompt. A worker on this harness only ever sees the dispatch text, so operating rules must be inlined into args.input by the orchestrator. Cannot be an orchestrator.",
     "unknown": "Not declared by Omnigent (user-configured ACP). Assume the prompt may not arrive; inline critical rules in the dispatch."
+  },
+  "$quota": {
+    "description": "Optional per-agent `quota` blocks drive `og stats` (see docs/STATS.md). `probe` is the stats-layer probe name; it is null when the limit is known but exposes no queryable API, so `og stats` reports it as unknown rather than guessing. `daily`/`per_launch` are params consumed by the launch-budget probe (freebuff).",
+    "probes": {
+      "anthropic-oauth": "claude",
+      "codex-wham": "codex",
+      "antigravity": "agy",
+      "kilo-profile": "kilo",
+      "cursor-dashboard": "cursor",
+      "deepseek-balance": "cline",
+      "launch-budget": "freebuff"
+    },
+    "params": {
+      "daily": 25,
+      "per_launch": 5
+    },
+    "null_probe": "known limit, not measurable"
   }
 }
