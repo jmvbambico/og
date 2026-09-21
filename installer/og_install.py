@@ -781,6 +781,20 @@ def render_vendor_map(plan: dict) -> str:
     return "\n".join(lines)
 
 
+def quota_line(a: dict) -> str:
+    """One line naming the worker's capacity probe, or `not measurable`.
+
+    The registry's `quota` block is optional and its `probe` may be null when
+    the limit is known but exposes no queryable API — `og stats` reports that
+    as `unknown` rather than guessing, so the line says so instead of naming a
+    probe that does not exist.
+    """
+    q = a.get("quota") or {}
+    probe = q.get("probe")
+    return (f"- quota: `{probe}`" if probe else
+            f"- quota: not measurable{'' if q else ' (no quota block in the registry)'}")
+
+
 def render_roster_skill(plan: dict) -> str:
     """The long-form roster notes, as a skill file rather than prompt bytes."""
     reg = agents_by_id()
@@ -796,12 +810,43 @@ def render_roster_skill(plan: dict) -> str:
         "go down only when the one above is unavailable, out of quota, or has already",
         "failed this run. Every worker pins its own model in its spec — never pass",
         "`args.model`.", "",
+        "## Capacity", "",
+        "Run `og stats --json` (og is on PATH) before the FIRST dispatch of this run,",
+        "and `og stats --agent <id> --json` before every later one. If `og` is missing",
+        "or errors, proceed as today and say so once — do not stall the run on it.",
+        "Map the stats output's agent ids back to workers by id: `coder_<id>` maps",
+        "to `<id>`, and `reviewer` maps to the reviewer's id. A worker whose state",
+        "is `dry` while `reset_at` is in the future is out of capacity — skip it and",
+        "take the next worker. Preference order still wins: only when two candidates",
+        "are otherwise equal does `ok` outrank `unknown`. `og stats` reports a",
+        "measured `ok` only when the probe actually answered; an inferred or unknown",
+        "state is not a clean bill of health.",
+        "",
+        "On a QUOTA failure — rate limit, usage cap, out of credits, Kilo's",
+        "`Add credits to continue, or switch to a free model`, freebuff's",
+        "`not enough Freebucks`, an OpenCode worker gone silent with `Rate limit",
+        "exceeded` in its log, or a Cline worker returning an empty turn — mark the",
+        "worker dry and move on, do not re-send it:",
+        "",
+        "    og stats --mark <id> dry --until <reset_at from stats if known, else +1h>",
+        "        --reason \"<the error line>\"",
+        "",
+        "Then re-dispatch from a CLEAN worktree to the next worker in preference",
+        "order — the replacement must not inherit half-finished state. `dry` is not",
+        "`dropped for the run`: before dispatching to that worker again, re-run",
+        "`og stats --agent <id> --json`. An expired mark or a measured `ok` puts it",
+        "back in the roster. Never paste the JSON into chat — one line per worker:",
+        "",
+        "    coder_cline     deepseek-balance  ok       23:41 reset",
+        "    coder_kilo      kilo-profile     dry      reset 20:00 tomorrow",
+        "",
     ]
     for i, c in enumerate(plan["coders"], 1):
         a = reg[c["id"]]
         out += [f"## {i}. `{worker_name(c['id'])}` — {a['label']}", "",
                 f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
-                f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}"]
+                f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}",
+                quota_line(a)]
         if a.get("relay") is False:
             out.append("- **Leaf worker.** Runs without Omnigent's `sys_*` tool relay, so it "
                        "cannot orchestrate or dispatch. Implementation and exploration only.")
@@ -811,6 +856,12 @@ def render_roster_skill(plan: dict) -> str:
                        "transcript containing only your prompt and an untouched worktree. That is "
                        "a misconfiguration, not a refusal — report it and move down the roster "
                        "rather than re-sending the same task.")
+        if a["id"] == "cline":
+            note = (a.get("model") or {}).get("note")
+            if not note or "one session at a time" not in note.lower():
+                out.append("- **One session at a time.** Concurrent Cline sessions on one login "
+                           "get cut mid-turn — never dispatch two tasks to `coder_cline` in the "
+                           "same turn.")
         note = (a.get("model") or {}).get("note")
         if note:
             out.append(f"- {note}")
@@ -827,6 +878,7 @@ def render_roster_skill(plan: dict) -> str:
     rv = reg[plan["reviewer"]["id"]]
     out += [f"## `reviewer` — {rv['label']}", "",
             f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, plan['reviewer'])}`",
+            quota_line(rv),
             "- Reviews only; never edits, never gets a worktree.",
             "- Cross-vendor review is the point: never route a diff to a reviewer whose",
             "  vendor matches the implementer's. If that is unavoidable, say so and label",
