@@ -758,6 +758,100 @@ def test_zen_preflight_only_for_a_free_zen_pin():
     assert "day-capped" in m.render_roster(free) and "day-capped" not in m.render_roster(paid)
 
 
+def test_render_roster_skill_names_quota_and_marks_dry_workers(monkeypatch):
+    """The roster skill's Capacity section says how to read `og stats`, how to
+    map `coder_<id>` -> `<id>`, how to skip a dry worker, and how to re-admit
+    one after reset_at. Each worker line names its quota probe, or says the
+    limit is not measurable when the registry row has no quota block or a null
+    probe."""
+    fake = {
+        "agents": [
+            {"id": "codex", "label": "Codex (OpenAI)", "harness": "codex-native",
+             "vendor": "openai", "roles": ["reviewer"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "argv",
+             "model": {"required": False}},
+            {"id": "kilo", "label": "Kilo Code", "harness": "acp:kilo-code",
+             "vendor": "kilo", "roles": ["coder"], "relay": False,
+             "silent_model_failure": True, "prompt_delivery": "unknown",
+             "model": {"required": True, "note": "kilo note"},
+             "quota": {"probe": "kilo-profile"}},
+            {"id": "opencode", "label": "OpenCode (Zen)", "harness": "opencode-native",
+             "vendor": "opencode-zen", "roles": ["coder"], "relay": True,
+             "silent_model_failure": False, "prompt_delivery": "per_turn",
+             "model": {"required": True},
+             "quota": {"probe": None, "note": "server-side, not queryable"}},
+            {"id": "gemini", "label": "Gemini CLI", "harness": "qwen-native",
+             "vendor": "google", "roles": ["coder"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "none",
+             "model": {"required": False}},
+        ]
+    }
+    monkeypatch.setattr(m, "REGISTRY", fake)
+    plan = _base_plan(coders=[
+        {"id": "kilo", "priority": 1, "model": "kilo/kilo-auto/free"},
+        {"id": "opencode", "priority": 2, "model": "opencode/mimo-v2.5-free"},
+        {"id": "gemini", "priority": 3, "model": None},
+    ])
+    skill = m.render_roster_skill(plan)
+
+    for needle in ("## Capacity", "og stats --json", "coder_<id>", "reset_at",
+                   "og stats --mark", "CLEAN worktree", "og stats --agent"):
+        assert needle in skill, needle
+    assert "quota: `kilo-profile`" in skill
+    assert "quota: not measurable" in skill
+    assert "quota: not measurable (no quota block in the registry)" in skill
+    # The cline concurrency note is rendered only when the row lacks it.
+    assert "One session at a time" not in skill
+    # A reviewer line too, with its own quota shape.
+    assert "## `reviewer`" in skill
+
+
+def test_render_roster_skill_renders_cline_concurrency_note(monkeypatch):
+    """The 'one session at a time' caveat is rendered for Cline unless the
+    registry row already carries it in its model note."""
+    with_note = {
+        "agents": [
+            {"id": "codex", "label": "Codex (OpenAI)", "harness": "codex-native",
+             "vendor": "openai", "roles": ["reviewer"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "argv",
+             "model": {"required": False}},
+            {"id": "cline", "label": "Cline", "harness": "acp:cline", "vendor": "deepseek",
+             "roles": ["coder"], "relay": False, "silent_model_failure": True,
+             "prompt_delivery": "unknown",
+             "model": {"required": True,
+                       "note": "one session at a time — concurrent Cline sessions on one "
+                               "login get cut mid-turn; never dispatch two tasks to "
+                               "`coder_cline` in the same turn."},
+             "quota": {"probe": "deepseek-balance"}},
+        ]
+    }
+    without_note = {
+        "agents": [
+            {"id": "codex", "label": "Codex (OpenAI)", "harness": "codex-native",
+             "vendor": "openai", "roles": ["reviewer"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "argv",
+             "model": {"required": False}},
+            {"id": "cline", "label": "Cline", "harness": "acp:cline", "vendor": "deepseek",
+             "roles": ["coder"], "relay": False, "silent_model_failure": True,
+             "prompt_delivery": "unknown",
+             "model": {"required": True, "note": "some other note"},
+             "quota": {"probe": "deepseek-balance"}},
+        ]
+    }
+    monkeypatch.setattr(m, "REGISTRY", with_note)
+    plan = _base_plan(coders=[{"id": "cline", "priority": 1, "model": "x"}])
+    rendered = m.render_roster_skill(plan)
+    # The row already carries the caveat in its model note, so the renderer
+    # renders the note as-is and does NOT add a second, bolded copy of it.
+    assert rendered.count("**One session at a time.**") == 0
+    assert "one session at a time — concurrent Cline sessions on one login" in rendered
+    assert "never dispatch two tasks to `coder_cline` in the same turn" in rendered
+    monkeypatch.setattr(m, "REGISTRY", without_note)
+    rendered = m.render_roster_skill(plan)
+    assert rendered.count("**One session at a time.**") == 1
+    assert "never dispatch two tasks to `coder_cline` in the same turn" in rendered
+
+
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", _fake_run(
         "opencode/mimo-v2.5-free\nopencode/glm-5\ndeepseek/deepseek-chat\n"))
@@ -978,3 +1072,113 @@ def test_install_pth_dies_without_an_omnigent_interpreter(monkeypatch, tmp_path)
     monkeypatch.setattr(m, "omnigent_python", lambda: None)
     with pytest.raises(SystemExit):
         m.install_pth(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# model.choices: a static lineup for agents with no live model listing
+# --------------------------------------------------------------------------
+def test_pick_model_offers_choices_by_number(monkeypatch):
+    # freebuff is required=false with no list_cmd but declares `model.choices`:
+    # the early-return bail-out no longer fires, so the static lineup is shown
+    # through the same numbered menu and selectable by number.
+    reg = m.agents_by_id()
+    answers = iter(["2"])
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
+    assert m.pick_model(reg["freebuff"], None) == "deepseek/deepseek-v4-flash"
+
+
+def test_pick_model_without_list_cmd_or_choices_keeps_current(monkeypatch):
+    # A required=false row with neither list_cmd nor choices is not pinnable:
+    # it must echo whatever is already set (today's behaviour), asking nothing.
+    asked = []
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: asked.append(prompt) or "")
+    agent = {"id": "agy", "label": "Antigravity", "vendor": "google",
+             "model": {"required": False, "pin_path": "executor.model"}}
+    assert m.pick_model(agent, "opencode/mimo-v2.5-free") == "opencode/mimo-v2.5-free"
+    assert asked == []
+
+
+def test_pick_model_choices_respect_prefer_default(monkeypatch):
+    reg = m.agents_by_id()
+    default = {}
+    monkeypatch.setattr(m, "ask", lambda prompt, d=None: default.setdefault("d", d) or d)
+    # freebuff's `prefer` (z-ai/glm-5.3-flash) is in choices, so an empty
+    # enter (returns default) pins the preferred model rather than the first.
+    assert m.pick_model(reg["freebuff"], None) == "z-ai/glm-5.3-flash"
+
+
+# --------------------------------------------------------------------------
+# emit_questions surfaces a row's static model choices
+# --------------------------------------------------------------------------
+def test_emit_questions_carries_choices(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"freebuff": "/bin/blink"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    coder_q = next(x for x in q["questions"] if x["key"] == "coders")
+    assert "choices" in coder_q["per_item"]
+    assert coder_q["per_item"]["choices"]["freebuff"] == [
+        "z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"]
+    # rows without choices are simply absent, not empty
+    assert "cline" not in coder_q["per_item"]["choices"]
+
+
+# --------------------------------------------------------------------------
+# model.env_var -> env-prefixed ACP command (freebuff/blink), additive
+# --------------------------------------------------------------------------
+def test_acp_command_injects_env_var_for_env_var_rows():
+    reg = m.agents_by_id()
+    # A row declaring model.env_var exports the pin as that variable.
+    assert m.acp_command(reg["freebuff"], "deepseek/deepseek-v4-flash") == \
+        "env BLINK_MODEL=deepseek/deepseek-v4-flash blink"
+    assert m.acp_command(reg["freebuff"], None) == "blink"
+    # A legacy row using top-level model_env still works (Cline's CLINE_MODEL).
+    assert m.acp_command(reg["cline"], "deepseek/deepseek-v4-flash") == \
+        "env CLINE_MODEL=deepseek/deepseek-v4-flash cline --acp --auto-approve true"
+    # An acp-user row with neither keeps a plain command.
+    assert m.acp_command(reg["kilo"], "kilo/kilo-auto/free") == "kilo acp"
+
+
+def test_patch_global_config_renders_env_var_for_freebuff(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    (tmp_path / "config.yaml").write_text("{}\n")
+    plan = _base_plan(coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4-flash"}])
+    m.patch_global_config(plan)
+    cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    row = next(r for r in cfg["acp"]["agents"] if r["name"] == "Freebuff")
+    assert row["command"].startswith("env BLINK_MODEL=deepseek/deepseek-v4-flash blink")
+
+
+# --------------------------------------------------------------------------
+# vendor follows the model (Part 2d): a freebuff deepseek/* pin is same-vendor
+# with a deepseek reviewer. No code change; the existing model_vendor family
+# already maps it. Lock it in here.
+# --------------------------------------------------------------------------
+def test_model_vendor_maps_freebuff_deepseek_pin_to_deepseek():
+    reg = m.agents_by_id()
+    assert m.vendor_of(reg["freebuff"], {"id": "freebuff",
+                                         "model": "deepseek/deepseek-v4-flash"}) == "deepseek"
+    assert m.vendor_of(reg["freebuff"], {"id": "freebuff",
+                                         "model": "deepseek/deepseek-v4-pro"}) == "deepseek"
+    assert m.vendor_of(reg["freebuff"], {"id": "freebuff", "model": None}) == "z-ai"
+
+
+def test_validate_warns_same_vendor_for_freebuff_deepseek_pin():
+    # Vendor follows the model: a deepseek/* Freebuff pin shares Cline's vendor
+    # (deepseek) for review. validate role-checks coders vs reviewer, not which
+    # agent the reviewer id is.
+    plan = _base_plan(
+        coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4-flash"}],
+        reviewer={"id": "cline", "model": None},
+    )
+    ws = [msg for level, msg in m.validate(plan) if level == "warn"
+          and "shares a vendor" in msg]
+    assert ws, [msg for _, msg in m.validate(plan)]
+    # ...and the registry's own vendor is NOT same-vendor with an unpinned
+    # Freebuff (z-ai vs cline's deepseek).
+    plan["coders"][0]["model"] = None
+    msgs = [msg for level, msg in m.validate(plan) if level == "warn"
+            and "shares a vendor" in msg]
+    assert not msgs
+

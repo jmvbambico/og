@@ -14,6 +14,17 @@ FIRST task and who absorbs overflow — it does not mean queueing everything ont
 the first worker. With N independent tasks and N available workers, spread
 them so they run concurrently.
 
+## 0. Check capacity
+
+Before decomposing, run `og stats --json` (og is on PATH; if it is missing or
+errors, proceed and say so once). Map `coder_<id>` -> `<id>` and `reviewer` ->
+the reviewer's id. A worker whose state is `dry` with `reset_at` in the future
+is out of capacity: skip it and take the next worker in preference order.
+Preference order still wins — only when two candidates are otherwise equal does
+`ok` outrank `unknown`. The roster skill's Capacity section says the rest,
+including how to mark a worker dry on a quota failure and re-admit it after
+`reset_at`.
+
 ## 1. Decompose
 
 Split the goal into tasks that touch **disjoint file sets** wherever possible.
@@ -79,6 +90,13 @@ them in waves rather than trying to exceed it.
 Wait via the inbox. When a worker reports, verify its claims against the
 worktree yourself — read the diff; do not trust a gate result you did not see.
 On failure, classify it (boot / task / quota) per your prompt's failure rules.
+On a QUOTA failure (rate limit, usage cap, out of credits, Kilo's `Add credits
+to continue, or switch to a free model`, freebuff's `not enough Freebucks`, an
+OpenCode worker gone silent with `Rate limit exceeded` in its log, or a Cline
+worker returning an empty turn), mark it dry with
+`og stats --mark <id> dry --until <reset_at from stats if known, else +1h>
+--reason "<the error line>"` before moving to the next worker, and re-dispatch
+from a CLEAN worktree.
 
 ## 5. Batch
 

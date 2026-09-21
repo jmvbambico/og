@@ -31,6 +31,58 @@ LOGS = OMNI / "logs" / "server"
 T_MESSAGE, T_CALL, T_RESULT, T_RESOURCE = 1, 2, 3, 8
 ASK_TOOLS = {"question", "askuserquestion", "ask_followup_question", "ask_user", "elicit"}
 
+# A worker's own text (T_RESULT outputs and T_MESSAGE text) or its runner log
+# can carry a quota-failure line that Omnigent never surfaces. Each entry is a
+# (regex, hint, log_only) triple; the hint ends with the remedy, so `og audit`
+# can point at the exact command to run instead of leaving the reader to guess.
+#
+# Where each string actually lands, read from ~/.omnigent/chat.db and the
+# runner logs (see docs/TROUBLESHOOTING.md):
+#   Kilo `Add credits to continue, or switch to a free model` — the harness
+#     error item (type 5, {"source":"harness","code":"RuntimeError",
+#     "message":"inner executor error: Internal error: ..."}), and echoed into
+#     the child's T_RESULT output; the runner log repeats it verbatim.
+#   freebuff `not enough Freebucks` — T_RESULT output and T_MESSAGE text.
+#   OpenCode `Rate limit exceeded` — the opencode log (opencode-native/<hash>/
+#     xdg-data/opencode/log/opencode.log). log_only: it also appears inside
+#     source code a worker is merely reading, so scanning chat.db for it would
+#     flag every opencode worker that happens to grep a rate-limit string.
+SIGNATURES: list[tuple[re.Pattern, str, bool]] = [
+    (re.compile(r"Add credits to continue, or switch to a free model"),
+     "Kilo is out of credits — the pin never landed on the free router. "
+     "Run `og stats --mark <id> dry --until +1h --reason \"Add credits to continue, "
+     "or switch to a free model\"` and set `kilo/kilo-auto/free` as Kilo's default.",
+     False),
+    (re.compile(r"[Nn]ot enough Freebucks"),
+     "freebuff's Freebucks pool is empty. Run `og stats --mark <id> dry --until +1h "
+     "--reason \"not enough Freebucks\"`; og infers the balance from launches in "
+     "chat.db, so the reset is a guess.",
+     False),
+    (re.compile(r"Rate limit exceeded"),
+     "a rate limit hit. Run `og stats --mark <id> dry --until <reset> --reason "
+     "\"Rate limit exceeded\"`; for OpenCode the log is at "
+     "~/.omnigent/opencode-native/<hash>/xdg-data/opencode/log/opencode.log.",
+     True),
+    (re.compile(r"out of credits"),
+     "out of credits. Run `og stats --mark <id> dry --until +1h --reason \"out of "
+     "credits\"`.",
+     False),
+    (re.compile(r"usage cap", re.IGNORECASE),
+     "a usage cap was hit. Run `og stats --mark <id> dry --until +1h --reason "
+     "\"usage cap\"`.",
+     False),
+]
+
+
+def signature_hints(text: str, log_only: bool = False) -> list[str]:
+    """Quota-failure hints found in `text`, in SIGNATURES order.
+
+    With `log_only=False` (the default) only the chat.db-facing signatures are
+    matched — the opencode rate-limit line is log_only because it also shows up
+    inside source code a worker is merely reading.
+    """
+    return [hint for rx, hint, lo in SIGNATURES if (lo == log_only) and rx.search(text)]
+
 
 def ts(t: int | None) -> str:
     return datetime.fromtimestamp(t).strftime("%m-%d %H:%M:%S") if t else "-"
@@ -98,14 +150,41 @@ def hook_waits() -> dict[str, list[tuple[str, float]]]:
     return out
 
 
-def rate_limit_hint(since: int | None) -> str | None:
+def opencode_log_text(since: int | None) -> str:
+    """Concatenated text of every recent OpenCode worker log.
+
+    OpenCode's rate-limit failure never reaches chat.db — it lives in the
+    worker's own log — so the signature scan has to read it separately.
+    """
+    if not since:
+        return ""
+    out: list[str] = []
+    for log in (OMNI / "opencode-native").glob("*/xdg-data/opencode/log/opencode.log"):
+        try:
+            if log.stat().st_mtime < since - 60:
+                continue
+            out.append(log.read_text(errors="replace"))
+        except OSError:
+            continue
+    return "\n".join(out)
+
+
+def rate_limit_hint(since: int | None, label: str | None = None) -> str | None:
     """Explain the stall Omnigent 0.13 cannot: an OpenCode worker whose model
     call was rate-limited. opencode logs `stream error ... Rate limit exceeded`
     and disables retries under Omnigent, but the forwarder gets no
     `session.error`, so the turn never completes and the orchestrator --
     inbox-driven by design -- is never woken. Only the worker's own log says why.
+
+    Restricted to opencode children. Previously this fired for ANY child with no
+    tool calls whenever an opencode log anywhere in the window had a rate-limit
+    line, which attributed a Kilo credit failure or a Cline boot failure to
+    OpenCode. The audit label for an opencode child is `opencode` or
+    `opencode-native` (see analyse()).
     """
     if not since:
+        return None
+    if not (label or "").lower().startswith("opencode"):
         return None
     hits = 0
     for log in (OMNI / "opencode-native").glob("*/xdg-data/opencode/log/opencode.log"):
@@ -130,6 +209,7 @@ def analyse(rows: list[tuple]) -> dict:
     agent = None
     first = last = None
     last_assistant = ""
+    items_text = ""
     for t, at, data in rows:
         first = first or at
         last = at
@@ -150,7 +230,9 @@ def analyse(rows: list[tuple]) -> dict:
             if name == "invalid":
                 invalid += 1
         elif t == T_RESULT:
-            out_chars += len(str(d.get("output", "")))
+            out = str(d.get("output", ""))
+            out_chars += len(out)
+            items_text += out
         elif t == T_MESSAGE:
             if d.get("role") == "user":
                 user_turns += 1
@@ -159,12 +241,13 @@ def analyse(rows: list[tuple]) -> dict:
                                if isinstance(c, dict))
                 if text.strip():
                     last_assistant = text
+                    items_text += text
         elif t == T_RESOURCE and not agent:
             meta = (d.get("resource") or {}).get("metadata") or {}
             agent = meta.get("terminal_name")
     return {"calls": calls, "asks": asks, "invalid": invalid, "turns": user_turns,
             "out_chars": out_chars, "agent": agent, "first": first, "last": last,
-            "report": last_assistant}
+            "report": last_assistant, "items_text": items_text}
 
 
 def show(con: sqlite3.Connection, root: bytes, full: bool) -> None:
@@ -190,9 +273,16 @@ def show(con: sqlite3.Connection, root: bytes, full: bool) -> None:
         # that produced neither tool calls nor a report never acted.
         if not a["calls"] and parent is not None and not a["report"]:
             flags.append("NO TOOL CALLS — never acted (boot failure or silent model failure?)")
-            hint = rate_limit_hint(a["first"])
+            hint = rate_limit_hint(a["first"], label)
             if hint:
                 flags.append(hint)
+        flags.extend(signature_hints(a["items_text"]))
+        # An OpenCode worker can die to a rate limit without a single item in
+        # chat.db — the failure lives in its own log. Scan it too, but only
+        # for opencode children: the log is theirs, and attributing it to a
+        # Kilo or Cline worker is a false alarm.
+        if label and label.lower().startswith("opencode"):
+            flags.extend(signature_hints(opencode_log_text(a["first"]), log_only=True))
         print(f"       output  {a['out_chars'] // 1000}k chars"
               + (f"   ⚠ {'; '.join(flags)}" if flags else ""))
         if parent is not None and a["report"]:
