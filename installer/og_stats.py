@@ -39,6 +39,17 @@ def _now() -> datetime:
 # lineup: who is installed, in dispatch order
 # ---------------------------------------------------------------------------
 
+def _agents_map(reg: dict) -> dict:
+    """Catalog rows by id. The real installer/registry.json carries agents as
+    a LIST of {"id": ..., "quota": {...}, ...} rows; accept an {id: row} dict
+    too (the shape the unit tests write)."""
+    agents = reg.get("agents") or {}
+    if isinstance(agents, list):
+        return {r.get("id"): r for r in agents
+                if isinstance(r, dict) and r.get("id")}
+    return agents
+
+
 def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     """[{role, agent, priority, probe, params, note}] in dispatch order:
     orchestrator, coders by priority, reviewer last."""
@@ -56,7 +67,7 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
         sys.exit(f"{registry_path} is not valid JSON: {e}")
 
     def entry(agent_id: str, role: str, priority: int | None) -> dict:
-        row = (reg.get("agents") or {}).get(agent_id) or {}
+        row = _agents_map(reg).get(agent_id) or {}
         quota = row.get("quota") or {}
         probe = quota.get("probe")
         params = {k: v for k, v in quota.items() if k not in ("probe", "note")}
@@ -307,9 +318,10 @@ def main(argv: list[str] | None = None) -> None:
         except FileNotFoundError:
             sys.exit(f"no registry at {registry_path}")
         entries = []
-        for aid, row in sorted((reg.get("agents") or {}).items()):
+        for aid, row in sorted(_agents_map(reg).items()):
             quota = row.get("quota") or {}
-            entries.append({"role": row.get("role") or "-", "agent": aid,
+            role = row.get("role") or "/".join(row.get("roles") or []) or "-"
+            entries.append({"role": role, "agent": aid,
                             "priority": None, "probe": quota.get("probe"),
                             "params": {k: v for k, v in quota.items()
                                        if k not in ("probe", "note")},

@@ -106,6 +106,29 @@ def test_anthropic_missing_auth(tmp_path, monkeypatch):
     assert rec["state"] == "unknown" and "no OAuth token" in rec["detail"]
 
 
+def test_anthropic_top_level_shape(tmp_path, monkeypatch):
+    # live api/oauth/usage nests five_hour/seven_day at the top level, with
+    # no "rate_limits" wrapper (observed 2026-09-21).
+    fake_home(tmp_path, monkeypatch)
+
+    def run(cmd, **kw):
+        r = type("R", (), {})()
+        r.returncode, r.stdout = 0, json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok",
+                               "expiresAt": 9999999999999}})
+        return r
+
+    rec = q._probe_anthropic_oauth({}, ctx(
+        http=ok_http({"five_hour": {"utilization": 0.08,
+                                    "resets_at": "2026-09-22T00:40:00+07:00"},
+                      "seven_day": {"utilization": 0.5,
+                                    "resets_at": "2026-09-25T00:00:00Z"}}),
+        now=lambda: NOW, run=run))
+    assert rec["state"] == "ok" and rec["tier"] == "measured"
+    assert rec["remaining"] == pytest.approx(92.0)  # five_hour binds
+    assert rec["reset_at"] == "2026-09-22T00:40:00+07:00"
+
+
 def test_anthropic_sk_ant_key_is_not_oauth(tmp_path, monkeypatch):
     fake_home(tmp_path, monkeypatch)
     cred = {"claudeAiOauth": {"accessToken": "sk-ant-api03-x", "expiresAt": 9999999999999}}
@@ -500,6 +523,26 @@ def test_lineup_order(tmp_path):
     assert [(r["role"], r["agent"]) for r in rows] == [
         ("orchestrator", "claude"), ("coder", "opencode"),
         ("coder", "kilo"), ("reviewer", "codex")]
+
+
+def test_lineup_list_registry(tmp_path):
+    # the real installer/registry.json carries agents as a list of rows
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    _write_install(inst)
+    reg.write_text(json.dumps({"agents": [
+        {"id": "claude", "roles": ["coder"],
+         "quota": {"probe": "anthropic-oauth"}},
+        {"id": "opencode", "roles": ["coder"]},
+        {"id": "kilo", "roles": ["coder"]},
+        {"id": "codex", "roles": ["coder"]},
+    ]}))
+    rows = st.lineup(inst, reg)
+    assert [(r["role"], r["agent"]) for r in rows] == [
+        ("orchestrator", "claude"), ("coder", "opencode"),
+        ("coder", "kilo"), ("reviewer", "codex")]
+    assert [r for r in rows if r["agent"] == "claude"][0]["probe"] == \
+        "anthropic-oauth"
 
 
 def test_table_and_json_shape(tmp_path, capsys):

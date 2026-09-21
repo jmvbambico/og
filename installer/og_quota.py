@@ -178,7 +178,10 @@ def _probe_anthropic_oauth(params: dict, ctx: Ctx) -> dict:
         return unknown_record("bad JSON from usage endpoint")
     # rate_limits.five_hour / seven_day: vendors flip between a 0-1
     # `utilization` and a 0-100 `used_percentage`; _pct takes both.
-    rl = d.get("rate_limits") or {}
+    # Live shape (2026-09-21, api/oauth/usage): windows sit at the TOP level
+    # {"five_hour": {"utilization": 0-1, "resets_at": ISO, ...}, "seven_day":
+    # {...}, ...} with no "rate_limits" wrapper, so accept both nestings.
+    rl = d.get("rate_limits") or d
     windows: list[dict] = []
     for name, key in (("five_hour", "five_hour"), ("seven_day", "seven_day")):
         w = rl.get(key) or {}
