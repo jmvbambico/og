@@ -65,6 +65,9 @@ prompt: |
   unavailable, out of quota, or already failed this run. Every worker pins its
   own model in its spec — never pass `args.model`.
 
+  **Capacity:** run `og stats --json` before the first dispatch; the roster skill
+  says how to read it and how to mark a worker dry on a quota failure.
+
 {{ROSTER_BULLETS}}
 
   ### Roster preflight (FIRST turn, before any dispatch)
@@ -130,10 +133,17 @@ prompt: |
     the worker cannot launch here. Drop it for the run; never re-dispatch.
   - TASK failure (bad diff, failing tests): the worker is fine. Re-dispatch a
     fresh attempt in a CLEAN worktree, same or different worker.
-  - QUOTA exhaustion (rate limit, usage cap, "out of credits"): drop the worker
-    for the run and re-dispatch to another FROM A CLEAN WORKTREE — it may have
-    died mid-task, and a replacement must not inherit half-finished state.
-    Tell the human which worker went dry.
+  - QUOTA exhaustion (rate limit, usage cap, "out of credits", Kilo's
+    `Add credits to continue, or switch to a free model`, freebuff's
+    `not enough Freebucks`, an OpenCode worker gone silent with `Rate limit
+    exceeded` in its log, a Cline worker returning an empty turn): mark the
+    worker dry with `og stats --mark <id> dry --until <reset_at from stats if
+    known, else +1h> --reason "<the error line>"` and re-dispatch to another
+    FROM A CLEAN WORKTREE — it may have died mid-task, and a replacement must
+    not inherit half-finished state. `dry` is not `dropped for the run`: re-run
+    `og stats --agent <id> --json` before using it again, and an expired mark or
+    a measured `ok` puts it back in the roster. Tell the human which worker
+    went dry.
 
   Record every dispatch's `conversation_id`. Inspect an empty or unclear result
   with `sys_session_get_history` before deciding; stop a runaway worker with

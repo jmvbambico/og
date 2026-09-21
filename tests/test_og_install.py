@@ -758,6 +758,100 @@ def test_zen_preflight_only_for_a_free_zen_pin():
     assert "day-capped" in m.render_roster(free) and "day-capped" not in m.render_roster(paid)
 
 
+def test_render_roster_skill_names_quota_and_marks_dry_workers(monkeypatch):
+    """The roster skill's Capacity section says how to read `og stats`, how to
+    map `coder_<id>` -> `<id>`, how to skip a dry worker, and how to re-admit
+    one after reset_at. Each worker line names its quota probe, or says the
+    limit is not measurable when the registry row has no quota block or a null
+    probe."""
+    fake = {
+        "agents": [
+            {"id": "codex", "label": "Codex (OpenAI)", "harness": "codex-native",
+             "vendor": "openai", "roles": ["reviewer"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "argv",
+             "model": {"required": False}},
+            {"id": "kilo", "label": "Kilo Code", "harness": "acp:kilo-code",
+             "vendor": "kilo", "roles": ["coder"], "relay": False,
+             "silent_model_failure": True, "prompt_delivery": "unknown",
+             "model": {"required": True, "note": "kilo note"},
+             "quota": {"probe": "kilo-profile"}},
+            {"id": "opencode", "label": "OpenCode (Zen)", "harness": "opencode-native",
+             "vendor": "opencode-zen", "roles": ["coder"], "relay": True,
+             "silent_model_failure": False, "prompt_delivery": "per_turn",
+             "model": {"required": True},
+             "quota": {"probe": None, "note": "server-side, not queryable"}},
+            {"id": "gemini", "label": "Gemini CLI", "harness": "qwen-native",
+             "vendor": "google", "roles": ["coder"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "none",
+             "model": {"required": False}},
+        ]
+    }
+    monkeypatch.setattr(m, "REGISTRY", fake)
+    plan = _base_plan(coders=[
+        {"id": "kilo", "priority": 1, "model": "kilo/kilo-auto/free"},
+        {"id": "opencode", "priority": 2, "model": "opencode/mimo-v2.5-free"},
+        {"id": "gemini", "priority": 3, "model": None},
+    ])
+    skill = m.render_roster_skill(plan)
+
+    for needle in ("## Capacity", "og stats --json", "coder_<id>", "reset_at",
+                   "og stats --mark", "CLEAN worktree", "og stats --agent"):
+        assert needle in skill, needle
+    assert "quota: `kilo-profile`" in skill
+    assert "quota: not measurable" in skill
+    assert "quota: not measurable (no quota block in the registry)" in skill
+    # The cline concurrency note is rendered only when the row lacks it.
+    assert "One session at a time" not in skill
+    # A reviewer line too, with its own quota shape.
+    assert "## `reviewer`" in skill
+
+
+def test_render_roster_skill_renders_cline_concurrency_note(monkeypatch):
+    """The 'one session at a time' caveat is rendered for Cline unless the
+    registry row already carries it in its model note."""
+    with_note = {
+        "agents": [
+            {"id": "codex", "label": "Codex (OpenAI)", "harness": "codex-native",
+             "vendor": "openai", "roles": ["reviewer"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "argv",
+             "model": {"required": False}},
+            {"id": "cline", "label": "Cline", "harness": "acp:cline", "vendor": "deepseek",
+             "roles": ["coder"], "relay": False, "silent_model_failure": True,
+             "prompt_delivery": "unknown",
+             "model": {"required": True,
+                       "note": "one session at a time — concurrent Cline sessions on one "
+                               "login get cut mid-turn; never dispatch two tasks to "
+                               "`coder_cline` in the same turn."},
+             "quota": {"probe": "deepseek-balance"}},
+        ]
+    }
+    without_note = {
+        "agents": [
+            {"id": "codex", "label": "Codex (OpenAI)", "harness": "codex-native",
+             "vendor": "openai", "roles": ["reviewer"], "relay": False,
+             "silent_model_failure": False, "prompt_delivery": "argv",
+             "model": {"required": False}},
+            {"id": "cline", "label": "Cline", "harness": "acp:cline", "vendor": "deepseek",
+             "roles": ["coder"], "relay": False, "silent_model_failure": True,
+             "prompt_delivery": "unknown",
+             "model": {"required": True, "note": "some other note"},
+             "quota": {"probe": "deepseek-balance"}},
+        ]
+    }
+    monkeypatch.setattr(m, "REGISTRY", with_note)
+    plan = _base_plan(coders=[{"id": "cline", "priority": 1, "model": "x"}])
+    rendered = m.render_roster_skill(plan)
+    # The row already carries the caveat in its model note, so the renderer
+    # renders the note as-is and does NOT add a second, bolded copy of it.
+    assert rendered.count("**One session at a time.**") == 0
+    assert "one session at a time — concurrent Cline sessions on one login" in rendered
+    assert "never dispatch two tasks to `coder_cline` in the same turn" in rendered
+    monkeypatch.setattr(m, "REGISTRY", without_note)
+    rendered = m.render_roster_skill(plan)
+    assert rendered.count("**One session at a time.**") == 1
+    assert "never dispatch two tasks to `coder_cline` in the same turn" in rendered
+
+
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", _fake_run(
         "opencode/mimo-v2.5-free\nopencode/glm-5\ndeepseek/deepseek-chat\n"))

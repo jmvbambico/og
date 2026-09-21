@@ -564,6 +564,18 @@ og restart
 Cline row. Verified: two Cline workers then implemented, tested and committed
 their tasks in ~2 minutes each.
 
+If the pin is correct and the worker still returns an empty turn, it is out
+of credits rather than misconfigured — mark it dry and move down the roster
+instead of re-sending it:
+
+```bash
+og stats --mark coder_cline dry --until +1h --reason "end_turn with no content"
+```
+
+Re-dispatch from a CLEAN worktree to the next worker, and re-run
+`og stats --agent coder_cline --json` before using it again — an expired mark or
+a measured `ok` puts it back. See docs/STATS.md.
+
 ---
 
 ## Every Cursor worker dies in 2 seconds with `Harness stream connection error`
@@ -601,6 +613,18 @@ tested and committed their tasks in about a minute each.
 `og audit` shows the worker with **NO TOOL CALLS**, no report, and a `Rate
 limit exceeded` hint; the orchestrator's last message is the dispatch. Nothing
 is running, nothing is failing, nothing wakes up.
+
+**Fix.** It is a quota, not a misconfiguration: the pinned model is over its
+daily cap. Mark the worker dry and move down the roster rather than re-sending
+it:
+
+```bash
+og stats --mark coder_zen dry --until +1h --reason "Rate limit exceeded"
+```
+
+Then re-dispatch from a CLEAN worktree to the next worker, and re-run
+`og stats --agent coder_zen --json` before using it again — an expired mark or
+a measured `ok` puts it back. See docs/STATS.md.
 
 **Cause.** The pinned model (a Zen free id, typically) is over its daily
 quota. opencode logs `stream error … Rate limit exceeded`; Omnigent launches
@@ -643,7 +667,17 @@ confirmation rather than the only guard:
 ```
 
 `og audit` shows the failed dispatch as a worker with no tool calls; the
-runner log carries the message above.
+runner log carries the message above. It is a quota failure, so mark the
+worker dry and move on rather than re-sending it:
+
+```bash
+og stats --mark coder_kilo dry --until +1h \
+    --reason "Add credits to continue, or switch to a free model"
+```
+
+Re-dispatch from a CLEAN worktree to the next worker, and re-run
+`og stats --agent coder_kilo --json` before using it again — an expired mark or
+a measured `ok` puts it back. See docs/STATS.md.
 
 ---
 
