@@ -15,6 +15,7 @@
 #   og url              print the public URL only (pipe-friendly)
 #   og logs [-f]        tail the server log
 #   og audit [id]       what happened in the latest run: per-worker tools, stalls, reports
+#   og stats            per-agent quota/capacity: remaining, reset, tier, source
 #   og update           pull the checkout and re-apply the install
 #   og version          print the installed version
 #
@@ -1169,6 +1170,13 @@ cmd_audit() {
   exec python3 "$repo/installer/og_audit.py" "$@"
 }
 
+cmd_stats() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_stats.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  exec python3 "$repo/installer/og_stats.py" "$@"
+}
+
 cmd_stop() {
   local stopped=0
   if server_running; then
@@ -1452,6 +1460,7 @@ case "${1:-}" in
   url)    shift; cmd_url ;;
   logs)   shift; cmd_logs "$@" ;;
   audit)  shift; cmd_audit "$@" ;;
+  stats)  shift; cmd_stats "$@" ;;
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
