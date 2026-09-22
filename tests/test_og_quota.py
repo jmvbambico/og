@@ -384,12 +384,27 @@ FREEBUFF_TITLE = "coder_freebuff:test"
 ORCH_TITLE = "Agent quota and delegation"  # the orchestrator's own session
 
 
+# SELF-MATCH HYGIENE (same invariant as installer/og_quota.py): a worker
+# session cat-ing THIS file must not become evidence, so the blink prefix,
+# the pool noun, and the per-hour rate unit are never written contiguously
+# here — every verbatim error frame below is assembled from these fragments
+# at runtime. The tests assert exactly what they did before; only the way
+# the literal is spelled changed.
+_BLINK = "free" + "buff:"
+_FB = "Free" + "bucks"
+_FB_HR = "Free" + "bucks/hr"
+
+
+def _frame(left: int) -> str:
+    """The verbatim live error frame (2026-09-22/23), assembled from pieces."""
+    return ("ACP session/new failed: " + _BLINK + " not enough " + _FB +
+            " \u2014 \u2502 Not enough " + _FB + " \u2014 5 " + _FB_HR +
+            f" against {left} left. Enter opens plans. \u2502")
+
+
 def _err(left: int) -> str:
     """Real-shape blink error payload (verbatim framing, 2026-09-22/23)."""
-    return ('{"error": "ACP session/new failed: freebuff: not enough '
-            "Freebucks \u2014 \u2502 Not enough Freebucks \u2014 "
-            f"5 Freebucks/hr against {left} left. Enter opens plans. "
-            "\u2502\"}")
+    return '{"error": "' + _frame(left) + '"}'
 
 
 def _itemsdb(path: Path, rows: list[tuple], title: str = FREEBUFF_TITLE):
@@ -468,7 +483,7 @@ def test_launch_budget_prefixed_not_enough_is_dry(tmp_path, monkeypatch):
     home = _mkhome(tmp_path, monkeypatch)
     ts = int(NOW.timestamp()) - 60
     _itemsdb(home / "chat.db",
-             [('{"error": "freebuff: Not enough Freebucks"}', ts)])
+             [('{"error": "' + _BLINK + " Not enough " + _FB + '"}', ts)])
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["remaining"] == 0
     assert rec["state"] == "dry"
@@ -552,7 +567,9 @@ def test_launch_budget_newest_provenanced_wins(tmp_path, monkeypatch):
 
 def test_launch_budget_source_window_without_rate_clause_is_unknown(
         tmp_path, monkeypatch):
-    """The reviewer's exact scenario: a window of og_quota.py's own source —
+    """Neither the probe's source nor THIS test file may read as evidence.
+
+    The reviewer's exact scenario: a window of og_quota.py's own source —
     pattern pieces plus surrounding prose — inside a worker session must
     yield unknown. The structural rule (rate clause adjacent to the figure)
     does the work here, NOT the self-marker rule: the window is asserted to
@@ -561,8 +578,11 @@ def test_launch_budget_source_window_without_rate_clause_is_unknown(
 
     WHY this test exists: this orchestrator routinely dispatches workers to
     review this very file, so its source (pattern strings included) lands in
-    worker sessions. If a future edit reintroduces a quotable full frame
-    into the source or comments, this test fails closed.
+    worker sessions — and the same holds for this test file, whose verbatim
+    frames are assembled from fragments at runtime for exactly that reason.
+    If a future edit reintroduces a quotable full frame into either file,
+    this test fails closed. Both files are read generically (q.__file__ and
+    __file__) so a rename cannot silently skip one.
     """
     home = _mkhome(tmp_path, monkeypatch)
     src = Path(q.__file__).read_text()
@@ -572,9 +592,16 @@ def test_launch_budget_source_window_without_rate_clause_is_unknown(
     window = "\n".join(lines[start:end + 1])
     assert "freebuff:" in window.lower()  # prefix present, as in the review
     assert not q._has_self_marker(window)  # ... but no self marker
-    assert "freebucks/hr" not in window.lower()  # rate unit never contiguous
+    # rate unit never contiguous (spelled via the runtime value, not the
+    # literal, so this assertion itself does not introduce the literal)
+    assert q._FB_RATE_UNIT.lower() not in window.lower()
     assert q._extract_freebucks(window) is None
-    _itemsdb(home / "chat.db", [(window, int(NOW.timestamp()) - 60)])
+    assert q._extract_freebucks(src) is None
+    tsrc = Path(__file__).read_text()
+    assert _FB_HR.lower() not in tsrc.lower()  # same, for this file
+    assert q._extract_freebucks(tsrc) is None
+    ts = int(NOW.timestamp())
+    _itemsdb(home / "chat.db", [(window, ts - 60), (tsrc, ts - 59)])
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["state"] == "unknown" and rec["remaining"] is None
 
@@ -597,10 +624,7 @@ def test_launch_budget_verbatim_live_error_is_observed(tmp_path, monkeypatch):
     load-bearing match: observed, remaining 0, dry."""
     home = _mkhome(tmp_path, monkeypatch)
     ts = int(NOW.timestamp()) - 60
-    _itemsdb(home / "chat.db",
-             [("ACP session/new failed: freebuff: not enough Freebucks \u2014 "
-               "\u2502 Not enough Freebucks \u2014 5 Freebucks/hr against "
-               "0 left. Enter opens plans. \u2502", ts)])
+    _itemsdb(home / "chat.db", [(_frame(0), ts)])
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["tier"] == "measured"
     assert rec["remaining"] == 0
@@ -615,8 +639,8 @@ def test_launch_budget_stale_stamped_line_in_fresh_file_is_unknown(
     home = _mkhome(tmp_path, monkeypatch)
     _wlog(home, "runner-fresh.log",
           _logline(NOW - timedelta(days=1, hours=1),
-                   "ACP session/new failed: freebuff: not enough Freebucks "
-                   "\u2014 5 Freebucks/hr against 0 left."),
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 0 left."),
           age_s=5)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["state"] == "unknown" and rec["remaining"] is None
@@ -628,8 +652,8 @@ def test_launch_budget_fresh_stamped_line_is_observed(tmp_path, monkeypatch):
     home = _mkhome(tmp_path, monkeypatch)
     _wlog(home, "runner-fresh.log",
           _logline(NOW - timedelta(minutes=5),
-                   "ACP session/new failed: freebuff: not enough Freebucks "
-                   "\u2014 5 Freebucks/hr against 5 left."),
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 5 left."),
           age_s=5)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["tier"] == "measured"
@@ -642,8 +666,8 @@ def test_launch_budget_unstamped_log_line_is_skipped(tmp_path, monkeypatch):
     look seconds old after any later append."""
     home = _mkhome(tmp_path, monkeypatch)
     _wlog(home, "runner-nostamp.log",
-          "ACP session/new failed: freebuff: not enough Freebucks \u2014 "
-          "5 Freebucks/hr against 0 left.\n",
+          "ACP session/new failed: " + _BLINK + " not enough " + _FB +
+          " \u2014 5 " + _FB_HR + " against 0 left.\n",
           age_s=5)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["state"] == "unknown" and rec["remaining"] is None
@@ -701,8 +725,9 @@ def test_launch_budget_harness_error_from_runner_log(tmp_path, monkeypatch):
           _logline(NOW - timedelta(seconds=180),
                    "turn surfaced to UI as failed "
                    "for 8ad3 (harness=acp): {'code': 'runner_error', 'message': "
-                   "'inner executor error: ACP session/new failed: freebuff: "
-                   "not enough Freebucks \u2014 5 Freebucks/hr against 8 left.'}\n"),
+                   "'inner executor error: ACP session/new failed: " +
+                   _BLINK + " not enough " + _FB + " \u2014 5 " + _FB_HR +
+                   " against 8 left.'}\n"),
           age_s=180)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["tier"] == "measured"
@@ -733,8 +758,8 @@ def test_launch_budget_newest_wins_across_sources(tmp_path, monkeypatch):
     _wlog(home, "runner-b.log",
           _logline(NOW - timedelta(seconds=600),
                    "turn surfaced to UI as failed (harness=acp): "
-                   "ACP session/new failed: freebuff: not enough Freebucks "
-                   "\u2014 5 Freebucks/hr against 3 left."),
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 3 left."),
           age_s=600)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["remaining"] == 3
@@ -745,8 +770,8 @@ def test_launch_budget_newer_db_beats_older_log(tmp_path, monkeypatch):
     home = _mkhome(tmp_path, monkeypatch)
     _wlog(home, "runner-c.log",
           _logline(NOW - timedelta(seconds=7200),
-                   "ACP session/new failed: freebuff: not enough Freebucks "
-                   "\u2014 5 Freebucks/hr against 2 left."),
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 2 left."),
           age_s=7200)
     _itemsdb(home / "chat.db",
              [(_err(20), int(NOW.timestamp()) - 600)])
