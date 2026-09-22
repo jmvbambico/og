@@ -55,8 +55,8 @@ SIGNATURES: list[tuple[re.Pattern, str, bool]] = [
      False),
     (re.compile(r"[Nn]ot enough Freebucks"),
      "freebuff's Freebucks pool is empty. Run `og stats --mark <id> dry --until +1h "
-     "--reason \"not enough Freebucks\"`; og infers the balance from launches in "
-     "chat.db, so the reset is a guess.",
+     "--reason \"not enough Freebucks\"`; `og stats` shows the last balance "
+     "freebuff itself reported.",
      False),
     (re.compile(r"Rate limit exceeded"),
      "a rate limit hit. Run `og stats --mark <id> dry --until <reset> --reason "
@@ -270,9 +270,16 @@ def show(con: sqlite3.Connection, root: bytes, full: bool) -> None:
         for kind, secs in waits.get(hexid(cid), []):
             flags.append(f"parked {kind.replace('-request', '')} {secs:.0f}s")
         # A text-only reviewer legitimately answers without tools; a worker
-        # that produced neither tool calls nor a report never acted.
+        # that produced neither tool calls nor a report never acted. The
+        # transcript cannot say whether that was a boot/silent-model failure
+        # or an account quota stop (seen twice on Cursor: 0 turns, quota page
+        # showing capped until Oct 19), so the hint names both and the check
+        # instead of guessing.
         if not a["calls"] and parent is not None and not a["report"]:
-            flags.append("NO TOOL CALLS — never acted (boot failure or silent model failure?)")
+            flags.append("NO TOOL CALLS — never acted (boot failure, silent "
+                         "model failure, OR an account quota stop — check the "
+                         "vendor's usage page, then og stats --mark <id> dry "
+                         "--until <reset>)")
             hint = rate_limit_hint(a["first"], label)
             if hint:
                 flags.append(hint)

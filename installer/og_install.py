@@ -1483,6 +1483,28 @@ def _run_py(py: Path, code: str) -> subprocess.CompletedProcess:
                           timeout=60, check=False)
 
 
+def _sandbox_real_home() -> str | None:
+    """The invoking user's real home when $HOME is sandboxed, else None.
+
+    The AGENTS.md sandbox recipe runs the installer with HOME pointed at a
+    temp dir; the .pth target (omnigent's site-packages) is OUTSIDE that
+    sandbox, so keying the skip on OMNIGENT_HOME alone is wrong — a user may
+    legitimately set OMNIGENT_HOME permanently and still need the .pth. Only
+    a $HOME that differs from the invoking user's real home counts.
+    """
+    home = os.environ.get("HOME")
+    if not home:
+        return None
+    try:
+        import pwd
+        real = pwd.getpwuid(os.getuid()).pw_dir
+    except (ImportError, KeyError, OSError):
+        return None  # cannot tell (e.g. non-posix): assume not sandboxed
+    if os.path.realpath(home) != os.path.realpath(real):
+        return real
+    return None
+
+
 def install_pth(pol_dir: Path) -> None:
     """Put the policies dir on the OMNIGENT interpreter's sys.path, and prove it.
 
@@ -1510,6 +1532,16 @@ def install_pth(pol_dir: Path) -> None:
     if site_dir is None or not site_dir.is_dir():
         die(f"could not resolve site-packages for {py}:\n    {out.stderr.strip()}\n{manual}")
     pth = site_dir / "omnigent-local-policies.pth"
+    real_home = _sandbox_real_home()
+    if real_home is not None:
+        # Sandboxed run (AGENTS.md recipe): the .pth lives outside
+        # $OMNIGENT_HOME, so writing it would repoint the LIVE policy stack
+        # at a temp policies dir that is deleted afterwards — silently
+        # unloading the user's merge-gate policy. Skip the write and say so,
+        # naming the live path left untouched.
+        warn(f"sandboxed HOME ({os.environ.get('HOME')} != {real_home}): "
+             f"skipping .pth write — live policy path {pth} left untouched")
+        return
     try:
         pth.write_text(pth_line)
     except OSError as e:
