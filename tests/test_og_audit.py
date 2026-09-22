@@ -162,3 +162,24 @@ def test_no_tool_calls_flag_still_fires(tmp_path, monkeypatch):
     assert m.rate_limit_hint(a["first"], "cline") is None
     assert m.signature_hints(a["items_text"]) == []
     con.close()
+
+
+def test_no_tool_calls_hint_names_quota_stop(tmp_path, monkeypatch, capsys):
+    """A 0-turn child (twice seen on Cursor: quota-capped, not boot-broken)
+    must hint at BOTH a boot failure and an account quota stop with the mark
+    remedy — the transcript cannot tell the two apart, so guessing one sends
+    the reader chasing the wrong cause."""
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    (tmp_path / "opencode-native").mkdir()
+    db = tmp_path / "chat.db"
+    con = _mk_db(db)
+    root = _root(con, "root", 1_000)
+    _child(con, root, "coder_cursor:task", 1_000)
+    con.commit()
+
+    m.show(con, root, False)
+    out = capsys.readouterr().out
+    assert "NO TOOL CALLS" in out
+    assert "account quota stop" in out
+    assert "og stats --mark <id> dry --until <reset>" in out
+    con.close()

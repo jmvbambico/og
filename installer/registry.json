@@ -443,7 +443,7 @@
       "kind": "acp-user",
       "acp_command": "blink",
       "omnigent_mcp": false,
-      "kind_note": "`blink` (github.com/jmvbambico/bufflink, >= v0.1.2) is an ACP bridge that drives the freebuff TUI in a PTY. Verified 2026-09-20/21 in og-sandbox: five backlog tasks (small to larger, incl. new modules and e2e tests), 3 of 3 first-try since v0.1.2; every commit in scope, gates green. Facts that matter: one blink process = one freebuff launch = 5 of the free tier's 25 daily Freebucks, and the process lives as long as the sub-agent SESSION. Omnigent's sys_session_close does NOT end it (observed 2026-09-21): after closing a finished session, `pgrep -x blink` and SIGTERM it - blink exits cleanly within ~5 s and releases freebuff's single-instance lock; verify with `pgrep -fl manicode/freebuff` before the next launch. freebuff writes its transcript only at turn end, so nothing streams while it thinks; all trial turns finished well inside HARNESS_ACP_PROMPT_TIMEOUT_S (300 s), but keep tasks single-purpose. Omnigent's injected system prompt (~5 kB) arrives as a collapsed 'Pasted text' chip, which blink handles; leave inject_system_prompt on. freebuff resolves RELATIVE paths against the cwd omnigent passed (the workspace, not the worktree): dispatch text must use absolute worktree paths and name the gate commands with `cd`. freebuff writes `.freebuff/project-id` into its cwd; gitignore `.freebuff/`. No approval gate: freebuff runs commands unattended - the worktree is the blast radius.",
+      "kind_note": "`blink` (github.com/jmvbambico/bufflink, >= v0.1.2) is an ACP bridge that drives the freebuff TUI in a PTY. Verified 2026-09-20/21 in og-sandbox: five backlog tasks (small to larger, incl. new modules and e2e tests), 3 of 3 first-try since v0.1.2; every commit in scope, gates green. Facts that matter: one blink process = one freebuff launch = one hour billed up front at the chosen model's rate (GLM 5.3 Flash 5/hr by default, up to DeepSeek V4.1 Flash 15/hr) from the free tier's 25 daily Freebucks, so a costlier pin means fewer launches per day, and the process lives as long as the sub-agent SESSION. Omnigent's sys_session_close does NOT end it (observed 2026-09-21): after closing a finished session, `pgrep -x blink` and SIGTERM it - blink exits cleanly within ~5 s and releases freebuff's single-instance lock; verify with `pgrep -fl manicode/freebuff` before the next launch. freebuff writes its transcript only at turn end, so nothing streams while it thinks; all trial turns finished well inside HARNESS_ACP_PROMPT_TIMEOUT_S (300 s), but keep tasks single-purpose. Omnigent's injected system prompt (~5 kB) arrives as a collapsed 'Pasted text' chip, which blink handles; leave inject_system_prompt on. freebuff resolves RELATIVE paths against the cwd omnigent passed (the workspace, not the worktree): dispatch text must use absolute worktree paths and name the gate commands with `cd`. freebuff writes `.freebuff/project-id` into its cwd; gitignore `.freebuff/`. No approval gate: freebuff runs commands unattended - the worktree is the blast radius.",
       "roles": [
         "coder"
       ],
@@ -473,8 +473,7 @@
       "quota": {
         "probe": "launch-budget",
         "daily": 25,
-        "per_launch": 5,
-        "note": "freebuff.com exposes no usable quota API (the subscription endpoint returns the SPA); og infers from launches counted in chat.db. blink fails fast with 'not enough Freebucks' when the pool is empty."
+        "note": "freebuff.com exposes no usable quota API (the subscription endpoint returns the SPA); og reports the balance freebuff itself last printed — in chat.db transcripts and runner logs — and unknown when nothing has reported since the daily reset. It never subtracts: freebuff bills per hour at a per-model rate (GLM 5.3 Flash 5/hr, MiMo 2.5 10/hr, Solar Pro 4 10/hr, DeepSeek V4.1 Flash 15/hr), so a launch's cost depends on its model and duration. blink fails fast with 'not enough Freebucks' when the pool is empty."
       }
     }
   ],
@@ -486,7 +485,7 @@
     "unknown": "Not declared by Omnigent (user-configured ACP). Assume the prompt may not arrive; inline critical rules in the dispatch."
   },
   "$quota": {
-    "description": "Optional per-agent `quota` blocks drive `og stats` (see docs/STATS.md). `probe` is the stats-layer probe name; it is null when the limit is known but exposes no queryable API, so `og stats` reports it as unknown rather than guessing. `daily`/`per_launch` are params consumed by the launch-budget probe (freebuff).",
+    "description": "Optional per-agent `quota` blocks drive `og stats` (see docs/STATS.md). `probe` is the stats-layer probe name; it is null when the limit is known but exposes no queryable API, so `og stats` reports it as unknown rather than guessing. `daily` is the pool size consumed by the launch-budget probe (freebuff); that probe reports the balance freebuff itself last printed and never subtracts a per-launch cost.",
     "probes": {
       "anthropic-oauth": "claude",
       "codex-wham": "codex",
@@ -497,8 +496,7 @@
       "launch-budget": "freebuff"
     },
     "params": {
-      "daily": 25,
-      "per_launch": 5
+      "daily": 25
     },
     "null_probe": "known limit, not measurable"
   }

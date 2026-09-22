@@ -3,11 +3,12 @@
 No network and no live ~/.omnigent: every test injects a stub http/read/run
 through Ctx and points the state file at tmp_path via OMNIGENT_HOME (module
 constant q.OMNI_STATE) or explicit paths. The launch-budget probe runs against
-a tmp sqlite with the chat.db schema's conversation columns.
+a tmp sqlite with the chat.db conversation_items columns plus tmp runner logs.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -376,43 +377,331 @@ def test_deepseek_no_key(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# launch-budget
+# launch-budget: observed balance or unknown, never inferred
 # --------------------------------------------------------------------------
 
-def _chatdb(path: Path, rows: list[tuple[str, int]]):
+FREEBUFF_TITLE = "coder_freebuff:test"
+ORCH_TITLE = "Agent quota and delegation"  # the orchestrator's own session
+
+
+# SELF-MATCH HYGIENE (same invariant as installer/og_quota.py): a worker
+# session cat-ing THIS file must not become evidence, so the blink prefix,
+# the pool noun, and the per-hour rate unit are never written contiguously
+# here — every verbatim error frame below is assembled from these fragments
+# at runtime. The tests assert exactly what they did before; only the way
+# the literal is spelled changed.
+_BLINK = "free" + "buff:"
+_FB = "Free" + "bucks"
+_FB_HR = "Free" + "bucks/hr"
+
+
+def _frame(left: int) -> str:
+    """The verbatim live error frame (2026-09-22/23), assembled from pieces."""
+    return ("ACP session/new failed: " + _BLINK + " not enough " + _FB +
+            " \u2014 \u2502 Not enough " + _FB + " \u2014 5 " + _FB_HR +
+            f" against {left} left. Enter opens plans. \u2502")
+
+
+def _err(left: int) -> str:
+    """Real-shape blink error payload (verbatim framing, 2026-09-22/23)."""
+    return '{"error": "' + _frame(left) + '"}'
+
+
+def _itemsdb(path: Path, rows: list[tuple], title: str = FREEBUFF_TITLE):
+    """chat.db-shaped db: conversations + conversation_items, ids joined.
+
+    Each row is (data, created) or (data, created, title); the join in
+    _scan_chat_items resolves the title per row.
+    """
     con = sqlite3.connect(path)
-    con.execute("create table conversations (id blob, title text, "
-                "created_at int, updated_at int, parent_conversation_id blob, "
-                "root_conversation_id blob)")
-    for i, (title, created) in enumerate(rows):
-        con.execute("insert into conversations values (?,?,?,?,?,?)",
-                    (bytes([i + 1]), title, created, created, None,
-                     bytes([i + 1])))
+    con.execute("create table conversations "
+                "(id blob, workspace_id bigint, title varchar(768))")
+    con.execute("create table conversation_items (id blob, "
+                "conversation_id blob, response_id text, created_at int, "
+                "position int, data text, search_text text, "
+                "workspace_id bigint)")
+    cids: dict[str, bytes] = {}
+
+    def cid_for(t: str) -> bytes:
+        if t not in cids:
+            cids[t] = bytes([len(cids) + 1]) * 16
+            con.execute("insert into conversations values (?,?,?)",
+                        (cids[t], 0, t))
+        return cids[t]
+
+    for i, row in enumerate(rows):
+        data, created = row[0], row[1]
+        t = row[2] if len(row) > 2 else title
+        con.execute("insert into conversation_items values (?,?,?,?,?,?,?,?)",
+                    (bytes([(i % 250) + 1]), cid_for(t), f"r{i}", created, i,
+                     data, data[:200], 0))
     con.commit()
     con.close()
 
 
-def test_launch_budget_counts_only_this_agent_today(tmp_path, monkeypatch):
+def _mkhome(tmp_path: Path, monkeypatch) -> Path:
+    """Point OMNI_STATE at tmp so chat.db + logs/runner resolve under it."""
     monkeypatch.setattr(q, "OMNI_STATE", tmp_path / "og-quota.json")
-    db = tmp_path / "chat.db"
-    today = int(NOW.timestamp())
-    yesterday = int((NOW - timedelta(days=1)).timestamp())
-    _chatdb(db, [
-        ("coder_freebuff: task one", today - 60),
-        ("coder_freebuff: task two", today - 30),
-        ("coder_kilo: other worker", today - 20),
-        ("orchestrator run", today - 10),        # not coder_*
-        ("coder_freebuff: yesterday", yesterday),  # not today
+    return tmp_path
+
+
+def _wlog(home: Path, name: str, text: str, age_s: float) -> Path:
+    d = home / "logs" / "runner"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text(text)
+    ts = NOW.timestamp() - age_s
+    os.utime(p, (ts, ts))
+    return p
+
+
+def _logline(dt: datetime, text: str) -> str:
+    """A realistic stamped runner log line (stamps carry no year)."""
+    return f"ERROR {dt.strftime('%m-%d %H:%M:%S')}.000 runner.app | {text}\n"
+
+
+def test_launch_budget_against_left_from_chat_db(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 14 * 60
+    _itemsdb(home / "chat.db", [
+        ('{"output": "old line, nothing"}', ts - 3600),
+        (_err(0), ts),
     ])
-    rec = q._probe_launch_budget(
-        {"daily": 25, "per_launch": 5, "agent_id": "freebuff"},
-        ctx(now=lambda: NOW))
-    assert rec["tier"] == "inferred"
-    assert rec["remaining"] == pytest.approx(25 - 2 * 5)
-    assert rec["unit"] == "freebucks"
-    assert rec["state"] == "ok"
-    assert rec["detail"] == "2 launch(es) today"
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["tier"] == "measured"
+    assert rec["source"] == "launch-budget (observed)"
+    assert rec["remaining"] == 0
+    assert rec["state"] == "dry"  # remaining 0 -> dry
+    assert rec["limit"] == 25 and rec["unit"] == "freebucks"
     assert rec["reset_at"]  # next local midnight
+    assert "0 left" in rec["detail"] and "chat.db" in rec["detail"]
+    assert q._parse_iso(rec["checked_at"]) is not None
+
+
+def test_launch_budget_prefixed_not_enough_is_dry(tmp_path, monkeypatch):
+    """`freebuff: not enough` with the blink prefix means an empty pool."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db",
+             [('{"error": "' + _BLINK + " Not enough " + _FB + '"}', ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 0
+    assert rec["state"] == "dry"
+    assert "not enough" in rec["detail"].lower()
+
+
+def test_launch_budget_orchestrator_session_is_ignored(tmp_path, monkeypatch):
+    """The SAME error text in the orchestrator's session is not an
+    observation — it is prose about freebuff, not output from freebuff."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db", [(_err(0), ts)], title=ORCH_TITLE)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["tier"] == "unknown"
+    assert rec["remaining"] is None
+
+
+def test_launch_budget_own_output_is_ignored(tmp_path, monkeypatch):
+    """The probe's own detail wording lands in chat.db; re-observing it
+    would self-sustain a fresh-looking reading forever."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 5
+    _itemsdb(home / "chat.db",
+             [("freebuff reported not enough Freebucks 9m ago (chat.db)",
+               ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_own_source_is_ignored(tmp_path, monkeypatch):
+    """A payload with the probe's source code is rejected even when it sits
+    next to a real error — the self-marker rule backing up the
+    title/prefix/structure rules."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 5
+    _itemsdb(home / "chat.db",
+             [("def _probe_launch_budget(params, ctx): " + _err(0), ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_bare_not_enough_is_ignored(tmp_path, monkeypatch):
+    """A bare `not enough` with no `freebuff:` prefix is quoted prose, not
+    an observation — no evidence, never zero."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db",
+             [('{"output": "Not enough Freebucks"}', ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_tui_meters_are_ignored(tmp_path, monkeypatch):
+    """The dropped TUI patterns match nothing, even with a prefix nearby —
+    they only ever appeared in prose we quoted ourselves."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db", [
+        ('{"error": "freebuff: done FREE \u00b7 8/25 Freebucks daily"}', ts),
+        ('{"error": "freebuff: Session ended \u00b7 12 Freebucks left"}',
+         ts + 1),
+    ])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_newest_provenanced_wins(tmp_path, monkeypatch):
+    """Newest-wins among rows that pass provenance; a newer row that does
+    not (orchestrator title here) must not shadow an older observation."""
+    home = _mkhome(tmp_path, monkeypatch)
+    now = int(NOW.timestamp())
+    _itemsdb(home / "chat.db", [
+        (_err(10), now - 7200),
+        (_err(3), now - 600),
+        (_err(99), now - 60, ORCH_TITLE),
+    ])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 3
+    assert "chat.db" in rec["detail"]
+
+
+def test_launch_budget_source_window_without_rate_clause_is_unknown(
+        tmp_path, monkeypatch):
+    """Neither the probe's source nor THIS test file may read as evidence.
+
+    The reviewer's exact scenario: a window of og_quota.py's own source —
+    pattern pieces plus surrounding prose — inside a worker session must
+    yield unknown. The structural rule (rate clause adjacent to the figure)
+    does the work here, NOT the self-marker rule: the window is asserted to
+    carry no self marker and to contain a `freebuff:` prefix occurrence, so
+    only the missing full frame can explain the unknown.
+
+    WHY this test exists: this orchestrator routinely dispatches workers to
+    review this very file, so its source (pattern strings included) lands in
+    worker sessions — and the same holds for this test file, whose verbatim
+    frames are assembled from fragments at runtime for exactly that reason.
+    If a future edit reintroduces a quotable full frame into either file,
+    this test fails closed. Both files are read generically (q.__file__ and
+    __file__) so a rename cannot silently skip one.
+    """
+    home = _mkhome(tmp_path, monkeypatch)
+    src = Path(q.__file__).read_text()
+    lines = src.splitlines()
+    start = next(i for i, l in enumerate(lines) if "_FB_RATE_UNIT =" in l)
+    end = next(i for i, l in enumerate(lines) if "_BLINK_PREFIX_RX =" in l)
+    window = "\n".join(lines[start:end + 1])
+    assert "freebuff:" in window.lower()  # prefix present, as in the review
+    assert not q._has_self_marker(window)  # ... but no self marker
+    # rate unit never contiguous (spelled via the runtime value, not the
+    # literal, so this assertion itself does not introduce the literal)
+    assert q._FB_RATE_UNIT.lower() not in window.lower()
+    assert q._extract_freebucks(window) is None
+    assert q._extract_freebucks(src) is None
+    tsrc = Path(__file__).read_text()
+    assert _FB_HR.lower() not in tsrc.lower()  # same, for this file
+    assert q._extract_freebucks(tsrc) is None
+    ts = int(NOW.timestamp())
+    _itemsdb(home / "chat.db", [(window, ts - 60), (tsrc, ts - 59)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_human_prose_with_figure_is_unknown(tmp_path,
+                                                          monkeypatch):
+    """Human prose carrying the prefix and a bare figure — but no rate
+    clause — is not an observation."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db",
+             [('{"output": "freebuff: it died with against 0 left again"}',
+               ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_verbatim_live_error_is_observed(tmp_path, monkeypatch):
+    """The verbatim live frame (rate clause adjacent to the figure) is the
+    load-bearing match: observed, remaining 0, dry."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db", [(_frame(0), ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["tier"] == "measured"
+    assert rec["remaining"] == 0
+    assert rec["state"] == "dry"
+
+
+def test_launch_budget_stale_stamped_line_in_fresh_file_is_unknown(
+        tmp_path, monkeypatch):
+    """A genuine error stamped yesterday, in a log touched seconds ago (a
+    later append), must NOT read as fresh: the line's own stamp is the
+    evidence time, and it decays across midnight."""
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-fresh.log",
+          _logline(NOW - timedelta(days=1, hours=1),
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 0 left."),
+          age_s=5)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_fresh_stamped_line_is_observed(tmp_path, monkeypatch):
+    """A line stamped minutes ago in a recently-touched file reads with its
+    real (fresh) age."""
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-fresh.log",
+          _logline(NOW - timedelta(minutes=5),
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 5 left."),
+          age_s=5)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["tier"] == "measured"
+    assert rec["remaining"] == 5 and rec["state"] == "ok"
+
+
+def test_launch_budget_unstamped_log_line_is_skipped(tmp_path, monkeypatch):
+    """A figure on a line with no parsable stamp is no evidence — even when
+    the file mtime is now. Falling back to mtime would make stale errors
+    look seconds old after any later append."""
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-nostamp.log",
+          "ACP session/new failed: " + _BLINK + " not enough " + _FB +
+          " \u2014 5 " + _FB_HR + " against 0 left.\n",
+          age_s=5)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_junk_created_at_is_skipped(tmp_path, monkeypatch):
+    """A row with an unparsable created_at is skipped, not treated as
+    just-observed: the newer junk-dated error must not shadow the older
+    valid one, and junk alone must read unknown (never permanently fresh)."""
+    home = _mkhome(tmp_path, monkeypatch)
+    now = int(NOW.timestamp())
+    _itemsdb(home / "chat.db", [
+        (_err(10), now - 7200),
+        (_err(0), "junk"),
+    ])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 10  # junk row skipped, older valid row wins
+
+    home2 = _mkhome(tmp_path, monkeypatch)
+    (home2 / "chat.db").unlink()
+    _itemsdb(home2 / "chat.db", [(_err(0), "junk")])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_underscore_title_is_not_a_worker(tmp_path,
+                                                        monkeypatch):
+    """`_` is a single-char LIKE wildcard: a `coderXfreebuff:` session must
+    not join as a worker even when it carries a real error."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db", [(_err(0), ts, "coderXfreebuff:e")])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
 
 
 def test_run_probes_injects_agent_id(tmp_path, monkeypatch):
@@ -430,19 +719,98 @@ def test_run_probes_injects_agent_id(tmp_path, monkeypatch):
     assert seen["agent_id"] == "freebuff"
 
 
-def test_launch_budget_exhausted_is_dry(tmp_path, monkeypatch):
-    monkeypatch.setattr(q, "OMNI_STATE", tmp_path / "og-quota.json")
-    db = tmp_path / "chat.db"
-    _chatdb(db, [(f"coder_a: run {i}", int(NOW.timestamp()) - i - 1)
-                 for i in range(4)])
-    rec = q._probe_launch_budget({"daily": 2, "per_launch": 1, "agent_id": "a"},
-                                 ctx(now=lambda: NOW))
-    assert rec["state"] == "dry" and rec["remaining"] == pytest.approx(-2)
+def test_launch_budget_harness_error_from_runner_log(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-a.log",
+          _logline(NOW - timedelta(seconds=180),
+                   "turn surfaced to UI as failed "
+                   "for 8ad3 (harness=acp): {'code': 'runner_error', 'message': "
+                   "'inner executor error: ACP session/new failed: " +
+                   _BLINK + " not enough " + _FB + " \u2014 5 " + _FB_HR +
+                   " against 8 left.'}\n"),
+          age_s=180)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["tier"] == "measured"
+    assert rec["source"] == "launch-budget (observed)"
+    assert rec["remaining"] == 8 and rec["limit"] == 25
+    assert rec["state"] == "ok"
+    assert "runner log" in rec["detail"]
+
+
+def test_launch_budget_runner_log_prompt_echo_is_ignored(tmp_path,
+                                                         monkeypatch):
+    """A log line that merely echoes prompt/report prose (no blink prefix,
+    no harness framing) must not qualify, even with a figure in it."""
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-a.log",
+          _logline(NOW - timedelta(seconds=60),
+                   "dispatched coder_freebuff with prompt: Session ended \u00b7 "
+                   "12 Freebucks left is the meter to watch\n"),
+          age_s=60)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_newest_wins_across_sources(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    _itemsdb(home / "chat.db",
+             [(_err(10), int(NOW.timestamp()) - 7200)])
+    _wlog(home, "runner-b.log",
+          _logline(NOW - timedelta(seconds=600),
+                   "turn surfaced to UI as failed (harness=acp): "
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 3 left."),
+          age_s=600)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 3
+    assert "runner log" in rec["detail"]
+
+
+def test_launch_budget_newer_db_beats_older_log(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-c.log",
+          _logline(NOW - timedelta(seconds=7200),
+                   "ACP session/new failed: " + _BLINK + " not enough " +
+                   _FB + " \u2014 5 " + _FB_HR + " against 2 left."),
+          age_s=7200)
+    _itemsdb(home / "chat.db",
+             [(_err(20), int(NOW.timestamp()) - 600)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 20
+    assert "chat.db" in rec["detail"]
+
+
+def test_launch_budget_stale_across_midnight_is_unknown(tmp_path, monkeypatch):
+    """Yesterday's balance says nothing about today's refilled pool."""
+    home = _mkhome(tmp_path, monkeypatch)
+    yesterday = int((NOW - timedelta(days=1)).timestamp())
+    _itemsdb(home / "chat.db", [(_err(20), yesterday)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["tier"] == "unknown"
+    assert rec["remaining"] is None
+    assert rec["limit"] == 25  # the pool size IS known
+    assert rec["reset_at"]  # next local midnight IS known
+    assert "no quota API" in rec["detail"]
+
+
+def test_launch_budget_nothing_found_is_unknown_not_a_number(tmp_path,
+                                                             monkeypatch):
+    """No observation anywhere: unknown with a null remaining, never 25-0."""
+    home = _mkhome(tmp_path, monkeypatch)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["tier"] == "unknown"
+    assert rec["remaining"] is None
+    assert rec["limit"] == 25 and rec["reset_at"]
+    # a db whose rows carry no figure is the same: no evidence, not zero
+    _itemsdb(home / "chat.db",
+             [('{"output": "hello world"}', int(NOW.timestamp()) - 60)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
 
 
 def test_launch_budget_no_db(tmp_path, monkeypatch):
     monkeypatch.setattr(q, "OMNI_STATE", tmp_path / "og-quota.json")
-    rec = q._probe_launch_budget({"daily": 10, "per_launch": 1}, ctx())
+    rec = q._probe_launch_budget({"daily": 10}, ctx())
     assert rec["state"] == "unknown"
 
 

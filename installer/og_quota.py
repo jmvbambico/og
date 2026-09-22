@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -513,45 +514,332 @@ def _probe_deepseek_balance(params: dict, ctx: Ctx) -> dict:
 
 
 def _probe_launch_budget(params: dict, ctx: Ctx) -> dict:
+    """freebuff's Freebucks balance, observed — never inferred.
+
+    freebuff exposes no quota API, bills per hour at a per-model rate, and
+    can be launched from anywhere (a human's own terminal, another tool), so
+    counting this orchestrator's launches and subtracting a flat per-launch
+    cost produced confident wrong numbers (2026-09-22: reported 15 left with
+    0 in the pool, and a reviewer was dispatched into the failure). An
+    inferred number presented as fact is worse than unknown, so this probe
+    only reports a balance freebuff itself printed — newest match wins — and
+    reports unknown otherwise. Provenance (2026-09-23): the observation is
+    taken only from freebuff worker sessions' own error output (chat.db rows
+    of `coder_freebuff:` conversations carrying blink's `freebuff:` prefix,
+    or runner log lines with the harness error framing), and figures only
+    as part of the full emitted frame (rate clause adjacent — prose and
+    source quotes cannot satisfy it); anything else —
+    including og's own reports — is ignored by design, because the probe's
+    own output lands in chat.db and would otherwise re-observe itself.
+    """
     daily = float(params.get("daily") or 0)
-    per_launch = float(params.get("per_launch") or 0)
-    # identity scope, injected by _one_agent for every probe: charge this
-    # agent only for its own launches (title "coder_<id>: ..."), never for
-    # every coder's. Absent only in direct unit calls, which keep the legacy
-    # all-coder count.
-    who = params.get("agent_id")
-    prefix = f"coder_{who}:" if who else "coder_"
     if daily <= 0:
         return unknown_record("no daily budget configured in registry quota block")
-    db = OMNI_STATE.parent / "chat.db"
-    launches = 0
+    now = ctx.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_midnight = midnight + timedelta(days=1)
+    home = OMNI_STATE.parent
+
+    best: tuple | None = None  # (ts, remaining, limit, error_only, origin)
+    db_ts, db_obs = _scan_chat_items(home / "chat.db")
+    if db_obs is not None:
+        best = (db_ts, *db_obs, "chat.db")
+    log_ts, log_obs, log_name = _scan_runner_logs(home / "logs" / "runner",
+                                                     now)
+    if log_obs is not None and (best is None or _aware(log_ts) > _aware(best[0])):
+        best = (log_ts, *log_obs, log_name)
+
+    if best is None or _aware(best[0]) < _aware(midnight):
+        # No observation, or the newest one predates the daily reset: the
+        # pool refills daily at local midnight, so a yesterday balance says
+        # nothing about today. Limit and reset ARE known (registry daily
+        # param, next local midnight); the balance is not. Both boundary
+        # choices fail toward unknown, never toward a confident number: a
+        # DST shift can only push evidence across the boundary (never make
+        # stale evidence look fresh), and a non-midnight real reset just
+        # reads as unknown until the next observation.
+        why = ("nothing has reported a Freebucks balance since the last reset"
+               if best is None else
+               "the newest reported balance predates today's reset")
+        return make_record(
+            "unknown", "unknown", None, daily, "freebucks", [],
+            next_midnight.isoformat(), "launch-budget", _iso(now),
+            f"freebuff exposes no quota API and {why}; "
+            f"pool is {daily:g}/day resetting at local midnight")
+    ts, remaining, limit, error_only, origin = best
+    age = max(0.0, (_aware(now) - _aware(ts)).total_seconds())
+    if error_only:
+        what = "not enough Freebucks"
+    elif limit is not None:
+        what = f"{remaining:g}/{limit:g} Freebucks (daily meter)"
+    else:
+        what = f"{remaining:g} left"
+    return make_record(
+        "dry" if (remaining <= 0 or error_only) else "ok", "measured",
+        remaining, daily if limit is None else limit, "freebucks", [],
+        next_midnight.isoformat(), "launch-budget (observed)", _iso(ts),
+        f"freebuff reported {what} {_age_str(age)} ago ({origin})")
+
+
+# The balance as freebuff/blink itself emits it — every pattern retargeted to
+# the real harness error framing seen on 2026-09-22/23: an inner-executor
+# ACP session/new failure carrying blink's error prefix, then the empty-pool
+# words, then a per-hour rate clause, then the figure (against M left).
+# (chat.db error payloads in worker sessions carry the same text.)
+#
+# PROVENANCE (2026-09-23 fix, hardened 2026-09-24): conversation_items holds
+# EVERY session's prose — dispatch prompts, reports, code reads, and this
+# probe's own previous output — so a bare figure match re-observes the probe
+# forever, always seconds old and never decaying to unknown. The
+# load-bearing rule is therefore STRUCTURAL: the remaining figure counts
+# only as part of the full emitted frame (empty-pool words, adjacent
+# per-hour rate clause, then the figure). Human prose and source quotes of
+# this file lack that adjacent rate clause, so they cannot satisfy it — the
+# reviewer's constructed case (a cat window of the pattern region inside a
+# worker session, whose docstring held the prefix and a bare figure) fails
+# closed. Defence in depth on top, none load-bearing alone: the
+# conversation-title join (worker sessions only), the blink/harness prefix
+# occurring earlier in the same payload/line, and rejection of payloads
+# carrying the probe's own output wording. The TUI meters (`FREE · N/25`,
+# `Session ended · N left`) were dropped outright: zero hits in any runner
+# log, and every chat.db hit was our own prose quoting them — an unreachable
+# pattern that can only false-positive is worse than no pattern.
+#
+# SELF-MATCH HYGIENE: this file's own source routinely lands in chat.db
+# (workers cat it during review), so the rate-unit literal is NEVER written
+# contiguously here — it is assembled from pieces below, and no comment
+# quotes the full frame. A regression test feeds this file's own source
+# back through the extractor and requires unknown.
+_FB_RATE_UNIT = "Free" + "bucks/hr"
+_FREEBUCKS_PATTERNS: list[tuple] = [
+    ("remaining", re.compile(
+        r"not enough free" + "bucks"
+        + r"[\s\u2014\u2013\u2502|\-.·]*\d+\s*"
+        + _FB_RATE_UNIT
+        + r"[\s\u2502|]+against[\s\u2502|]+(\d+)[\s\u2502|]+left",
+        re.IGNORECASE)),
+    ("empty", re.compile(r"freebuff:[\s\u2502|]*not enough free" + "bucks",
+                          re.IGNORECASE)),
+]
+
+# Bounds for the scan: chat.db is 100 MB+ on a live machine and the probe
+# budget is 8 s, so only the newest rows / newest logs are read.
+_FREEBUCKS_SCAN_ROWS = 4000
+_FREEBUCKS_SCAN_LOGS = 5
+
+
+# Provenance prefixes: blink's error prefix, and the harness framing that
+# carries it. A figure match counts only when one of these occurs EARLIER in
+# the same payload/line — i.e. the text is something blink or the harness
+# emitted, not prose quoting it.
+_BLINK_PREFIX_RX = re.compile(r"freebuff:", re.IGNORECASE)
+_HARNESS_FRAMING_RX = re.compile(
+    r"ACP session/new failed|surfaced to UI as failed", re.IGNORECASE)
+# Defence in depth on top of the title/prefix rules (the structural frame
+# above is the load-bearing one): the probe's own output is itself stored
+# in chat.db (and echoed into runner logs), so reject any payload/line
+# carrying it. WHY: without this, any future prose change that weakens the
+# structural rule would let the probe re-observe itself forever.
+_SELF_MARKERS = ("freebuff reported", "_probe_launch_budget",
+                 "launch-budget (observed)")
+
+
+def _has_self_marker(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _SELF_MARKERS)
+
+
+def _extract_freebucks(text: str, *,
+                       extra_prefix_rx=None) -> tuple | None:
+    """Newest provenanced Freebucks observation in `text`.
+
+    Returns (remaining, limit, error_only). Later matches win (a turn whose
+    full frame ends on the lower figure reports that figure, not the
+    earlier error-only line). A `remaining` figure counts only as part of
+    the full emitted frame — empty-pool words with the adjacent per-hour
+    rate clause — AND only when a provenance prefix occurs earlier in the
+    same text; the `empty` pattern carries its `freebuff:` prefix inline
+    so it is provenanced by construction. Unprovenanced figures (quoted
+    prose, regex source, bare mentions) yield None — no evidence, never
+    zero.
+    """
+    text = text or ""
+    marks = [m.start() for m in _BLINK_PREFIX_RX.finditer(text)]
+    if extra_prefix_rx is not None:
+        marks += [m.start() for m in extra_prefix_rx.finditer(text)]
+    best: tuple | None = None  # (pos, remaining, limit, error_only)
+    for kind, rx in _FREEBUCKS_PATTERNS:
+        for m in rx.finditer(text):
+            if kind == "empty":
+                cand = (m.start(), 0.0, None, True)
+            else:
+                if not any(p < m.start() for p in marks):
+                    continue
+                cand = (m.start(), float(m.group(1)), None, False)
+            if best is None or cand[0] >= best[0]:
+                best = cand
+    return None if best is None else best[1:]
+
+
+def _epoch_to_aware(created: Any, now: datetime) -> datetime | None:
+    """A chat.db created_at (epoch seconds) as an aware datetime; None on junk.
+
+    WHY None and not now: falling back to now makes a junk-dated row
+    permanently fresh — never older than midnight, never decaying — so a
+    stale balance would read as just observed. A row without a trustworthy
+    timestamp is no evidence; the caller skips it.
+    """
+    try:
+        return datetime.fromtimestamp(float(created)).astimezone()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _scan_chat_items(db: Path) -> tuple:
+    """Newest provenanced (ts, observation) in conversation_items, or (None, None).
+
+    Only rows of `coder_freebuff:` worker sessions count — the join on
+    conversations enforces that, so the orchestrator's own prompts, reports
+    and code reads never qualify. Within those rows the figure must still
+    carry the blink/harness prefix (see _extract_freebucks), and any payload
+    carrying the probe's own output is rejected outright: the probe's output
+    is itself stored in chat.db, and re-observing it would self-sustain a
+    fresh-looking reading forever.
+
+    Newest-first via rowid (append order ~ time order, no full-table sort);
+    the first row with a match is the newest evidence. A missing table or an
+    unreadable db is "no evidence", not an error — the probe reports unknown.
+    """
     try:
         # read-only, same precedent as og_audit.py
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            today = ctx.now().date()
-            for title, created in con.execute(
-                    "select title, created_at from conversations"):
-                if not title or not title.startswith(prefix):
-                    continue
-                # created_at is epoch seconds (chat.db convention, og_audit.py)
-                when = datetime.fromtimestamp(created).astimezone()
-                if when.date() == today:
-                    launches += 1
+            rows = con.execute(
+                "select ci.data, ci.created_at from conversation_items ci "
+                "join conversations c on c.id = ci.conversation_id "
+                "and c.workspace_id = ci.workspace_id "
+                # `_` is a single-char LIKE wildcard: escape it so only the
+                # literal `coder_freebuff:` prefix joins, not e.g.
+                # `coderXfreebuff:`.
+                "where c.title like 'coder\\_freebuff:%' escape '\\' "
+                "order by ci.rowid desc limit ?",
+                (_FREEBUCKS_SCAN_ROWS,)).fetchall()
         finally:
             con.close()
-    except FileNotFoundError:
-        return unknown_record(f"no chat.db at {db}")
-    except sqlite3.Error as e:
-        return unknown_record(f"chat.db unreadable: {e}")
-    used = launches * per_launch
-    remaining = daily - used
-    # next local midnight: replace the clock, then step a day if we wrapped
-    midnight = ctx.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    return make_record(
-        "ok" if remaining > 0 else "dry", "inferred", remaining, daily,
-        "freebucks", [], midnight.isoformat(), "launch-budget", _iso(ctx.now()),
-        f"{launches} launch(es) today")
+    except sqlite3.Error:
+        return None, None
+    for data, created in rows:
+        text = str(data or "")
+        if _has_self_marker(text):
+            continue
+        ts = _epoch_to_aware(created, datetime.now())
+        if ts is None:
+            continue  # junk timestamp is no evidence (see _epoch_to_aware)
+        obs = _extract_freebucks(text)
+        if obs is not None:
+            return ts, obs
+    return None, None
+
+
+# Runner log lines open with a level and a year-less stamp, e.g.
+# `ERROR 09-22 18:51:55.547 runner.app ...`. The stamp is the evidence time:
+# the file mtime must NOT stand in for it — a log appended to after the
+# error (e.g. a later successful launch) would otherwise make a 09:00 error
+# read seconds old until midnight. Lines without a parsable stamp are
+# SKIPPED, never mtime-dated: an undated line is no evidence, and failing
+# closed toward unknown is the safe direction.
+_LOG_STAMP_RX = re.compile(
+    r"^(?:INFO|WARN(?:ING)?|ERROR|DEBUG|CRITICAL)\s+"
+    r"(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?")
+
+
+def _parse_log_stamp(line: str, now: datetime) -> datetime | None:
+    """A runner log line's own stamp as an aware datetime; None if unparsable.
+
+    Stamps carry no year: assume now's year, falling back to the previous
+    year when that lands in the future (a December log read in January).
+    The fallback only ever makes evidence older, never fresher.
+    """
+    m = _LOG_STAMP_RX.match(line or "")
+    if not m:
+        return None
+    mo, day, hh, mm, ss, frac = m.groups()
+    try:
+        us = int((frac or "0")[:6].ljust(6, "0"))
+        ref = _aware(now)
+        dt = datetime(ref.year, int(mo), int(day), int(hh), int(mm),
+                      int(ss), us, tzinfo=ref.tzinfo)
+    except ValueError:
+        return None
+    if dt > _aware(now):
+        try:
+            dt = dt.replace(year=dt.year - 1)
+        except ValueError:  # Feb 29 edge
+            return None
+    return dt
+
+
+def _extract_freebucks_lines(text: str, now: datetime) -> tuple | None:
+    """Newest (ts, observation) across stamped log lines; later stamps win.
+
+    A line counts only when it carries the blink `freebuff:` prefix or the
+    harness error framing — a log that merely echoes the orchestrator's
+    prompt text must not qualify — never when it carries the probe's
+    own output wording, and never without its own parsable stamp.
+    """
+    best: tuple | None = None  # (ts, remaining, limit, error_only)
+    for line in (text or "").splitlines():
+        if _has_self_marker(line):
+            continue
+        if not (_BLINK_PREFIX_RX.search(line)
+                or _HARNESS_FRAMING_RX.search(line)):
+            continue
+        ts = _parse_log_stamp(line, now)
+        if ts is None:
+            continue
+        obs = _extract_freebucks(line, extra_prefix_rx=_HARNESS_FRAMING_RX)
+        if obs is not None and (best is None or _aware(ts) > _aware(best[0])):
+            best = (ts, *obs)
+    return best
+
+
+def _scan_runner_logs(logdir: Path, now: datetime) -> tuple:
+    """Newest (ts, observation, origin) in the newest runner logs.
+
+    Files newest-first by mtime (read budget: newest few only); the evidence
+    time is each LINE's own stamp, compared across all scanned files, so a
+    stale error in a recently-appended log keeps its real age and decays
+    normally. Returns (None, None, None) when nothing matches.
+    """
+    try:
+        logs = sorted(logdir.glob("*.log"),
+                      key=lambda p: p.stat().st_mtime,
+                      reverse=True)[:_FREEBUCKS_SCAN_LOGS]
+    except OSError:
+        return None, None, None
+    best: tuple | None = None  # (ts, observation, origin)
+    for lp in logs:
+        try:
+            found = _extract_freebucks_lines(lp.read_text(errors="replace"),
+                                             now)
+        except OSError:
+            continue
+        if found is not None and (best is None
+                                  or _aware(found[0]) > _aware(best[0])):
+            best = (found[0], found[1:], "runner log")
+    if best is None:
+        return None, None, None
+    return best
+
+
+def _age_str(age_s: float) -> str:
+    if age_s < 90:
+        return f"{age_s:.0f}s"
+    if age_s < 3600:
+        return f"{age_s / 60:.0f}m"
+    if age_s < 86400:
+        return f"{age_s / 3600:.1f}h"
+    return f"{age_s / 86400:.1f}d"
 
 
 class _RateLimited(Exception):
@@ -697,7 +985,9 @@ def _cached_or(probe_name: str, prev: dict, ctx: Ctx,
     is younger than CACHE_TTL_S, else report unknown."""
     for rec in (prev or {}).values():
         src = str(rec.get("source", ""))
-        if src.split(" (cached)")[0] != probe_name:
+        # strip any parenthetical suffix (" (cached)", " (observed)") so an
+        # observed launch-budget record stays reusable like any other probe's
+        if src.split(" (")[0] != probe_name:
             continue
         age = _age_s(rec.get("checked_at"), ctx)
         if age is not None and age <= CACHE_TTL_S:

@@ -1074,6 +1074,25 @@ def test_install_pth_dies_without_an_omnigent_interpreter(monkeypatch, tmp_path)
         m.install_pth(tmp_path)
 
 
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="posix HOME/pwd semantics")
+def test_install_pth_sandboxed_home_leaves_live_pth_untouched(
+        fake_omnigent_venv, tmp_path, monkeypatch, capsys):
+    """A sandboxed run (HOME pointed at a temp dir per the AGENTS.md recipe)
+    must not repoint the LIVE .pth at the temp policies dir: the write is
+    skipped and the pre-existing .pth stays byte-identical."""
+    purelib = subprocess.run(
+        [str(fake_omnigent_venv), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        capture_output=True, text=True, check=True).stdout.strip()
+    pth = Path(purelib) / "omnigent-local-policies.pth"
+    pth.write_text("live-contents\n")
+    before = pth.read_bytes()
+    monkeypatch.setenv("HOME", str(tmp_path / "sandbox-home"))
+    m.install_pth(tmp_path / "policies")  # must neither raise nor write
+    assert pth.read_bytes() == before
+    out = capsys.readouterr().out
+    assert "sandbox" in out.lower() and str(pth) in out
+
+
 # --------------------------------------------------------------------------
 # model.choices: a static lineup for agents with no live model listing
 # --------------------------------------------------------------------------

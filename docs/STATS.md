@@ -22,7 +22,7 @@ og stats --clear kilo
 | role      | orchestrator / coder / reviewer (from the install state) |
 | agent     | agent id |
 | state     | `ok`, `dry`, or `unknown` |
-| remaining | quota left, e.g. `60/100%`, `12.5 credits`, `8 launches` |
+| remaining | quota left, e.g. `60/100%`, `12.5 credits`, `0 Freebucks` |
 | reset     | next window reset, local time with a relative hint (`in 45m`) |
 | tier      | how the number was obtained (below) |
 | source    | which probe produced it, `mark`, or `<probe> (cached)` |
@@ -36,10 +36,11 @@ og stats --clear kilo
 
 ## Tiers
 
-- **measured** — read from the vendor (OAuth usage endpoint, CLI, dashboard).
-- **inferred** — computed locally without the vendor (freebuff launch budget
-  counts today's `coder_*` launches in `chat.db`).
-- **unknown** — no credential, no endpoint answer, no budget configured.
+- **measured** — read from the vendor (OAuth usage endpoint, CLI, dashboard),
+  or from the vendor tool's own printed output (freebuff launch-budget: the
+  balance freebuff last reported in a transcript or runner log).
+- **unknown** — no credential, no endpoint answer, no reported balance since
+  the daily reset, no budget configured.
 
 ## Probes (one per agent)
 
@@ -51,7 +52,7 @@ og stats --clear kilo
 | kilo-profile | kilo | `kilo profile --json` balance |
 | cursor-dashboard | cursor | token from `state.vscdb` → current-period usage |
 | deepseek-balance | cline | `GET user/balance`, needs `$DEEPSEEK_API_KEY` |
-| launch-budget | freebuff | 25 daily / 5 per launch inferred from local `chat.db` |
+| launch-budget | freebuff | last balance freebuff itself printed (chat.db transcripts + newest runner logs); `unknown` when nothing reported since the daily reset — og never subtracts a per-launch cost. The observation is taken only from freebuff worker sessions' own error output, and anything else — including og's own reports — is ignored by design |
 | (none) | opencode, kiro | known limit, not measurable: row shows the registry `quota.note` |
 
 ## Marks
@@ -83,4 +84,7 @@ session. Missing credentials report `unknown`, never an error.
 - 5h/primary windows bind by design; a nearly-spent weekly window is visible
   in `detail` but does not flip `state` on its own.
 - Cached records are at most 30 minutes old; anything older reports `unknown`.
-- The freebuff budget is an inference from launch titles, not vendor truth.
+- The freebuff balance is observed, not computed: freebuff bills per hour at a
+  per-model rate and launches from anywhere, so counting launches and
+  subtracting a flat cost produced confident wrong numbers. A balance older
+  than the last local midnight reads as `unknown` (the pool resets daily).
