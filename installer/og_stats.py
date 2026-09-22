@@ -289,7 +289,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--json", action="store_true", help="emit the merged view as JSON")
     ap.add_argument("--all", action="store_true",
                     help="include every registry agent, not just the installed lineup")
-    ap.add_argument("--mark", metavar="AGENT_ID", help="mark an agent dry (dry-run: prints, writes state)")
+    # --mark takes an optional trailing state word so the CLI accepts its own
+    # documented syntax: the orchestrator prompt, the generated roster skill,
+    # the fanout skill and docs/STATS.md all run
+    # `og stats --mark <id> dry --until ...`. nargs="+" (not a positional)
+    # keeps the word attached to --mark: a bare positional would also match
+    # `og stats dry` with no --mark at all.
+    ap.add_argument("--mark", nargs="+", metavar="AGENT_ID",
+                    help="mark an agent dry: --mark AGENT_ID [dry] (dry-run: prints, writes state)")
     ap.add_argument("--until", metavar="WHEN",
                     help="with --mark: ISO8601 or +2h/+30m/+1d (default: no expiry)")
     ap.add_argument("--reason", default="", help="with --mark: why it is dry")
@@ -305,7 +312,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.mark:
         if args.clear:
             ap.error("--mark and --clear are mutually exclusive")
-        do_mark(args.mark, args.until, args.reason, state_path)
+        if len(args.mark) == 1:
+            mark_id = args.mark[0]
+        elif len(args.mark) == 2 and args.mark[1] == "dry":
+            mark_id = args.mark[0]
+        else:
+            ap.error("--mark takes AGENT_ID [dry]; the optional state must be the literal 'dry'")
+        do_mark(mark_id, args.until, args.reason, state_path)
         return
     if args.clear:
         do_clear(args.clear, state_path)

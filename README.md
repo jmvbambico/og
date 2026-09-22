@@ -143,7 +143,7 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | Kilo Code | `acp:kilo-code` | coder | **required** | via `kilo acp`; unverified here |
 | Kiro (AWS) | `acp:kiro-aws` | coder / reviewer | optional | via `kiro-cli acp --trust-all-tools` (see below); 50 free credits/mo; unverified here |
 | Cursor | `cursor-native` | coder / reviewer | optional | |
-| Freebuff | `acp:freebuff` | coder | optional — 3 choices; needs a blink that honours BLINK_MODEL | via [`blink`](https://github.com/jmvbambico/bufflink) ≥ v0.1.2, an ACP bridge over freebuff's TUI; 5 of 25 daily Freebucks per launch; silent until the turn ends; **verified** (5 backlog tasks, 3/3 first-try since v0.1.2); close the session then SIGTERM `blink` to release freebuff's lock |
+| Freebuff | `acp:freebuff` | coder | optional — 4 rotating choices; needs a blink that honours BLINK_MODEL | via [`blink`](https://github.com/jmvbambico/bufflink) ≥ v0.1.2, an ACP bridge over freebuff's TUI; 5 of 25 daily Freebucks per launch; silent until the turn ends; **verified** (5 backlog tasks, 3/3 first-try since v0.1.2); close the session then SIGTERM `blink` to release freebuff's lock |
 | Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
 | Goose, Hermes, Gemini, Grok, Devin | various | coder | optional | |
 

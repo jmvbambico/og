@@ -694,3 +694,31 @@ def test_cli_bad_until_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OMNI", tmp_path)
     with pytest.raises(SystemExit):
         st.main(["--mark", "opencode", "--until", "next week"])
+
+
+def test_cli_mark_with_and_without_dry_state(tmp_path, monkeypatch, capsys):
+    # The orchestrator prompt, the roster/fanout skills and docs all run
+    # `og stats --mark <id> dry ...`; the bare `--mark <id>` form must mark
+    # the agent identically.
+    state_path = tmp_path / "og-quota.json"
+    monkeypatch.setattr(st, "OMNI", tmp_path)
+    monkeypatch.setattr(q, "OMNI_STATE", state_path)
+    st.main(["--mark", "kilo", "--until", "+1h", "--reason", "quota"])
+    capsys.readouterr()
+    st.main(["--mark", "cline", "dry", "--until", "+1h", "--reason", "quota"])
+    assert "mark cline" in capsys.readouterr().out
+    marks = q.load_state(state_path)["marks"]
+    for aid in ("kilo", "cline"):
+        assert marks[aid]["state"] == "dry"
+        assert marks[aid]["reason"] == "quota"
+        assert marks[aid]["until"] is not None
+    st.main(["--clear", "kilo"])
+    st.main(["--clear", "cline"])
+
+
+def test_cli_mark_bad_state_exits(tmp_path, monkeypatch):
+    # The optional trailing word is the literal `dry`; anything else names
+    # the accepted value in the usage error.
+    monkeypatch.setattr(st, "OMNI", tmp_path)
+    with pytest.raises(SystemExit):
+        st.main(["--mark", "opencode", "wet"])

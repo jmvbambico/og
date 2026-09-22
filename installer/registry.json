@@ -453,11 +453,12 @@
       "model": {
         "required": false,
         "pin_path": "executor.model",
-        "note": "The model is chosen inside freebuff (default GLM 5.3 Flash on the free tier); blink accepts the model splash's default and does not switch models. A pin is ignored. These are the models freebuff's own splash offers (from its binary). Pinning one records the choice and exports BLINK_MODEL=<id> into the worker env; a blink that honours BLINK_MODEL selects it on the splash, older blink accepts the default (GLM 5.3 Flash). Vendor follows the model: a deepseek/* pick makes Freebuff same-vendor with Cline for review purposes.",
+        "note": "The model is chosen on freebuff's splash (default GLM 5.3 Flash; the lineup ROTATES - there is a limited-time-trial slot - so `choices` is a convenience list, not a closed set: a free-text id matching a splash display name also works). Pinning one exports BLINK_MODEL=<id> into the worker env; a blink that honours BLINK_MODEL selects it on the splash, older blink accepts the default. A pin naming a model freebuff is not offering fails the dispatch loudly rather than running the default, as does a dispatch into a freebuff hour already running on another model (wait for the hour to end or unset the pin). Vendor follows the model: a deepseek/* pick makes Freebuff same-vendor with Cline for review purposes.",
         "choices": [
           "z-ai/glm-5.3-flash",
-          "deepseek/deepseek-v4-flash",
-          "deepseek/deepseek-v4-pro"
+          "mimo-2.5",
+          "solar-pro-4",
+          "deepseek-v4.1-flash"
         ],
         "prefer": "z-ai/glm-5.3-flash",
         "env_var": "BLINK_MODEL"
