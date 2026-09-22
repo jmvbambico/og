@@ -52,7 +52,7 @@ og stats --clear kilo
 | kilo-profile | kilo | `kilo profile --json` balance |
 | cursor-dashboard | cursor | token from `state.vscdb` → current-period usage |
 | deepseek-balance | cline | `GET user/balance`, needs `$DEEPSEEK_API_KEY` |
-| launch-budget | freebuff | last balance freebuff itself printed (chat.db transcripts + newest runner logs); `unknown` when nothing reported since the daily reset — og never subtracts a per-launch cost |
+| launch-budget | freebuff | last balance freebuff itself printed (chat.db transcripts + newest runner logs); `unknown` when nothing reported since the daily reset — og never subtracts a per-launch cost. The observation is taken only from freebuff worker sessions' own error output, and anything else — including og's own reports — is ignored by design |
 | (none) | opencode, kiro | known limit, not measurable: row shows the registry `quota.note` |
 
 ## Marks

@@ -380,16 +380,46 @@ def test_deepseek_no_key(tmp_path, monkeypatch):
 # launch-budget: observed balance or unknown, never inferred
 # --------------------------------------------------------------------------
 
-def _itemsdb(path: Path, rows: list[tuple[str, int]]):
-    """chat.db-shaped db with a conversation_items table: (data, created_at)."""
+FREEBUFF_TITLE = "coder_freebuff:test"
+ORCH_TITLE = "Agent quota and delegation"  # the orchestrator's own session
+
+
+def _err(left: int) -> str:
+    """Real-shape blink error payload (verbatim framing, 2026-09-22/23)."""
+    return ('{"error": "ACP session/new failed: freebuff: not enough '
+            "Freebucks \u2014 \u2502 Not enough Freebucks \u2014 "
+            f"5 Freebucks/hr against {left} left. Enter opens plans. "
+            "\u2502\"}")
+
+
+def _itemsdb(path: Path, rows: list[tuple], title: str = FREEBUFF_TITLE):
+    """chat.db-shaped db: conversations + conversation_items, ids joined.
+
+    Each row is (data, created) or (data, created, title); the join in
+    _scan_chat_items resolves the title per row.
+    """
     con = sqlite3.connect(path)
+    con.execute("create table conversations "
+                "(id blob, workspace_id bigint, title varchar(768))")
     con.execute("create table conversation_items (id blob, "
                 "conversation_id blob, response_id text, created_at int, "
-                "position int, data text, search_text text)")
-    for i, (data, created) in enumerate(rows):
-        con.execute("insert into conversation_items values (?,?,?,?,?,?,?)",
-                    (bytes([i + 1]), bytes([i + 1]), f"r{i}", created, i,
-                     data, data[:200]))
+                "position int, data text, search_text text, "
+                "workspace_id bigint)")
+    cids: dict[str, bytes] = {}
+
+    def cid_for(t: str) -> bytes:
+        if t not in cids:
+            cids[t] = bytes([len(cids) + 1]) * 16
+            con.execute("insert into conversations values (?,?,?)",
+                        (cids[t], 0, t))
+        return cids[t]
+
+    for i, row in enumerate(rows):
+        data, created = row[0], row[1]
+        t = row[2] if len(row) > 2 else title
+        con.execute("insert into conversation_items values (?,?,?,?,?,?,?,?)",
+                    (bytes([(i % 250) + 1]), cid_for(t), f"r{i}", created, i,
+                     data, data[:200], 0))
     con.commit()
     con.close()
 
@@ -415,8 +445,7 @@ def test_launch_budget_against_left_from_chat_db(tmp_path, monkeypatch):
     ts = int(NOW.timestamp()) - 14 * 60
     _itemsdb(home / "chat.db", [
         ('{"output": "old line, nothing"}', ts - 3600),
-        ('{"output": "ACP session/new failed: freebuff: not enough Freebucks '
-        '\\u2014 5 Freebucks/hr against 0 left."}', ts),
+        (_err(0), ts),
     ])
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["tier"] == "measured"
@@ -427,6 +456,92 @@ def test_launch_budget_against_left_from_chat_db(tmp_path, monkeypatch):
     assert rec["reset_at"]  # next local midnight
     assert "0 left" in rec["detail"] and "chat.db" in rec["detail"]
     assert q._parse_iso(rec["checked_at"]) is not None
+
+
+def test_launch_budget_prefixed_not_enough_is_dry(tmp_path, monkeypatch):
+    """`freebuff: not enough` with the blink prefix means an empty pool."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db",
+             [('{"error": "freebuff: Not enough Freebucks"}', ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 0
+    assert rec["state"] == "dry"
+    assert "not enough" in rec["detail"].lower()
+
+
+def test_launch_budget_orchestrator_session_is_ignored(tmp_path, monkeypatch):
+    """The SAME error text in the orchestrator's session is not an
+    observation — it is prose about freebuff, not output from freebuff."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db", [(_err(0), ts)], title=ORCH_TITLE)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["tier"] == "unknown"
+    assert rec["remaining"] is None
+
+
+def test_launch_budget_own_output_is_ignored(tmp_path, monkeypatch):
+    """The probe's own detail wording lands in chat.db; re-observing it
+    would self-sustain a fresh-looking reading forever."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 5
+    _itemsdb(home / "chat.db",
+             [("freebuff reported not enough Freebucks 9m ago (chat.db)",
+               ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_own_source_is_ignored(tmp_path, monkeypatch):
+    """A payload with the probe's source code is rejected even when it sits
+    next to a real error — belt and braces over the title/prefix rules."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 5
+    _itemsdb(home / "chat.db",
+             [("def _probe_launch_budget(params, ctx): " + _err(0), ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_bare_not_enough_is_ignored(tmp_path, monkeypatch):
+    """A bare `not enough` with no `freebuff:` prefix is quoted prose, not
+    an observation — no evidence, never zero."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db",
+             [('{"output": "Not enough Freebucks"}', ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_tui_meters_are_ignored(tmp_path, monkeypatch):
+    """The dropped TUI patterns match nothing, even with a prefix nearby —
+    they only ever appeared in prose we quoted ourselves."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db", [
+        ('{"error": "freebuff: done FREE \u00b7 8/25 Freebucks daily"}', ts),
+        ('{"error": "freebuff: Session ended \u00b7 12 Freebucks left"}',
+         ts + 1),
+    ])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
+
+
+def test_launch_budget_newest_provenanced_wins(tmp_path, monkeypatch):
+    """Newest-wins among rows that pass provenance; a newer row that does
+    not (orchestrator title here) must not shadow an older observation."""
+    home = _mkhome(tmp_path, monkeypatch)
+    now = int(NOW.timestamp())
+    _itemsdb(home / "chat.db", [
+        (_err(10), now - 7200),
+        (_err(3), now - 600),
+        (_err(99), now - 60, ORCH_TITLE),
+    ])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 3
+    assert "chat.db" in rec["detail"]
 
 
 def test_run_probes_injects_agent_id(tmp_path, monkeypatch):
@@ -444,9 +559,13 @@ def test_run_probes_injects_agent_id(tmp_path, monkeypatch):
     assert seen["agent_id"] == "freebuff"
 
 
-def test_launch_budget_daily_meter_from_runner_log(tmp_path, monkeypatch):
+def test_launch_budget_harness_error_from_runner_log(tmp_path, monkeypatch):
     home = _mkhome(tmp_path, monkeypatch)
-    _wlog(home, "runner-a.log", "boot\nFREE \u00b7 8/25 Freebucks daily\n",
+    _wlog(home, "runner-a.log",
+          "ERROR 09-22 18:51:55 runner.app | turn surfaced to UI as failed "
+          "for 8ad3 (harness=acp): {'code': 'runner_error', 'message': "
+          "'inner executor error: ACP session/new failed: freebuff: "
+          "not enough Freebucks \u2014 5 Freebucks/hr against 8 left.'}\n",
           age_s=180)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["tier"] == "measured"
@@ -456,34 +575,28 @@ def test_launch_budget_daily_meter_from_runner_log(tmp_path, monkeypatch):
     assert "runner log" in rec["detail"]
 
 
-def test_launch_budget_session_ended_from_chat_db(tmp_path, monkeypatch):
+def test_launch_budget_runner_log_prompt_echo_is_ignored(tmp_path,
+                                                         monkeypatch):
+    """A log line that merely echoes prompt/report prose (no blink prefix,
+    no harness framing) must not qualify, even with a figure in it."""
     home = _mkhome(tmp_path, monkeypatch)
-    ts = int(NOW.timestamp()) - 300
-    _itemsdb(home / "chat.db",
-             [('{"output": "Session ended \u00b7 12 Freebucks left"}', ts)])
+    _wlog(home, "runner-a.log",
+          "dispatched coder_freebuff with prompt: Session ended \u00b7 "
+          "12 Freebucks left is the meter to watch\n",
+          age_s=60)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
-    assert rec["remaining"] == 12
-    assert rec["state"] == "ok" and rec["tier"] == "measured"
-
-
-def test_launch_budget_bare_not_enough_is_dry(tmp_path, monkeypatch):
-    """A `not enough` error with no figure means an empty pool: 0, dry."""
-    home = _mkhome(tmp_path, monkeypatch)
-    ts = int(NOW.timestamp()) - 60
-    _itemsdb(home / "chat.db",
-             [('{"output": "Not enough Freebucks"}', ts)])
-    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
-    assert rec["remaining"] == 0
-    assert rec["state"] == "dry"
-    assert "not enough" in rec["detail"].lower()
+    assert rec["state"] == "unknown" and rec["remaining"] is None
 
 
 def test_launch_budget_newest_wins_across_sources(tmp_path, monkeypatch):
     home = _mkhome(tmp_path, monkeypatch)
     _itemsdb(home / "chat.db",
-             [('{"output": "Session ended \u00b7 10 Freebucks left"}',
-               int(NOW.timestamp()) - 7200)])
-    _wlog(home, "runner-b.log", "5 Freebucks/hr against 3 left", age_s=600)
+             [(_err(10), int(NOW.timestamp()) - 7200)])
+    _wlog(home, "runner-b.log",
+          "turn surfaced to UI as failed (harness=acp): ACP session/new "
+          "failed: freebuff: not enough Freebucks \u2014 5 Freebucks/hr "
+          "against 3 left.",
+          age_s=600)
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["remaining"] == 3
     assert "runner log" in rec["detail"]
@@ -491,10 +604,12 @@ def test_launch_budget_newest_wins_across_sources(tmp_path, monkeypatch):
 
 def test_launch_budget_newer_db_beats_older_log(tmp_path, monkeypatch):
     home = _mkhome(tmp_path, monkeypatch)
-    _wlog(home, "runner-c.log", "FREE \u00b7 2/25 Freebucks daily", age_s=7200)
+    _wlog(home, "runner-c.log",
+          "ACP session/new failed: freebuff: not enough Freebucks \u2014 "
+          "5 Freebucks/hr against 2 left.",
+          age_s=7200)
     _itemsdb(home / "chat.db",
-             [('{"output": "Session ended \u00b7 20 Freebucks left"}',
-               int(NOW.timestamp()) - 600)])
+             [(_err(20), int(NOW.timestamp()) - 600)])
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["remaining"] == 20
     assert "chat.db" in rec["detail"]
@@ -504,9 +619,7 @@ def test_launch_budget_stale_across_midnight_is_unknown(tmp_path, monkeypatch):
     """Yesterday's balance says nothing about today's refilled pool."""
     home = _mkhome(tmp_path, monkeypatch)
     yesterday = int((NOW - timedelta(days=1)).timestamp())
-    _itemsdb(home / "chat.db",
-             [('{"output": "Session ended \u00b7 20 Freebucks left"}',
-               yesterday)])
+    _itemsdb(home / "chat.db", [(_err(20), yesterday)])
     rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
     assert rec["state"] == "unknown" and rec["tier"] == "unknown"
     assert rec["remaining"] is None

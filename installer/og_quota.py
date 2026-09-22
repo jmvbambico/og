@@ -523,7 +523,12 @@ def _probe_launch_budget(params: dict, ctx: Ctx) -> dict:
     0 in the pool, and a reviewer was dispatched into the failure). An
     inferred number presented as fact is worse than unknown, so this probe
     only reports a balance freebuff itself printed — newest match wins — and
-    reports unknown otherwise.
+    reports unknown otherwise. Provenance (2026-09-23): the observation is
+    taken only from freebuff worker sessions' own error output (chat.db rows
+    of `coder_freebuff:` conversations carrying blink's `freebuff:` prefix,
+    or runner log lines with the harness error framing); anything else —
+    including og's own reports — is ignored by design, because the probe's
+    own output lands in chat.db and would otherwise re-observe itself.
     """
     daily = float(params.get("daily") or 0)
     if daily <= 0:
@@ -569,14 +574,26 @@ def _probe_launch_budget(params: dict, ctx: Ctx) -> dict:
         f"freebuff reported {what} {_age_str(age)} ago ({origin})")
 
 
-# The balance as freebuff itself prints it — every pattern seen verbatim in
-# chat.db transcripts and runner logs on 2026-09-21/22 (matched
-# case-insensitively). "empty" means out of pool with no figure attached.
+# The balance as freebuff/blink itself emits it — every pattern retargeted to
+# the real harness error framing seen verbatim on 2026-09-22/23:
+#   `... (harness=acp): {... 'inner executor error: ACP session/new failed:
+#   freebuff: not enough Freebucks — │ Not enough Freebucks — 5 Freebucks/hr
+#   against 0 left. Enter opens plans. │ ...}'`
+# (chat.db error payloads in `coder_freebuff:` sessions carry the same text.)
+#
+# PROVENANCE (2026-09-23 fix): conversation_items holds EVERY session's prose
+# — dispatch prompts, reports, code reads, and this probe's own previous
+# output — so a bare figure match re-observes the probe forever, always
+# seconds old and never decaying to unknown. A figure counts only when
+# preceded in the same payload/line by blink's `freebuff:` error prefix (or
+# the harness framing that carries it). The TUI meters (`FREE · N/25`,
+# `Session ended · N left`) were dropped outright: zero hits in any runner
+# log, and every chat.db hit was our own prose quoting them — an unreachable
+# pattern that can only false-positive is worse than no pattern.
 _FREEBUCKS_PATTERNS: list[tuple] = [
     ("remaining", re.compile(r"against (\d+) left", re.IGNORECASE)),
-    ("daily", re.compile(r"FREE\s*·\s*(\d+)/(\d+) Freebucks daily", re.IGNORECASE)),
-    ("remaining", re.compile(r"Session ended\s*·\s*(\d+) Freebucks left", re.IGNORECASE)),
-    ("empty", re.compile(r"not enough Freebucks", re.IGNORECASE)),
+    ("empty", re.compile(r"freebuff:\s*│?\s*not enough freebucks",
+                          re.IGNORECASE)),
 ]
 
 # Bounds for the scan: chat.db is 100 MB+ on a live machine and the probe
@@ -585,21 +602,51 @@ _FREEBUCKS_SCAN_ROWS = 4000
 _FREEBUCKS_SCAN_LOGS = 5
 
 
-def _extract_freebucks(text: str) -> tuple | None:
-    """Newest Freebucks observation in `text`: (remaining, limit, error_only).
+# Provenance prefixes: blink's error prefix, and the harness framing that
+# carries it. A figure match counts only when one of these occurs EARLIER in
+# the same payload/line — i.e. the text is something blink or the harness
+# emitted, not prose quoting it.
+_BLINK_PREFIX_RX = re.compile(r"freebuff:", re.IGNORECASE)
+_HARNESS_FRAMING_RX = re.compile(
+    r"ACP session/new failed|surfaced to UI as failed", re.IGNORECASE)
+# Belt and braces on top of the title/prefix rules: the probe's own output is
+# itself stored in chat.db (and echoed into runner logs), so reject any
+# payload/line carrying it. WHY: without this, any future prose change that
+# weakens the prefix rule would let the probe re-observe itself forever.
+_SELF_MARKERS = ("freebuff reported", "_probe_launch_budget",
+                 "launch-budget (observed)")
 
-    Later matches win (a turn that ends `against 0 left` after an earlier
-    `not enough Freebucks` line reports the 0, not the error).
+
+def _has_self_marker(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _SELF_MARKERS)
+
+
+def _extract_freebucks(text: str, *,
+                       extra_prefix_rx=None) -> tuple | None:
+    """Newest provenanced Freebucks observation in `text`.
+
+    Returns (remaining, limit, error_only). Later matches win (a turn that
+    ends `against 0 left` after an earlier `not enough Freebucks` line
+    reports the 0, not the error). A `remaining` figure counts only when a
+    provenance prefix occurs earlier in the same text; the `empty` pattern
+    carries its `freebuff:` prefix inline so it is provenanced by construction.
+    Unprovenanced figures (quoted prose, regex source, bare mentions) yield
+    None — no evidence, never zero.
     """
+    text = text or ""
+    marks = [m.start() for m in _BLINK_PREFIX_RX.finditer(text)]
+    if extra_prefix_rx is not None:
+        marks += [m.start() for m in extra_prefix_rx.finditer(text)]
     best: tuple | None = None  # (pos, remaining, limit, error_only)
     for kind, rx in _FREEBUCKS_PATTERNS:
-        for m in rx.finditer(text or ""):
-            if kind == "daily":
-                cand = (m.start(), float(m.group(1)), float(m.group(2)), False)
-            elif kind == "remaining":
-                cand = (m.start(), float(m.group(1)), None, False)
-            else:
+        for m in rx.finditer(text):
+            if kind == "empty":
                 cand = (m.start(), 0.0, None, True)
+            else:
+                if not any(p < m.start() for p in marks):
+                    continue
+                cand = (m.start(), float(m.group(1)), None, False)
             if best is None or cand[0] >= best[0]:
                 best = cand
     return None if best is None else best[1:]
@@ -614,7 +661,15 @@ def _epoch_to_aware(created: Any, now: datetime) -> datetime:
 
 
 def _scan_chat_items(db: Path) -> tuple:
-    """Newest (ts, observation) in conversation_items, or (None, None).
+    """Newest provenanced (ts, observation) in conversation_items, or (None, None).
+
+    Only rows of `coder_freebuff:` worker sessions count — the join on
+    conversations enforces that, so the orchestrator's own prompts, reports
+    and code reads never qualify. Within those rows the figure must still
+    carry the blink/harness prefix (see _extract_freebucks), and any payload
+    carrying the probe's own output is rejected outright: the probe's output
+    is itself stored in chat.db, and re-observing it would self-sustain a
+    fresh-looking reading forever.
 
     Newest-first via rowid (append order ~ time order, no full-table sort);
     the first row with a match is the newest evidence. A missing table or an
@@ -625,17 +680,45 @@ def _scan_chat_items(db: Path) -> tuple:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
             rows = con.execute(
-                "select data, created_at from conversation_items "
-                "order by rowid desc limit ?", (_FREEBUCKS_SCAN_ROWS,)).fetchall()
+                "select ci.data, ci.created_at from conversation_items ci "
+                "join conversations c on c.id = ci.conversation_id "
+                "and c.workspace_id = ci.workspace_id "
+                "where c.title like 'coder_freebuff:%' "
+                "order by ci.rowid desc limit ?",
+                (_FREEBUCKS_SCAN_ROWS,)).fetchall()
         finally:
             con.close()
     except sqlite3.Error:
         return None, None
     for data, created in rows:
-        obs = _extract_freebucks(str(data or ""))
+        text = str(data or "")
+        if _has_self_marker(text):
+            continue
+        obs = _extract_freebucks(text)
         if obs is not None:
             return _epoch_to_aware(created, datetime.now()), obs
     return None, None
+
+
+def _extract_freebucks_lines(text: str) -> tuple | None:
+    """Newest provenanced observation across log lines; later lines win.
+
+    A line counts only when it carries the blink `freebuff:` prefix or the
+    harness error framing — a log that merely echoes the orchestrator's
+    prompt text must not qualify — and never when it carries the probe's
+    own output wording.
+    """
+    best: tuple | None = None
+    for line in (text or "").splitlines():
+        if _has_self_marker(line):
+            continue
+        if not (_BLINK_PREFIX_RX.search(line)
+                or _HARNESS_FRAMING_RX.search(line)):
+            continue
+        obs = _extract_freebucks(line, extra_prefix_rx=_HARNESS_FRAMING_RX)
+        if obs is not None:
+            best = obs
+    return best
 
 
 def _scan_runner_logs(logdir: Path) -> tuple:
@@ -656,7 +739,7 @@ def _scan_runner_logs(logdir: Path) -> tuple:
     for lp in logs:
         try:
             ts = datetime.fromtimestamp(lp.stat().st_mtime).astimezone()
-            obs = _extract_freebucks(lp.read_text(errors="replace"))
+            obs = _extract_freebucks_lines(lp.read_text(errors="replace"))
         except OSError:
             continue
         if obs is not None:
