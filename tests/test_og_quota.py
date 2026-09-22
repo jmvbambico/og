@@ -3,11 +3,12 @@
 No network and no live ~/.omnigent: every test injects a stub http/read/run
 through Ctx and points the state file at tmp_path via OMNIGENT_HOME (module
 constant q.OMNI_STATE) or explicit paths. The launch-budget probe runs against
-a tmp sqlite with the chat.db schema's conversation columns.
+a tmp sqlite with the chat.db conversation_items columns plus tmp runner logs.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -376,43 +377,56 @@ def test_deepseek_no_key(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# launch-budget
+# launch-budget: observed balance or unknown, never inferred
 # --------------------------------------------------------------------------
 
-def _chatdb(path: Path, rows: list[tuple[str, int]]):
+def _itemsdb(path: Path, rows: list[tuple[str, int]]):
+    """chat.db-shaped db with a conversation_items table: (data, created_at)."""
     con = sqlite3.connect(path)
-    con.execute("create table conversations (id blob, title text, "
-                "created_at int, updated_at int, parent_conversation_id blob, "
-                "root_conversation_id blob)")
-    for i, (title, created) in enumerate(rows):
-        con.execute("insert into conversations values (?,?,?,?,?,?)",
-                    (bytes([i + 1]), title, created, created, None,
-                     bytes([i + 1])))
+    con.execute("create table conversation_items (id blob, "
+                "conversation_id blob, response_id text, created_at int, "
+                "position int, data text, search_text text)")
+    for i, (data, created) in enumerate(rows):
+        con.execute("insert into conversation_items values (?,?,?,?,?,?,?)",
+                    (bytes([i + 1]), bytes([i + 1]), f"r{i}", created, i,
+                     data, data[:200]))
     con.commit()
     con.close()
 
 
-def test_launch_budget_counts_only_this_agent_today(tmp_path, monkeypatch):
+def _mkhome(tmp_path: Path, monkeypatch) -> Path:
+    """Point OMNI_STATE at tmp so chat.db + logs/runner resolve under it."""
     monkeypatch.setattr(q, "OMNI_STATE", tmp_path / "og-quota.json")
-    db = tmp_path / "chat.db"
-    today = int(NOW.timestamp())
-    yesterday = int((NOW - timedelta(days=1)).timestamp())
-    _chatdb(db, [
-        ("coder_freebuff: task one", today - 60),
-        ("coder_freebuff: task two", today - 30),
-        ("coder_kilo: other worker", today - 20),
-        ("orchestrator run", today - 10),        # not coder_*
-        ("coder_freebuff: yesterday", yesterday),  # not today
+    return tmp_path
+
+
+def _wlog(home: Path, name: str, text: str, age_s: float) -> Path:
+    d = home / "logs" / "runner"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text(text)
+    ts = NOW.timestamp() - age_s
+    os.utime(p, (ts, ts))
+    return p
+
+
+def test_launch_budget_against_left_from_chat_db(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 14 * 60
+    _itemsdb(home / "chat.db", [
+        ('{"output": "old line, nothing"}', ts - 3600),
+        ('{"output": "ACP session/new failed: freebuff: not enough Freebucks '
+        '\\u2014 5 Freebucks/hr against 0 left."}', ts),
     ])
-    rec = q._probe_launch_budget(
-        {"daily": 25, "per_launch": 5, "agent_id": "freebuff"},
-        ctx(now=lambda: NOW))
-    assert rec["tier"] == "inferred"
-    assert rec["remaining"] == pytest.approx(25 - 2 * 5)
-    assert rec["unit"] == "freebucks"
-    assert rec["state"] == "ok"
-    assert rec["detail"] == "2 launch(es) today"
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["tier"] == "measured"
+    assert rec["source"] == "launch-budget (observed)"
+    assert rec["remaining"] == 0
+    assert rec["state"] == "dry"  # remaining 0 -> dry
+    assert rec["limit"] == 25 and rec["unit"] == "freebucks"
     assert rec["reset_at"]  # next local midnight
+    assert "0 left" in rec["detail"] and "chat.db" in rec["detail"]
+    assert q._parse_iso(rec["checked_at"]) is not None
 
 
 def test_run_probes_injects_agent_id(tmp_path, monkeypatch):
@@ -430,19 +444,95 @@ def test_run_probes_injects_agent_id(tmp_path, monkeypatch):
     assert seen["agent_id"] == "freebuff"
 
 
-def test_launch_budget_exhausted_is_dry(tmp_path, monkeypatch):
-    monkeypatch.setattr(q, "OMNI_STATE", tmp_path / "og-quota.json")
-    db = tmp_path / "chat.db"
-    _chatdb(db, [(f"coder_a: run {i}", int(NOW.timestamp()) - i - 1)
-                 for i in range(4)])
-    rec = q._probe_launch_budget({"daily": 2, "per_launch": 1, "agent_id": "a"},
-                                 ctx(now=lambda: NOW))
-    assert rec["state"] == "dry" and rec["remaining"] == pytest.approx(-2)
+def test_launch_budget_daily_meter_from_runner_log(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-a.log", "boot\nFREE \u00b7 8/25 Freebucks daily\n",
+          age_s=180)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["tier"] == "measured"
+    assert rec["source"] == "launch-budget (observed)"
+    assert rec["remaining"] == 8 and rec["limit"] == 25
+    assert rec["state"] == "ok"
+    assert "runner log" in rec["detail"]
+
+
+def test_launch_budget_session_ended_from_chat_db(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 300
+    _itemsdb(home / "chat.db",
+             [('{"output": "Session ended \u00b7 12 Freebucks left"}', ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 12
+    assert rec["state"] == "ok" and rec["tier"] == "measured"
+
+
+def test_launch_budget_bare_not_enough_is_dry(tmp_path, monkeypatch):
+    """A `not enough` error with no figure means an empty pool: 0, dry."""
+    home = _mkhome(tmp_path, monkeypatch)
+    ts = int(NOW.timestamp()) - 60
+    _itemsdb(home / "chat.db",
+             [('{"output": "Not enough Freebucks"}', ts)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 0
+    assert rec["state"] == "dry"
+    assert "not enough" in rec["detail"].lower()
+
+
+def test_launch_budget_newest_wins_across_sources(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    _itemsdb(home / "chat.db",
+             [('{"output": "Session ended \u00b7 10 Freebucks left"}',
+               int(NOW.timestamp()) - 7200)])
+    _wlog(home, "runner-b.log", "5 Freebucks/hr against 3 left", age_s=600)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 3
+    assert "runner log" in rec["detail"]
+
+
+def test_launch_budget_newer_db_beats_older_log(tmp_path, monkeypatch):
+    home = _mkhome(tmp_path, monkeypatch)
+    _wlog(home, "runner-c.log", "FREE \u00b7 2/25 Freebucks daily", age_s=7200)
+    _itemsdb(home / "chat.db",
+             [('{"output": "Session ended \u00b7 20 Freebucks left"}',
+               int(NOW.timestamp()) - 600)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["remaining"] == 20
+    assert "chat.db" in rec["detail"]
+
+
+def test_launch_budget_stale_across_midnight_is_unknown(tmp_path, monkeypatch):
+    """Yesterday's balance says nothing about today's refilled pool."""
+    home = _mkhome(tmp_path, monkeypatch)
+    yesterday = int((NOW - timedelta(days=1)).timestamp())
+    _itemsdb(home / "chat.db",
+             [('{"output": "Session ended \u00b7 20 Freebucks left"}',
+               yesterday)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["tier"] == "unknown"
+    assert rec["remaining"] is None
+    assert rec["limit"] == 25  # the pool size IS known
+    assert rec["reset_at"]  # next local midnight IS known
+    assert "no quota API" in rec["detail"]
+
+
+def test_launch_budget_nothing_found_is_unknown_not_a_number(tmp_path,
+                                                             monkeypatch):
+    """No observation anywhere: unknown with a null remaining, never 25-0."""
+    home = _mkhome(tmp_path, monkeypatch)
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["tier"] == "unknown"
+    assert rec["remaining"] is None
+    assert rec["limit"] == 25 and rec["reset_at"]
+    # a db whose rows carry no figure is the same: no evidence, not zero
+    _itemsdb(home / "chat.db",
+             [('{"output": "hello world"}', int(NOW.timestamp()) - 60)])
+    rec = q._probe_launch_budget({"daily": 25}, ctx(now=lambda: NOW))
+    assert rec["state"] == "unknown" and rec["remaining"] is None
 
 
 def test_launch_budget_no_db(tmp_path, monkeypatch):
     monkeypatch.setattr(q, "OMNI_STATE", tmp_path / "og-quota.json")
-    rec = q._probe_launch_budget({"daily": 10, "per_launch": 1}, ctx())
+    rec = q._probe_launch_budget({"daily": 10}, ctx())
     assert rec["state"] == "unknown"
 
 

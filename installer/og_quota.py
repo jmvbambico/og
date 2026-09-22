@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -513,45 +514,164 @@ def _probe_deepseek_balance(params: dict, ctx: Ctx) -> dict:
 
 
 def _probe_launch_budget(params: dict, ctx: Ctx) -> dict:
+    """freebuff's Freebucks balance, observed — never inferred.
+
+    freebuff exposes no quota API, bills per hour at a per-model rate, and
+    can be launched from anywhere (a human's own terminal, another tool), so
+    counting this orchestrator's launches and subtracting a flat per-launch
+    cost produced confident wrong numbers (2026-09-22: reported 15 left with
+    0 in the pool, and a reviewer was dispatched into the failure). An
+    inferred number presented as fact is worse than unknown, so this probe
+    only reports a balance freebuff itself printed — newest match wins — and
+    reports unknown otherwise.
+    """
     daily = float(params.get("daily") or 0)
-    per_launch = float(params.get("per_launch") or 0)
-    # identity scope, injected by _one_agent for every probe: charge this
-    # agent only for its own launches (title "coder_<id>: ..."), never for
-    # every coder's. Absent only in direct unit calls, which keep the legacy
-    # all-coder count.
-    who = params.get("agent_id")
-    prefix = f"coder_{who}:" if who else "coder_"
     if daily <= 0:
         return unknown_record("no daily budget configured in registry quota block")
-    db = OMNI_STATE.parent / "chat.db"
-    launches = 0
+    now = ctx.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    next_midnight = midnight + timedelta(days=1)
+    home = OMNI_STATE.parent
+
+    best: tuple | None = None  # (ts, remaining, limit, error_only, origin)
+    db_ts, db_obs = _scan_chat_items(home / "chat.db")
+    if db_obs is not None:
+        best = (db_ts, *db_obs, "chat.db")
+    log_ts, log_obs, log_name = _scan_runner_logs(home / "logs" / "runner")
+    if log_obs is not None and (best is None or _aware(log_ts) > _aware(best[0])):
+        best = (log_ts, *log_obs, log_name)
+
+    if best is None or _aware(best[0]) < _aware(midnight):
+        # No observation, or the newest one predates the daily reset: the
+        # pool refills at local midnight, so a yesterday balance says nothing
+        # about today. Limit and reset ARE known (registry daily param, next
+        # local midnight); the balance is not.
+        why = ("nothing has reported a Freebucks balance since the last reset"
+               if best is None else
+               "the newest reported balance predates today's reset")
+        return make_record(
+            "unknown", "unknown", None, daily, "freebucks", [],
+            next_midnight.isoformat(), "launch-budget", _iso(now),
+            f"freebuff exposes no quota API and {why}; "
+            f"pool is {daily:g}/day resetting at local midnight")
+    ts, remaining, limit, error_only, origin = best
+    age = max(0.0, (_aware(now) - _aware(ts)).total_seconds())
+    if error_only:
+        what = "not enough Freebucks"
+    elif limit is not None:
+        what = f"{remaining:g}/{limit:g} Freebucks (daily meter)"
+    else:
+        what = f"{remaining:g} left"
+    return make_record(
+        "dry" if (remaining <= 0 or error_only) else "ok", "measured",
+        remaining, daily if limit is None else limit, "freebucks", [],
+        next_midnight.isoformat(), "launch-budget (observed)", _iso(ts),
+        f"freebuff reported {what} {_age_str(age)} ago ({origin})")
+
+
+# The balance as freebuff itself prints it — every pattern seen verbatim in
+# chat.db transcripts and runner logs on 2026-09-21/22 (matched
+# case-insensitively). "empty" means out of pool with no figure attached.
+_FREEBUCKS_PATTERNS: list[tuple] = [
+    ("remaining", re.compile(r"against (\d+) left", re.IGNORECASE)),
+    ("daily", re.compile(r"FREE\s*·\s*(\d+)/(\d+) Freebucks daily", re.IGNORECASE)),
+    ("remaining", re.compile(r"Session ended\s*·\s*(\d+) Freebucks left", re.IGNORECASE)),
+    ("empty", re.compile(r"not enough Freebucks", re.IGNORECASE)),
+]
+
+# Bounds for the scan: chat.db is 100 MB+ on a live machine and the probe
+# budget is 8 s, so only the newest rows / newest logs are read.
+_FREEBUCKS_SCAN_ROWS = 4000
+_FREEBUCKS_SCAN_LOGS = 5
+
+
+def _extract_freebucks(text: str) -> tuple | None:
+    """Newest Freebucks observation in `text`: (remaining, limit, error_only).
+
+    Later matches win (a turn that ends `against 0 left` after an earlier
+    `not enough Freebucks` line reports the 0, not the error).
+    """
+    best: tuple | None = None  # (pos, remaining, limit, error_only)
+    for kind, rx in _FREEBUCKS_PATTERNS:
+        for m in rx.finditer(text or ""):
+            if kind == "daily":
+                cand = (m.start(), float(m.group(1)), float(m.group(2)), False)
+            elif kind == "remaining":
+                cand = (m.start(), float(m.group(1)), None, False)
+            else:
+                cand = (m.start(), 0.0, None, True)
+            if best is None or cand[0] >= best[0]:
+                best = cand
+    return None if best is None else best[1:]
+
+
+def _epoch_to_aware(created: Any, now: datetime) -> datetime:
+    """A chat.db created_at (epoch seconds) as an aware datetime; now on junk."""
+    try:
+        return datetime.fromtimestamp(float(created)).astimezone()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return _aware(now)
+
+
+def _scan_chat_items(db: Path) -> tuple:
+    """Newest (ts, observation) in conversation_items, or (None, None).
+
+    Newest-first via rowid (append order ~ time order, no full-table sort);
+    the first row with a match is the newest evidence. A missing table or an
+    unreadable db is "no evidence", not an error — the probe reports unknown.
+    """
     try:
         # read-only, same precedent as og_audit.py
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            today = ctx.now().date()
-            for title, created in con.execute(
-                    "select title, created_at from conversations"):
-                if not title or not title.startswith(prefix):
-                    continue
-                # created_at is epoch seconds (chat.db convention, og_audit.py)
-                when = datetime.fromtimestamp(created).astimezone()
-                if when.date() == today:
-                    launches += 1
+            rows = con.execute(
+                "select data, created_at from conversation_items "
+                "order by rowid desc limit ?", (_FREEBUCKS_SCAN_ROWS,)).fetchall()
         finally:
             con.close()
-    except FileNotFoundError:
-        return unknown_record(f"no chat.db at {db}")
-    except sqlite3.Error as e:
-        return unknown_record(f"chat.db unreadable: {e}")
-    used = launches * per_launch
-    remaining = daily - used
-    # next local midnight: replace the clock, then step a day if we wrapped
-    midnight = ctx.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    return make_record(
-        "ok" if remaining > 0 else "dry", "inferred", remaining, daily,
-        "freebucks", [], midnight.isoformat(), "launch-budget", _iso(ctx.now()),
-        f"{launches} launch(es) today")
+    except sqlite3.Error:
+        return None, None
+    for data, created in rows:
+        obs = _extract_freebucks(str(data or ""))
+        if obs is not None:
+            return _epoch_to_aware(created, datetime.now()), obs
+    return None, None
+
+
+def _scan_runner_logs(logdir: Path) -> tuple:
+    """Newest (ts, observation, origin) in the newest runner logs.
+
+    Files newest-first by mtime; the first file with a match wins, and within
+    it the last match (newest line) wins. The mtime stands in for the match's
+    own timestamp — a log appended to after the match reads slightly newer
+    than the line really is, which only ever makes the evidence look fresher.
+    Returns (None, None, None) when nothing matches.
+    """
+    try:
+        logs = sorted(logdir.glob("*.log"),
+                      key=lambda p: p.stat().st_mtime,
+                      reverse=True)[:_FREEBUCKS_SCAN_LOGS]
+    except OSError:
+        return None, None, None
+    for lp in logs:
+        try:
+            ts = datetime.fromtimestamp(lp.stat().st_mtime).astimezone()
+            obs = _extract_freebucks(lp.read_text(errors="replace"))
+        except OSError:
+            continue
+        if obs is not None:
+            return ts, obs, "runner log"
+    return None, None, None
+
+
+def _age_str(age_s: float) -> str:
+    if age_s < 90:
+        return f"{age_s:.0f}s"
+    if age_s < 3600:
+        return f"{age_s / 60:.0f}m"
+    if age_s < 86400:
+        return f"{age_s / 3600:.1f}h"
+    return f"{age_s / 86400:.1f}d"
 
 
 class _RateLimited(Exception):
@@ -697,7 +817,9 @@ def _cached_or(probe_name: str, prev: dict, ctx: Ctx,
     is younger than CACHE_TTL_S, else report unknown."""
     for rec in (prev or {}).values():
         src = str(rec.get("source", ""))
-        if src.split(" (cached)")[0] != probe_name:
+        # strip any parenthetical suffix (" (cached)", " (observed)") so an
+        # observed launch-budget record stays reusable like any other probe's
+        if src.split(" (")[0] != probe_name:
             continue
         age = _age_s(rec.get("checked_at"), ctx)
         if age is not None and age <= CACHE_TTL_S:

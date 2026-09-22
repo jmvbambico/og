@@ -473,8 +473,7 @@
       "quota": {
         "probe": "launch-budget",
         "daily": 25,
-        "per_launch": 5,
-        "note": "freebuff.com exposes no usable quota API (the subscription endpoint returns the SPA); og infers from launches counted in chat.db. blink fails fast with 'not enough Freebucks' when the pool is empty."
+        "note": "freebuff.com exposes no usable quota API (the subscription endpoint returns the SPA); og reports the balance freebuff itself last printed — in chat.db transcripts and runner logs — and unknown when nothing has reported since the daily reset. It never subtracts: freebuff bills per hour at a per-model rate (GLM 5.3 Flash 5/hr, MiMo 2.5 10/hr, Solar Pro 4 10/hr, DeepSeek V4.1 Flash 15/hr), so a launch's cost depends on its model and duration. blink fails fast with 'not enough Freebucks' when the pool is empty."
       }
     }
   ],
@@ -486,7 +485,7 @@
     "unknown": "Not declared by Omnigent (user-configured ACP). Assume the prompt may not arrive; inline critical rules in the dispatch."
   },
   "$quota": {
-    "description": "Optional per-agent `quota` blocks drive `og stats` (see docs/STATS.md). `probe` is the stats-layer probe name; it is null when the limit is known but exposes no queryable API, so `og stats` reports it as unknown rather than guessing. `daily`/`per_launch` are params consumed by the launch-budget probe (freebuff).",
+    "description": "Optional per-agent `quota` blocks drive `og stats` (see docs/STATS.md). `probe` is the stats-layer probe name; it is null when the limit is known but exposes no queryable API, so `og stats` reports it as unknown rather than guessing. `daily` is the pool size consumed by the launch-budget probe (freebuff); that probe reports the balance freebuff itself last printed and never subtracts a per-launch cost.",
     "probes": {
       "anthropic-oauth": "claude",
       "codex-wham": "codex",
@@ -497,8 +496,7 @@
       "launch-budget": "freebuff"
     },
     "params": {
-      "daily": 25,
-      "per_launch": 5
+      "daily": 25
     },
     "null_probe": "known limit, not measurable"
   }

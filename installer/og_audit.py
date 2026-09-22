@@ -55,8 +55,8 @@ SIGNATURES: list[tuple[re.Pattern, str, bool]] = [
      False),
     (re.compile(r"[Nn]ot enough Freebucks"),
      "freebuff's Freebucks pool is empty. Run `og stats --mark <id> dry --until +1h "
-     "--reason \"not enough Freebucks\"`; og infers the balance from launches in "
-     "chat.db, so the reset is a guess.",
+     "--reason \"not enough Freebucks\"`; `og stats` shows the last balance "
+     "freebuff itself reported.",
      False),
     (re.compile(r"Rate limit exceeded"),
      "a rate limit hit. Run `og stats --mark <id> dry --until <reset> --reason "
