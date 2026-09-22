@@ -1082,9 +1082,9 @@ def test_pick_model_offers_choices_by_number(monkeypatch):
     # the early-return bail-out no longer fires, so the static lineup is shown
     # through the same numbered menu and selectable by number.
     reg = m.agents_by_id()
-    answers = iter(["2"])
+    answers = iter(["4"])
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
-    assert m.pick_model(reg["freebuff"], None) == "deepseek/deepseek-v4-flash"
+    assert m.pick_model(reg["freebuff"], None) == "deepseek-v4.1-flash"
 
 
 def test_pick_model_without_list_cmd_or_choices_keeps_current(monkeypatch):
@@ -1119,7 +1119,7 @@ def test_emit_questions_carries_choices(monkeypatch, capsys):
     coder_q = next(x for x in q["questions"] if x["key"] == "coders")
     assert "choices" in coder_q["per_item"]
     assert coder_q["per_item"]["choices"]["freebuff"] == [
-        "z-ai/glm-5.3-flash", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"]
+        "z-ai/glm-5.3-flash", "mimo-2.5", "solar-pro-4", "deepseek-v4.1-flash"]
     # rows without choices are simply absent, not empty
     assert "cline" not in coder_q["per_item"]["choices"]
 
@@ -1130,8 +1130,8 @@ def test_emit_questions_carries_choices(monkeypatch, capsys):
 def test_acp_command_injects_env_var_for_env_var_rows():
     reg = m.agents_by_id()
     # A row declaring model.env_var exports the pin as that variable.
-    assert m.acp_command(reg["freebuff"], "deepseek/deepseek-v4-flash") == \
-        "env BLINK_MODEL=deepseek/deepseek-v4-flash blink"
+    assert m.acp_command(reg["freebuff"], "deepseek/deepseek-v4.1-flash") == \
+        "env BLINK_MODEL=deepseek/deepseek-v4.1-flash blink"
     assert m.acp_command(reg["freebuff"], None) == "blink"
     # A legacy row using top-level model_env still works (Cline's CLINE_MODEL).
     assert m.acp_command(reg["cline"], "deepseek/deepseek-v4-flash") == \
@@ -1143,11 +1143,11 @@ def test_acp_command_injects_env_var_for_env_var_rows():
 def test_patch_global_config_renders_env_var_for_freebuff(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "OMNI", tmp_path)
     (tmp_path / "config.yaml").write_text("{}\n")
-    plan = _base_plan(coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4-flash"}])
+    plan = _base_plan(coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4.1-flash"}])
     m.patch_global_config(plan)
     cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
     row = next(r for r in cfg["acp"]["agents"] if r["name"] == "Freebuff")
-    assert row["command"].startswith("env BLINK_MODEL=deepseek/deepseek-v4-flash blink")
+    assert row["command"].startswith("env BLINK_MODEL=deepseek/deepseek-v4.1-flash blink")
 
 
 # --------------------------------------------------------------------------
@@ -1158,9 +1158,9 @@ def test_patch_global_config_renders_env_var_for_freebuff(tmp_path, monkeypatch)
 def test_model_vendor_maps_freebuff_deepseek_pin_to_deepseek():
     reg = m.agents_by_id()
     assert m.vendor_of(reg["freebuff"], {"id": "freebuff",
-                                         "model": "deepseek/deepseek-v4-flash"}) == "deepseek"
+                                         "model": "deepseek/deepseek-v4.1-flash"}) == "deepseek"
     assert m.vendor_of(reg["freebuff"], {"id": "freebuff",
-                                         "model": "deepseek/deepseek-v4-pro"}) == "deepseek"
+                                         "model": "deepseek/deepseek-chat"}) == "deepseek"
     assert m.vendor_of(reg["freebuff"], {"id": "freebuff", "model": None}) == "z-ai"
 
 
@@ -1169,7 +1169,7 @@ def test_validate_warns_same_vendor_for_freebuff_deepseek_pin():
     # (deepseek) for review. validate role-checks coders vs reviewer, not which
     # agent the reviewer id is.
     plan = _base_plan(
-        coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4-flash"}],
+        coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4.1-flash"}],
         reviewer={"id": "cline", "model": None},
     )
     ws = [msg for level, msg in m.validate(plan) if level == "warn"
