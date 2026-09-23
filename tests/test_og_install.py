@@ -1269,6 +1269,25 @@ def test_write_shims_is_idempotent(tmp_path, monkeypatch):
     assert dest.stat().st_mtime_ns == before
 
 
+def test_write_shims_repairs_a_clobbered_mode(tmp_path, monkeypatch):
+    # The bridge exec's the shim path directly, so a mode that drifted (umask,
+    # a stray chmod, a dotfile sync) is a launch failure with no message
+    # pointing at the installer. Content already matches here: only the mode
+    # must converge, and the repair must be reported, not silent.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    row = _registry_with_cmd_shim(monkeypatch)
+    plan = _cmdtest_plan()
+    assert m.write_shims(plan)
+    dest = tmp_path / "shims" / "cmdtest-og"
+    dest.chmod(0o644)
+    changed = m.write_shims(plan)
+    assert dest.stat().st_mode & 0o777 == 0o755
+    assert dest.read_text() == row["shim"]["script"]
+    assert changed and all("cmdtest-og" in entry for entry in changed)
+    # ...and once converged, silence again.
+    assert m.write_shims(plan) == []
+
+
 def test_acp_command_expands_a_shim_token(tmp_path, monkeypatch):
     # No $VAR may survive: the executor runs this argv with no shell, so the
     # token becomes the absolute shim path, not $OMNI/shims/....
