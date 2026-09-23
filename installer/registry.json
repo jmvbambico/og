@@ -475,6 +475,48 @@
         "daily": 25,
         "note": "freebuff.com exposes no usable quota API (the subscription endpoint returns the SPA); og reports the balance freebuff itself last printed — in chat.db transcripts and runner logs — and unknown when nothing has reported since the daily reset. It never subtracts: freebuff bills per hour at a per-model rate (GLM 5.3 Flash 5/hr, MiMo 2.5 10/hr, Solar Pro 4 10/hr, DeepSeek V4.1 Flash 15/hr), so a launch's cost depends on its model and duration. blink fails fast with 'not enough Freebucks' when the pool is empty."
       }
+    },
+    {
+      "id": "cmdcode",
+      "label": "Command Code",
+      "harness": "acp:command-code",
+      "binary": "cmd-acp",
+      "kind": "acp-user",
+      "acp_command": "env CMD_BIN={shim:cmd-og} cmd-acp",
+      "omnigent_mcp": false,
+      "kind_note": "`cmd-acp` (npm, v0.2.0, ~9 commits, last published 2026-08-06, fork of soycanopa/cmd-acp) bridges ACP to `cmd -p`, spawning one `cmd -p` process per prompt. It exposes model, reasoning effort and permission mode ONLY through the ACP method session/set_config_option, which Omnigent never sends (the acp_command docstring in og_install.py traces the wire). Its session config therefore starts EMPTY: no --model and, critically, no --yolo. Headless runs still go through Command Code's permission engine, so without --yolo the worker returns end_turn having changed nothing — the 'completed with no output' signature. The bridge does honour the env var CMD_BIN to choose the binary it spawns (dist/index.js, resolveCmdBinary), and passes the parent env through to it. That is why og points CMD_BIN at a generated shim instead of patching or forking the bridge. --tools-all is needed because headless runs withhold some tools; --skip-onboarding is needed because Command Code otherwise runs a taste-onboarding step on first launch. Setting permissions.defaultMode = yolo in ~/.commandcode/settings.json is the alternative to the shim, but it applies globally to the user's interactive cmd too and cannot carry --tools-all. The shim keeps it per-worker. Unlike freebuff/blink there is no long-lived process to reap: each prompt is one `cmd -p` that exits.",
+      "roles": [
+        "coder"
+      ],
+      "vendor": "moonshotai",
+      "relay": false,
+      "silent_model_failure": true,
+      "shim": {
+        "name": "cmd-og",
+        "script": "#!/bin/sh\nexec cmd \"$@\" ${CMD_MODEL:+--model \"$CMD_MODEL\"} --yolo --tools-all --skip-onboarding\n"
+      },
+      "model": {
+        "required": true,
+        "pin_path": "executor.model",
+        "note": "(a) ids are provider-prefixed for open-weight models (moonshotai/…, deepseek/…, z-ai/…) but BARE for Anthropic and OpenAI (claude-sonnet-5, gpt-5.5); (b) vendor MUST follow the pinned model, exactly as the freebuff row says — pinning deepseek/* makes this same-vendor with Cline, z-ai/* same-vendor with Freebuff, meta/muse-spark-* same-vendor with OpenCode's pin, and claude-*/gpt-* same-vendor with the orchestrator and reviewer; the default moonshotai pin is chosen because no other roster member uses that vendor; (c) an unpinned run is a SUCCESSFUL cmd invocation on cmd's own default model, which is why silent_model_failure is true.",
+        "prefer": "moonshotai/kimi-k3",
+        "env_var": "CMD_MODEL",
+        "list_cmd": [
+          "cmd",
+          "--list-models"
+        ]
+      },
+      "install": {
+        "npm": "npm i -g command-code cmd-acp"
+      },
+      "login": "cmd login",
+      "docs": "https://commandcode.ai/docs",
+      "unverified": true,
+      "prompt_delivery": "unknown",
+      "quota": {
+        "probe": null,
+        "note": "Command Code enforces a rolling 5-hour AND a rolling weekly credit window, both rolling from first use, on top of the monthly credit pool (Go $1/$10, GOAT $10/$70, Pro $20/$80, Max 10x $100/$150, Max 20x $200/$300; Pro's windows are $16 per 5h and $40 per week). No queryable quota API. Exhaustion prints `You've reached your 5-hour usage limit. Resets in 2h 41m` — match that string to mark the worker dry and take --until from it."
+      }
     }
   ],
   "$prompt_delivery": {
