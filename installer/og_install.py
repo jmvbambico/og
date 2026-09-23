@@ -1102,8 +1102,12 @@ def write_shims(plan: dict) -> list:
     Covers the same selected set patch_global_config renders rows for --
     plan["coders"] plus plan["reviewer"] -- so a `{shim:<name>}` token in any
     rendered command line already exists on disk. Rerunnable: a script whose
-    on-disk content already matches is left alone and reported as no change.
-    Returns human-readable entries in patch_global_config's style.
+    on-disk content AND mode already match is left alone and reported as no
+    change. Converges both: a script with right content but wrong mode gets
+    its mode repaired (and reported), because the bridge exec's this path
+    directly and a non-executable shim fails at launch with nothing pointing
+    back at the installer. Returns human-readable entries in
+    patch_global_config's style.
     """
     reg = agents_by_id()
     changed = []
@@ -1113,6 +1117,10 @@ def write_shims(plan: dict) -> list:
             continue
         dest = OMNI / "shims" / shim["name"]
         if dest.is_file() and dest.read_text() == shim["script"]:
+            if dest.stat().st_mode & 0o777 == 0o755:
+                continue
+            dest.chmod(0o755)
+            changed.append(f"shims[{shim['name']}] mode -> 0o755 ({dest})")
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(shim["script"])
