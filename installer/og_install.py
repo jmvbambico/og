@@ -208,7 +208,13 @@ def list_models(agent: dict) -> list:
         # cursor-agent prints "id - Display Name (tags)" with single spaces, and
         # a heading line. Take the id before " - "; drop lines with no id shape.
         model_id = model_id.split(" - ", 1)[0].strip()
-        if model_id and " " not in model_id:
+        # cmd's `--list-models` groups ids under Capitalized vendor section
+        # headings (Stealth, Anthropic, OpenAI, ...) plus a trailing `Docs:`
+        # line, each of which otherwise parses as a bare id. Real ids from
+        # every vendor CLI seen so far are lowercase, so drop any candidate
+        # with an uppercase letter instead of allowlisting vendor names that
+        # will drift the next time cmd adds a provider.
+        if model_id and " " not in model_id and model_id == model_id.lower():
             models.append(model_id)
     return models
 
@@ -1042,6 +1048,12 @@ def render_reviewer(plan: dict) -> str:
 # --------------------------------------------------------------------------
 # apply
 # --------------------------------------------------------------------------
+# A `{shim:<name>}` token inside a registry `acp_command` expands to the
+# absolute path of the helper script write_shims() materializes. The name is
+# everything up to the closing brace; names are installer-controlled slugs.
+SHIM_TOKEN = re.compile(r"\{shim:([^}]+)\}")
+
+
 def acp_command(agent: dict, model: str | None) -> str:
     """The ACP launch command, with the model pin baked in where the CLI needs it.
 
@@ -1065,12 +1077,48 @@ def acp_command(agent: dict, model: str | None) -> str:
     Newer rows name the variable inline as `model.env_var` (e.g. a freebuff/blink
     pin must reach `BLINK_MODEL`). Read it from there first, then the legacy
     top-level `model_env` -- never hardcode an agent name.
+
+    A row may also carry `{shim:<name>}` inside `acp_command`. The token
+    expands to the absolute path of a helper script materialized by
+    write_shims() before this is ever rendered (OMNI/"shims"/<name>). This
+    exists for bridges like cmd-acp that only accept their model and write
+    permission via `session/set_config_option`, which Omnigent never sends:
+    the bridge honours CMD_BIN to pick which binary it spawns, so the shim
+    appends the flags the bridge will not otherwise receive. Expansion is a
+    plain substitution, so it composes with the env-var prefix below, and the
+    executor exec's the argv with no shell -- no $VAR may survive unexpanded.
     """
-    cmd = agent["acp_command"]
+    cmd = SHIM_TOKEN.sub(lambda mt: str(OMNI / "shims" / mt.group(1)), agent["acp_command"])
     var = (agent.get("model") or {}).get("env_var") or agent.get("model_env")
     if var and model:
         return f"env {var}={shlex.quote(model)} {cmd}"
     return cmd
+
+
+def write_shims(plan: dict) -> list:
+    """Write helper scripts for selected agents whose registry row has a `shim`
+    block ({"name": ..., "script": ...}) to OMNI/"shims"/<name>, mode 0o755.
+
+    Covers the same selected set patch_global_config renders rows for --
+    plan["coders"] plus plan["reviewer"] -- so a `{shim:<name>}` token in any
+    rendered command line already exists on disk. Rerunnable: a script whose
+    on-disk content already matches is left alone and reported as no change.
+    Returns human-readable entries in patch_global_config's style.
+    """
+    reg = agents_by_id()
+    changed = []
+    for c in list(plan["coders"]) + [plan["reviewer"]]:
+        shim = reg[c["id"]].get("shim")
+        if not shim:
+            continue
+        dest = OMNI / "shims" / shim["name"]
+        if dest.is_file() and dest.read_text() == shim["script"]:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(shim["script"])
+        dest.chmod(0o755)
+        changed.append(f"shims[{shim['name']}] = {dest}")
+    return changed
 
 
 def patch_global_config(plan: dict) -> list:
@@ -1336,7 +1384,11 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     install_pth(pol_dir)
 
     # 4. global config + og.env + the og script
+    # Shims first: patch_global_config renders command lines that may
+    # reference OMNI/"shims"/<name>, so the scripts must exist before that.
+    shim_changed = write_shims(plan)
     changed = patch_global_config(plan)
+    changed = shim_changed + changed
     ocd = write_opencode_worker_config(plan)
     write_og_env(plan)
     bindir = resolve_bin_dir(plan)
