@@ -1201,3 +1201,168 @@ def test_validate_warns_same_vendor_for_freebuff_deepseek_pin():
             and "shares a vendor" in msg]
     assert not msgs
 
+
+# --------------------------------------------------------------------------
+# write_shims + {shim:...} expansion (cmd bridge support)
+# --------------------------------------------------------------------------
+def _registry_with_cmd_shim(monkeypatch):
+    # A stand-in for the cmd row (owned by a parallel change): an acp-user
+    # bridge whose model and write permission only arrive via the binary
+    # named by CMD_BIN, so the plan materializes a shim script for it.
+    row = {
+        "id": "cmdtest",
+        "label": "CmdTest",
+        "harness": "acp:cmdtest",
+        "kind": "acp-user",
+        "binary": "cmd",
+        "acp_command": "env CMD_BIN={shim:cmdtest-og} cmd-acp",
+        "model": {"env_var": "CMD_MODEL", "list_cmd": ["cmd", "--list-models"]},
+        "shim": {"name": "cmdtest-og",
+                 "script": "#!/bin/sh\nexec cmd \"$@\" --yolo\n"},
+    }
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], row]})
+    return row
+
+
+def _cmdtest_plan(**overrides):
+    plan = _base_plan(
+        coders=[{"id": "cmdtest", "priority": 1, "model": "moonshotai/kimi-k3"}],
+    )
+    plan.update(overrides)
+    return plan
+
+
+def test_write_shims_writes_an_executable_script(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    row = _registry_with_cmd_shim(monkeypatch)
+    changed = m.write_shims(_cmdtest_plan())
+    dest = tmp_path / "shims" / "cmdtest-og"
+    assert dest.read_text() == row["shim"]["script"]
+    # The bridge exec's this path directly, so it must be executable.
+    assert dest.stat().st_mode & 0o777 == 0o755
+    assert changed and all("cmdtest-og" in entry for entry in changed)
+
+
+def test_write_shims_covers_a_reviewer_too(tmp_path, monkeypatch):
+    # patch_global_config renders a row for an ACP reviewer as well, so a
+    # shimmed reviewer must materialize its script the same way.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    _registry_with_cmd_shim(monkeypatch)
+    plan = _cmdtest_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}],
+        reviewer={"id": "cmdtest", "model": None},
+    )
+    assert m.write_shims(plan)
+    assert (tmp_path / "shims" / "cmdtest-og").is_file()
+
+
+def test_write_shims_is_idempotent(tmp_path, monkeypatch):
+    # The installer is rerunnable by design: a second apply with identical
+    # content must leave the file alone and report no change.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    _registry_with_cmd_shim(monkeypatch)
+    plan = _cmdtest_plan()
+    assert m.write_shims(plan)
+    dest = tmp_path / "shims" / "cmdtest-og"
+    before = dest.stat().st_mtime_ns
+    assert m.write_shims(plan) == []
+    assert dest.stat().st_mtime_ns == before
+
+
+def test_write_shims_repairs_a_clobbered_mode(tmp_path, monkeypatch):
+    # The bridge exec's the shim path directly, so a mode that drifted (umask,
+    # a stray chmod, a dotfile sync) is a launch failure with no message
+    # pointing at the installer. Content already matches here: only the mode
+    # must converge, and the repair must be reported, not silent.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    row = _registry_with_cmd_shim(monkeypatch)
+    plan = _cmdtest_plan()
+    assert m.write_shims(plan)
+    dest = tmp_path / "shims" / "cmdtest-og"
+    dest.chmod(0o644)
+    changed = m.write_shims(plan)
+    assert dest.stat().st_mode & 0o777 == 0o755
+    assert dest.read_text() == row["shim"]["script"]
+    assert changed and all("cmdtest-og" in entry for entry in changed)
+    # ...and once converged, silence again.
+    assert m.write_shims(plan) == []
+
+
+def test_acp_command_expands_a_shim_token(tmp_path, monkeypatch):
+    # No $VAR may survive: the executor runs this argv with no shell, so the
+    # token becomes the absolute shim path, not $OMNI/shims/....
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    row = _registry_with_cmd_shim(monkeypatch)
+    assert m.acp_command(row, None) == \
+        f"env CMD_BIN={tmp_path}/shims/cmdtest-og cmd-acp"
+
+
+def test_acp_command_composes_shim_with_the_model_env_prefix(tmp_path, monkeypatch):
+    # The bridge reads the pin from CMD_MODEL and the binary from CMD_BIN, so
+    # both env assignments chain in the one argv (chained `env` is valid).
+    # shlex.quote leaves this id bare (no shell-unsafe chars); the contract
+    # here is the composition -- prefix outside, expanded path inside.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    row = _registry_with_cmd_shim(monkeypatch)
+    assert m.acp_command(row, "moonshotai/kimi-k3") == (
+        "env CMD_MODEL=moonshotai/kimi-k3 "
+        f"env CMD_BIN={tmp_path}/shims/cmdtest-og cmd-acp"
+    )
+
+
+def test_acp_command_leaves_rows_without_a_shim_token_alone(tmp_path, monkeypatch):
+    # Expansion must be a no-op for every existing row: byte-identical output.
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    reg = m.agents_by_id()
+    assert m.acp_command(reg["cline"], "deepseek/deepseek-v4-flash") == \
+        "env CLINE_MODEL=deepseek/deepseek-v4-flash cline --acp --auto-approve true"
+    assert m.acp_command(reg["kilo"], "kilo/kilo-auto/free") == "kilo acp"
+
+
+def test_list_models_drops_cmd_section_headings_and_docs_line(monkeypatch):
+    # cmd --list-models groups ids under bare Capitalized vendor headings
+    # ("Stealth", "Anthropic", ...) with a trailing docs line, each of which
+    # parsed as a bare id. The live CLI pads its description column, so the
+    # docs line's first field is the bare token "Docs:" -- reproduced here
+    # with a double space, which is what let it through.
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        _fake_run(
+            "Available models  ·  81 models\n"
+            "\n"
+            "Open Source\n"
+            "\n"
+            "deepseek/deepseek-v4-flash             fast hybrid-attention reasoning (default)\n"
+            "moonshotai/kimi-k3                     long-horizon coding & knowledge work with 1M context\n"
+            "\n"
+            "Stealth\n"
+            "\n"
+            "stealth/space-bunny-alpha              FREE stealth model with 1M context\n"
+            "\n"
+            "Anthropic\n"
+            "\n"
+            "claude-sonnet-5                        best combo of speed & intelligence (recommended)\n"
+            "\n"
+            "OpenAI\n"
+            "\n"
+            "gpt-5.3-codex                          frontier coding model\n"
+            "\n"
+            "Google\n"
+            "\n"
+            "Sakana\n"
+            "\n"
+            "Meta\n"
+            "\n"
+            "xAI\n"
+            "\n"
+            "Docs:  https://commandcode.ai/docs\n"
+        ),
+    )
+    agent = {"model": {"list_cmd": ["cmd", "--list-models"]}}
+    got = m.list_models(agent)
+    assert got == ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k3",
+                   "stealth/space-bunny-alpha", "claude-sonnet-5", "gpt-5.3-codex"]
+    for junk in ("Stealth", "Anthropic", "OpenAI", "Google", "Sakana",
+                 "Meta", "xAI", "Docs:"):
+        assert junk not in got
+
