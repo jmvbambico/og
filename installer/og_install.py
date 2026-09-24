@@ -705,6 +705,23 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                        "inlined into args.input on every dispatch; the generated `roster` "
                        "skill tells the orchestrator to do exactly that."))
 
+    # A `{shim:<name>}` token with no matching shim block renders a path to
+    # a file nothing ever writes. The launch then fails with an exec error
+    # pointing nowhere near the installer, so refuse it here instead.
+    for c in list(plan["coders"]) + [plan["reviewer"]]:
+        a = reg.get(c["id"])
+        if not a:
+            continue
+        declared = (a.get("shim") or {}).get("name")
+        for tok in sorted(set(SHIM_TOKEN.findall(a.get("acp_command") or ""))):
+            if tok != declared:
+                issues.append(("error",
+                               f"{a['label']} ({c['id']}) references {{shim:{tok}}} in "
+                               f"acp_command but declares no shim named '{tok}'. The "
+                               "expanded path points at a file nothing writes and the "
+                               "launch fails — declare shim.name == "
+                               f"'{tok}' or fix the token."))
+
     # The tmux command-string ceiling only binds when the prompt rides on argv.
     if rendered_prompt is not None and od == "argv":
         quoted = len(shlex.quote(rendered_prompt))
@@ -1085,10 +1102,11 @@ def acp_command(agent: dict, model: str | None) -> str:
     permission via `session/set_config_option`, which Omnigent never sends:
     the bridge honours CMD_BIN to pick which binary it spawns, so the shim
     appends the flags the bridge will not otherwise receive. Expansion is a
-    plain substitution, so it composes with the env-var prefix below, and the
+    shlex.quoted substitution (a no-op when the path has no special
+    characters), so it composes with the env-var prefix below, and the
     executor exec's the argv with no shell -- no $VAR may survive unexpanded.
     """
-    cmd = SHIM_TOKEN.sub(lambda mt: str(OMNI / "shims" / mt.group(1)), agent["acp_command"])
+    cmd = SHIM_TOKEN.sub(lambda mt: shlex.quote(str(OMNI / "shims" / mt.group(1))), agent["acp_command"])
     var = (agent.get("model") or {}).get("env_var") or agent.get("model_env")
     if var and model:
         return f"env {var}={shlex.quote(model)} {cmd}"
