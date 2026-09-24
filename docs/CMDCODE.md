@@ -1,9 +1,9 @@
 # Command Code (cmdcode) registry row
 
 Everything a future maintainer needs to know about the `cmdcode` row in
-`installer/registry.json`. It is **unverified**: nothing has been exercised end
-to end yet, because the account is not subscribed and `cmd status` currently
-reports not authenticated. Treat every claim here as researched-but-untested.
+`installer/registry.json`. The row was **verified end to end on 2026-09-24**
+against a subscribed, authenticated account — see [How it was verified](#how-it-was-verified)
+for what was actually exercised and what still has not been.
 
 ---
 
@@ -82,27 +82,65 @@ Id form matters: open-weight models are provider-prefixed
 (`moonshotai/…`, `deepseek/…`, `z-ai/…`) but Anthropic and OpenAI ids are
 **bare** (`claude-sonnet-5`, `gpt-5.5`).
 
-## Verify before trusting
+## How it was verified
 
-The row is `unverified: true`; nothing has been exercised end to end. Before
-flipping it:
+Verified 2026-09-24 by driving `cmd-acp` over ACP stdio directly (a hand-written
+JSON-RPC client: `initialize`, `session/new`, `session/prompt`), against a
+subscribed and authenticated account. Two runs, differing only in whether the
+shim was in the path:
 
-- [ ] `cmd login` in a shell actually authenticates (see the login note below).
-- [ ] A real dispatch produces a **real commit** in scope with gates green —
-      an empty transcript means the pin or shim is wrong, not that it refused.
-- [ ] With `CMD_MODEL` set to the preferred pin, `cmd` runs *that* model
-      (`--model` reached it through the shim).
-- [ ] `--yolo` and `--tools-all` both reached `cmd` (the worker changed files
-      without any permission card).
-- [ ] The first `cmd -p` boot that omits `--skip-onboarding` would hang/fail;
-      confirm onboarding was skipped on a fresh install.
-- [ ] The quota-exhaustion string `You've reached your 5-hour usage limit.`
-      appears in real transcript output when dry.
+| Run | `CMD_BIN` | Result |
+|---|---|---|
+| Control | unset (plain `cmd-acp`) | Agent replied *"I can't complete this — file writes are blocked"*, returned `stopReason: end_turn`, changed **nothing** |
+| Treatment | the generated shim, `CMD_MODEL=moonshotai/kimi-k3` | `write_file` tool call ran; the requested file appeared with the requested contents |
 
-### Open discrepancy: the login command
+The control is the important half. It demonstrates that `--yolo` is
+**load-bearing, not a precaution**: without it a Command Code worker reports a
+clean `end_turn` having done nothing, which upstream looks exactly like success.
+That is the failure mode this whole row is built to avoid.
 
-`cmd --help` documents `cmd login`, but `cmd status` tells the user to run
-`cmd auth login`. The registry row currently records `cmd login`. Whichever is
-real must be confirmed (on an authenticated machine) before the row's `login`
-field is trusted; this is exactly the sort of thing that only the first real
-login settles.
+### Three facts that run produced
+
+1. **`cmd`'s own default model is `deepseek/deepseek-v4-pro`**, read from the
+   bridge's `session/new` response (`configOptions` → `model` → `currentValue`).
+   An **unpinned** cmdcode worker therefore runs DeepSeek and is silently
+   same-vendor with Cline for cross-vendor review. This is why `model.required`
+   is `true` and `silent_model_failure` is `true`: an unpinned run is a
+   *successful* run on the wrong vendor, not an error.
+2. **Command Code writes a `.commandcode/` directory into its cwd** (the
+   worktree), the same way freebuff writes `.freebuff/`. It is gitignored;
+   without that it turns up in every worker's diff.
+3. **`cmd login` is the real command.** `cmd status` tells the user to run
+   `cmd auth login`, but there is no `auth` subcommand — `cmd auth --help` falls
+   back to the general help, and `cmd help` documents `cmd login`. The row's
+   `login` field is correct as written; the CLI's own error message is wrong.
+
+## What is still NOT verified
+
+- **A real dispatch through Omnigent.** The verification above drove the bridge
+  directly, not through a live `og` worker session. The first real dispatch is
+  still the only proof the harness wiring holds end to end.
+- **Quota exhaustion behaviour.** The string `You've reached your 5-hour usage
+  limit.` is documented, not observed. The `quota.probe` is `null` and nothing
+  has driven the account dry.
+- **`--tools-all` and `--skip-onboarding` individually.** Both were present in
+  the treatment run, which passed; neither has been shown necessary on its own
+  by removing it and watching the run fail.
+
+## Guardrails in the installer
+
+Two failure modes are now refused rather than discovered at launch (added in
+v0.10.1 after an independent review):
+
+- **An unresolved `{shim:<name>}` token is a validation ERROR.** Previously a
+  typo rendered a path to a file nothing writes, and the launch failed with an
+  exec error pointing nowhere near the installer.
+- **The substituted shim path is `shlex.quote`d.** Previously a raw path
+  containing a space split into two argv entries — `CMD_BIN=/Users/John` plus a
+  stray `Smith/...` — breaking the launch for anyone whose home directory
+  contains a space. "No shell" prevents variable *expansion*; it does not
+  prevent argv *splitting*.
+
+`write_shims` also converges mode as well as content, so a shim that loses its
+exec bit is repaired and reported on the next install rather than failing
+silently.

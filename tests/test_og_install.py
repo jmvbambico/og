@@ -8,6 +8,7 @@ OMNI/STATE constants rather than the real ~/.omnigent.
 from __future__ import annotations
 
 import json
+import shlex
 import socket
 import subprocess
 import sys
@@ -1365,4 +1366,83 @@ def test_list_models_drops_cmd_section_headings_and_docs_line(monkeypatch):
     for junk in ("Stealth", "Anthropic", "OpenAI", "Google", "Sakana",
                  "Meta", "xAI", "Docs:"):
         assert junk not in got
+
+
+# --------------------------------------------------------------------------
+# unresolved {shim:...} tokens are refused + shim paths survive spaces
+# --------------------------------------------------------------------------
+def _bad_shim_row(**overrides):
+    row = {
+        "id": "badshim",
+        "label": "BadShim",
+        "harness": "acp:badshim",
+        "kind": "acp-user",
+        "binary": "badshim",
+        "vendor": "badvendor",
+        "acp_command": "env CMD_BIN={shim:missing} badshim-acp",
+        "model": {"env_var": "CMD_MODEL", "list_cmd": ["badshim", "--list-models"]},
+        "shim": {"name": "something-else",
+                 "script": "#!/bin/sh\nexec badshim \"$@\"\n"},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_validate_errors_on_shim_token_with_wrong_declared_name(monkeypatch):
+    row = _bad_shim_row()
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], row]})
+    plan = _base_plan(coders=[{"id": "badshim", "priority": 1,
+                               "model": "moonshotai/kimi-k3"}])
+    issues = m.validate(plan)
+    shim_errors = [(level, msg) for level, msg in issues if "{shim:missing}" in msg]
+    assert shim_errors, issues
+    assert all(level == "error" for level, _ in shim_errors)
+    assert any("badshim" in msg for _, msg in shim_errors)
+
+
+def test_validate_errors_on_shim_token_with_no_declared_shim(monkeypatch):
+    row = _bad_shim_row(shim=None)
+    row.pop("shim", None)
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], row]})
+    plan = _base_plan(coders=[{"id": "badshim", "priority": 1,
+                               "model": "moonshotai/kimi-k3"}])
+    issues = m.validate(plan)
+    shim_errors = [(level, msg) for level, msg in issues if "{shim:missing}" in msg]
+    assert shim_errors, issues
+    assert all(level == "error" for level, _ in shim_errors)
+    assert any("badshim" in msg for _, msg in shim_errors)
+
+
+def test_validate_errors_on_unresolved_shim_token_in_reviewer(monkeypatch):
+    row = _bad_shim_row()
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], row]})
+    plan = _base_plan(reviewer={"id": "badshim", "model": None})
+    issues = m.validate(plan)
+    shim_errors = [(level, msg) for level, msg in issues if "{shim:missing}" in msg]
+    assert shim_errors, issues
+    assert all(level == "error" for level, _ in shim_errors)
+    assert any("badshim" in msg for _, msg in shim_errors)
+
+
+def test_validate_no_shim_error_for_a_correctly_declared_row(monkeypatch):
+    _registry_with_cmd_shim(monkeypatch)
+    issues = m.validate(_cmdtest_plan())
+    assert not [msg for _, msg in issues if "shim" in msg.lower()], issues
+
+
+def test_acp_command_keeps_a_spaced_shim_path_as_one_argv_entry(monkeypatch):
+    # OMNI with a space (ordinary on macOS): argv is what matters, so assert
+    # against shlex.split, not the raw string.
+    monkeypatch.setattr(m, "OMNI", Path("/Users/John Smith/.omnigent"))
+    row = _bad_shim_row(
+        acp_command="env CMD_BIN={shim:cmd-og} cmd-acp",
+        shim={"name": "cmd-og", "script": "#!/bin/sh\nexec cmd \"$@\"\n"},
+    )
+    row["acp_command"] = "env CMD_BIN={shim:cmd-og} cmd-acp"
+    rendered = m.acp_command(row, "moonshotai/kimi-k3")
+    argv = shlex.split(rendered)
+    assert "CMD_BIN=/Users/John Smith/.omnigent/shims/cmd-og" in argv
+    # ...and without the model prefix the same single-entry shape holds.
+    argv_plain = shlex.split(m.acp_command(row, None))
+    assert "CMD_BIN=/Users/John Smith/.omnigent/shims/cmd-og" in argv_plain
 

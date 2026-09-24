@@ -7,3 +7,4 @@ __pycache__/
 og-install.json
 auth_tokens.json
 .cookie-secret
+.commandcode/
