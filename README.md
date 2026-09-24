@@ -144,12 +144,13 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | Kiro (AWS) | `acp:kiro-aws` | coder / reviewer | optional | via `kiro-cli acp --trust-all-tools` (see below); 50 free credits/mo; unverified here |
 | Cursor | `cursor-native` | coder / reviewer | optional | |
 | Freebuff | `acp:freebuff` | coder | optional — 4 rotating choices; needs a blink that honours BLINK_MODEL | via [`blink`](https://github.com/jmvbambico/bufflink) ≥ v0.1.2, an ACP bridge over freebuff's TUI; one hour billed per launch at the model's rate (5/hr default GLM, up to 15/hr DeepSeek) from 25 free daily; silent until the turn ends; **verified** (5 backlog tasks, 3/3 first-try since v0.1.2); close the session then SIGTERM `blink` to release freebuff's lock |
+| Command Code | `acp:command-code` | coder | **required** | via [`cmd-acp`](https://github.com/toolsHelp/cmd-acp) plus a **generated shim** (see below); one `cmd -p` per prompt, nothing to reap; rolling 5h + weekly credit windows, no quota API; **verified** (control/treatment run, 2026-09-24) |
 | Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
 | Goose, Hermes, Gemini, Grok, Devin | various | coder | optional | |
 
 Each row may declare a `quota` block; these power `og stats` (see [docs/STATS.md](docs/STATS.md), written by a sibling task) — `probe: null` marks a known limit with no queryable API.
 
-### Four properties worth understanding
+### Five properties worth understanding
 
 **Cline runs with `--auto-approve true`.** Cline's ACP mode (used for editor
 integration, which is how it's invoked here) defaults tool auto-approval to
@@ -177,6 +178,34 @@ covers whatever it relays; the same Omnigent policies gate the rest. The
 name (`Kiro (AWS)` → `kiro-aws`, `Kilo Code` → `kilo-code`): a wrong slug does
 not error, it silently resolves to the *first* configured ACP row — a different
 vendor. A test pins this.
+
+**Command Code reaches Omnigent through a generated shim.** `cmd` has no
+native ACP, so it is driven by [`cmd-acp`](https://github.com/toolsHelp/cmd-acp),
+a third-party bridge that spawns one `cmd -p` per prompt. That bridge accepts
+its model and its *write permission* only via the ACP method
+`session/set_config_option`, which Omnigent never sends — so a session starts
+with no `--model` and, critically, no `--yolo`. Headless `cmd -p` still goes
+through Command Code's permission engine, so such a worker returns a clean
+`end_turn` having changed nothing, which upstream is indistinguishable from
+success. Measured: without the shim the agent replies *"I can't complete this —
+file writes are blocked"*; with it, the file gets written.
+
+The bridge does honour `CMD_BIN`, so rather than fork it, a registry row may
+declare a `shim` block. The installer materializes that script at
+`$OMNIGENT_HOME/shims/<name>` (mode 0755, repaired on rerun if the exec bit is
+lost) and expands `{shim:<name>}` inside the row's `acp_command` to its
+absolute path, quoted. The generated script appends `--yolo`, `--tools-all`
+(headless withholds some tools) and `--skip-onboarding`, plus the `--model`
+pin from `CMD_MODEL`. Setting `permissions.defaultMode: yolo` in
+`~/.commandcode/settings.json` is the alternative, but it applies to the
+user's *interactive* `cmd` too and cannot carry `--tools-all`. A `{shim:}`
+token naming a shim the row does not declare is a validation error, not a
+launch failure. See [docs/CMDCODE.md](docs/CMDCODE.md).
+
+A pin is **required** for a reason particular to this row: `cmd`'s own default
+is `deepseek/deepseek-v4-pro`, so an unpinned worker silently runs DeepSeek and
+becomes same-vendor with Cline for cross-vendor review. The row ships pinned to
+`moonshotai/kimi-k3`, the one vendor no other roster member uses.
 
 **Model pin location.** A pin goes at `executor.model`. `executor.config` is a
 free-form dict, so a `model:` placed there is accepted without complaint and
@@ -218,7 +247,8 @@ The installer will ask you to:
 3. pick which agents **implement**, *in preference order* — the first is tried
    first, later ones absorb overflow
 4. pin a **model** per coder — the installer runs the CLI's own listing
-   (`opencode models`, `kilo models`, `cursor-agent models`), grouped by
+   (`opencode models`, `kilo models`, `cursor-agent models`,
+   `cmd --list-models`), grouped by
    provider in the tool's own order; type part of a name to search a long
    list. Anything you've logged into with the CLI shows up: a DeepSeek key
    added via `opencode auth login` appears as `deepseek/…` next to Zen's
