@@ -138,7 +138,7 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 |---|---|---|---|---|
 | Claude Code | `claude-native` | orch / coder / reviewer | optional | multi-account via `CLAUDE_CONFIG_DIR` |
 | OpenCode (Zen) | `opencode-native` | orch / coder | **required** | lists every provider you've added with `opencode auth login` (Zen, DeepSeek, Anthropic, …); Zen's free `-free` lineup rotates and is day-capped |
-| Codex | `codex-native` | orch / coder / reviewer | optional | |
+| Codex | `codex-native` | orch / coder / reviewer | optional — 4 static choices | the CLI does not enumerate models, so the picker offers a static list and accepts a hand-typed newer id |
 | Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model**; runs with `--auto-approve true` (see below) |
 | Kilo Code | `acp:kilo-code` | coder | **required** | via `kilo acp`; unverified here |
 | Kiro (AWS) | `acp:kiro-aws` | coder / reviewer | optional | via `kiro-cli acp --trust-all-tools` (see below); 50 free credits/mo; unverified here |
@@ -146,7 +146,8 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | Freebuff | `acp:freebuff` | coder | optional — 4 rotating choices; needs a blink that honours BLINK_MODEL | via [`blink`](https://github.com/jmvbambico/bufflink) ≥ v0.1.2, an ACP bridge over freebuff's TUI; one hour billed per launch at the model's rate (5/hr default GLM, up to 15/hr DeepSeek) from 25 free daily; silent until the turn ends; **verified** (5 backlog tasks, 3/3 first-try since v0.1.2); close the session then SIGTERM `blink` to release freebuff's lock |
 | Command Code | `acp:command-code` | coder | **required** | via [`cmd-acp`](https://github.com/toolsHelp/cmd-acp) plus a **generated shim** (see below); one `cmd -p` per prompt, nothing to reap; rolling 5h + weekly credit windows, no quota API; **verified** (control/treatment run, 2026-09-24) |
 | Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
-| Goose, Hermes, Gemini, Grok, Devin | various | coder | optional | |
+| Grok, Devin | various | orch / coder | optional | orchestrator-capable on the two bars `validate()` enforces (`relay`, prompt delivered) but **unverified in that role** — see each row's `roles_note` |
+| Goose, Hermes, Gemini | various | coder | optional | |
 
 Each row may declare a `quota` block; these power `og stats` (see [docs/STATS.md](docs/STATS.md), written by a sibling task) — `probe: null` marks a known limit with no queryable API.
 
