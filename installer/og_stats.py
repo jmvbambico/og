@@ -66,7 +66,13 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     except json.JSONDecodeError as e:
         sys.exit(f"{registry_path} is not valid JSON: {e}")
 
-    def entry(agent_id: str, role: str, priority: int | None) -> dict:
+    def entry(agent_id, role: str, priority: int | None) -> dict | None:
+        # A malformed entry -- a bare number, a null, an object with no id --
+        # names no agent, and a row for it would carry agent=None and crash the
+        # table render. og stats runs interactively before a dispatch decision,
+        # so a hand-edited file must skip the bad entry, never trace back.
+        if not isinstance(agent_id, str):
+            return None
         row = _agents_map(reg).get(agent_id) or {}
         quota = row.get("quota") or {}
         probe = quota.get("probe")
@@ -81,25 +87,41 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
         A role is an ORDERED chain, so it may be a list of entries; the older
         shapes (a bare id string, a single {"id": ...} object) still appear in
         state files written before the chain existed and must keep reporting.
+        A hand-edited file can also carry a malformed element -- `"reviewer":
+        [5]` used to raise AttributeError on `5.get`. Anything that is neither
+        an id string nor an object carrying one is skipped, never guessed at.
         """
         if isinstance(value, str):
             return [value]
         if isinstance(value, dict):
-            return [value.get("id")]
+            return [value["id"]] if isinstance(value.get("id"), str) else []
         if isinstance(value, list):
-            return [e if isinstance(e, str) else (e or {}).get("id") for e in value]
+            out = []
+            for e in value:
+                if isinstance(e, str):
+                    out.append(e)
+                elif isinstance(e, dict) and isinstance(e.get("id"), str):
+                    out.append(e["id"])
+            return out
         return []
 
     entries: list[dict] = []
+
+    def add(agent_id, role: str, priority: int | None) -> None:
+        e = entry(agent_id, role, priority)
+        if e is not None:
+            entries.append(e)
+
     for aid in ids(inst.get("orchestrator")):
-        entries.append(entry(aid, "orchestrator", None))
-    for c in sorted(inst.get("coders") or [], key=lambda c: c.get("priority", 999)):
-        entries.append(entry(c.get("id"), "coder", c.get("priority")))
+        add(aid, "orchestrator", None)
+    for c in sorted((c for c in (inst.get("coders") or []) if isinstance(c, dict)),
+                    key=lambda c: c.get("priority", 999)):
+        add(c.get("id"), "coder", c.get("priority"))
     # One row per reviewer, in chain order: this is the probe surface the
     # orchestrator reads to pick the earliest entry with capacity, so a backup
     # that is absent here cannot be failed over to on evidence.
     for aid in ids(inst.get("reviewer")):
-        entries.append(entry(aid, "reviewer", None))
+        add(aid, "reviewer", None)
     return entries
 
 

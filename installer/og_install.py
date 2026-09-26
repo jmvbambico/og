@@ -597,6 +597,30 @@ def reviewer_names(plan: dict) -> list:
             for i in range(1, len(chain(plan, "reviewer")) + 1)]
 
 
+def account_entries(plan: dict) -> list:
+    """(agent_id, env_var, config_dir) for every installed id that has an account.
+
+    `accounts` is keyed by agent id, and interactive collects it for every id in
+    every chain -- orchestrator, each reviewer, each coder -- not just the head.
+    Only a row whose registry `multi_account.env` names the variable can be
+    wired; a stray accounts key is ignored rather than guessed at. Chain order,
+    first occurrence of a repeated id wins.
+    """
+    reg = agents_by_id()
+    out, seen = [], set()
+    for role in ("orchestrator", "reviewer", "coders"):
+        for e in chain(plan, role):
+            aid = e["id"]
+            if aid in seen:
+                continue
+            seen.add(aid)
+            acct = (plan.get("accounts") or {}).get(aid)
+            env = (reg.get(aid, {}).get("multi_account") or {}).get("env")
+            if acct and env:
+                out.append((aid, f"OG_{env}", acct))
+    return out
+
+
 def role_caveat(agent: dict, role: str) -> str | None:
     """The UNVERIFIED-in-this-role caveat for `agent`, or None.
 
@@ -841,17 +865,22 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # telling them plainly what they are getting. Checked for EVERY entry in the
     # chain: the one that gets used is the one the orchestrator reaches for when
     # the primary is dry.
-    for name, r in zip(reviewer_names(plan), reviewers):
+    for i, (name, r) in enumerate(zip(reviewer_names(plan), reviewers)):
         rv = vendor_of(reg[r["id"]], r)
         colliding = [f"`{worker_name(c['id'])}` ({reg[c['id']]['label']})"
                      for c in plan["coders"] if vendor_of(reg[c["id"]], c) == rv]
         if colliding:
+            # The PRIMARY collides immediately -- you never fail over TO the
+            # primary -- so the failover wording is right only for a backup.
+            tail = ("cross-vendor, so this is a same-vendor review — the PR must be "
+                    "labelled `degraded-review`." if i == 0 else
+                    f"cross-vendor, so failing over to `{name}` would produce a "
+                    "same-vendor review — the PR must then be labelled "
+                    "`degraded-review`.")
             issues.append(("warn",
                            f"reviewer `{name}` ({reg[r['id']]['label']}) shares a vendor with "
                            f"{', '.join(colliding)}: all are `{rv}`. Review is meant to be "
-                           f"cross-vendor, so failing over to `{name}` would produce a "
-                           "same-vendor review — the PR must then be labelled "
-                           "`degraded-review`."))
+                           + tail))
 
     for o in orchestrators:
         a = reg[o["id"]]
@@ -862,14 +891,14 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "orchestrator."))
 
         # A harness that never receives the spec prompt cannot orchestrate: the
-        # whole orchestration contract lives in that prompt.
+        # whole orchestration contract lives in that prompt. Checked for EVERY
+        # entry in the chain -- a `none` BACKUP is exactly as unusable as a
+        # `none` primary, and it is the one reached for when the primary is dry.
         if a.get("prompt_delivery") == "none":
             issues.append(("error",
                            f"{a['label']} never receives a spec prompt "
                            "(Omnigent reports instruction delivery NOT_DELIVERED), so the "
                            "orchestration contract would be silently discarded."))
-
-    od = reg[orchestrators[0]["id"]].get("prompt_delivery")
 
     # Workers on such a harness only ever see the dispatch text.
     mute = [reg[c["id"]]["label"] for c in plan["coders"]
@@ -931,14 +960,42 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                                "launch fails — declare shim.name == "
                                f"'{tok}' or fix the token."))
 
-    # The tmux command-string ceiling only binds when the prompt rides on argv.
-    if rendered_prompt is not None and od == "argv":
+    # og launches ONE server with ONE environment, so a single env var cannot
+    # name two config dirs. Two installed ids can share a `multi_account.env`
+    # (nothing in the registry forbids it) and each be given a different
+    # account; whichever og.env line won would silently run the other agent on
+    # the wrong account. Refuse rather than write a file where one account is
+    # quietly dropped.
+    by_env = {}
+    for aid, var, acct in account_entries(plan):
+        prev = by_env.get(var)
+        if prev and prev[1] != acct:
+            issues.append(("error",
+                           f"{reg[aid]['label']} and {reg[prev[0]]['label']} both need "
+                           f"{var}, but og launches one server with one value. Two "
+                           f"accounts ({prev[1]} and {acct}) cannot both be set. Give "
+                           "them different multi_account.env values in the registry, or "
+                           "drop one of the accounts."))
+        else:
+            by_env[var] = (aid, acct)
+
+    # The tmux command-string ceiling binds whenever ANY orchestrator in the
+    # chain rides on argv -- NOT just the head. Reading only orchestrators[0]
+    # meant a per_turn primary (OpenCode) hid an argv BACKUP (claude, codex):
+    # the config validated clean, then the backup -- the entry that actually
+    # launches once the primary is dry -- died at launch with 'command too long'
+    # (surfacing as a native terminal that failed to start). Name every argv
+    # entry so a two-orchestrator chain says WHICH one is over the ceiling.
+    argv_orchestrators = [o for o in orchestrators
+                          if reg[o["id"]].get("prompt_delivery") == "argv"]
+    if rendered_prompt is not None and argv_orchestrators:
         quoted = len(shlex.quote(rendered_prompt))
+        names = ", ".join(reg[o["id"]]["label"] for o in argv_orchestrators)
         if quoted > PROMPT_CEILING:
             issues.append(("error",
                            f"orchestrator prompt is {quoted} bytes shell-quoted, over the "
                            f"{PROMPT_CEILING} ceiling for an argv-delivered harness "
-                           f"({reg[orchestrators[0]['id']]['label']}). tmux refuses the launch "
+                           f"({names}). tmux refuses the launch "
                            "with 'command too long'. Options: drop a coder, move guidance into "
                            "a skill file, or pick an orchestrator whose harness composes the "
                            "prompt per turn (OpenCode) and has no ceiling."))
@@ -1280,7 +1337,12 @@ def render_orchestrator(plan: dict) -> str:
     s = tmpl("orchestrator.yaml.tmpl")
     # Every reviewer in the chain, not just the primary: tools.agents is the
     # only dispatch surface, so a backup omitted here is unreachable and the
-    # failover the roster skill promises cannot happen.
+    # failover the roster skill promises cannot happen. EACH backup grows the
+    # rendered prompt by an agent-list line here plus its roster lines in
+    # {{ROSTER_BULLETS}}, so headroom against PROMPT_CEILING shrinks per entry
+    # (1,401 bytes left with the measured four-coder roster). validate() refuses
+    # an argv chain over the ceiling, so the hazard stays guarded -- but a new
+    # chain entry spends bytes the prompt has to have.
     agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
     agent_list += "".join(f"\n    - {n}" for n in reviewer_names(plan))
     subs = {
@@ -1621,7 +1683,6 @@ def installed_version() -> str:
 
 
 def write_og_env(plan: dict) -> None:
-    reg = agents_by_id()
     lines = [
         "# Generated by og install.sh. Sourced by `og` at startup.",
         "",
@@ -1651,13 +1712,17 @@ def write_og_env(plan: dict) -> None:
     else:
         lines += ["# OG_NGROK_DOMAIN=your-name.ngrok.app   # a reserved domain keeps",
                   "#   invite links and session cookies working across restarts."]
-    rev = primary(plan, "reviewer")["id"]
-    acct = plan.get("accounts", {}).get(rev)
-    if acct:
-        env = (reg[rev].get("multi_account") or {}).get("env")
-        if env == "CLAUDE_CONFIG_DIR":
-            lines += ["", "# The reviewer runs on this account, separate from your interactive one.",
-                      f"OG_CLAUDE_CONFIG_DIR={acct}"]
+    # Every id with its own account gets an env line, not just the primary
+    # reviewer. Interactive now collects `accounts` for every id in every chain,
+    # but this only ever emitted the head's -- so a BACKUP reviewer configured
+    # with its own account silently ran on the primary's (or the user's
+    # interactive) login. Same failure shape as the ceiling gate: the config
+    # looked right and the backup ran wrong.
+    accts = account_entries(plan)
+    if accts:
+        lines += ["", "# Each agent below runs on this account, separate from your",
+                  "# interactive login for that agent."]
+        lines += [f"{var}={acct}" for _aid, var, acct in accts]
     ocd = opencode_worker_config_dir(plan)
     if ocd:
         lines += ["", "# OpenCode worker overrides (drops the blocking `question` tool). og start",
@@ -2035,7 +2100,8 @@ def emit_questions() -> None:
              "ask": "Which agents review the batched diff, in preference order (first "
                     "is tried first; the next takes over when one is out of quota)? "
                     "Prefer a vendor that differs from every coder.",
-             "per_item": {"model": "Model id to pin for this reviewer.",
+             "per_item": {"model": "Model id to pin. REQUIRED for agents where "
+                                   "registry.model.required is true.",
                           "choices": model_choices}},
             {"key": "accounts", "type": "map",
              "ask": "For any agent with registry.multi_account.supported, should the "

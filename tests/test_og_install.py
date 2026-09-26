@@ -206,6 +206,25 @@ def test_validate_warns_same_vendor_reviewer():
     assert any("shares a vendor with" in msg for _, msg in issues)
 
 
+def test_primary_collision_warning_reads_as_immediate_not_failover():
+    # The head collides right away -- you never fail over TO the primary -- so
+    # its wording must not talk about failover; a BACKUP keeps that wording,
+    # because it is exactly the entry reached on failover.
+    primary = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}],
+                         reviewer={"id": "agy", "model": None})
+    msgs = [msg for _, msg in m.validate(primary) if "shares a vendor" in msg]
+    assert msgs, msgs
+    assert "failing over" not in msgs[0], msgs[0]
+    assert "same-vendor review" in msgs[0] and "degraded-review" in msgs[0]
+
+    backup = _base_plan(
+        coders=[{"id": "gemini", "priority": 1, "model": None}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "agy", "priority": 2, "model": None}])
+    bmsgs = [msg for _, msg in m.validate(backup) if "shares a vendor" in msg]
+    assert bmsgs and "failing over to `reviewer_2`" in bmsgs[0], bmsgs
+
+
 def test_validate_errors_when_orchestrator_cannot_relay():
     plan = _base_plan(orchestrator="cline")
     issues = m.validate(plan)
@@ -284,6 +303,41 @@ def test_validate_prompt_ceiling_ignored_for_non_argv_orchestrator():
     huge = "x" * (m.PROMPT_CEILING * 2)
     issues = m.validate(plan, huge)
     assert not any("ceiling" in msg for _, msg in issues)
+
+
+def test_validate_prompt_ceiling_fires_for_an_argv_backup_behind_a_per_turn_primary():
+    # A per_turn primary (OpenCode) has no ceiling, so reading only
+    # orchestrators[0] skipped the refusal entirely. The BACKUP (claude) is an
+    # argv harness -- the entry that launches when the primary is dry -- so an
+    # over-ceiling prompt must be refused for IT, and the message must name it.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1},
+                                    {"id": "claude", "priority": 2}])
+    over = "x" * (m.PROMPT_CEILING + 500)
+    msgs = [msg for level, msg in m.validate(plan, over) if level == "error"]
+    assert any("over the" in msg and "Claude Code" in msg for msg in msgs), msgs
+
+
+def test_validate_prompt_ceiling_warns_for_an_argv_backup_behind_a_per_turn_primary():
+    # Same chain inside the 800-byte warn band: the hazard is real (that backup
+    # is the one that launches) and must surface even though the head has no
+    # ceiling at all.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1},
+                                    {"id": "claude", "priority": 2}])
+    near = "x" * (m.PROMPT_CEILING - 500)
+    assert any(level == "warn" and "tmux ceiling" in msg
+               for level, msg in m.validate(plan, near))
+
+
+def test_validate_errors_when_a_backup_orchestrator_never_receives_its_prompt():
+    # cursor is prompt_delivery: none. As a BACKUP orchestrator it drops the
+    # whole orchestration contract exactly like a primary would, and it is the
+    # entry reached for when the primary is dry -- so the error must fire for
+    # it, not only for the head.
+    plan = _base_plan(orchestrator=[{"id": "claude", "priority": 1},
+                                    {"id": "cursor", "priority": 2}])
+    msgs = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("never receives a spec prompt" in msg and "Cursor" in msg
+               for msg in msgs), msgs
 
 
 def test_validate_warns_when_the_orchestrator_is_unverified_for_that_role():
@@ -566,6 +620,12 @@ def test_emit_questions_offers_orchestrator_and_reviewer_as_ordered_chains(monke
     # AI installer can pin each entry of the chain.
     assert "choices" in next(x for x in q["questions"]
                              if x["key"] == "reviewer")["per_item"]
+    # ...and the same model REQUIREMENT wording: a reviewer pin is required
+    # exactly where a coder's is, so the prompt must carry the caveat too.
+    coder_model = next(x for x in q["questions"] if x["key"] == "coders")["per_item"]["model"]
+    reviewer_model = next(x for x in q["questions"] if x["key"] == "reviewer")["per_item"]["model"]
+    assert reviewer_model == coder_model
+    assert "REQUIRED" in reviewer_model
 
 
 # --------------------------------------------------------------------------
@@ -767,6 +827,46 @@ def test_og_env_auto_update_off_is_zero_not_absent(tmp_path, monkeypatch):
     env = _og_env(tmp_path, monkeypatch, _base_plan(auto_update=False))
     assert "OG_AUTO_UPDATE=0\n" in env
     assert "og update" in env
+
+
+def test_og_env_wires_a_backup_reviewers_own_account(tmp_path, monkeypatch):
+    # Interactive collects `accounts` for every id in the reviewer chain, so a
+    # BACKUP can have its own. write_og_env emitted the env line for the primary
+    # only, so that backup silently ran on the wrong account -- the failure the
+    # separate account exists to prevent.
+    plan = _base_plan(
+        orchestrator="codex",
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "claude", "priority": 2, "model": None}],
+        accounts={"claude": "/tmp/claude-work"})
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-work\n" in env
+
+
+def test_og_env_wires_the_primary_reviewers_account(tmp_path, monkeypatch):
+    # The head's account keeps working exactly as before.
+    plan = _base_plan(reviewer={"id": "claude", "model": None},
+                      accounts={"claude": "/tmp/claude-primary"})
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-primary\n" in env
+
+
+def test_validate_errors_when_two_agents_share_an_env_but_need_different_accounts(monkeypatch):
+    # Nothing in the registry forbids two rows sharing `multi_account.env`, and
+    # og launches ONE server with ONE value: a second account for each means one
+    # og.env line silently overwrites the other and an agent runs on the wrong
+    # login. Refuse rather than write a file where one account is dropped.
+    row = next(a for a in m.REGISTRY["agents"] if a["id"] == "claude")
+    twin = {**row, "id": "claude2", "label": "Claude Two"}
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], twin]})
+    plan = _base_plan(
+        orchestrator="codex",
+        reviewer=[{"id": "claude", "priority": 1, "model": None},
+                  {"id": "claude2", "priority": 2, "model": None}],
+        accounts={"claude": "/tmp/a", "claude2": "/tmp/b"})
+    msgs = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("OG_CLAUDE_CONFIG_DIR" in msg and "/tmp/a" in msg and "/tmp/b" in msg
+               for msg in msgs), msgs
 
 
 # --------------------------------------------------------------------------

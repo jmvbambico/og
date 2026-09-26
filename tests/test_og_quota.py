@@ -1020,6 +1020,46 @@ def test_lineup_expands_orchestrator_and_reviewer_chains(tmp_path):
         ("reviewer", "codex"), ("reviewer", "kiro")]
 
 
+def test_lineup_skips_a_malformed_chain_entry(tmp_path):
+    # og stats runs interactively before a dispatch decision, so a hand-edited
+    # og-install.json must skip a bad entry, not trace back: `"reviewer": [5]`
+    # used to raise AttributeError on `5.get`. None/{}/int/list elements, a
+    # scalar role value, and a dict with no id all have to be tolerated.
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "orchestrator": [None, "claude", {}, 5, ["x"]],
+        "coders": [{"id": "opencode", "priority": 1}],
+        "reviewer": [5, None, {}, "codex"],
+    }))
+    _write_registry(reg)
+    rows = st.lineup(inst, reg)
+    assert [(r["role"], r["agent"]) for r in rows] == [
+        ("orchestrator", "claude"), ("coder", "opencode"), ("reviewer", "codex")]
+    # no malformed entry may reach the renderer as a None agent
+    assert all(isinstance(r["agent"], str) for r in rows)
+
+    # A non-list, non-str, non-dict role value is simply empty.
+    inst.write_text(json.dumps({"orchestrator": 5, "coders": [],
+                                "reviewer": {"id": "codex"}}))
+    assert [r["agent"] for r in st.lineup(inst, reg)] == ["codex"]
+
+
+def test_lineup_malformed_entries_survive_the_table_render(tmp_path):
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "orchestrator": [5],
+        "coders": [],
+        "reviewer": [{"id": "codex", "priority": 1}, None],
+    }))
+    _write_registry(reg)
+    rows = st.build_rows(st.lineup(inst, reg), tmp_path / "s.json",
+                         no_probe=True, only=None)
+    table = st.render_table(rows, NOW)   # crashed on a None agent before
+    assert "codex" in table
+
+
 def test_table_and_json_shape(tmp_path, capsys):
     state_path = tmp_path / "og-quota.json"
     rec = q.make_record("ok", "measured", 60, 100, "percent",
