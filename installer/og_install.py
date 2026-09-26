@@ -574,24 +574,36 @@ def primary(plan: dict, role: str) -> dict:
 # --------------------------------------------------------------------------
 # the role table
 # --------------------------------------------------------------------------
-# ONE table declares every role this installer wires. The per-role loops below
-# iterate it rather than naming the roles again: normalize_plan(),
-# account_entries(), validate(), write_shims(), patch_global_config(),
-# render_orchestrator(), apply() and emit_questions(). Adding a role used to
-# mean editing those in lockstep, and roles added that way drift apart the
-# moment one of them is touched: a role copy-pasted through many call sites
-# looks correct until a branch is missed. A row here is the whole change -- for
-# THOSE eight.
+# ONE table declares every role this installer wires. The loops that iterate it
+# rather than naming the roles again pick their row up for free: plan
+# normalization, chain handling, spec naming, the --questions entry, and the
+# eligibility / caveat plumbing all follow from a row. Adding a role used to
+# mean editing those call sites in lockstep, and roles added that way drift
+# apart the moment one of them is touched: a role copy-pasted through many call
+# sites looks correct until a branch is missed.
 #
-# Two per-role sites are NOT table-driven and still need a hand-edit when a
-# role is added; this comment names them rather than implying coverage:
+# A number of per-role sites are still hand-written and NOT table-driven, so
+# adding a role means finding them. This comment claims no count and no
+# complete list: a prose count of these sites was wrong three times, each
+# version true of the code its author happened to read and wrong about the
+# rest. Three of the biggest, named AS EXAMPLES rather than as the whole set:
+#   * render_roster_skill() hand-writes each role's section as bespoke prose
+#     describing what that role does and how to dispatch it, which cannot be
+#     generated from a table row.
 #   * show() prints each role with its own label and column width, so its
 #     presentation loops are hand-written per role.
-#   * og_stats.lineup() hardcodes the same role order. That module is run as
-#     `og stats` by the PATH python3 (bin/og: `exec python3 .../og_stats.py`),
-#     so it must not import this installer -- doing so would pull PyYAML into a
-#     command that needs only the stdlib today, the exact interpreter gap
-#     install.sh's fallback exists to paper over.
+#   * og_stats.lineup() hardcodes the role order -- for now. It must not
+#     import this installer, which would pull PyYAML into `og stats`, a command
+#     the PATH python3 runs with only the stdlib (bin/og: `exec python3
+#     .../og_stats.py`), the interpreter gap install.sh's fallback exists to
+#     paper over. Two routes would make it table-driven cleanly: a stdlib-only
+#     shared module both can import, or the role order carried in
+#     og-install.json, which `og stats` already parses as JSON without PyYAML.
+#
+# The authoritative, current list is the test
+# test_per_role_sites_are_pinned in tests/test_og_install.py: it parses this
+# module and og_stats, and fails when a new hand-written site appears, so the
+# author must either generalize the site or add it to the test's pin.
 class Role(NamedTuple):
     key: str        # plan key, and the spec-name stem of a singleton chain
     role: str       # the name a registry row lists in its `roles` array
