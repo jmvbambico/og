@@ -8,6 +8,7 @@ OMNI/STATE constants rather than the real ~/.omnigent.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import socket
 import subprocess
@@ -788,14 +789,15 @@ def test_grouped_models_features_auto_and_free_but_hides_nothing():
 
 
 def test_zen_preflight_only_for_a_free_zen_pin():
-    # The preflight tells the orchestrator to substitute a `-free` id when the
-    # pin rotates out. A paid Zen pin (a subscriber) or a user-added provider
-    # never rotates, so the section must be absent -- it would only invite an
-    # `args.model` override.
+    # The procedure tells the orchestrator to substitute a `-free` id when the
+    # pin rotates out. It MOVED into the generated roster skill to free argv
+    # bytes, so it is asserted there. A paid Zen pin (a subscriber) or a
+    # user-added provider never rotates, so the section must be absent -- it
+    # would only invite an `args.model` override.
     free = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}])
     paid = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": "opencode/claude-sonnet-5"}])
-    assert "Zen model preflight" in m.render_orchestrator(free)
-    assert "Zen model preflight" not in m.render_orchestrator(paid)
+    assert "Zen model preflight" in m.render_roster_skill(free)
+    assert "Zen model preflight" not in m.render_roster_skill(paid)
     assert "day-capped" in m.render_roster(free) and "day-capped" not in m.render_roster(paid)
 
 
@@ -908,6 +910,118 @@ def test_render_roster_skill_reviewer_mute_bullet_only_for_a_none_reviewer():
     assert "**Does not receive its sub-agent prompt.**" not in normal
 
 
+# --------------------------------------------------------------------------
+# prompt diet: guidance moved out of the argv prompt into the roster skill
+#
+# The orchestrator prompt is inlined into the harness command line and capped
+# at PROMPT_CEILING shell-quoted bytes, so mechanics are rendered into the
+# generated `roster` skill (free) instead. These tests pin BOTH halves: the
+# moved fact is in the skill, and the section that must be known before
+# anything is read is still in the prompt.
+# --------------------------------------------------------------------------
+FOUR_CODER_PLAN = {
+    "agent_name": "dev-lead", "orchestrator": "claude",
+    "coders": [{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"},
+               {"id": "opencode", "priority": 2, "model": "opencode/mimo-v2.6-flash-free"},
+               {"id": "kilo", "priority": 3, "model": "kilo/kilo-auto/free"},
+               {"id": "freebuff", "priority": 4, "model": "z-ai/glm-5.3-flash"}],
+    "reviewer": {"id": "codex"}, "port": 6767, "ngrok_domain": "", "max_dispatches": 4,
+}
+
+
+def _prompt_body(rendered: str) -> str:
+    return re.search(r"prompt:\s*\|(.*)", rendered, re.S).group(1)
+
+
+def test_roster_skill_carries_the_preflight_procedure_moved_out_of_the_prompt():
+    """The roster preflight is pure mechanics consulted while a dispatch is
+    being prepared, so it lives in the skill; only the fact that it is
+    MANDATORY on the first turn stays inline. Every procedural fact must have
+    MOVED, not vanished."""
+    skill = m.render_roster_skill(FOUR_CODER_PLAN)
+    for moved in ("## Preflight (FIRST turn, before any dispatch)",
+                  "sys_session_get_info({})", "configured_harnesses",
+                  "exactly `true`", "MISSING worker", "same turn you start planning",
+                  "`coder_cmdcode` -> `acp:command-code`",
+                  "`coder_zen` -> `opencode-native`",
+                  "`coder_kilo` -> `acp:kilo-code`",
+                  "`coder_freebuff` -> `acp:freebuff`",
+                  "`reviewer` -> `codex-native`"):
+        assert moved in skill, moved
+
+
+def test_roster_skill_preflight_mapping_is_generated_from_the_plan():
+    """The worker -> harness-id table is generated from the plan, so a
+    reconfigured roster produces a different table instead of a stale one."""
+    a = m.render_roster_skill(_base_plan(coders=[{"id": "cmdcode", "priority": 1,
+                                                  "model": "moonshotai/kimi-k3"}]))
+    b = m.render_roster_skill(_base_plan(coders=[{"id": "cline", "priority": 1,
+                                                  "model": "deepseek/deepseek-v4-flash"}]))
+    assert "`coder_cmdcode` -> `acp:command-code`" in a
+    assert "`coder_cmdcode` -> `acp:command-code`" not in b
+    assert "`coder_cline` -> `acp:cline`" in b
+    assert "`coder_cline` -> `acp:cline`" not in a
+
+
+def test_roster_skill_carries_the_per_worker_failure_shapes():
+    """The vendor-specific exhaustion strings and the exact mark-dry invocation
+    moved out of the prompt, generated from the registry `quota.note` /
+    `model.note` fields so they cannot drift from the catalog."""
+    skill = m.render_roster_skill(FOUR_CODER_PLAN)
+    assert "og stats --mark <id> dry --until" in skill
+    assert "Add credits to continue, or switch to a free model" in skill   # kilo model.note
+    assert "not enough Freebucks" in skill                                 # freebuff quota.note
+    assert "Rate limit exceeded" in skill                                  # opencode quota.note
+    assert "empty turn" in skill                                           # cline, Capacity
+    assert "You've reached your 5-hour usage limit" in skill               # cmdcode quota.note
+    assert "quota failure shape:" in skill
+
+
+def test_orchestrator_prompt_keeps_the_safety_critical_inline_sections():
+    """Whatever moved, these must survive in the prompt: each changes a
+    decision made BEFORE the orchestrator reads anything."""
+    rendered = m.render_orchestrator(FOUR_CODER_PLAN)
+    for needle in (
+            "you do NOT write product code",
+            "NEVER merge into a `protected` branch",
+            "Merge only into `auto_merge_target`",
+            "NEVER write the passed marker for a review that did not happen",
+            "`cross-vendor-review: passed`",
+            "`degraded-review`",
+            "DIFFERENT vendor",
+            "DROPPED turn",
+            "BOOT failure",
+            "Drop it for the run; never re-dispatch.",
+            "TASK failure",
+            "fresh attempt in a CLEAN worktree",
+            "QUOTA failure",
+            "FROM A CLEAN WORKTREE",
+            "MANDATORY before any dispatch",
+            "sys_session_get_info({})"):
+        assert needle in rendered, needle
+
+
+def test_orchestrator_prompt_left_the_moved_detail_to_the_skill():
+    """Guard against the moved detail creeping back into the argv prompt."""
+    rendered = m.render_orchestrator(FOUR_CODER_PLAN)
+    for moved in ("Add credits to continue", "not enough Freebucks",
+                  "Rate limit exceeded", "--until", "--reason", "og stats --agent"):
+        assert moved not in rendered, moved
+
+
+def test_orchestrator_prompt_leaves_headroom_for_a_four_coder_roster():
+    """The measured 4-coder roster must clear the 1,200-byte bar that the two
+    new sub-agent roles and the singleton failover entries are budgeted
+    against. A regression that re-inflates the prompt fails here, loudly."""
+    body = _prompt_body(m.render_orchestrator(FOUR_CODER_PLAN))
+    quoted = len(shlex.quote(body).encode())
+    headroom = m.PROMPT_CEILING - quoted
+    assert headroom >= 1200, f"{quoted} quoted, {headroom} headroom"
+    # The installer itself must not warn about the ceiling: its warn band starts
+    # 800 below it, so a 1,200-byte margin is comfortably outside.
+    assert not any("ceiling" in msg for _, msg in m.validate(FOUR_CODER_PLAN, body))
+
+
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", _fake_run(
         "opencode/mimo-v2.5-free\nopencode/glm-5\ndeepseek/deepseek-chat\n"))
@@ -981,11 +1095,11 @@ def test_validate_flags_same_vendor_through_a_reseller():
 def test_zen_preflight_only_for_zen_pins():
     plan = _rendering_plan()
     plan["coders"] = [{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}]
-    assert "Zen model preflight" in m.render_orchestrator(plan)
+    assert "Zen model preflight" in m.render_roster_skill(plan)
     plan["coders"][0]["model"] = "deepseek/deepseek-chat"
-    rendered = m.render_orchestrator(plan)
+    rendered = m.render_roster_skill(plan)
     assert "Zen model preflight" not in rendered
-    assert "day-capped" not in rendered
+    assert "day-capped" not in m.render_orchestrator(plan)
 
 
 # --------------------------------------------------------------------------

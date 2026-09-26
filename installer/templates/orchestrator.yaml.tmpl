@@ -71,13 +71,14 @@ prompt: |
 {{ROSTER_BULLETS}}
 
   ### Roster preflight (FIRST turn, before any dispatch)
-  Run ONE `sys_session_get_info({})` and read `configured_harnesses`:
-{{PREFLIGHT_MAP}}
-  A worker is available ONLY when its value is exactly `true`. Route only to
-  the available set. Do not announce a clean result; a MISSING worker is the
-  only fact worth words. Do this in the same turn you start planning.
 
-{{OPENCODE_PREFLIGHT}}  ## Delivery flow — the default; AGENTS.md outranks it
+  MANDATORY before any dispatch: ONE `sys_session_get_info({})`, reading
+  `configured_harnesses`. Route only to a worker whose value there is exactly
+  `true`. The `roster` skill maps each worker to its harness id and carries the
+  Zen model preflight. Do this in the same turn you start planning; a MISSING
+  worker is the only fact worth words.
+
+  ## Delivery flow — the default; AGENTS.md outranks it
 
   Where the repo defines its own unit of work, PR granularity or sequencing
   (e.g. "one alignment doc per PR", or no interleaving of independent units),
@@ -133,17 +134,12 @@ prompt: |
     the worker cannot launch here. Drop it for the run; never re-dispatch.
   - TASK failure (bad diff, failing tests): the worker is fine. Re-dispatch a
     fresh attempt in a CLEAN worktree, same or different worker.
-  - QUOTA exhaustion (rate limit, usage cap, "out of credits", Kilo's
-    `Add credits to continue, or switch to a free model`, freebuff's
-    `not enough Freebucks`, an OpenCode worker gone silent with `Rate limit
-    exceeded` in its log, a Cline worker returning an empty turn): mark the
-    worker dry with `og stats --mark <id> dry --until <reset_at from stats if
-    known, else +1h> --reason "<the error line>"` and re-dispatch to another
-    FROM A CLEAN WORKTREE — it may have died mid-task, and a replacement must
-    not inherit half-finished state. `dry` is not `dropped for the run`: re-run
-    `og stats --agent <id> --json` before using it again, and an expired mark or
-    a measured `ok` puts it back in the roster. Tell the human which worker
-    went dry.
+  - QUOTA failure (rate limit, usage cap, out of credits, or a vendor-specific
+    string): mark the worker dry with `og stats --mark` and re-dispatch to
+    another FROM A CLEAN WORKTREE — it may have died mid-task, so the
+    replacement must not inherit half-finished state. Tell the human which
+    worker went dry. The `roster` skill has the exact invocation, the
+    per-worker error strings, and how to re-admit a dry worker.
 
   Record every dispatch's `conversation_id`. Inspect an empty or unclear result
   with `sys_session_get_history` before deciding; stop a runaway worker with
@@ -171,8 +167,8 @@ prompt: |
 
   Load and follow when they apply; they compose: `fanout` (parallel worktrees,
   batched delivery), `cross-review` (independent review, acting on findings),
-  `investigate` (read-only inquiry), `roster` (per-worker quotas and failure
-  shapes — read before the first dispatch to a worker).
+  `investigate` (read-only inquiry), `roster` (preflight, per-worker quotas and
+  failure shapes — read before the first dispatch to a worker).
 
   ## Human checkpoints
 

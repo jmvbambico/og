@@ -845,9 +845,33 @@ def quota_line(a: dict) -> str:
             f"- quota: not measurable{'' if q else ' (no quota block in the registry)'}")
 
 
+def quota_failure_lines(a: dict) -> list:
+    """The vendor-specific failure strings for a row, from its `quota.note`.
+
+    Generated rather than frozen into the prompt: the exact message a worker
+    prints when it is dry is what the orchestrator matches to mark it dry, and a
+    hand-copied string drifts the moment a registry row is reworded. A row with
+    no quota block, or a null note, has no known failure shape to name.
+    """
+    note = (a.get("quota") or {}).get("note")
+    return [f"- quota failure shape: {note}"] if note else []
+
+
 def render_roster_skill(plan: dict) -> str:
-    """The long-form roster notes, as a skill file rather than prompt bytes."""
+    """The long-form roster notes, as a skill file rather than prompt bytes.
+
+    The preflight procedure and the per-worker failure strings live here rather
+    than in the prompt: both are consulted while a dispatch is already being
+    prepared or has just failed, which is when an on-demand read is affordable.
+    What stays in the prompt is the part that changes a decision made BEFORE
+    anything is read (that a preflight is mandatory, and the three-way BOOT /
+    TASK / QUOTA classification). The mapping and the failure shapes are
+    generated from the plan and the registry so they cannot drift.
+    """
     reg = agents_by_id()
+    oc = next((c for c in plan["coders"] if c["id"] == "opencode"), None)
+    zen = ([zen_preflight_note(worker_name("opencode")), ""]
+           if oc and is_zen_free(oc.get("model")) else [])
     out = [
         "---", "name: roster",
         "description: What each worker in this orchestrator's roster actually is — "
@@ -860,6 +884,14 @@ def render_roster_skill(plan: dict) -> str:
         "go down only when the one above is unavailable, out of quota, or has already",
         "failed this run. Every worker pins its own model in its spec — never pass",
         "`args.model`.", "",
+        "## Preflight (FIRST turn, before any dispatch)", "",
+        "Run ONE `sys_session_get_info({})` and read `configured_harnesses`. Each",
+        "worker maps to exactly one harness id:", "",
+        render_preflight_map(plan), "",
+        "A worker is available ONLY when its value is exactly `true`. Route only to",
+        "the available set. Do not announce a clean result; a MISSING worker is the",
+        "only fact worth words. Do this in the same turn you start planning.", "",
+        *zen,
         "## Capacity", "",
         "Run `og stats --json` (og is on PATH) before the FIRST dispatch of this run,",
         "and `og stats --agent <id> --json` before every later one. If `og` is missing",
@@ -897,6 +929,7 @@ def render_roster_skill(plan: dict) -> str:
                 f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
                 f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}",
                 quota_line(a)]
+        out += quota_failure_lines(a)
         if a.get("relay") is False:
             out.append("- **Leaf worker.** Runs without Omnigent's `sys_*` tool relay, so it "
                        "cannot orchestrate or dispatch. Implementation and exploration only.")
@@ -928,7 +961,7 @@ def render_roster_skill(plan: dict) -> str:
     rv = reg[plan["reviewer"]["id"]]
     out += [f"## `reviewer` — {rv['label']}", "",
             f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, plan['reviewer'])}`",
-            quota_line(rv),
+            quota_line(rv), *quota_failure_lines(rv),
             "- Reviews only; never edits, never gets a worktree.",
             "- Cross-vendor review is the point: never route a diff to a reviewer whose",
             "  vendor matches the implementer's. If that is unavoidable, say so and label",
@@ -968,27 +1001,40 @@ def _wrap(text: str, width: int) -> list:
 
 
 def render_preflight_map(plan: dict) -> str:
+    """The worker -> harness-id table the roster skill's preflight uses.
+
+    Generated from the plan rather than frozen into the prompt: the mapping
+    must match the roster the user actually chose, and a hardcoded table
+    silently drifts the moment a coder is added, dropped or renamed.
+    """
     reg = agents_by_id()
     rows = [f"    `{worker_name(c['id'])}` -> `{reg[c['id']]['harness']}`" for c in plan["coders"]]
     rows.append(f"    `reviewer` -> `{reg[plan['reviewer']['id']]['harness']}`")
     return "\n".join(rows)
 
 
-OPENCODE_PREFLIGHT = """  ### Zen model preflight (once per run, only if dispatching {name})
-  A CHECK, not a choice: `args.model` replaces a verified free pin with a
-  guess, which is how a paid model hits OpenCode's "No payment method" wall.
-  Call `sys_list_models` once. Pinned id listed, or query failed -> dispatch
-  with no `args.model`, say nothing. Gone (Zen rotates its lineup) -> pick the
-  strongest replacement ending in `-free`, pass it as `args.model` this run
-  only, and tell the human the pin needs updating. A non-`-free` id is a
-  failed dispatch, not a slower one.
+def zen_preflight_note(name: str) -> str:
+    """The Zen free-tier preflight, as roster-skill prose.
 
-"""
+    Moved out of the prompt, where it cost ~570 shell-quoted bytes inline: it
+    is a procedure consulted while already dispatching, not a fact that changes
+    a decision made before reading anything. Generated rather than frozen so it
+    names the worker this plan actually wires the harness to.
+    """
+    return (
+        f"### Zen model preflight (once per run, only if dispatching `{name}`)\n\n"
+        "A CHECK, not a choice: `args.model` replaces a verified free pin with a\n"
+        "guess, which is how a paid model hits OpenCode's \"No payment method\" wall.\n"
+        "Call `sys_list_models` once. Pinned id listed, or query failed -> dispatch\n"
+        "with no `args.model`, say nothing. Gone (Zen rotates its lineup) -> pick the\n"
+        "strongest replacement ending in `-free`, pass it as `args.model` this run\n"
+        "only, and tell the human the pin needs updating. A non-`-free` id is a\n"
+        "failed dispatch, not a slower one.")
+
 
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()
     s = tmpl("orchestrator.yaml.tmpl")
-    oc = next((c for c in plan["coders"] if c["id"] == "opencode"), None)
     agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
     agent_list += "\n    - reviewer"
     subs = {
@@ -996,12 +1042,6 @@ def render_orchestrator(plan: dict) -> str:
         "{{ORCHESTRATOR_HARNESS}}": reg[plan["orchestrator"]]["harness"],
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
-        "{{PREFLIGHT_MAP}}": render_preflight_map(plan),
-        # The Zen preflight guards against a rotated FREE-tier id; a paid Zen
-        # pin or a provider the user added (deepseek/..., anthropic/...) has no
-        # such rotation, so the check would only invite an `args.model` override.
-        "{{OPENCODE_PREFLIGHT}}": (OPENCODE_PREFLIGHT.format(name=worker_name("opencode"))
-                                   if oc and is_zen_free(oc.get("model")) else ""),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
         "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + 1),
