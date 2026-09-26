@@ -804,6 +804,46 @@ def test_og_env_auto_update_off_is_zero_not_absent(tmp_path, monkeypatch):
     assert "og update" in env
 
 
+def test_og_env_wires_a_backup_reviewers_own_account(tmp_path, monkeypatch):
+    # Interactive collects `accounts` for every id in the reviewer chain, so a
+    # BACKUP can have its own. write_og_env emitted the env line for the primary
+    # only, so that backup silently ran on the wrong account -- the failure the
+    # separate account exists to prevent.
+    plan = _base_plan(
+        orchestrator="codex",
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "claude", "priority": 2, "model": None}],
+        accounts={"claude": "/tmp/claude-work"})
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-work\n" in env
+
+
+def test_og_env_wires_the_primary_reviewers_account(tmp_path, monkeypatch):
+    # The head's account keeps working exactly as before.
+    plan = _base_plan(reviewer={"id": "claude", "model": None},
+                      accounts={"claude": "/tmp/claude-primary"})
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-primary\n" in env
+
+
+def test_validate_errors_when_two_agents_share_an_env_but_need_different_accounts(monkeypatch):
+    # Nothing in the registry forbids two rows sharing `multi_account.env`, and
+    # og launches ONE server with ONE value: a second account for each means one
+    # og.env line silently overwrites the other and an agent runs on the wrong
+    # login. Refuse rather than write a file where one account is dropped.
+    row = next(a for a in m.REGISTRY["agents"] if a["id"] == "claude")
+    twin = {**row, "id": "claude2", "label": "Claude Two"}
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], twin]})
+    plan = _base_plan(
+        orchestrator="codex",
+        reviewer=[{"id": "claude", "priority": 1, "model": None},
+                  {"id": "claude2", "priority": 2, "model": None}],
+        accounts={"claude": "/tmp/a", "claude2": "/tmp/b"})
+    msgs = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("OG_CLAUDE_CONFIG_DIR" in msg and "/tmp/a" in msg and "/tmp/b" in msg
+               for msg in msgs), msgs
+
+
 # --------------------------------------------------------------------------
 # OpenCode worker config -- the `question` tool must not be able to park a run
 # --------------------------------------------------------------------------
