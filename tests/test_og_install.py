@@ -465,10 +465,10 @@ def test_role_table_is_the_single_source_of_truth(monkeypatch):
     account_entries(), validate(), apply(), render_*() and emit_questions()
     that drifts from the others. Proven by moving the table and watching the
     plumbing follow it, not by restating the role list by hand."""
-    assert [r.key for r in m.ROLES] == ["orchestrator", "coders", "reviewer"]
+    assert [r.key for r in m.ROLES] == ["orchestrator", "coders", "reviewer", "scout"]
     # The spec-rendering subset is derived from the same rows, not a second list.
     assert m.SPEC_ROLES == [r for r in m.ROLES if r.spec]
-    assert [r.key for r in m.SPEC_ROLES] == ["coders", "reviewer"]
+    assert [r.key for r in m.SPEC_ROLES] == ["coders", "reviewer", "scout"]
     # Every registry role a row names is one some registry row actually offers.
     for r in m.ROLES:
         assert any(r.role in a["roles"] for a in m.REGISTRY["agents"]), r.key
@@ -623,6 +623,104 @@ def test_render_reviewer_can_target_a_chain_entry_by_name():
     backup = yaml.safe_load(m.render_reviewer(plan, m.chain(plan, "reviewer")[1], "reviewer_2"))
     assert backup["name"] == "reviewer_2"
     assert backup["executor"]["model"] == "auto"
+
+
+# --------------------------------------------------------------------------
+# scout -- an optional read-only worker, a chain like the reviewer
+# --------------------------------------------------------------------------
+def test_plan_without_a_scout_installs_with_none(tmp_path, monkeypatch):
+    """scout is OPTIONAL: omitting the key must produce a correct bundle with no
+    scout spec on disk and no dangling reference in the orchestrator's agent
+    list or prompt, so a user who does not want one is never charged for it."""
+    plan = _chain_plan()
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    assert not (bundle / "agents" / "scout").exists()
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert "scout" not in orch["tools"]["agents"]
+    assert "scout" not in m.render_orchestrator(plan)
+
+
+def test_an_old_install_with_no_scout_key_still_loads():
+    # Backward compatibility, as for the reviewer chain: a plan written before
+    # the role existed carries no scout key and must keep loading, validating
+    # and rendering unchanged rather than erroring on a missing role.
+    plan = _base_plan()
+    assert "scout" not in plan
+    assert m.chain(plan, "scout") == []
+    assert m.role_names(plan, "scout") == []
+    assert "scout" not in m.normalize_plan(dict(plan))
+    assert not [msg for _, msg in m.validate(plan) if "scout" in msg]
+
+
+def test_two_scout_chain_emits_a_spec_per_entry_with_its_own_pin(tmp_path, monkeypatch):
+    plan = _chain_plan(scout=[{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"},
+                              {"id": "codex", "priority": 2, "model": "gpt-5.5"}])
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    primary = yaml.safe_load((bundle / "agents" / "scout" / "config.yaml").read_text())
+    backup = yaml.safe_load((bundle / "agents" / "scout_2" / "config.yaml").read_text())
+    assert primary["name"] == "scout"
+    assert primary["executor"]["model"] == "moonshotai/kimi-k3"
+    assert primary["executor"]["config"]["harness"] == "acp:command-code"
+    assert backup["name"] == "scout_2"
+    assert backup["executor"]["model"] == "gpt-5.5"
+    assert backup["executor"]["config"]["harness"] == "codex-native"
+    # Both are reachable: tools.agents is the only dispatch surface, and the
+    # count in the prompt must match what is actually listed.
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert orch["tools"]["agents"] == ["coder_zen", "reviewer", "scout", "scout_2"]
+    assert "four sub-agents" in orch["prompt"]
+
+
+def test_scout_template_carries_the_read_only_contract():
+    plan = _base_plan(scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+    parsed = yaml.safe_load(m.render_scout(plan))
+    prompt = " ".join(parsed["prompt"].split())
+    assert "READ-ONLY" in prompt
+    assert "never edit, create or delete a file" in prompt
+    assert "never commit" in prompt
+    # The bounded answer is the whole point: a scout that pastes whole files
+    # back into the orchestrator's context has failed its purpose.
+    assert "BOUNDED SUMMARY" in prompt
+    assert "NOT file dumps" in prompt
+    assert "could not find something, say so plainly" in prompt
+    # ...and it is a normal worker spec: pinned model, named harness, skills off.
+    assert parsed["executor"]["model"] == "moonshotai/kimi-k3"
+    assert parsed["skills"] == "none"
+
+
+def test_a_none_scout_warns_for_the_primary_and_the_backup():
+    # cursor and gemini are prompt_delivery: none. As scout entries they never
+    # see scout.yaml.tmpl, so BOTH the read-only and the bounded-answer rules
+    # must be inlined -- and the backup is reached exactly when the primary is
+    # dry, so it must warn too, not only the head.
+    plan = _base_plan(scout=[{"id": "cursor", "priority": 1, "model": None},
+                             {"id": "gemini", "priority": 2, "model": None}])
+    warnings = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert sum("never receives the scout contract" in msg for msg in warnings) == 2, warnings
+    # A scout on a delivering harness gets no such warning.
+    quiet = _base_plan(scout=[{"id": "codex", "model": None}])
+    assert not [msg for _, msg in m.validate(quiet) if "scout contract" in msg]
+
+
+def test_scout_gets_an_inline_roster_bullet_only_when_installed():
+    roster = m.render_roster(_base_plan(scout=[{"id": "codex", "model": None}]))
+    assert "`scout`" in roster and "Read-only" in roster
+    assert "`scout`" not in m.render_roster(_base_plan())
+
+
+def test_emit_questions_offers_scout_as_an_ordered_chain(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex", "cmdcode": "/bin/cmd"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    scout = next(x for x in q["questions"] if x["key"] == "scout")
+    assert scout["type"] == "ordered_multi"
+    assert set(scout["choices"]) == {"codex", "cmdcode"}
+    # ...with the same model-pin surface as coders and the reviewer.
+    assert "choices" in scout["per_item"]
 
 
 def test_show_renders_both_chains_in_order_with_the_primary_first(tmp_path, monkeypatch, capsys):

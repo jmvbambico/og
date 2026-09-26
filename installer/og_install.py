@@ -605,6 +605,14 @@ ROLES = [
          ask="Which agents review the batched diff, in preference order (first "
              "is tried first; the next takes over when one is out of quota)? "
              "Prefer a vendor that differs from every coder."),
+    # A read-only worker for the orchestrator's own biggest sink: reading and
+    # searching a repo with its own hands (measured at 52% of its result bytes
+    # across 30 sessions). Optional because it spends prompt bytes; a user who
+    # omits it gets a bundle with no scout spec and no dangling reference.
+    Role("scout", "scout", "scout.yaml.tmpl",
+         multi=False, spec=True, optional=True,
+         ask="Which agents answer repo reading, search and git-state questions "
+             "as a read-only scout, in preference order (first is tried first)?"),
 ]
 
 # Roles that render a sub-agent spec under <bundle>/agents/<name>. The
@@ -811,9 +819,34 @@ def build_plan_interactive(state: dict) -> dict:
     reviewers = [{"id": rid, "priority": i, "model": pick_model(reg[rid], rev_prev.get(rid))}
                  for i, rid in enumerate(reviewer_ids, 1)]
 
+    # --- optional roles, one row each (scout) ---
+    # The answer defaults to what a previous install chose, and "no" writes an
+    # EMPTY chain rather than omitting the key: the generated bundle then carries
+    # no spec for the role, the orchestrator prompt spends no bytes on it, and
+    # re-running the installer offers the same choice again. A role the table
+    # marks optional is never forced.
+    optional = {}
+    for r in ROLES:
+        if not (r.optional and r.spec):
+            continue
+        o_opts = opts(r.role)
+        cur = [e["id"] for e in chain(state, r.key)]
+        prev_models = {e["id"]: e.get("model") for e in chain(state, r.key)}
+        optional[r.key] = []
+        if not o_opts:
+            continue
+        say()
+        say(f"{C['dim']}{r.ask}{C['x']}")
+        if not ask_yes(f"Install an optional {r.key} worker?", default=bool(cur)):
+            continue
+        optional[r.key] = [
+            {"id": oid, "priority": i, "model": pick_model(reg[oid], prev_models.get(oid))}
+            for i, oid in enumerate(pick_many_ordered(r.ask, o_opts, cur), 1)]
+
     # --- multi-account, for any selected agent that supports it ---
     accounts = dict(state.get("accounts") or {})
-    involved = set(orchestrator_ids) | set(reviewer_ids) | {c["id"] for c in coders}
+    involved = set(orchestrator_ids) | set(reviewer_ids) | {c["id"] for c in coders} \
+        | {e["id"] for chain_ in optional.values() for e in chain_}
     for aid in sorted(involved):
         ma = reg[aid].get("multi_account") or {}
         if not ma.get("supported"):
@@ -874,6 +907,7 @@ def build_plan_interactive(state: dict) -> dict:
         "orchestrator": orchestrators,
         "coders": coders,
         "reviewer": reviewers,
+        **optional,
         "accounts": accounts,
         "port": int(port),
         "ngrok_domain": domain,
@@ -997,6 +1031,23 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "into args.input on every review dispatch; the generated `roster` skill "
                            "tells the orchestrator to do exactly that."))
 
+    # The scout's version of the same hazard, with its own remedy. A `none`
+    # scout never sees scout.yaml.tmpl, so both halves of its contract must be
+    # inlined on every dispatch: missing the read-only rule it can edit the
+    # repo, and missing the bounded-answer rule it pastes whole files back into
+    # the context the role exists to keep clear.
+    for s in chain(plan, "scout"):
+        if reg[s["id"]].get("prompt_delivery") == "none":
+            issues.append(("warn",
+                           f"{reg[s['id']]['label']} never receives the scout "
+                           "contract in scout.yaml.tmpl — that harness does not deliver spec "
+                           "instructions. Every scout dispatch must therefore inline the whole "
+                           "contract itself: READ-ONLY (never edit, create or delete a file, never "
+                           "commit, never run a command that mutates the repo or working tree) and "
+                           "a BOUNDED summary (paths with line ranges and short excerpts, never a "
+                           "file dump), and it must say plainly when something was not found. The "
+                           "generated `roster` skill tells the orchestrator to do exactly that."))
+
     # A role a row marks `unverified_roles` clears validate()'s gates but has
     # never been driven here -- grok/devin as orchestrator. The registry used to
     # record that only in a free-text `roles_note` nothing read, so a user
@@ -1103,9 +1154,10 @@ def render_roster(plan: dict) -> str:
     """
     reg = agents_by_id()
     ordinals = ["FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH", "SIXTH"]
-    rev_names = reviewer_names(plan)
+    rev_names = role_names(plan, "reviewer")
+    sc_names = role_names(plan, "scout")
     names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] \
-        + [f"`{n}`" for n in rev_names]
+        + [f"`{n}`" for n in rev_names + sc_names]
     width = max(len(n) for n in names) + 1
     lines = []
     for i, c in enumerate(plan["coders"]):
@@ -1127,6 +1179,14 @@ def render_roster(plan: dict) -> str:
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{rv['label']} "
                      f"(`{rv['harness']}`){pin}. Reviews only; never edits.")
+    # The scout's read-only contract is a fact the orchestrator must know BEFORE
+    # it dispatches one, so it stays inline rather than behind the roster skill.
+    for name, e in zip(sc_names, chain(plan, "scout")):
+        sc = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        lines.append(f"  - {f'`{name}`'.ljust(width)}{sc['label']} "
+                     f"(`{sc['harness']}`){pin}. Read-only; never edits, commits "
+                     "or mutates. Bounded summary only.")
     return "\n".join(lines)
 
 
@@ -1499,21 +1559,60 @@ def render_reviewer(plan: dict, entry: dict | None = None, name: str = "reviewer
     reg = agents_by_id()
     entry = primary(plan, "reviewer") if entry is None else entry
     a = reg[entry["id"]]
-    acct = plan.get("accounts", {}).get(a["id"])
-    note = ""
-    if acct:
-        env = (a.get("multi_account") or {}).get("env", "CONFIG_DIR")
-        note = (f"# Runs on a SEPARATE account: the server is launched with\n"
-                f"# {env}={acct}, so this reviewer is independent of the\n"
-                f"# account your interactive sessions use.\n")
     s = tmpl("reviewer.yaml.tmpl")
     for k, v in {
         "{{NAME}}": name,
         "{{LABEL}}": a["label"],
         "{{HARNESS}}": a["harness"],
         "{{ORCHESTRATOR}}": plan["agent_name"],
-        "{{ACCOUNT_NOTE}}": note,
+        "{{ACCOUNT_NOTE}}": account_note(plan, a, "reviewer"),
         "{{MODEL_BLOCK}}": model_block(entry.get("model")),
+    }.items():
+        s = s.replace(k, v)
+    return s
+
+
+def account_note(plan: dict, a: dict, what: str) -> str:
+    """The `# Runs on a SEPARATE account` comment for an agent that has one.
+
+    Shared by every worker spec that can be given its own account, so the
+    reviewer's and the scout's notes cannot drift apart. `what` names the role
+    in the prose, so the generated sentence still reads as the role it lands in.
+    """
+    acct = (plan.get("accounts") or {}).get(a["id"])
+    if not acct:
+        return ""
+    env = (a.get("multi_account") or {}).get("env", "CONFIG_DIR")
+    return (f"# Runs on a SEPARATE account: the server is launched with\n"
+            f"# {env}={acct}, so this {what} is independent of the\n"
+            f"# account your interactive sessions use.\n")
+
+
+def render_scout(plan: dict, entry: dict | None = None, name: str = "scout") -> str:
+    """One scout spec.
+
+    Same chain shape as the reviewer: the primary keeps the stable `scout` name
+    and each backup appends its position. The one thing it does differently is
+    `permission_mode`: an acp-user CLI relays every tool call as an approval
+    request, and `auto` parks a human card for anything no policy opines on —
+    a read-only scout runs `cat`/`grep`/`git`, so it would stall on its first
+    read. Same reasoning as coder.yaml.tmpl's bypass; a native harness keeps
+    the reviewer's `auto`.
+    """
+    reg = agents_by_id()
+    entry = primary(plan, "scout") if entry is None else entry
+    a = reg[entry["id"]]
+    perm = ("    permission_mode: bypassPermissions" if a["kind"] == "acp-user"
+            else "    permission_mode: auto")
+    s = tmpl("scout.yaml.tmpl")
+    for k, v in {
+        "{{NAME}}": name,
+        "{{LABEL}}": a["label"],
+        "{{HARNESS}}": a["harness"],
+        "{{ORCHESTRATOR}}": plan["agent_name"],
+        "{{ACCOUNT_NOTE}}": account_note(plan, a, "scout"),
+        "{{MODEL_BLOCK}}": model_block(entry.get("model")),
+        "{{PERMISSION_MODE_BLOCK}}": perm,
     }.items():
         s = s.replace(k, v)
     return s
@@ -1525,6 +1624,7 @@ def render_reviewer(plan: dict, entry: dict | None = None, name: str = "reviewer
 SPEC_RENDERERS = {
     "coder.yaml.tmpl": render_coder,
     "reviewer.yaml.tmpl": render_reviewer,
+    "scout.yaml.tmpl": render_scout,
 }
 
 
@@ -1918,6 +2018,12 @@ def apply(plan: dict, dry_run: bool = False) -> None:
             ok(f"reviewer      {reg[e['id']]['label']}{pin}")
         else:
             ok(f"reviewer #{e['priority']}   {name} ({reg[e['id']]['label']}){pin}")
+    for i, (name, e) in enumerate(zip(role_names(plan, "scout"), chain(plan, "scout"))):
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            ok(f"scout         {reg[e['id']]['label']}{pin}")
+        else:
+            ok(f"scout #{e['priority']}      {name} ({reg[e['id']]['label']}){pin}")
     for line in changed:
         ok(f"config.yaml   {line}")
     if ocd:
@@ -2211,6 +2317,7 @@ def show(state: dict) -> None:
     # exactly as it always has.
     orch = chain(state, "orchestrator")
     revs = chain(state, "reviewer")
+    scs = chain(state, "scout")
     say(f"{C['b']}orchestrator{C['x']}  {state['agent_name']} "
         f"({reg[orch[0]['id']]['label']}){' (primary)' if len(orch) > 1 else ''}")
     for e in orch[1:]:
@@ -2229,6 +2336,15 @@ def show(state: dict) -> None:
             say(f"{C['b']}reviewer{C['x']}      {reg[e['id']]['label']}{pin}{tail}{live}")
         else:
             say(f"{C['b']}  backup #{e['priority']}{C['x']}  {reg[e['id']]['label']}"
+                f"{pin}{live}")
+    for i, e in enumerate(scs):
+        live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            tail = " (primary)" if len(scs) > 1 else ""
+            say(f"{C['b']}scout{C['x']}         {reg[e['id']]['label']}{pin}{tail}{live}")
+        else:
+            say(f"{C['b']}scout #{e['priority']}{C['x']}     {reg[e['id']]['label']}"
                 f"{pin}{live}")
     for aid, path in (state.get("accounts") or {}).items():
         say(f"{C['b']}account{C['x']}       {reg[aid]['label']} → {path}")

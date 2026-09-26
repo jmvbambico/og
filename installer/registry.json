@@ -58,7 +58,8 @@
       "roles": [
         "orchestrator",
         "coder",
-        "reviewer"
+        "reviewer",
+        "scout"
       ],
       "vendor": "anthropic",
       "relay": true,
@@ -94,7 +95,8 @@
       "kind": "native",
       "roles": [
         "orchestrator",
-        "coder"
+        "coder",
+        "scout"
       ],
       "vendor": "opencode-zen",
       "relay": true,
@@ -140,7 +142,8 @@
       "kind": "native",
       "roles": [
         "coder",
-        "reviewer"
+        "reviewer",
+        "scout"
       ],
       "vendor": "google",
       "relay": true,
@@ -170,7 +173,8 @@
       "roles": [
         "orchestrator",
         "coder",
-        "reviewer"
+        "reviewer",
+        "scout"
       ],
       "vendor": "openai",
       "relay": true,
@@ -208,7 +212,8 @@
       "model_env": "CLINE_MODEL",
       "omnigent_mcp": false,
       "roles": [
-        "coder"
+        "coder",
+        "scout"
       ],
       "vendor": "deepseek",
       "relay": false,
@@ -241,7 +246,8 @@
       "acp_command": "kilo acp",
       "omnigent_mcp": false,
       "roles": [
-        "coder"
+        "coder",
+        "scout"
       ],
       "vendor": "kilo",
       "relay": false,
@@ -281,7 +287,8 @@
       "kind_note": "ACP rather than kiro-native on purpose. Omnigent's headless-worker seam (_derive_terminal_launch_args_from_spec) maps claude/codex/cursor/kimi/agy to their no-prompt flags but has no kiro-native entry, so a native Kiro worker asks for permission on every tool and depends on a tmux permission mirror that fails ('permission prompt was not safely focused before verdict delivery'). Over ACP, Kiro's own --trust-all-tools answers its prompts and permission_mode: bypassPermissions (acp-user) covers what it relays. Revisit once Omnigent maps kiro-native.",
       "roles": [
         "coder",
-        "reviewer"
+        "reviewer",
+        "scout"
       ],
       "vendor": "aws-kiro",
       "relay": false,
@@ -317,7 +324,8 @@
       "kind": "native",
       "roles": [
         "coder",
-        "reviewer"
+        "reviewer",
+        "scout"
       ],
       "vendor": "cursor",
       "relay": true,
@@ -349,7 +357,8 @@
       "binary": "gemini",
       "kind": "native",
       "roles": [
-        "coder"
+        "coder",
+        "scout"
       ],
       "vendor": "google",
       "relay": true,
@@ -373,7 +382,8 @@
       "binary": "goose",
       "kind": "native",
       "roles": [
-        "coder"
+        "coder",
+        "scout"
       ],
       "vendor": "goose",
       "relay": true,
@@ -397,7 +407,8 @@
       "kind": "native",
       "roles": [
         "coder",
-        "reviewer"
+        "reviewer",
+        "scout"
       ],
       "vendor": "hermes",
       "relay": true,
@@ -421,7 +432,8 @@
       "kind": "acp-builtin",
       "roles": [
         "orchestrator",
-        "coder"
+        "coder",
+        "scout"
       ],
       "roles_note": "`orchestrator` added on the only two bars validate() enforces for that role: `relay: true` (the sys_* relay can dispatch) and `prompt_delivery` not `none` — `first_user` prepends the spec prompt to the first user message, so the orchestration contract IS delivered. UNVERIFIED as an orchestrator: no og run has been driven with grok as the brain. Demote to `coder` if the first real dispatch cannot orchestrate.",
       "unverified_roles": [
@@ -450,7 +462,8 @@
       "kind": "acp-builtin",
       "roles": [
         "orchestrator",
-        "coder"
+        "coder",
+        "scout"
       ],
       "roles_note": "`orchestrator` added on the only two bars validate() enforces for that role: `relay: true` (the sys_* relay can dispatch) and `prompt_delivery` not `none` — `first_user` prepends the spec prompt to the first user message, so the orchestration contract IS delivered. UNVERIFIED as an orchestrator: no og run has been driven with devin as the brain. Demote to `coder` if the first real dispatch cannot orchestrate.",
       "unverified_roles": [
@@ -480,7 +493,8 @@
       "omnigent_mcp": false,
       "kind_note": "`blink` (github.com/jmvbambico/bufflink, >= v0.1.2) is an ACP bridge that drives the freebuff TUI in a PTY. Verified 2026-09-20/21 in og-sandbox: five backlog tasks (small to larger, incl. new modules and e2e tests), 3 of 3 first-try since v0.1.2; every commit in scope, gates green. Facts that matter: one blink process = one freebuff launch = one hour billed up front at the chosen model's rate (GLM 5.3 Flash 5/hr by default, up to DeepSeek V4.1 Flash 15/hr) from the free tier's 25 daily Freebucks, so a costlier pin means fewer launches per day, and the process lives as long as the sub-agent SESSION. Omnigent's sys_session_close does NOT end it (observed 2026-09-21): after closing a finished session, `pgrep -x blink` and SIGTERM it - blink exits cleanly within ~5 s and releases freebuff's single-instance lock; verify with `pgrep -fl manicode/freebuff` before the next launch. freebuff writes its transcript only at turn end, so nothing streams while it thinks; all trial turns finished well inside HARNESS_ACP_PROMPT_TIMEOUT_S (300 s), but keep tasks single-purpose. Omnigent's injected system prompt (~5 kB) arrives as a collapsed 'Pasted text' chip, which blink handles; leave inject_system_prompt on. freebuff resolves RELATIVE paths against the cwd omnigent passed (the workspace, not the worktree): dispatch text must use absolute worktree paths and name the gate commands with `cd`. freebuff writes `.freebuff/project-id` into its cwd; gitignore `.freebuff/`. No approval gate: freebuff runs commands unattended - the worktree is the blast radius.",
       "roles": [
-        "coder"
+        "coder",
+        "scout"
       ],
       "vendor": "z-ai",
       "relay": false,
@@ -521,7 +535,8 @@
       "omnigent_mcp": false,
       "kind_note": "`cmd-acp` (npm, v0.2.0, ~9 commits, last published 2026-08-06, fork of soycanopa/cmd-acp) bridges ACP to `cmd -p`, spawning one `cmd -p` process per prompt. It exposes model, reasoning effort and permission mode ONLY through the ACP method session/set_config_option, which Omnigent never sends (the acp_command docstring in og_install.py traces the wire). Its session config therefore starts EMPTY: no --model and, critically, no --yolo. Headless runs still go through Command Code's permission engine, so without --yolo the worker returns end_turn having changed nothing — the 'completed with no output' signature. The bridge does honour the env var CMD_BIN to choose the binary it spawns (dist/index.js, resolveCmdBinary), and passes the parent env through to it. That is why og points CMD_BIN at a generated shim instead of patching or forking the bridge. --tools-all is needed because headless runs withhold some tools; --skip-onboarding is needed because Command Code otherwise runs a taste-onboarding step on first launch. Setting permissions.defaultMode = yolo in ~/.commandcode/settings.json is the alternative to the shim, but it applies globally to the user's interactive cmd too and cannot carry --tools-all. The shim keeps it per-worker. Unlike freebuff/blink there is no long-lived process to reap: each prompt is one `cmd -p` that exits. Verified 2026-09-24 by driving cmd-acp over ACP stdio on a subscribed, authenticated account: with plain cmd-acp (no shim) the agent answered \"I can't complete this — file writes are blocked\", returned stopReason `end_turn`, and left the worktree untouched — the silent no-op this note predicts is real, and the proof the shim's --yolo is load-bearing rather than a precaution. WITH CMD_BIN pointed at the generated shim and CMD_MODEL=moonshotai/kimi-k3 it ran write_file and the file appeared with the requested contents; the shim fix works. cmd's OWN default model, read from the bridge's `session/new` response (`configOptions` -> model -> `currentValue`), is `deepseek/deepseek-v4-pro`: an UNPINNED cmdcode worker therefore runs DeepSeek and is silently same-vendor with Cline for cross-vendor review purposes — exactly why `model.required` is true and `silent_model_failure` is true. Command Code writes a `.commandcode/` directory into the cwd it is given (the worktree), the same way freebuff writes `.freebuff/`; gitignore `.commandcode/` or it turns up in every worker's diff.",
       "roles": [
-        "coder"
+        "coder",
+        "scout"
       ],
       "vendor": "moonshotai",
       "relay": false,
