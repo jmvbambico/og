@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     import yaml
@@ -570,16 +571,122 @@ def primary(plan: dict, role: str) -> dict:
     return chain(plan, role)[0]
 
 
+# --------------------------------------------------------------------------
+# the role table
+# --------------------------------------------------------------------------
+# ONE table declares every role this installer wires. The loops that iterate it
+# rather than naming the roles again pick their row up for free: plan
+# normalization, chain handling, spec naming, the --questions entry, and the
+# eligibility / caveat plumbing all follow from a row. Adding a role used to
+# mean editing those call sites in lockstep, and roles added that way drift
+# apart the moment one of them is touched: a role copy-pasted through many call
+# sites looks correct until a branch is missed.
+#
+# A number of per-role sites are still hand-written and NOT table-driven, so
+# adding a role means finding them. This comment claims no count and no
+# complete list: a prose count of these sites was wrong three times, each
+# version true of the code its author happened to read and wrong about the
+# rest. Three of the biggest, named AS EXAMPLES rather than as the whole set:
+#   * render_roster_skill() hand-writes each role's section as bespoke prose
+#     describing what that role does and how to dispatch it, which cannot be
+#     generated from a table row.
+#   * show() prints each role with its own label and column width, so its
+#     presentation loops are hand-written per role.
+#   * og_stats.lineup() hardcodes the role order -- for now. It must not
+#     import this installer, which would pull PyYAML into `og stats`, a command
+#     the PATH python3 runs with only the stdlib (bin/og: `exec python3
+#     .../og_stats.py`), the interpreter gap install.sh's fallback exists to
+#     paper over. Two routes would make it table-driven cleanly: a stdlib-only
+#     shared module both can import, or the role order carried in
+#     og-install.json, which `og stats` already parses as JSON without PyYAML.
+#
+# The authoritative, current list is the test
+# test_per_role_sites_are_pinned in tests/test_og_install.py: it parses this
+# module and og_stats, and fails when a new hand-written site appears, so the
+# author must either generalize the site or add it to the test's pin.
+class Role(NamedTuple):
+    key: str        # plan key, and the spec-name stem of a singleton chain
+    role: str       # the name a registry row lists in its `roles` array
+    template: str   # the template that renders it
+    multi: bool     # True: many parallel workers; False: one-at-a-time chain
+    spec: bool      # True: renders a sub-agent dir; False: the root config
+    optional: bool  # True: the plan may omit it and the bundle stays correct
+    ask: str        # the --questions prompt that offers this role
+
+
+ROLES = [
+    Role("orchestrator", "orchestrator", "orchestrator.yaml.tmpl",
+         multi=False, spec=False, optional=False,
+         ask="Which agent plans and delegates (never writes product code), "
+             "in preference order (first is tried first)?"),
+    Role("coders", "coder", "coder.yaml.tmpl",
+         multi=True, spec=True, optional=False,
+         ask="Which agents implement code, in preference order (first is tried first)?"),
+    Role("reviewer", "reviewer", "reviewer.yaml.tmpl",
+         multi=False, spec=True, optional=False,
+         ask="Which agents review the batched diff, in preference order (first "
+             "is tried first; the next takes over when one is out of quota)? "
+             "Prefer a vendor that differs from every coder."),
+    # A read-only worker for the orchestrator's own biggest sink: reading and
+    # searching a repo with its own hands (measured at 52% of its result bytes
+    # across 30 sessions). Optional because it spends prompt bytes; a user who
+    # omits it gets a bundle with no scout spec and no dangling reference.
+    Role("scout", "scout", "scout.yaml.tmpl",
+         multi=False, spec=True, optional=True,
+         ask="Which agents answer repo reading, search and git-state questions "
+             "as a read-only scout, in preference order (first is tried first)?"),
+    # A worker for the orchestrator's own git and gate plumbing — measured at
+    # 727 git calls / 725 kB of result bytes (diff, log, status, worktree,
+    # merge) plus 185 gate calls / 84 kB across 30 audited sessions, all of it
+    # mechanical and all of it otherwise ingested whole. Optional because it
+    # spends prompt bytes; a user who omits it gets a bundle with no integrator
+    # spec and no dangling reference.
+    Role("integrator", "integrator", "integrator.yaml.tmpl",
+         multi=False, spec=True, optional=True,
+         ask="Which agents run git, worktree and gate plumbing for the "
+             "orchestrator (they never decide a merge), in preference order "
+             "(first is tried first)?"),
+]
+
+# Roles that render a sub-agent spec under <bundle>/agents/<name>. The
+# orchestrator is the one excluded: its spec IS the bundle's root config.
+SPEC_ROLES = [r for r in ROLES if r.spec]
+
+
+def role_of(key: str) -> Role:
+    return next(r for r in ROLES if r.key == key)
+
+
+def role_names(plan: dict, key: str) -> list:
+    """Spec names for a role, in chain order.
+
+    A singleton chain keeps its own name for the head (`reviewer`, `scout`) and
+    appends the position for each backup — the rule `reviewer_names` has always
+    used, and the same rule the coder specs follow (a stable name for the head,
+    a distinct one per addition, so renaming nothing that already exists in a
+    session history). A multi role names each worker by its registry `worker`
+    override or `coder_<id>` instead, so two roles can wire the same agent
+    without their spec directories colliding.
+    """
+    r = role_of(key)
+    entries = chain(plan, key)
+    if r.multi:
+        return [worker_name(e["id"]) for e in entries]
+    return [key if i == 1 else f"{key}_{i}" for i in range(1, len(entries) + 1)]
+
+
 def normalize_plan(plan: dict) -> dict:
     """Rewrite every role to the ordered-list shape, in place.
 
     Applied once before a plan is persisted, so og-install.json always holds
     the new shape going forward. Readers go through chain()/primary() and stay
     correct for either, which is what lets an old state file skip a migration.
+    The set of roles comes from ROLES, so a role the table does not declare (a
+    hand-added key) is left exactly as it was rather than guessed at.
     """
-    for role in ("orchestrator", "coders", "reviewer"):
-        if plan.get(role) is not None:
-            plan[role] = chain_entries(plan[role])
+    for r in ROLES:
+        if plan.get(r.key) is not None:
+            plan[r.key] = chain_entries(plan[r.key])
     return plan
 
 
@@ -593,23 +700,30 @@ def reviewer_names(plan: dict) -> list:
     rows pinning `worker` explicitly to keep a name stable across an id
     change): the head keeps its name, additions get a distinct one.
     """
-    return ["reviewer" if i == 1 else f"reviewer_{i}"
-            for i in range(1, len(chain(plan, "reviewer")) + 1)]
+    return role_names(plan, "reviewer")
 
 
-def account_entries(plan: dict) -> list:
+def account_entries(plan: dict, reg: dict | None = None) -> list:
     """(agent_id, env_var, config_dir) for every installed id that has an account.
 
     `accounts` is keyed by agent id, and interactive collects it for every id in
-    every chain -- orchestrator, each reviewer, each coder -- not just the head.
-    Only a row whose registry `multi_account.env` names the variable can be
-    wired; a stray accounts key is ignored rather than guessed at. Chain order,
-    first occurrence of a repeated id wins.
+    every chain — orchestrator, each coder, each reviewer, each scout, each
+    integrator — not just the head. Only a row whose registry `multi_account.env`
+    names the variable can be wired; a stray accounts key is ignored rather than
+    guessed at. Chain order, first occurrence of a repeated id wins.
+
+    The ORDER follows the role table (orchestrator, coders, reviewers, scouts,
+    integrators), not the old orchestrator/reviewer/coders sequence. The rows
+    are id-derived, so the same accounts come out either way; a consumer must
+    not depend on the old order or on a kind of role sorting before another.
+
+    `reg` is passed in by validate(), which already holds the catalog; reloading
+    it here was a second agents_by_id() per call for no reason.
     """
-    reg = agents_by_id()
+    reg = reg or agents_by_id()
     out, seen = [], set()
-    for role in ("orchestrator", "reviewer", "coders"):
-        for e in chain(plan, role):
+    for r in ROLES:
+        for e in chain(plan, r.key):
             aid = e["id"]
             if aid in seen:
                 continue
@@ -743,9 +857,34 @@ def build_plan_interactive(state: dict) -> dict:
     reviewers = [{"id": rid, "priority": i, "model": pick_model(reg[rid], rev_prev.get(rid))}
                  for i, rid in enumerate(reviewer_ids, 1)]
 
+    # --- optional roles, one row each (scout) ---
+    # The answer defaults to what a previous install chose, and "no" writes an
+    # EMPTY chain rather than omitting the key: the generated bundle then carries
+    # no spec for the role, the orchestrator prompt spends no bytes on it, and
+    # re-running the installer offers the same choice again. A role the table
+    # marks optional is never forced.
+    optional = {}
+    for r in ROLES:
+        if not (r.optional and r.spec):
+            continue
+        o_opts = opts(r.role)
+        cur = [e["id"] for e in chain(state, r.key)]
+        prev_models = {e["id"]: e.get("model") for e in chain(state, r.key)}
+        optional[r.key] = []
+        if not o_opts:
+            continue
+        say()
+        say(f"{C['dim']}{r.ask}{C['x']}")
+        if not ask_yes(f"Install an optional {r.key} worker?", default=bool(cur)):
+            continue
+        optional[r.key] = [
+            {"id": oid, "priority": i, "model": pick_model(reg[oid], prev_models.get(oid))}
+            for i, oid in enumerate(pick_many_ordered(r.ask, o_opts, cur), 1)]
+
     # --- multi-account, for any selected agent that supports it ---
     accounts = dict(state.get("accounts") or {})
-    involved = set(orchestrator_ids) | set(reviewer_ids) | {c["id"] for c in coders}
+    involved = set(orchestrator_ids) | set(reviewer_ids) | {c["id"] for c in coders} \
+        | {e["id"] for chain_ in optional.values() for e in chain_}
     for aid in sorted(involved):
         ma = reg[aid].get("multi_account") or {}
         if not ma.get("supported"):
@@ -806,6 +945,7 @@ def build_plan_interactive(state: dict) -> dict:
         "orchestrator": orchestrators,
         "coders": coders,
         "reviewer": reviewers,
+        **optional,
         "accounts": accounts,
         "port": int(port),
         "ngrok_domain": domain,
@@ -834,8 +974,7 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # unpinned and inherits the ORCHESTRATOR's model id -- the exact failure
     # `required` exists to prevent, now silent. Refuse it. No row does this
     # today; the guard is here so the next registry edit cannot slip it past.
-    for aid in sorted({e["id"] for e in orchestrators + reviewers}
-                      | {c["id"] for c in plan["coders"]}):
+    for aid in sorted({e["id"] for r in ROLES for e in chain(plan, r.key)}):
         spec = reg[aid].get("model") or {}
         if spec.get("required") and not spec.get("pinnable", True):
             issues.append(("error",
@@ -930,35 +1069,75 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "into args.input on every review dispatch; the generated `roster` skill "
                            "tells the orchestrator to do exactly that."))
 
+    # The scout's version of the same hazard, with its own remedy. A `none`
+    # scout never sees scout.yaml.tmpl, so both halves of its contract must be
+    # inlined on every dispatch: missing the read-only rule it can edit the
+    # repo, and missing the bounded-answer rule it pastes whole files back into
+    # the context the role exists to keep clear.
+    for s in chain(plan, "scout"):
+        if reg[s["id"]].get("prompt_delivery") == "none":
+            issues.append(("warn",
+                           f"{reg[s['id']]['label']} never receives the scout "
+                           "contract in scout.yaml.tmpl — that harness does not deliver spec "
+                           "instructions. Every scout dispatch must therefore inline the whole "
+                           "contract itself: READ-ONLY (never edit, create or delete a file, never "
+                           "commit, never run a command that mutates the repo or working tree) and "
+                           "a BOUNDED summary (paths with line ranges and short excerpts, never a "
+                           "file dump), and it must say plainly when something was not found. The "
+                           "generated `roster` skill tells the orchestrator to do exactly that."))
+
+    # The integrator's version of the same hazard, with its own remedy. A `none`
+    # integrator never sees integrator.yaml.tmpl, so its whole contract must be
+    # inlined on every dispatch: missing the BOUNDED-result rule it pastes a
+    # full diff or log back into the orchestrator's context (the bytes the role
+    # exists to keep out), and missing the never-decide-a-merge rule it can
+    # decide one. Every entry in the chain is checked: a BACKUP that never
+    # receives the contract is exactly as dangerous as a primary that does not.
+    for ig in chain(plan, "integrator"):
+        if reg[ig["id"]].get("prompt_delivery") == "none":
+            issues.append(("warn",
+                           f"{reg[ig['id']]['label']} never receives the integrator "
+                           "contract in integrator.yaml.tmpl — that harness does not deliver "
+                           "spec instructions. Every integrator dispatch must therefore inline "
+                           "the whole contract itself: git and gate plumbing on the "
+                           "orchestrator's behalf (worktrees, the gate commands, the combined "
+                           "diff for review, commit SHAs and branch state) returning a BOUNDED "
+                           "result (the verdict, the SHAs, and only the FAILING gate output — "
+                           "never a full diff, log or passing log); NEVER merging into a protected "
+                           "branch, never pushing, never opening or merging a PR, and never "
+                           "deciding whether a merge is allowed; and never running the "
+                           "integration suite while another integrator may be running it. The "
+                           "generated `roster` skill tells the orchestrator to do exactly that."))
+
     # A role a row marks `unverified_roles` clears validate()'s gates but has
     # never been driven here -- grok/devin as orchestrator. The registry used to
     # record that only in a free-text `roles_note` nothing read, so a user
     # selecting one as the brain was never shown the caveat. The config is legal
     # (a weak orchestrator at runtime, not a broken install), so this WARNs
     # rather than refuses; the first real dispatch is the proof.
-    for role, aid in ([("orchestrator", o["id"]) for o in orchestrators]
-                      + [("coder", c["id"]) for c in plan["coders"]]
-                      + [("reviewer", r["id"]) for r in reviewers]):
-        caveat = role_caveat(reg[aid], role)
-        if caveat:
-            issues.append(("warn", caveat))
+    for r in ROLES:
+        for e in chain(plan, r.key):
+            caveat = role_caveat(reg[e["id"]], r.role)
+            if caveat:
+                issues.append(("warn", caveat))
 
     # A `{shim:<name>}` token with no matching shim block renders a path to
     # a file nothing ever writes. The launch then fails with an exec error
     # pointing nowhere near the installer, so refuse it here instead.
-    for c in list(plan["coders"]) + reviewers:
-        a = reg.get(c["id"])
-        if not a:
-            continue
-        declared = (a.get("shim") or {}).get("name")
-        for tok in sorted(set(SHIM_TOKEN.findall(a.get("acp_command") or ""))):
-            if tok != declared:
-                issues.append(("error",
-                               f"{a['label']} ({c['id']}) references {{shim:{tok}}} in "
-                               f"acp_command but declares no shim named '{tok}'. The "
-                               "expanded path points at a file nothing writes and the "
-                               "launch fails — declare shim.name == "
-                               f"'{tok}' or fix the token."))
+    for r in SPEC_ROLES:
+        for c in chain(plan, r.key):
+            a = reg.get(c["id"])
+            if not a:
+                continue
+            declared = (a.get("shim") or {}).get("name")
+            for tok in sorted(set(SHIM_TOKEN.findall(a.get("acp_command") or ""))):
+                if tok != declared:
+                    issues.append(("error",
+                                   f"{a['label']} ({c['id']}) references {{shim:{tok}}} in "
+                                   f"acp_command but declares no shim named '{tok}'. The "
+                                   "expanded path points at a file nothing writes and the "
+                                   "launch fails — declare shim.name == "
+                                   f"'{tok}' or fix the token."))
 
     # og launches ONE server with ONE environment, so a single env var cannot
     # name two config dirs. Two installed ids can share a `multi_account.env`
@@ -967,7 +1146,7 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # the wrong account. Refuse rather than write a file where one account is
     # quietly dropped.
     by_env = {}
-    for aid, var, acct in account_entries(plan):
+    for aid, var, acct in account_entries(plan, reg):
         prev = by_env.get(var)
         if prev and prev[1] != acct:
             issues.append(("error",
@@ -991,10 +1170,15 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     if rendered_prompt is not None and argv_orchestrators:
         quoted = len(shlex.quote(rendered_prompt))
         names = ", ".join(reg[o["id"]]["label"] for o in argv_orchestrators)
+        # A two-entry argv chain names two harnesses; "an argv-delivered harness
+        # (A, B)" reads as if only one were over the ceiling. Pluralize both the
+        # noun and the article so WHICH entries are bound is never misread.
+        phrase = ("an argv-delivered harness" if len(argv_orchestrators) == 1
+                  else "argv-delivered harnesses")
         if quoted > PROMPT_CEILING:
             issues.append(("error",
                            f"orchestrator prompt is {quoted} bytes shell-quoted, over the "
-                           f"{PROMPT_CEILING} ceiling for an argv-delivered harness "
+                           f"{PROMPT_CEILING} ceiling for {phrase} "
                            f"({names}). tmux refuses the launch "
                            "with 'command too long'. Options: drop a coder, move guidance into "
                            "a skill file, or pick an orchestrator whose harness composes the "
@@ -1036,9 +1220,11 @@ def render_roster(plan: dict) -> str:
     """
     reg = agents_by_id()
     ordinals = ["FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH", "SIXTH"]
-    rev_names = reviewer_names(plan)
+    rev_names = role_names(plan, "reviewer")
+    sc_names = role_names(plan, "scout")
+    ig_names = role_names(plan, "integrator")
     names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] \
-        + [f"`{n}`" for n in rev_names]
+        + [f"`{n}`" for n in rev_names + sc_names + ig_names]
     width = max(len(n) for n in names) + 1
     lines = []
     for i, c in enumerate(plan["coders"]):
@@ -1060,6 +1246,24 @@ def render_roster(plan: dict) -> str:
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{rv['label']} "
                      f"(`{rv['harness']}`){pin}. Reviews only; never edits.")
+    # The scout's read-only contract is a fact the orchestrator must know BEFORE
+    # it dispatches one, so it stays inline rather than behind the roster skill.
+    for name, e in zip(sc_names, chain(plan, "scout")):
+        sc = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        lines.append(f"  - {f'`{name}`'.ljust(width)}{sc['label']} "
+                     f"(`{sc['harness']}`){pin}. Read-only; never edits, commits "
+                     "or mutates. Bounded summary only.")
+    # The integrator's two hard rules change a decision made BEFORE anything is
+    # read: that its answer is bounded (so delegating is worth the round trip),
+    # and that the merge decision is still the orchestrator's. Both stay inline
+    # rather than behind the roster skill, for the same reason as the scout's.
+    for name, e in zip(ig_names, chain(plan, "integrator")):
+        ig = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        lines.append(f"  - {f'`{name}`'.ljust(width)}{ig['label']} "
+                     f"(`{ig['harness']}`){pin}. Git/gate plumbing; bounded "
+                     "result; never decides a merge.")
     return "\n".join(lines)
 
 
@@ -1126,6 +1330,10 @@ def render_roster_skill(plan: dict) -> str:
     generated from the plan and the registry so they cannot drift.
     """
     reg = agents_by_id()
+    # The singleton chain roles og stats reports by name; generated from the
+    # table so a new one cannot leave this sentence stale the way it read
+    # `reviewer`/`scout` after integrator landed.
+    stats_chain_roles = "/".join(f"`{r.key}`" for r in SPEC_ROLES if not r.multi)
     oc = next((c for c in plan["coders"] if c["id"] == "opencode"), None)
     zen = ([zen_preflight_note(worker_name("opencode")), ""]
            if oc and is_zen_free(oc.get("model")) else [])
@@ -1154,11 +1362,11 @@ def render_roster_skill(plan: dict) -> str:
         "and `og stats --agent <id> --json` before every later one. If `og` is missing",
         "or errors, proceed as today and say so once — do not stall the run on it.",
         "Map the stats output's agent ids back to workers by id: `coder_<id>` maps",
-        "to `<id>`, and `reviewer` maps to the reviewer's id. A worker whose state",
-        "is `dry` while `reset_at` is in the future is out of capacity — skip it and",
-        "take the next worker. Preference order still wins: only when two candidates",
-        "are otherwise equal does `ok` outrank `unknown`. `og stats` reports a",
-        "measured `ok` only when the probe actually answered; an inferred or unknown",
+        f"to `<id>`, and {stats_chain_roles} map to their chain's agent ids. A worker",
+        "whose state is `dry` while `reset_at` is in the future is out of capacity —",
+        "skip it and take the next worker. Preference order still wins: only when two",
+        "candidates are otherwise equal does `ok` outrank `unknown`. `og stats` reports",
+        "a measured `ok` only when the probe actually answered; an inferred or unknown",
         "state is not a clean bill of health.",
         "",
         "On a QUOTA failure — rate limit, usage cap, out of credits, Kilo's",
@@ -1278,6 +1486,152 @@ def render_roster_skill(plan: dict) -> str:
                        "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
                        "evidence. Do not assume it knows the review format.")
         out.append("")
+    # The scout chain, only when one is installed. Same chain rule and same
+    # per-entry voice as the reviewers above, plus the contract that makes the
+    # role worth its prompt bytes: read-only, and bounded.
+    sc_chain = chain(plan, "scout")
+    if sc_chain:
+        sc_names = role_names(plan, "scout")
+        listed = [f"`{n}` ({reg[e['id']]['label']})" for n, e in zip(sc_names, sc_chain)]
+        if len(listed) == 1:
+            order = f"{listed[0]} is the only scout in this roster."
+        else:
+            verb = "backs it up" if len(listed) == 2 else "back it up"
+            order = (f"{listed[0]} is the primary; {', '.join(listed[1:])} "
+                     f"{verb}, in that order.")
+        out += ["## Scouts — read-only repo reading", "",
+                order, "",
+                "Send `scout` the repo reading you would otherwise do yourself:",
+                "locating code, `grep`-style searches, git state (`status`, `log`,",
+                "`diff`, `rev-parse`, branch and worktree listings), and worker capacity",
+                "(`og stats`). It answers with a BOUNDED summary — paths with line ranges,",
+                "short excerpts, the shape of the answer — never a file dump; a scout that",
+                "pastes whole files has failed its purpose. Take its answer instead of",
+                "re-reading the files. It is READ-ONLY: it never edits, creates or deletes",
+                "a file, never commits, and never runs a command that mutates the repo or",
+                "the working tree, so when the answer needs a change it reports that",
+                "instead of making it. That rule is TRUSTED, not sandboxed — nothing",
+                "mechanically stops a scout from writing — so never give a scout",
+                "dispatch a task whose success depends on it not writing.", "",
+                "Same chain rule as the reviewers: check `og stats` before the first",
+                "scout dispatch and `og stats --agent <id> --json` before every later one,",
+                "take the earliest entry with capacity, and move down only when one is",
+                "dry, dropped for the run, or already failed this run — never re-send a",
+                "question to a scout that already failed.", ""]
+        for name, e in zip(sc_names, sc_chain):
+            sc = reg[e["id"]]
+            pin = f", pinned `{e['model']}`" if e.get("model") else ""
+            out += [f"## `{name}` — {sc['label']}{pin}", "",
+                    f"- harness `{sc['harness']}`, vendor `{vendor_of(sc, e)}`",
+                    quota_line(sc), *quota_failure_lines(sc),
+                    "- **Read-only.** Never edits, creates or deletes a file, never",
+                    "  commits, never runs a command that mutates the repo or the working",
+                    "  tree. If the answer needs a change, it reports that instead of",
+                    "  making it.",
+                    "- **Bounded answer.** Paths with line ranges, short excerpts and the",
+                    "  shape of the answer — never a file dump.",
+                    "- **Says what it did not find.** It says so plainly rather than",
+                    "  guessing; a confident wrong answer is worse than \"not found\",",
+                    "  because you cannot tell the two apart."]
+            if sc.get("silent_model_failure"):
+                out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
+                           "transcript with no error, which reads as \"found nothing\" rather than "
+                           "\"misconfigured\" — check the pin before trusting an empty scout "
+                           "report, and do not re-send the same question.")
+            if sc.get("prompt_delivery") == "none":
+                # The same hazard as the reviewer bullet above, restated for the
+                # scout's contract. Rendered per entry: a BACKUP that never
+                # receives the contract is exactly as dangerous as a primary.
+                out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                           "delivers spec instructions, so the scout sees ONLY the text you send "
+                           "in `args.input`. Every scout dispatch must therefore carry the whole "
+                           "contract itself: READ-ONLY — never edit, create or delete a file, "
+                           "never commit, never run a command that mutates the repo or working "
+                           "tree, and report a needed change rather than making it — and a "
+                           "BOUNDED summary: paths with line ranges and short excerpts, never a "
+                           "file dump, and an explicit \"not found\" instead of a guess. Do not "
+                           "assume it knows the read-only rule.")
+            out.append("")
+    # The integrator chain, only when one is installed. Same chain rule and
+    # same per-entry voice as the scouts above, plus the two contracts that
+    # make the role safe to hand the orchestrator's git plumbing to: a BOUNDED
+    # result, and no merge decision. The concurrency rule is restated because
+    # getting it wrong produces flaky failures that look like real bugs.
+    ig_chain = chain(plan, "integrator")
+    if ig_chain:
+        ig_names = role_names(plan, "integrator")
+        listed = [f"`{n}` ({reg[e['id']]['label']})" for n, e in zip(ig_names, ig_chain)]
+        if len(listed) == 1:
+            order = f"{listed[0]} is the only integrator in this roster."
+        else:
+            verb = "backs it up" if len(listed) == 2 else "back it up"
+            order = (f"{listed[0]} is the primary; {', '.join(listed[1:])} "
+                     f"{verb}, in that order.")
+        out += ["## Integrators — git and gate plumbing", "",
+                order, "",
+                "Send `integrator` the git and gate plumbing you would otherwise do",
+                "yourself: creating and removing worktrees, running the gate commands,",
+                "collecting diffs and producing the combined diff text for a review,",
+                "and reporting commit SHAs and branch state. It answers with a BOUNDED",
+                "result — the verdict, the exact SHAs and branch names, and only the",
+                "FAILING gate output, never a full diff, log or passing log; an",
+                "integrator that pastes a full diff back has failed its purpose.",
+                "Take its result instead of re-running the plumbing.",
+                "",
+                "**The merge decision is yours, never the integrator's.** It never",
+                "merges into a protected branch, never pushes, and never opens or",
+                "merges a PR. It may merge task branches into an integration branch",
+                "only when you explicitly tell it to, and it reports what it did.",
+                "",
+                "**One integrator at a time.** Never dispatch two integrators against",
+                "one repo concurrently: the integration suite must run in exactly ONE",
+                "place at a time, and parallel runs against one database corrupt each",
+                "other's state and surface as flaky failures that look like real bugs.",
+                "An integrator must not run the integration suite while it believes",
+                "another is running it.",
+                "",
+                "Same chain rule as the reviewers: check `og stats` before the first",
+                "integrator dispatch and `og stats --agent <id> --json` before every",
+                "later one, take the earliest entry with capacity, and move down only",
+                "when one is dry, dropped for the run, or already failed this run —",
+                "never re-send a dispatch to an integrator that already failed.", ""]
+        for name, e in zip(ig_names, ig_chain):
+            ig = reg[e["id"]]
+            pin = f", pinned `{e['model']}`" if e.get("model") else ""
+            out += [f"## `{name}` — {ig['label']}{pin}", "",
+                    f"- harness `{ig['harness']}`, vendor `{vendor_of(ig, e)}`",
+                    quota_line(ig), *quota_failure_lines(ig),
+                    "- **Bounded result.** The verdict, the SHAs and branch names, and",
+                    "  only the FAILING gate output — never a full diff, log or passing",
+                    "  log.",
+                    "- **Never decides a merge.** It never merges into a protected",
+                    "  branch, never pushes, never opens or merges a PR. It merges task",
+                    "  branches into an integration branch only when explicitly told to,",
+                    "  and reports what it did.",
+                    "- **One at a time.** Never run the integration suite while another",
+                    "  integrator may be running it; it runs in exactly one place."]
+            if ig.get("silent_model_failure"):
+                out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
+                           "transcript with no error, which reads as \"nothing to report\" rather "
+                           "than \"misconfigured\" — check the pin before trusting an empty "
+                           "integrator report, and do not re-send the same dispatch.")
+            if ig.get("prompt_delivery") == "none":
+                # The same hazard as the scout bullet above, restated for the
+                # integrator's contract. Rendered per entry: a BACKUP that never
+                # receives the contract is exactly as dangerous as a primary.
+                out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                           "delivers spec instructions, so the integrator sees ONLY the text "
+                           "you send in `args.input`. Every integrator dispatch must therefore "
+                           "carry the whole contract itself: git and gate plumbing on your "
+                           "behalf — worktrees, the gate commands, the combined diff for review, "
+                           "commit SHAs and branch state — returning a BOUNDED result (the "
+                           "verdict, the SHAs, and only the FAILING gate output, never a full "
+                           "diff, log or passing log); NEVER merging into a protected branch, "
+                           "never pushing, never opening or merging a PR, never deciding whether "
+                           "a merge is allowed; and never running the integration suite while "
+                           "another integrator may be running it. Do not assume it knows any of "
+                           "this.")
+            out.append("")
     return "\n".join(out)
 
 
@@ -1307,9 +1661,9 @@ def render_preflight_map(plan: dict) -> str:
     silently drifts the moment a coder is added, dropped or renamed.
     """
     reg = agents_by_id()
-    rows = [f"    `{worker_name(c['id'])}` -> `{reg[c['id']]['harness']}`" for c in plan["coders"]]
-    rows += [f"    `{name}` -> `{reg[e['id']]['harness']}`"
-             for name, e in zip(reviewer_names(plan), chain(plan, "reviewer"))]
+    rows = [f"    `{name}` -> `{reg[e['id']]['harness']}`"
+            for r in SPEC_ROLES
+            for name, e in zip(role_names(plan, r.key), chain(plan, r.key))]
     return "\n".join(rows)
 
 
@@ -1332,6 +1686,53 @@ def zen_preflight_note(name: str) -> str:
         "failed dispatch, not a slower one.")
 
 
+def scout_note(plan: dict) -> str:
+    """The scout pointer for the prompt, or "" when no scout is installed.
+
+    Only the part the orchestrator must know BEFORE it decides to read
+    anything: the role exists, it is read-only, and sending it the reading is
+    cheaper than doing it here. The chain, the failover rule and the full
+    read-only contract live in the generated `roster` skill, which loads from
+    disk and costs the command line nothing. The existing tension is kept — a
+    quick look at a file or two to scope a dispatch is still fine, because a
+    scout round trip is not free — rather than telling the brain to delegate
+    every read, which would cost more round trips than it saves.
+
+    Trailing newline when present so the paragraph keeps its blank line before
+    the next section; empty otherwise, which leaves the template byte-identical
+    for a plan with no scout.
+    """
+    if not chain(plan, "scout"):
+        return ""
+    return ("  Reading beyond that quick look — locating code, `grep`-style searches,\n"
+            "  git state — goes to `scout`: read-only, never edits or commits, answers\n"
+            "  with a bounded summary. Take its answer rather than reading the files\n"
+            "  yourself.\n")
+
+
+def integrator_note(plan: dict) -> str:
+    """The integrator pointer for the prompt, or "" when none is installed.
+
+    Only what the orchestrator must know BEFORE it decides anything: that the
+    role exists, that it does the git/worktree/gate plumbing, and — the clause
+    that must not live behind an on-demand read — that the merge decision stays
+    with the orchestrator. An orchestrator that had to read a skill to learn it
+    could sail past a gate it is not allowed to delegate. Everything else (the
+    chain, the failover rule, the bounded-output and one-integrator-at-a-time
+    contracts) is in the generated `roster` skill, which costs no prompt bytes.
+
+    Trailing newline when present so the paragraph keeps its blank line before
+    the next section; empty otherwise, which leaves the template byte-identical
+    for a plan with no integrator.
+    """
+    if not chain(plan, "integrator"):
+        return ""
+    return ("  Git and gate plumbing — worktrees, the gate commands, the combined\n"
+            "  diff for review — goes to `integrator`, which returns a BOUNDED\n"
+            "  result, never a full diff or log. It NEVER decides a merge: that\n"
+            "  decision stays with you.\n")
+
+
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()
     s = tmpl("orchestrator.yaml.tmpl")
@@ -1339,20 +1740,25 @@ def render_orchestrator(plan: dict) -> str:
     # only dispatch surface, so a backup omitted here is unreachable and the
     # failover the roster skill promises cannot happen. EACH backup grows the
     # rendered prompt by an agent-list line here plus its roster lines in
-    # {{ROSTER_BULLETS}}, so headroom against PROMPT_CEILING shrinks per entry
-    # (1,401 bytes left with the measured four-coder roster). validate() refuses
-    # an argv chain over the ceiling, so the hazard stays guarded -- but a new
-    # chain entry spends bytes the prompt has to have.
-    agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
-    agent_list += "".join(f"\n    - {n}" for n in reviewer_names(plan))
+    # {{ROSTER_BULLETS}}, so headroom against PROMPT_CEILING shrinks per entry.
+    # Run --dry-run for the current shell-quoted size and the bytes left; a
+    # hardcoded figure here went stale the moment the prompt changed (it read
+    # 1,401 while the measured roster sat at 1,004). validate() refuses an argv
+    # chain over the ceiling, so the hazard stays guarded -- but a new chain
+    # entry spends bytes the prompt has to have.
+    agent_list = "\n".join(f"    - {name}" for r in SPEC_ROLES
+                           for name in role_names(plan, r.key))
     subs = {
         "{{AGENT_NAME}}": plan["agent_name"],
         "{{ORCHESTRATOR_HARNESS}}": reg[primary(plan, "orchestrator")["id"]]["harness"],
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
+        "{{SCOUT_NOTE}}": scout_note(plan),
+        "{{INTEGRATOR_NOTE}}": integrator_note(plan),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
-        "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + len(chain(plan, "reviewer"))),
+        "{{AGENT_COUNT_WORD}}": _count_word(sum(len(chain(plan, r.key))
+                                                 for r in SPEC_ROLES)),
     }
     for k, v in subs.items():
         s = s.replace(k, v)
@@ -1382,7 +1788,7 @@ def model_block(model: str | None) -> str:
     )
 
 
-def render_coder(plan: dict, c: dict) -> str:
+def render_coder(plan: dict, c: dict, name: str | None = None) -> str:
     reg = agents_by_id()
     a = reg[c["id"]]
     notes = []
@@ -1406,7 +1812,7 @@ def render_coder(plan: dict, c: dict) -> str:
         permission_mode_block = "    permission_mode: bypassPermissions"
     s = tmpl("coder.yaml.tmpl")
     for k, v in {
-        "{{NAME}}": worker_name(c["id"]),
+        "{{NAME}}": name or worker_name(c["id"]),
         "{{LABEL}}": a["label"],
         "{{PRIORITY}}": str(c["priority"]),
         "{{HARNESS}}": a["harness"],
@@ -1431,24 +1837,109 @@ def render_reviewer(plan: dict, entry: dict | None = None, name: str = "reviewer
     reg = agents_by_id()
     entry = primary(plan, "reviewer") if entry is None else entry
     a = reg[entry["id"]]
-    acct = plan.get("accounts", {}).get(a["id"])
-    note = ""
-    if acct:
-        env = (a.get("multi_account") or {}).get("env", "CONFIG_DIR")
-        note = (f"# Runs on a SEPARATE account: the server is launched with\n"
-                f"# {env}={acct}, so this reviewer is independent of the\n"
-                f"# account your interactive sessions use.\n")
     s = tmpl("reviewer.yaml.tmpl")
     for k, v in {
         "{{NAME}}": name,
         "{{LABEL}}": a["label"],
         "{{HARNESS}}": a["harness"],
         "{{ORCHESTRATOR}}": plan["agent_name"],
-        "{{ACCOUNT_NOTE}}": note,
+        "{{ACCOUNT_NOTE}}": account_note(plan, a, "reviewer"),
         "{{MODEL_BLOCK}}": model_block(entry.get("model")),
     }.items():
         s = s.replace(k, v)
     return s
+
+
+def account_note(plan: dict, a: dict, what: str) -> str:
+    """The `# Runs on a SEPARATE account` comment for an agent that has one.
+
+    Shared by every worker spec that can be given its own account, so the
+    reviewer's and the scout's notes cannot drift apart. `what` names the role
+    in the prose, so the generated sentence still reads as the role it lands in.
+    """
+    acct = (plan.get("accounts") or {}).get(a["id"])
+    if not acct:
+        return ""
+    env = (a.get("multi_account") or {}).get("env", "CONFIG_DIR")
+    return (f"# Runs on a SEPARATE account: the server is launched with\n"
+            f"# {env}={acct}, so this {what} is independent of the\n"
+            f"# account your interactive sessions use.\n")
+
+
+def render_scout(plan: dict, entry: dict | None = None, name: str = "scout") -> str:
+    """One scout spec.
+
+    Same chain shape as the reviewer: the primary keeps the stable `scout` name
+    and each backup appends its position. The one thing it does differently is
+    `permission_mode`: an acp-user CLI relays every tool call as an approval
+    request, and `auto` parks a human card for anything no policy opines on —
+    a read-only scout runs `cat`/`grep`/`git`, so it would stall on its first
+    read. Same reasoning as coder.yaml.tmpl's bypass; a native harness keeps
+    the reviewer's `auto`.
+    """
+    reg = agents_by_id()
+    entry = primary(plan, "scout") if entry is None else entry
+    a = reg[entry["id"]]
+    perm = ("    permission_mode: bypassPermissions" if a["kind"] == "acp-user"
+            else "    permission_mode: auto")
+    s = tmpl("scout.yaml.tmpl")
+    for k, v in {
+        "{{NAME}}": name,
+        "{{LABEL}}": a["label"],
+        "{{HARNESS}}": a["harness"],
+        "{{ORCHESTRATOR}}": plan["agent_name"],
+        "{{ACCOUNT_NOTE}}": account_note(plan, a, "scout"),
+        "{{MODEL_BLOCK}}": model_block(entry.get("model")),
+        "{{PERMISSION_MODE_BLOCK}}": perm,
+    }.items():
+        s = s.replace(k, v)
+    return s
+
+
+def render_integrator(plan: dict, entry: dict | None = None, name: str = "integrator") -> str:
+    """One integrator spec.
+
+    Same chain shape as the reviewer and the scout: the primary keeps the stable
+    `integrator` name and each backup appends its position. It writes, so it
+    keeps the coder's permission rule rather than the scout's read-only one:
+    an acp-user CLI relays every tool call as an approval request and `auto`
+    parks a human card for anything no policy opines on, which would stall a
+    worker whose first act is `git worktree add`. A native harness keeps the
+    reviewer's `auto`.
+    """
+    reg = agents_by_id()
+    entry = primary(plan, "integrator") if entry is None else entry
+    a = reg[entry["id"]]
+    perm = ("    permission_mode: bypassPermissions" if a["kind"] == "acp-user"
+            else "    permission_mode: auto")
+    s = tmpl("integrator.yaml.tmpl")
+    for k, v in {
+        "{{NAME}}": name,
+        "{{LABEL}}": a["label"],
+        "{{HARNESS}}": a["harness"],
+        "{{ORCHESTRATOR}}": plan["agent_name"],
+        "{{ACCOUNT_NOTE}}": account_note(plan, a, "integrator"),
+        "{{MODEL_BLOCK}}": model_block(entry.get("model")),
+        "{{PERMISSION_MODE_BLOCK}}": perm,
+    }.items():
+        s = s.replace(k, v)
+    return s
+
+
+# role.template -> the renderer for it. Keyed by the template string the ROLES
+# row names, so a role added to the table without a renderer fails loudly on
+# the first apply instead of writing an empty spec directory.
+SPEC_RENDERERS = {
+    "coder.yaml.tmpl": render_coder,
+    "reviewer.yaml.tmpl": render_reviewer,
+    "scout.yaml.tmpl": render_scout,
+    "integrator.yaml.tmpl": render_integrator,
+}
+
+
+def render_spec(plan: dict, role: Role, entry: dict, name: str) -> str:
+    """Render one sub-agent spec through the role's own renderer."""
+    return SPEC_RENDERERS[role.template](plan, entry, name)
 
 
 # --------------------------------------------------------------------------
@@ -1518,21 +2009,22 @@ def write_shims(plan: dict) -> list:
     """
     reg = agents_by_id()
     changed = []
-    for c in list(plan["coders"]) + chain(plan, "reviewer"):
-        shim = reg[c["id"]].get("shim")
-        if not shim:
-            continue
-        dest = OMNI / "shims" / shim["name"]
-        if dest.is_file() and dest.read_text() == shim["script"]:
-            if dest.stat().st_mode & 0o777 == 0o755:
+    for r in SPEC_ROLES:
+        for c in chain(plan, r.key):
+            shim = reg[c["id"]].get("shim")
+            if not shim:
                 continue
+            dest = OMNI / "shims" / shim["name"]
+            if dest.is_file() and dest.read_text() == shim["script"]:
+                if dest.stat().st_mode & 0o777 == 0o755:
+                    continue
+                dest.chmod(0o755)
+                changed.append(f"shims[{shim['name']}] mode -> 0o755 ({dest})")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(shim["script"])
             dest.chmod(0o755)
-            changed.append(f"shims[{shim['name']}] mode -> 0o755 ({dest})")
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(shim["script"])
-        dest.chmod(0o755)
-        changed.append(f"shims[{shim['name']}] = {dest}")
+            changed.append(f"shims[{shim['name']}] = {dest}")
     return changed
 
 
@@ -1558,8 +2050,8 @@ def patch_global_config(plan: dict) -> list:
     # resolves an unknown acp:<slug> to the FIRST configured row, so an ACP
     # reviewer with no row of its own would silently run as whichever coder is
     # listed first.
-    want = [c for c in plan["coders"] if reg[c["id"]]["kind"] == "acp-user"]
-    want += [r for r in chain(plan, "reviewer") if reg[r["id"]]["kind"] == "acp-user"]
+    want = [c for r in SPEC_ROLES for c in chain(plan, r.key)
+            if reg[c["id"]]["kind"] == "acp-user"]
     if want:
         acp = cfg.get("acp") or {}
         rows = list(acp.get("agents") or [])
@@ -1777,19 +2269,16 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # tools.agents) but indistinguishable on disk from a live worker, which is
     # exactly the kind of stale state that makes a rerunnable installer
     # untrustworthy.
-    keep = {worker_name(c["id"]) for c in plan["coders"]} | set(reviewer_names(plan))
+    keep = {name for r in SPEC_ROLES for name in role_names(plan, r.key)}
     for d in sorted((bundle / "agents").iterdir()):
         if d.is_dir() and d.name not in keep:
             shutil.rmtree(d)
             say(f"{C['dim']}  pruned stale worker: {d.name}{C['x']}")
-    for c in plan["coders"]:
-        d = bundle / "agents" / worker_name(c["id"])
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "config.yaml").write_text(render_coder(plan, c))
-    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
-        d = bundle / "agents" / name
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "config.yaml").write_text(render_reviewer(plan, e, name))
+    for r in SPEC_ROLES:
+        for name, e in zip(role_names(plan, r.key), chain(plan, r.key)):
+            d = bundle / "agents" / name
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.yaml").write_text(render_spec(plan, r, e, name))
 
     # 2. skills (verbatim from the repo)
     skills_src = REPO / "agents" / "dev-lead" / "skills"
@@ -1838,6 +2327,19 @@ def apply(plan: dict, dry_run: bool = False) -> None:
             ok(f"reviewer      {reg[e['id']]['label']}{pin}")
         else:
             ok(f"reviewer #{e['priority']}   {name} ({reg[e['id']]['label']}){pin}")
+    for i, (name, e) in enumerate(zip(role_names(plan, "scout"), chain(plan, "scout"))):
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            ok(f"scout         {reg[e['id']]['label']}{pin}")
+        else:
+            ok(f"scout #{e['priority']}      {name} ({reg[e['id']]['label']}){pin}")
+    for i, (name, e) in enumerate(zip(role_names(plan, "integrator"),
+                                      chain(plan, "integrator"))):
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            ok(f"integrator    {reg[e['id']]['label']}{pin}")
+        else:
+            ok(f"integrator #{e['priority']}   {name} ({reg[e['id']]['label']}){pin}")
     for line in changed:
         ok(f"config.yaml   {line}")
     if ocd:
@@ -1861,9 +2363,7 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # worker and let the user confirm it themselves.
     # Every agent in the roster, chains included: a backup that is not logged in
     # is only discovered when the primary goes dry and the failover dies too.
-    login_agents = [reg[o["id"]] for o in chain(plan, "orchestrator")] \
-        + [reg[c["id"]] for c in plan["coders"]] \
-        + [reg[r["id"]] for r in chain(plan, "reviewer")]
+    login_agents = [reg[e["id"]] for r in ROLES for e in chain(plan, r.key)]
     seen_ids = set()
     login_lines = []
     for a in login_agents:
@@ -2063,6 +2563,33 @@ def emit_questions() -> None:
     model_choices = {a["id"]: (a.get("model") or {}).get("choices")
                      for a in REGISTRY["agents"]
                      if (a.get("model") or {}).get("choices")}
+    # One question per role, in table order. Orchestrator and reviewer are
+    # ordered chains, exactly like coders: the entries after the first are the
+    # failover used when the one above is out of quota. A single id is still
+    # accepted (it normalizes to a one-element chain), so a consumer that
+    # answers with one value does not have to change. The per-role UNVERIFIED
+    # caveat rides the question: AGENTS.md Part 1 has the AI installer drive its
+    # conversation from this output, and it must never offer a role without the
+    # warning that applies to it.
+    role_questions = []
+    for r in ROLES:
+        q = {"key": r.key, "type": "ordered_multi",
+             # An AI driving from --questions must see that a role may be
+             # omitted: the interactive path asks yes/no, but this JSON is the
+             # only signal AGENTS.md Part 1's installer gets.
+             "optional": r.optional,
+             "choices": [a["id"] for a in REGISTRY["agents"]
+                         if a["id"] in found and r.role in a["roles"]],
+             "notes": role_notes(r.role),
+             "ask": r.ask}
+        if r.spec:
+            # The same static model list under every role that pins one, so an
+            # AI installer can answer for each entry of the chain.
+            q["per_item"] = {
+                "model": "Model id to pin. REQUIRED for agents where "
+                         "registry.model.required is true.",
+                "choices": model_choices}
+        role_questions.append(q)
     say(json.dumps({
         "detected": {k: reg[k]["label"] for k in found},
         "state_file": str(STATE),
@@ -2071,41 +2598,10 @@ def emit_questions() -> None:
         "questions": [
             {"key": "agent_name", "type": "string", "default": "dev-lead",
              "ask": "What should the orchestrator bundle be called?"},
-            # Orchestrator and reviewer are ordered chains, exactly like coders:
-            # the entries after the first are the failover used when the one
-            # above is out of quota. A single id is still accepted (it normalizes
-            # to a one-element chain), so a consumer that answers with one value
-            # does not have to change.
-            {"key": "orchestrator", "type": "ordered_multi",
-             "choices": [a["id"] for a in REGISTRY["agents"]
-                         if a["id"] in found and "orchestrator" in a["roles"]],
-             # The per-role UNVERIFIED caveat travels with the choice: AGENTS.md
-             # Part 1 has the AI installer drive its conversation from this
-             # output, and it must never offer a role without the warning.
-             "notes": role_notes("orchestrator"),
-             "ask": "Which agent plans and delegates (never writes product code), "
-                    "in preference order (first is tried first)?"},
-            {"key": "coders", "type": "ordered_multi",
-             "choices": [a["id"] for a in REGISTRY["agents"]
-                         if a["id"] in found and "coder" in a["roles"]],
-             "notes": role_notes("coder"),
-             "ask": "Which agents implement code, in preference order (first is tried first)?",
-             "per_item": {"model": "Model id to pin. REQUIRED for agents where "
-                                  "registry.model.required is true.",
-                          "choices": model_choices}},
-            {"key": "reviewer", "type": "ordered_multi",
-             "choices": [a["id"] for a in REGISTRY["agents"]
-                         if a["id"] in found and "reviewer" in a["roles"]],
-             "notes": role_notes("reviewer"),
-             "ask": "Which agents review the batched diff, in preference order (first "
-                    "is tried first; the next takes over when one is out of quota)? "
-                    "Prefer a vendor that differs from every coder.",
-             "per_item": {"model": "Model id to pin. REQUIRED for agents where "
-                                   "registry.model.required is true.",
-                          "choices": model_choices}},
+            *role_questions,
             {"key": "accounts", "type": "map",
-             "ask": "For any agent with registry.multi_account.supported, should the "
-                    "reviewer run on a second account? Value is the config dir path.",
+             "ask": "For any agent with registry.multi_account.supported, should it "
+                    "run on a second account? Value is the config dir path.",
              "applies_to": [a["id"] for a in REGISTRY["agents"]
                             if (a.get("multi_account") or {}).get("supported")]},
             {"key": "port", "type": "int", "default": 6767, "ask": "Omnigent server port?"},
@@ -2141,6 +2637,7 @@ def show(state: dict) -> None:
     # exactly as it always has.
     orch = chain(state, "orchestrator")
     revs = chain(state, "reviewer")
+    scs = chain(state, "scout")
     say(f"{C['b']}orchestrator{C['x']}  {state['agent_name']} "
         f"({reg[orch[0]['id']]['label']}){' (primary)' if len(orch) > 1 else ''}")
     for e in orch[1:]:
@@ -2159,6 +2656,25 @@ def show(state: dict) -> None:
             say(f"{C['b']}reviewer{C['x']}      {reg[e['id']]['label']}{pin}{tail}{live}")
         else:
             say(f"{C['b']}  backup #{e['priority']}{C['x']}  {reg[e['id']]['label']}"
+                f"{pin}{live}")
+    for i, e in enumerate(scs):
+        live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            tail = " (primary)" if len(scs) > 1 else ""
+            say(f"{C['b']}scout{C['x']}         {reg[e['id']]['label']}{pin}{tail}{live}")
+        else:
+            say(f"{C['b']}scout #{e['priority']}{C['x']}     {reg[e['id']]['label']}"
+                f"{pin}{live}")
+    igs = chain(state, "integrator")
+    for i, e in enumerate(igs):
+        live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            tail = " (primary)" if len(igs) > 1 else ""
+            say(f"{C['b']}integrator{C['x']}    {reg[e['id']]['label']}{pin}{tail}{live}")
+        else:
+            say(f"{C['b']}integrator #{e['priority']}{C['x']} {reg[e['id']]['label']}"
                 f"{pin}{live}")
     for aid, path in (state.get("accounts") or {}).items():
         say(f"{C['b']}account{C['x']}       {reg[aid]['label']} → {path}")

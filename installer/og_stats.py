@@ -2,8 +2,9 @@
 """og stats — per-agent quota/capacity reporter.
 
 Builds the lineup from og-install.json (orchestrator, coders by priority,
-reviewers in chain order), finds each agent's quota probe from the registry
-row's `quota` block, runs probes concurrently, and prints one row per agent.
+reviewers, scouts and integrators in chain order), finds each agent's quota
+probe from the registry row's `quota` block, runs probes concurrently, and
+prints one row per agent.
 Probes live in og_quota.py; this CLI owns presentation and the mark commands.
 
 Privacy: read-only everywhere, never prints token values, never refreshes
@@ -50,9 +51,25 @@ def _agents_map(reg: dict) -> dict:
     return agents
 
 
+def _priority_key(p) -> tuple:
+    """Sort key for a coder's `priority`.
+
+    A hand-edited og-install.json can carry a null (or a string) priority, and
+    the old `key=lambda c: c.get("priority", 999)` then raised
+    `TypeError: '<' not supported between instances of 'int' and 'NoneType'`,
+    taking the whole lineup down right before a dispatch decision. Real (int)
+    priorities sort first; anything else sorts after them, and because sorted()
+    is stable the malformed entries keep their original array order.
+    """
+    if isinstance(p, int) and not isinstance(p, bool):
+        return (0, p)
+    return (1, 0)
+
+
 def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     """[{role, agent, priority, probe, params, note}] in dispatch order:
-    orchestrator, coders by priority, reviewers in chain order."""
+    orchestrator, coders by priority, reviewers, scouts and integrators in
+    chain order."""
     try:
         inst = json.loads(install_path.read_text())
     except FileNotFoundError:
@@ -114,14 +131,30 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
 
     for aid in ids(inst.get("orchestrator")):
         add(aid, "orchestrator", None)
-    for c in sorted((c for c in (inst.get("coders") or []) if isinstance(c, dict)),
-                    key=lambda c: c.get("priority", 999)):
+    coders = inst.get("coders")
+    if not isinstance(coders, list):
+        # A hand-edited "coders": 5 is not iterable and used to raise
+        # TypeError: 'int' object is not iterable. `og stats` runs interactively
+        # right before a dispatch decision, so it must skip what it cannot read.
+        coders = []
+    for c in sorted((c for c in coders if isinstance(c, dict)),
+                    key=lambda c: _priority_key(c.get("priority", 999))):
         add(c.get("id"), "coder", c.get("priority"))
     # One row per reviewer, in chain order: this is the probe surface the
     # orchestrator reads to pick the earliest entry with capacity, so a backup
     # that is absent here cannot be failed over to on evidence.
     for aid in ids(inst.get("reviewer")):
         add(aid, "reviewer", None)
+    # Same rule for the scout chain, appended after the reviewers: the earliest
+    # scout WITH CAPACITY is the one dispatched, so an absent entry cannot be
+    # chosen on evidence and the failover the roster skill promises is lost.
+    for aid in ids(inst.get("scout")):
+        add(aid, "scout", None)
+    # Same rule again for the integrator chain, appended after the scouts: the
+    # earliest integrator with capacity is the one dispatched, so a backup
+    # missing here cannot be failed over to on evidence.
+    for aid in ids(inst.get("integrator")):
+        add(aid, "integrator", None)
     return entries
 
 

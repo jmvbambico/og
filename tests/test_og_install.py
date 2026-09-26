@@ -7,6 +7,7 @@ OMNI/STATE constants rather than the real ~/.omnigent.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shlex
@@ -317,6 +318,27 @@ def test_validate_prompt_ceiling_fires_for_an_argv_backup_behind_a_per_turn_prim
     assert any("over the" in msg and "Claude Code" in msg for msg in msgs), msgs
 
 
+def test_ceiling_error_pluralizes_when_two_argv_harnesses_are_named():
+    # Two argv entries are both bound by the tmux ceiling; "an argv-delivered
+    # harness (A, B)" reads as though only one were over it.
+    plan = _base_plan(orchestrator=[{"id": "claude", "priority": 1},
+                                    {"id": "codex", "priority": 2}])
+    over = "x" * (m.PROMPT_CEILING + 500)
+    msg = next(msg for level, msg in m.validate(plan, over)
+               if level == "error" and "over the" in msg)
+    assert "for argv-delivered harnesses (Claude Code, Codex (OpenAI))" in msg
+    assert "an argv-delivered harnesses" not in msg
+
+
+def test_ceiling_error_stays_singular_for_one_argv_harness():
+    plan = _base_plan(orchestrator="claude")
+    over = "x" * (m.PROMPT_CEILING + 500)
+    msg = next(msg for level, msg in m.validate(plan, over)
+               if level == "error" and "over the" in msg)
+    assert "for an argv-delivered harness (Claude Code)" in msg
+    assert "harnesses" not in msg
+
+
 def test_validate_prompt_ceiling_warns_for_an_argv_backup_behind_a_per_turn_primary():
     # Same chain inside the 800-byte warn band: the hazard is real (that backup
     # is the one that launches) and must surface even though the head has no
@@ -459,6 +481,43 @@ def test_chain_priority_comes_from_array_order():
     assert [e["priority"] for e in plan["coders"]] == [1, 2]
 
 
+def test_role_table_is_the_single_source_of_truth(monkeypatch):
+    """One declarative table (ROLES) is what every per-role branch reads, so a
+    new role is a row rather than a new literal tuple in normalize_plan(),
+    account_entries(), validate(), apply(), render_*() and emit_questions()
+    that drifts from the others. Proven by moving the table and watching the
+    plumbing follow it, not by restating the role list by hand."""
+    assert [r.key for r in m.ROLES] == ["orchestrator", "coders", "reviewer",
+                                        "scout", "integrator"]
+    # The spec-rendering subset is derived from the same rows, not a second list.
+    assert m.SPEC_ROLES == [r for r in m.ROLES if r.spec]
+    assert [r.key for r in m.SPEC_ROLES] == ["coders", "reviewer", "scout",
+                                             "integrator"]
+    # Every registry role a row names is one some registry row actually offers.
+    for r in m.ROLES:
+        assert any(r.role in a["roles"] for a in m.REGISTRY["agents"]), r.key
+    # reviewer_names() is a thin alias of the generic helper, not a copy of it.
+    plan = _chain_plan(reviewer=[{"id": "codex", "priority": 1, "model": None},
+                                 {"id": "kiro", "priority": 2, "model": "auto"}])
+    assert m.role_names(plan, "reviewer") == ["reviewer", "reviewer_2"]
+    assert m.reviewer_names(plan) == m.role_names(plan, "reviewer")
+
+    # A role added to the table is normalized and named with no other change...
+    # (a hypothetical role, since every real one now has a row of its own).
+    extra = m.Role("fuzzer", "fuzzer", "fuzzer.yaml.tmpl",
+                   multi=False, spec=True, optional=True, ask="x")
+    monkeypatch.setattr(m, "ROLES", [*m.ROLES, extra])
+    moved = {"orchestrator": "claude", "fuzzer": ["codex", "kiro"]}
+    m.normalize_plan(moved)
+    assert moved["fuzzer"] == [{"id": "codex", "priority": 1},
+                               {"id": "kiro", "priority": 2}]
+    assert m.role_names(moved, "fuzzer") == ["fuzzer", "fuzzer_2"]
+    # ...and a key the table does NOT declare is left alone, never guessed at.
+    untouched = {"mystery": "codex"}
+    m.normalize_plan(untouched)
+    assert untouched == {"mystery": "codex"}
+
+
 def test_validate_and_render_accept_the_old_singleton_shape():
     # The read path never mutates the caller's plan into a list; readers
     # normalize on the way in, so a legacy dict keeps validating and rendering.
@@ -589,6 +648,119 @@ def test_render_reviewer_can_target_a_chain_entry_by_name():
     backup = yaml.safe_load(m.render_reviewer(plan, m.chain(plan, "reviewer")[1], "reviewer_2"))
     assert backup["name"] == "reviewer_2"
     assert backup["executor"]["model"] == "auto"
+
+
+# --------------------------------------------------------------------------
+# scout -- an optional read-only worker, a chain like the reviewer
+# --------------------------------------------------------------------------
+def test_plan_without_a_scout_installs_with_none(tmp_path, monkeypatch):
+    """scout is OPTIONAL: omitting the key must produce a correct bundle with no
+    scout spec on disk and no dangling reference in the orchestrator's agent
+    list or prompt, so a user who does not want one is never charged for it."""
+    plan = _chain_plan()
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    assert not (bundle / "agents" / "scout").exists()
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert "scout" not in orch["tools"]["agents"]
+    assert "scout" not in m.render_orchestrator(plan)
+
+
+def test_an_old_install_with_no_scout_key_still_loads():
+    # Backward compatibility, as for the reviewer chain: a plan written before
+    # the role existed carries no scout key and must keep loading, validating
+    # and rendering unchanged rather than erroring on a missing role.
+    plan = _base_plan()
+    assert "scout" not in plan
+    assert m.chain(plan, "scout") == []
+    assert m.role_names(plan, "scout") == []
+    assert "scout" not in m.normalize_plan(dict(plan))
+    assert not [msg for _, msg in m.validate(plan) if "scout" in msg]
+
+
+def test_two_scout_chain_emits_a_spec_per_entry_with_its_own_pin(tmp_path, monkeypatch):
+    plan = _chain_plan(scout=[{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"},
+                              {"id": "codex", "priority": 2, "model": "gpt-5.5"}])
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    primary = yaml.safe_load((bundle / "agents" / "scout" / "config.yaml").read_text())
+    backup = yaml.safe_load((bundle / "agents" / "scout_2" / "config.yaml").read_text())
+    assert primary["name"] == "scout"
+    assert primary["executor"]["model"] == "moonshotai/kimi-k3"
+    assert primary["executor"]["config"]["harness"] == "acp:command-code"
+    assert backup["name"] == "scout_2"
+    assert backup["executor"]["model"] == "gpt-5.5"
+    assert backup["executor"]["config"]["harness"] == "codex-native"
+    # Both are reachable: tools.agents is the only dispatch surface, and the
+    # count in the prompt must match what is actually listed.
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert orch["tools"]["agents"] == ["coder_zen", "reviewer", "scout", "scout_2"]
+    assert "four sub-agents" in orch["prompt"]
+
+
+def test_scout_template_carries_the_read_only_contract():
+    plan = _base_plan(scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+    parsed = yaml.safe_load(m.render_scout(plan))
+    prompt = " ".join(parsed["prompt"].split())
+    assert "READ-ONLY" in prompt
+    assert "never edit, create or delete a file" in prompt
+    assert "never commit" in prompt
+    # The bounded answer is the whole point: a scout that pastes whole files
+    # back into the orchestrator's context has failed its purpose.
+    assert "BOUNDED SUMMARY" in prompt
+    assert "NOT file dumps" in prompt
+    assert "could not find something, say so plainly" in prompt
+    # ...and it is a normal worker spec: pinned model, named harness, skills off.
+    assert parsed["executor"]["model"] == "moonshotai/kimi-k3"
+    assert parsed["skills"] == "none"
+
+
+def test_scout_read_only_is_stated_as_trusted_not_sandboxed():
+    """The read-only rule is a CONTRACT the scout honours, not a policy that
+    stops it: blast_radius only denies force-push/rm -rf/hard-reset, gate_pushes
+    only blocks pushes, and an acp-user scout runs bypassPermissions. So the spec
+    prompt must say so to the scout, and the roster must tell the orchestrator it
+    cannot rely on the sandbox to keep a scout from writing."""
+    plan = _base_plan(scout=[{"id": "codex", "model": None}])
+    prompt = " ".join(yaml.safe_load(m.render_scout(plan))["prompt"].split())
+    assert "READ-ONLY IS A CONTRACT, NOT A SANDBOX" in prompt
+    assert "bug in your own reasoning" in prompt
+    skill = m.render_roster_skill(plan)
+    assert "TRUSTED, not sandboxed" in skill
+    assert "depends on it not writing" in skill
+
+
+def test_a_none_scout_warns_for_the_primary_and_the_backup():
+    # cursor and gemini are prompt_delivery: none. As scout entries they never
+    # see scout.yaml.tmpl, so BOTH the read-only and the bounded-answer rules
+    # must be inlined -- and the backup is reached exactly when the primary is
+    # dry, so it must warn too, not only the head.
+    plan = _base_plan(scout=[{"id": "cursor", "priority": 1, "model": None},
+                             {"id": "gemini", "priority": 2, "model": None}])
+    warnings = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert sum("never receives the scout contract" in msg for msg in warnings) == 2, warnings
+    # A scout on a delivering harness gets no such warning.
+    quiet = _base_plan(scout=[{"id": "codex", "model": None}])
+    assert not [msg for _, msg in m.validate(quiet) if "scout contract" in msg]
+
+
+def test_scout_gets_an_inline_roster_bullet_only_when_installed():
+    roster = m.render_roster(_base_plan(scout=[{"id": "codex", "model": None}]))
+    assert "`scout`" in roster and "Read-only" in roster
+    assert "`scout`" not in m.render_roster(_base_plan())
+
+
+def test_emit_questions_offers_scout_as_an_ordered_chain(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex", "cmdcode": "/bin/cmd"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    scout = next(x for x in q["questions"] if x["key"] == "scout")
+    assert scout["type"] == "ordered_multi"
+    assert set(scout["choices"]) == {"codex", "cmdcode"}
+    # ...with the same model-pin surface as coders and the reviewer.
+    assert "choices" in scout["per_item"]
 
 
 def test_show_renders_both_chains_in_order_with_the_primary_first(tmp_path, monkeypatch, capsys):
@@ -1340,6 +1512,253 @@ def test_roster_skill_says_so_when_there_is_only_one_reviewer():
     assert "is the primary" not in skill
 
 
+def test_roster_skill_names_the_scout_chain_in_order_and_states_the_rule():
+    """The scout's contract has to be in the skill because it is what makes the
+    role worth its prompt bytes: read-only, and a bounded answer. Same chain and
+    failover rule as the reviewers, since the backup is reached on a dry primary."""
+    plan = _base_plan(scout=[{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"},
+                             {"id": "kiro", "priority": 2, "model": "auto"}])
+    skill = m.render_roster_skill(plan)
+    assert "## Scouts — read-only repo reading" in skill
+    assert "`scout` (Command Code) is the primary" in skill
+    assert "`scout_2` (Kiro (AWS)) backs it up, in that order." in skill
+    for phrase in ("BOUNDED summary", "never a file dump", "READ-ONLY",
+                   "`og stats --agent <id> --json`", "earliest entry with capacity",
+                   "never re-send a"):
+        assert phrase in skill, phrase
+    assert skill.index("## `scout`") < skill.index("## `scout_2`")
+    # Each entry section carries its own harness, pin and quota shape.
+    assert "harness `acp:command-code`" in skill
+    assert "pinned `moonshotai/kimi-k3`" in skill
+    assert "`scout` -> `acp:command-code`" in skill
+    assert "`scout_2` -> `acp:kiro-aws`" in skill
+
+
+def test_roster_skill_has_no_scout_section_without_a_scout():
+    skill = m.render_roster_skill(_base_plan())
+    assert "## Scouts" not in skill
+    assert "is the only scout" not in skill
+    assert "## `scout" not in skill
+
+
+def test_roster_skill_scout_section_is_single_when_there_is_only_one():
+    skill = m.render_roster_skill(_base_plan(scout=[{"id": "codex", "model": None}]))
+    assert "`scout` (Codex (OpenAI)) is the only scout in this roster." in skill
+    assert "backs it up" not in skill
+
+
+def test_a_none_scout_backup_gets_its_own_roster_bullet():
+    # cursor is prompt_delivery: none. A BACKUP scout drops the contract exactly
+    # like a primary would, so its section must restate the read-only rule and
+    # the bounded answer rather than assume the spec prompt arrived.
+    plan = _base_plan(scout=[{"id": "codex", "priority": 1, "model": None},
+                             {"id": "cursor", "priority": 2, "model": None}])
+    skill = m.render_roster_skill(plan)
+    backup = skill.split("## `scout_2`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in backup
+    assert "never edit, create or delete a file" in backup
+    assert "never a file dump" in backup
+    primary = skill.split("## `scout`")[1].split("## `scout_2`")[0]
+    assert "Does not receive" not in primary     # codex delivers its prompt
+
+
+# --------------------------------------------------------------------------
+# integrator -- an optional git/gate plumbing worker, a chain like the scout
+# --------------------------------------------------------------------------
+def test_plan_without_an_integrator_installs_with_none(tmp_path, monkeypatch):
+    """integrator is OPTIONAL: omitting the key must produce a correct bundle
+    with no integrator spec on disk and no dangling reference in the
+    orchestrator's agent list or prompt, so a user who does not want one is
+    never charged for it."""
+    plan = _chain_plan()
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    assert not (bundle / "agents" / "integrator").exists()
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert "integrator" not in orch["tools"]["agents"]
+    assert "integrator" not in m.render_orchestrator(plan)
+    assert "integrator" not in m.render_roster(plan)
+
+
+def test_an_old_install_with_no_integrator_key_still_loads():
+    # Backward compatibility, as for the scout: a plan written before the role
+    # existed carries no integrator key and must keep loading, validating and
+    # rendering unchanged rather than erroring on a missing role.
+    plan = _base_plan()
+    assert "integrator" not in plan
+    assert m.chain(plan, "integrator") == []
+    assert m.role_names(plan, "integrator") == []
+    assert "integrator" not in m.normalize_plan(dict(plan))
+    assert not [msg for _, msg in m.validate(plan) if "integrator" in msg]
+
+
+def test_two_integrator_chain_emits_a_spec_per_entry_with_its_own_pin(tmp_path, monkeypatch,
+                                                                     capsys):
+    plan = _chain_plan(integrator=[{"id": "cmdcode", "priority": 1,
+                                    "model": "moonshotai/kimi-k3"},
+                                   {"id": "codex", "priority": 2, "model": "gpt-5.5"}])
+    _apply_into(tmp_path, monkeypatch, plan)
+    out = capsys.readouterr().out
+    # The apply summary names both entries, so a user sees the chain they got.
+    assert "integrator    Command Code → moonshotai/kimi-k3" in out, out
+    assert "integrator #2   integrator_2 (Codex (OpenAI)) → gpt-5.5" in out, out
+    bundle = tmp_path / "agents" / "test-agent"
+    primary = yaml.safe_load((bundle / "agents" / "integrator" / "config.yaml").read_text())
+    backup = yaml.safe_load((bundle / "agents" / "integrator_2" / "config.yaml").read_text())
+    assert primary["name"] == "integrator"
+    assert primary["executor"]["model"] == "moonshotai/kimi-k3"
+    assert primary["executor"]["config"]["harness"] == "acp:command-code"
+    assert backup["name"] == "integrator_2"
+    assert backup["executor"]["model"] == "gpt-5.5"
+    assert backup["executor"]["config"]["harness"] == "codex-native"
+    # Both are reachable: tools.agents is the only dispatch surface, and the
+    # count in the prompt must match what is actually listed.
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert orch["tools"]["agents"] == ["coder_zen", "reviewer", "integrator", "integrator_2"]
+    assert "four sub-agents" in orch["prompt"]
+
+
+def test_integrator_template_carries_the_bounded_and_never_merge_contract():
+    plan = _base_plan(integrator=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+    parsed = yaml.safe_load(m.render_integrator(plan))
+    prompt = " ".join(parsed["prompt"].split())
+    # The bounded result IS the role: an integrator that pastes a full diff back
+    # has re-inflated the context it exists to keep clear.
+    assert "BOUNDED" in prompt
+    assert "a full `git log` or a full passing log back has FAILED ITS PURPOSE" in prompt
+    assert "ONLY the failing output" in prompt
+    # The merge boundary: it never decides, and never pushes or opens a PR.
+    assert "THE MERGE DECISION IS NOT YOURS" in prompt
+    assert "NEVER merge into a protected branch" in prompt
+    assert "never `git push`" in prompt
+    assert "never open or merge a pull request" in prompt
+    assert "only when" in prompt and "explicitly told to" in prompt
+    # The concurrency hazard: the integration suite runs in exactly one place.
+    assert "EXACTLY ONE PLACE AT A TIME" in prompt
+    assert "another integrator" in prompt
+    # ...and it is a normal write worker: pinned model, named harness, skills off.
+    assert parsed["executor"]["model"] == "moonshotai/kimi-k3"
+    assert parsed["skills"] == "none"
+
+
+def test_a_none_integrator_warns_for_the_primary_and_the_backup():
+    # cursor and gemini are prompt_delivery: none. As integrator entries they
+    # never see integrator.yaml.tmpl, so BOTH the bounded-result rule and the
+    # never-decide-a-merge rule must be inlined -- and the backup is reached
+    # exactly when the primary is dry, so it must warn too, not only the head.
+    plan = _base_plan(integrator=[{"id": "cursor", "priority": 1, "model": None},
+                                  {"id": "gemini", "priority": 2, "model": None}])
+    warnings = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert sum("never receives the integrator contract" in msg for msg in warnings) == 2, warnings
+    # An integrator on a delivering harness gets no such warning.
+    quiet = _base_plan(integrator=[{"id": "codex", "model": None}])
+    assert not [msg for _, msg in m.validate(quiet) if "integrator contract" in msg]
+
+
+def test_integrator_gets_an_inline_roster_bullet_only_when_installed():
+    roster = m.render_roster(_base_plan(integrator=[{"id": "codex", "model": None}]))
+    assert "`integrator`" in roster and "never decides a merge" in roster
+    assert "`integrator`" not in m.render_roster(_base_plan())
+
+
+def test_emit_questions_offers_integrator_as_an_ordered_chain(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex", "cmdcode": "/bin/cmd"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    ig = next(x for x in q["questions"] if x["key"] == "integrator")
+    assert ig["type"] == "ordered_multi"
+    assert set(ig["choices"]) == {"codex", "cmdcode"}
+    # ...with the same model-pin surface as coders, the reviewer and the scout.
+    assert "choices" in ig["per_item"]
+
+
+def test_emit_questions_marks_the_optional_roles_optional(monkeypatch, capsys):
+    """AGENTS.md Part 1 drives an AI install from --questions. The interactive
+    path asks yes/no for an optional role, so that JSON is the only signal a
+    non-interactive installer gets that scout and integrator may be omitted."""
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    opts = {x["key"]: x.get("optional") for x in q["questions"] if x["key"] in
+            {r.key for r in m.ROLES}}
+    assert opts == {"orchestrator": False, "coders": False, "reviewer": False,
+                    "scout": True, "integrator": True}
+    # Only role questions carry the field -- no other question invents one.
+    assert sum("optional" in x for x in q["questions"]) == len(m.ROLES)
+
+
+def test_roster_skill_names_the_integrator_chain_in_order_and_states_the_rules():
+    """The integrator's contract has to be in the skill because it is what
+    makes the role safe: a bounded result, no merge decision, and one integrator
+    at a time. Same chain and failover rule as the reviewers and scouts."""
+    plan = _base_plan(integrator=[{"id": "cmdcode", "priority": 1,
+                                   "model": "moonshotai/kimi-k3"},
+                                  {"id": "kiro", "priority": 2, "model": "auto"}])
+    skill = m.render_roster_skill(plan)
+    assert "## Integrators — git and gate plumbing" in skill
+    assert "`integrator` (Command Code) is the primary" in skill
+    assert "`integrator_2` (Kiro (AWS)) backs it up, in that order." in skill
+    for phrase in ("BOUNDED", "only the", "FAILING gate output",
+                   "**The merge decision is yours, never the integrator's.**",
+                   "merges into a protected branch, never pushes", "never opens or",
+                   "**One integrator at a time.**", "exactly ONE",
+                   "`og stats --agent <id> --json`", "earliest entry with capacity",
+                   "never re-send a dispatch"):
+        assert phrase in skill, phrase
+    assert skill.index("## `integrator`") < skill.index("## `integrator_2`")
+    # Each entry section carries its own harness, pin and quota shape.
+    assert "harness `acp:command-code`" in skill
+    assert "pinned `moonshotai/kimi-k3`" in skill
+    assert "`integrator` -> `acp:command-code`" in skill
+    assert "`integrator_2` -> `acp:kiro-aws`" in skill
+
+
+def test_roster_skill_has_no_integrator_section_without_one():
+    skill = m.render_roster_skill(_base_plan())
+    assert "## Integrators" not in skill
+    assert "is the only integrator" not in skill
+    assert "## `integrator" not in skill
+
+
+def test_roster_skill_integrator_section_is_single_when_there_is_only_one():
+    skill = m.render_roster_skill(_base_plan(integrator=[{"id": "codex", "model": None}]))
+    assert "`integrator` (Codex (OpenAI)) is the only integrator in this roster." in skill
+    assert "backs it up" not in skill
+
+
+def test_a_none_integrator_backup_gets_its_own_roster_bullet():
+    # cursor is prompt_delivery: none. A BACKUP integrator drops the contract
+    # exactly like a primary would, so its section must restate the bounded
+    # result, the never-decide-a-merge rule and the one-at-a-time rule.
+    plan = _base_plan(integrator=[{"id": "codex", "priority": 1, "model": None},
+                                  {"id": "cursor", "priority": 2, "model": None}])
+    skill = m.render_roster_skill(plan)
+    backup = skill.split("## `integrator_2`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in backup
+    assert "BOUNDED result" in backup
+    assert "never opening or merging a PR" in backup
+    assert "never running the integration suite while" in backup
+    primary = skill.split("## `integrator`")[1].split("## `integrator_2`")[0]
+    assert "Does not receive" not in primary     # codex delivers its prompt
+
+
+def test_roster_skill_stats_id_map_names_every_chain_role():
+    """The og-stats id-mapping sentence is generated from the role table, so a
+    chain role added later cannot leave it stale -- it read
+    `reviewer`/`scout` once integrator landed."""
+    skill = m.render_roster_skill(_base_plan(
+        scout=[{"id": "codex", "model": None}],
+        integrator=[{"id": "cmdcode", "model": None}]))
+    assert "`reviewer`/`scout`/`integrator` map to their chain's agent ids" in skill
+    # Generated, not hardcoded: the table's singleton spec roles, in order.
+    expected = "/".join(f"`{r.key}`" for r in m.SPEC_ROLES if not r.multi)
+    assert expected == "`reviewer`/`scout`/`integrator`"
+
+
 # --------------------------------------------------------------------------
 # prompt diet: guidance moved out of the argv prompt into the roster skill
 #
@@ -1450,6 +1869,63 @@ def test_orchestrator_prompt_leaves_headroom_for_a_four_coder_roster():
     # The installer itself must not warn about the ceiling: its warn band starts
     # 800 below it, so a 1,200-byte margin is comfortably outside.
     assert not any("ceiling" in msg for _, msg in m.validate(FOUR_CODER_PLAN, body))
+
+
+FOUR_CODER_PLAN_SCOUT = dict(
+    FOUR_CODER_PLAN, scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+
+
+def test_orchestrator_prompt_leaves_headroom_with_a_scout_installed():
+    """The acceptance bar for the scout task: a four-coder roster PLUS the
+    optional scout must still clear 900 bytes of headroom. Below that, the
+    integrator role that follows has nothing to spend, and a later regression
+    that re-inflates the prompt fails here rather than at tmux launch."""
+    body = _prompt_body(m.render_orchestrator(FOUR_CODER_PLAN_SCOUT))
+    quoted = len(shlex.quote(body).encode())
+    headroom = m.PROMPT_CEILING - quoted
+    assert headroom >= 900, f"{quoted} quoted, {headroom} headroom"
+    assert not any("ceiling" in msg for _, msg in m.validate(FOUR_CODER_PLAN_SCOUT, body))
+
+
+def test_orchestrator_prompt_names_scout_only_when_installed():
+    with_scout = m.render_orchestrator(FOUR_CODER_PLAN_SCOUT)
+    assert "`scout`" in with_scout
+    assert "read-only, never edits or commits" in with_scout
+    # The existing tension survives: a quick look to scope a dispatch is still
+    # fine, so the prompt does not tell the brain to delegate every read.
+    assert "quick look at a file or two" in with_scout
+    assert "`scout`" not in m.render_orchestrator(FOUR_CODER_PLAN)
+
+
+FOUR_CODER_PLAN_INTEGRATOR = dict(
+    FOUR_CODER_PLAN_SCOUT, integrator=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+
+
+def test_orchestrator_prompt_keeps_the_merge_decision_and_leaves_headroom():
+    """The acceptance bar for the integrator task: a four-coder roster PLUS the
+    optional scout AND integrator must still clear 550 bytes of headroom, and
+    the one safety-critical clause stays INLINE — an orchestrator that had to
+    read a skill to learn it must not delegate a merge could delegate one."""
+    rendered = m.render_orchestrator(FOUR_CODER_PLAN_INTEGRATOR)
+    assert "`integrator`" in rendered
+    assert "NEVER decides a merge" in rendered
+    assert "that\n  decision stays with you" in rendered or \
+        "decision stays with you" in rendered
+    body = _prompt_body(rendered)
+    quoted = len(shlex.quote(body).encode())
+    headroom = m.PROMPT_CEILING - quoted
+    assert headroom >= 550, f"{quoted} quoted, {headroom} headroom"
+    # It works and is NOT refused, but it spends into the 800-byte warn band:
+    # the installer must SAY SO rather than refuse, and the harness still
+    # launches. A regression that re-inflates the prompt silently would not.
+    msgs = [msg for _, msg in m.validate(FOUR_CODER_PLAN_INTEGRATOR, body)]
+    assert any("ceiling" in msg for msg in msgs), msgs
+    assert not any("over the" in msg for msg in msgs), msgs
+
+
+def test_orchestrator_prompt_names_integrator_only_when_installed():
+    assert "`integrator`" not in m.render_orchestrator(FOUR_CODER_PLAN_SCOUT)
+    assert "`integrator`" in m.render_orchestrator(FOUR_CODER_PLAN_INTEGRATOR)
 
 
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
@@ -2189,3 +2665,73 @@ def test_registry_comment_documents_the_role_unverified_fields():
     comment = "\n".join(m.REGISTRY["$comment"])
     assert "unverified_roles" in comment
     assert "roles_note" in comment
+
+
+# --------------------------------------------------------------------------
+# the ROLES table is not the whole story: pin the hand-written per-role sites
+# --------------------------------------------------------------------------
+# A prose count in the ROLES comment of the per-role sites the table does NOT
+# drive was wrong three times running (two, then four, then "eight" that also
+# misclassified two table-driven functions). A count of a scattered invariant
+# rots by construction -- each version was true of the code its author read and
+# wrong about the rest -- so this test stops describing the set and asserts it.
+#
+# It parses each module and collects every function -- at any nesting depth,
+# including class methods -- whose body names a role key. Adding a role that
+# introduces a NEW hand-written site fails here, forcing the author to either
+# generalize the site or add it to the pin below deliberately. Deliberately
+# over-broad: an accessor such as role_names(plan, "scout") counts as a site
+# too, because a false positive that forces a look beats a false negative that
+# hides a site. Excluded: the ROLES table itself (a declaration, not a branch),
+# and it is not a function, so the scan skips it for free.
+#
+# ROLE_KEYS is derived from ROLES, never hardcoded: a hardcoded set is blind to
+# the exact case this test exists for, since a NEW role's key would not be in it
+# and its hand-written sites would be invisible to the scan.
+ROLE_KEYS = {r.key for r in m.ROLES}
+PER_ROLE_SITES = {
+    "og_install.py": {
+        "apply",
+        "build_plan_interactive",
+        "integrator_note",
+        "opencode_worker_config_dir",
+        "patch_global_config",
+        "render_integrator",
+        "render_orchestrator",
+        "render_reviewer",
+        "render_roster",
+        "render_roster_skill",
+        "render_scout",
+        "render_vendor_map",
+        "reviewer_names",
+        "role_options",
+        "scout_note",
+        "show",
+        "validate",
+    },
+    "og_stats.py": {"lineup"},
+}
+
+
+def _functions_naming_a_role(path):
+    found = set()
+    for node in ast.walk(ast.parse(Path(path).read_text())):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and sub.value in ROLE_KEYS:
+                found.add(node.name)
+                break
+    return found
+
+
+def test_per_role_sites_are_pinned():
+    measured = {
+        module: _functions_naming_a_role(REPO / "installer" / module)
+        for module in PER_ROLE_SITES
+    }
+    assert measured == PER_ROLE_SITES, (
+        "the per-role site set changed. A new hand-written site names a role key: "
+        "generalize it, or add its function to PER_ROLE_SITES. Or a pinned site "
+        "was renamed or removed: update PER_ROLE_SITES to match."
+    )
