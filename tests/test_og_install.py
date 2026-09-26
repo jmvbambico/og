@@ -1584,6 +1584,32 @@ def test_orchestrator_prompt_leaves_headroom_for_a_four_coder_roster():
     assert not any("ceiling" in msg for _, msg in m.validate(FOUR_CODER_PLAN, body))
 
 
+FOUR_CODER_PLAN_SCOUT = dict(
+    FOUR_CODER_PLAN, scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+
+
+def test_orchestrator_prompt_leaves_headroom_with_a_scout_installed():
+    """The acceptance bar for the scout task: a four-coder roster PLUS the
+    optional scout must still clear 900 bytes of headroom. Below that, the
+    integrator role that follows has nothing to spend, and a later regression
+    that re-inflates the prompt fails here rather than at tmux launch."""
+    body = _prompt_body(m.render_orchestrator(FOUR_CODER_PLAN_SCOUT))
+    quoted = len(shlex.quote(body).encode())
+    headroom = m.PROMPT_CEILING - quoted
+    assert headroom >= 900, f"{quoted} quoted, {headroom} headroom"
+    assert not any("ceiling" in msg for _, msg in m.validate(FOUR_CODER_PLAN_SCOUT, body))
+
+
+def test_orchestrator_prompt_names_scout_only_when_installed():
+    with_scout = m.render_orchestrator(FOUR_CODER_PLAN_SCOUT)
+    assert "`scout`" in with_scout
+    assert "read-only, never edits or commits" in with_scout
+    # The existing tension survives: a quick look to scope a dispatch is still
+    # fine, so the prompt does not tell the brain to delegate every read.
+    assert "quick look at a file or two" in with_scout
+    assert "`scout`" not in m.render_orchestrator(FOUR_CODER_PLAN)
+
+
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", _fake_run(
         "opencode/mimo-v2.5-free\nopencode/glm-5\ndeepseek/deepseek-chat\n"))

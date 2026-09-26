@@ -1459,6 +1459,30 @@ def zen_preflight_note(name: str) -> str:
         "failed dispatch, not a slower one.")
 
 
+def scout_note(plan: dict) -> str:
+    """The scout pointer for the prompt, or "" when no scout is installed.
+
+    Only the part the orchestrator must know BEFORE it decides to read
+    anything: the role exists, it is read-only, and sending it the reading is
+    cheaper than doing it here. The chain, the failover rule and the full
+    read-only contract live in the generated `roster` skill, which loads from
+    disk and costs the command line nothing. The existing tension is kept — a
+    quick look at a file or two to scope a dispatch is still fine, because a
+    scout round trip is not free — rather than telling the brain to delegate
+    every read, which would cost more round trips than it saves.
+
+    Trailing newline when present so the paragraph keeps its blank line before
+    the next section; empty otherwise, which leaves the template byte-identical
+    for a plan with no scout.
+    """
+    if not chain(plan, "scout"):
+        return ""
+    return ("  Reading beyond that quick look — locating code, `grep`-style searches,\n"
+            "  git state — goes to `scout`: read-only, never edits or commits, answers\n"
+            "  with a bounded summary. Take its answer rather than reading the files\n"
+            "  yourself.\n")
+
+
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()
     s = tmpl("orchestrator.yaml.tmpl")
@@ -1477,6 +1501,7 @@ def render_orchestrator(plan: dict) -> str:
         "{{ORCHESTRATOR_HARNESS}}": reg[primary(plan, "orchestrator")["id"]]["harness"],
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
+        "{{SCOUT_NOTE}}": scout_note(plan),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
         "{{AGENT_COUNT_WORD}}": _count_word(sum(len(chain(plan, r.key))
