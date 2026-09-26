@@ -1661,6 +1661,25 @@ def test_list_models_drops_cmd_section_headings_and_docs_line(monkeypatch):
         assert junk not in got
 
 
+def test_validate_errors_on_an_impossible_required_and_unpinnable_model(monkeypatch):
+    """A row that both demands a pin (`model.required`) and forbids offering one
+    (`model.pinnable: false`) is self-contradictory: pick_model skips the
+    question, so the worker runs unpinned and inherits the orchestrator's model
+    id -- the exact failure `required` exists to prevent. No real row does this;
+    the guard is for the next registry edit, so a synthetic row exercises it."""
+    row = {
+        "id": "contradiction", "label": "Contradiction", "harness": "acp:contradiction",
+        "kind": "acp-user", "binary": "contradiction", "vendor": "test",
+        "roles": ["coder"], "relay": False, "silent_model_failure": False,
+        "prompt_delivery": "unknown",
+        "model": {"required": True, "pinnable": False, "pin_path": "executor.model"},
+    }
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], row]})
+    plan = _base_plan(coders=[{"id": "contradiction", "priority": 1, "model": None}])
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("model.required true and model.pinnable false" in msg for msg in errors), errors
+
+
 # --------------------------------------------------------------------------
 # unresolved {shim:...} tokens are refused + shim paths survive spaces
 # --------------------------------------------------------------------------

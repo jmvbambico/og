@@ -720,6 +720,23 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     reg = agents_by_id()
     issues = []
 
+    # A row declaring both `model.required` (a dispatch MUST pin a model) and
+    # `model.pinnable: false` (the installer must never offer one) is
+    # self-contradictory: `pick_model` skips the question, so the worker runs
+    # unpinned and inherits the ORCHESTRATOR's model id -- the exact failure
+    # `required` exists to prevent, now silent. Refuse it. No row does this
+    # today; the guard is here so the next registry edit cannot slip it past.
+    for aid in sorted({plan["orchestrator"], plan["reviewer"]["id"]}
+                      | {c["id"] for c in plan["coders"]}):
+        spec = reg[aid].get("model") or {}
+        if spec.get("required") and not spec.get("pinnable", True):
+            issues.append(("error",
+                           f"{reg[aid]['label']} declares model.required true and "
+                           "model.pinnable false. The installer would never ask "
+                           "for the pin, so the worker runs unpinned and inherits "
+                           "the orchestrator's model id. Drop one of the two in "
+                           "the registry row."))
+
     for c in plan["coders"]:
         spec = reg[c["id"]].get("model") or {}
         if spec.get("required") and not c.get("model"):
