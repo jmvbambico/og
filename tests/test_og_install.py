@@ -224,6 +224,46 @@ def test_validate_warns_when_a_coder_never_receives_its_prompt():
     assert any("never receive their sub-agent prompt" in msg for _, msg in issues)
 
 
+def test_validate_warns_when_a_reviewer_never_receives_its_prompt():
+    # cursor is prompt_delivery: none. As reviewer its whole contract lives in
+    # reviewer.yaml.tmpl and would be dropped, so validate must warn.
+    plan = _base_plan(reviewer={"id": "cursor", "model": None})
+    issues = m.validate(plan)
+    assert any(level == "warn" and "never receives the review contract" in msg
+               for level, msg in issues)
+
+
+def test_validate_no_reviewer_mute_warning_for_a_delivering_reviewer():
+    # argv (codex) and per_turn (opencode) both deliver the spec prompt, so
+    # neither triggers the reviewer warning.
+    for rid in ("codex", "opencode"):
+        plan = _base_plan(reviewer={"id": rid, "model": None})
+        assert not any("never receives the review contract" in msg
+                       for _, msg in m.validate(plan)), rid
+
+
+def test_validate_coder_and_reviewer_mute_warnings_are_independent():
+    # gemini is a `none` coder, cursor a `none` reviewer. Each warns on its own
+    # with distinct wording; when both apply, both messages appear.
+    coder_only = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}])
+    coder_msgs = [msg for _, msg in m.validate(coder_only)]
+    assert any("never receive their sub-agent prompt" in msg for msg in coder_msgs)
+    assert not any("never receives the review contract" in msg for msg in coder_msgs)
+
+    reviewer_only = _base_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}],
+        reviewer={"id": "cursor", "model": None})
+    rev_msgs = [msg for _, msg in m.validate(reviewer_only)]
+    assert not any("never receive their sub-agent prompt" in msg for msg in rev_msgs)
+    assert any("never receives the review contract" in msg for msg in rev_msgs)
+
+    both = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}],
+                      reviewer={"id": "cursor", "model": None})
+    both_msgs = [msg for _, msg in m.validate(both)]
+    assert any("never receive their sub-agent prompt" in msg for msg in both_msgs)
+    assert any("never receives the review contract" in msg for msg in both_msgs)
+
+
 def test_validate_prompt_ceiling_error_and_warn_boundaries():
     plan = _base_plan()
     under = "x" * (m.PROMPT_CEILING - 1000)
@@ -851,6 +891,21 @@ def test_render_roster_skill_renders_cline_concurrency_note(monkeypatch):
     rendered = m.render_roster_skill(plan)
     assert rendered.count("**One session at a time.**") == 1
     assert "never dispatch two tasks to `coder_cline` in the same turn" in rendered
+
+
+def test_render_roster_skill_reviewer_mute_bullet_only_for_a_none_reviewer():
+    """A `none` reviewer never sees reviewer.yaml.tmpl, so its section must
+    restate the contract (diff as text, judge only against it, no edits, the
+    three-section report). A delivering reviewer gets no such bullet."""
+    mute = m.render_roster_skill(_base_plan(reviewer={"id": "cursor", "model": None}))
+    rv_section = mute.split("## `reviewer`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in rv_section
+    assert "never go looking for a worktree" in rv_section
+    assert "BLOCKING / NON-BLOCKING / SUGGESTIONS" in rv_section
+    assert "file:line" in rv_section
+
+    normal = m.render_roster_skill(_base_plan(reviewer={"id": "codex", "model": None}))
+    assert "**Does not receive its sub-agent prompt.**" not in normal
 
 
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
