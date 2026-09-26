@@ -1472,6 +1472,56 @@ def test_roster_skill_says_so_when_there_is_only_one_reviewer():
     assert "is the primary" not in skill
 
 
+def test_roster_skill_names_the_scout_chain_in_order_and_states_the_rule():
+    """The scout's contract has to be in the skill because it is what makes the
+    role worth its prompt bytes: read-only, and a bounded answer. Same chain and
+    failover rule as the reviewers, since the backup is reached on a dry primary."""
+    plan = _base_plan(scout=[{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"},
+                             {"id": "kiro", "priority": 2, "model": "auto"}])
+    skill = m.render_roster_skill(plan)
+    assert "## Scouts — read-only repo reading" in skill
+    assert "`scout` (Command Code) is the primary" in skill
+    assert "`scout_2` (Kiro (AWS)) backs it up, in that order." in skill
+    for phrase in ("BOUNDED summary", "never a file dump", "READ-ONLY",
+                   "`og stats --agent <id> --json`", "earliest entry with capacity",
+                   "never re-send a"):
+        assert phrase in skill, phrase
+    assert skill.index("## `scout`") < skill.index("## `scout_2`")
+    # Each entry section carries its own harness, pin and quota shape.
+    assert "harness `acp:command-code`" in skill
+    assert "pinned `moonshotai/kimi-k3`" in skill
+    assert "`scout` -> `acp:command-code`" in skill
+    assert "`scout_2` -> `acp:kiro-aws`" in skill
+
+
+def test_roster_skill_has_no_scout_section_without_a_scout():
+    skill = m.render_roster_skill(_base_plan())
+    assert "## Scouts" not in skill
+    assert "is the only scout" not in skill
+    assert "## `scout" not in skill
+
+
+def test_roster_skill_scout_section_is_single_when_there_is_only_one():
+    skill = m.render_roster_skill(_base_plan(scout=[{"id": "codex", "model": None}]))
+    assert "`scout` (Codex (OpenAI)) is the only scout in this roster." in skill
+    assert "backs it up" not in skill
+
+
+def test_a_none_scout_backup_gets_its_own_roster_bullet():
+    # cursor is prompt_delivery: none. A BACKUP scout drops the contract exactly
+    # like a primary would, so its section must restate the read-only rule and
+    # the bounded answer rather than assume the spec prompt arrived.
+    plan = _base_plan(scout=[{"id": "codex", "priority": 1, "model": None},
+                             {"id": "cursor", "priority": 2, "model": None}])
+    skill = m.render_roster_skill(plan)
+    backup = skill.split("## `scout_2`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in backup
+    assert "never edit, create or delete a file" in backup
+    assert "never a file dump" in backup
+    primary = skill.split("## `scout`")[1].split("## `scout_2`")[0]
+    assert "Does not receive" not in primary     # codex delivers its prompt
+
+
 # --------------------------------------------------------------------------
 # prompt diet: guidance moved out of the argv prompt into the roster skill
 #

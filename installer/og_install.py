@@ -1281,11 +1281,11 @@ def render_roster_skill(plan: dict) -> str:
         "and `og stats --agent <id> --json` before every later one. If `og` is missing",
         "or errors, proceed as today and say so once — do not stall the run on it.",
         "Map the stats output's agent ids back to workers by id: `coder_<id>` maps",
-        "to `<id>`, and `reviewer` maps to the reviewer's id. A worker whose state",
-        "is `dry` while `reset_at` is in the future is out of capacity — skip it and",
-        "take the next worker. Preference order still wins: only when two candidates",
-        "are otherwise equal does `ok` outrank `unknown`. `og stats` reports a",
-        "measured `ok` only when the probe actually answered; an inferred or unknown",
+        "to `<id>`, and `reviewer`/`scout` map to their chain's agent ids. A worker",
+        "whose state is `dry` while `reset_at` is in the future is out of capacity —",
+        "skip it and take the next worker. Preference order still wins: only when two",
+        "candidates are otherwise equal does `ok` outrank `unknown`. `og stats` reports",
+        "a measured `ok` only when the probe actually answered; an inferred or unknown",
         "state is not a clean bill of health.",
         "",
         "On a QUOTA failure — rate limit, usage cap, out of credits, Kilo's",
@@ -1405,6 +1405,70 @@ def render_roster_skill(plan: dict) -> str:
                        "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
                        "evidence. Do not assume it knows the review format.")
         out.append("")
+    # The scout chain, only when one is installed. Same chain rule and same
+    # per-entry voice as the reviewers above, plus the contract that makes the
+    # role worth its prompt bytes: read-only, and bounded.
+    sc_chain = chain(plan, "scout")
+    if sc_chain:
+        sc_names = role_names(plan, "scout")
+        listed = [f"`{n}` ({reg[e['id']]['label']})" for n, e in zip(sc_names, sc_chain)]
+        if len(listed) == 1:
+            order = f"{listed[0]} is the only scout in this roster."
+        else:
+            verb = "backs it up" if len(listed) == 2 else "back it up"
+            order = (f"{listed[0]} is the primary; {', '.join(listed[1:])} "
+                     f"{verb}, in that order.")
+        out += ["## Scouts — read-only repo reading", "",
+                order, "",
+                "Send `scout` the repo reading you would otherwise do yourself:",
+                "locating code, `grep`-style searches, git state (`status`, `log`,",
+                "`diff`, `rev-parse`, branch and worktree listings), and worker capacity",
+                "(`og stats`). It answers with a BOUNDED summary — paths with line ranges,",
+                "short excerpts, the shape of the answer — never a file dump; a scout that",
+                "pastes whole files has failed its purpose. Take its answer instead of",
+                "re-reading the files. It is READ-ONLY: it never edits, creates or deletes",
+                "a file, never commits, and never runs a command that mutates the repo or",
+                "the working tree, so when the answer needs a change it reports that",
+                "instead of making it.", "",
+                "Same chain rule as the reviewers: check `og stats` before the first",
+                "scout dispatch and `og stats --agent <id> --json` before every later one,",
+                "take the earliest entry with capacity, and move down only when one is",
+                "dry, dropped for the run, or already failed this run — never re-send a",
+                "question to a scout that already failed.", ""]
+        for name, e in zip(sc_names, sc_chain):
+            sc = reg[e["id"]]
+            pin = f", pinned `{e['model']}`" if e.get("model") else ""
+            out += [f"## `{name}` — {sc['label']}{pin}", "",
+                    f"- harness `{sc['harness']}`, vendor `{vendor_of(sc, e)}`",
+                    quota_line(sc), *quota_failure_lines(sc),
+                    "- **Read-only.** Never edits, creates or deletes a file, never",
+                    "  commits, never runs a command that mutates the repo or the working",
+                    "  tree. If the answer needs a change, it reports that instead of",
+                    "  making it.",
+                    "- **Bounded answer.** Paths with line ranges, short excerpts and the",
+                    "  shape of the answer — never a file dump.",
+                    "- **Says what it did not find.** It says so plainly rather than",
+                    "  guessing; a confident wrong answer is worse than \"not found\",",
+                    "  because you cannot tell the two apart."]
+            if sc.get("silent_model_failure"):
+                out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
+                           "transcript with no error, which reads as \"found nothing\" rather than "
+                           "\"misconfigured\" — check the pin before trusting an empty scout "
+                           "report, and do not re-send the same question.")
+            if sc.get("prompt_delivery") == "none":
+                # The same hazard as the reviewer bullet above, restated for the
+                # scout's contract. Rendered per entry: a BACKUP that never
+                # receives the contract is exactly as dangerous as a primary.
+                out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                           "delivers spec instructions, so the scout sees ONLY the text you send "
+                           "in `args.input`. Every scout dispatch must therefore carry the whole "
+                           "contract itself: READ-ONLY — never edit, create or delete a file, "
+                           "never commit, never run a command that mutates the repo or working "
+                           "tree, and report a needed change rather than making it — and a "
+                           "BOUNDED summary: paths with line ranges and short excerpts, never a "
+                           "file dump, and an explicit \"not found\" instead of a guess. Do not "
+                           "assume it knows the read-only rule.")
+            out.append("")
     return "\n".join(out)
 
 
