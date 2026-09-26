@@ -1337,7 +1337,12 @@ def render_orchestrator(plan: dict) -> str:
     s = tmpl("orchestrator.yaml.tmpl")
     # Every reviewer in the chain, not just the primary: tools.agents is the
     # only dispatch surface, so a backup omitted here is unreachable and the
-    # failover the roster skill promises cannot happen.
+    # failover the roster skill promises cannot happen. EACH backup grows the
+    # rendered prompt by an agent-list line here plus its roster lines in
+    # {{ROSTER_BULLETS}}, so headroom against PROMPT_CEILING shrinks per entry
+    # (1,401 bytes left with the measured four-coder roster). validate() refuses
+    # an argv chain over the ceiling, so the hazard stays guarded -- but a new
+    # chain entry spends bytes the prompt has to have.
     agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
     agent_list += "".join(f"\n    - {n}" for n in reviewer_names(plan))
     subs = {
@@ -2095,7 +2100,8 @@ def emit_questions() -> None:
              "ask": "Which agents review the batched diff, in preference order (first "
                     "is tried first; the next takes over when one is out of quota)? "
                     "Prefer a vendor that differs from every coder.",
-             "per_item": {"model": "Model id to pin for this reviewer.",
+             "per_item": {"model": "Model id to pin. REQUIRED for agents where "
+                                   "registry.model.required is true.",
                           "choices": model_choices}},
             {"key": "accounts", "type": "map",
              "ask": "For any agent with registry.multi_account.supported, should the "

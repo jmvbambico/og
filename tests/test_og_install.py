@@ -620,6 +620,12 @@ def test_emit_questions_offers_orchestrator_and_reviewer_as_ordered_chains(monke
     # AI installer can pin each entry of the chain.
     assert "choices" in next(x for x in q["questions"]
                              if x["key"] == "reviewer")["per_item"]
+    # ...and the same model REQUIREMENT wording: a reviewer pin is required
+    # exactly where a coder's is, so the prompt must carry the caveat too.
+    coder_model = next(x for x in q["questions"] if x["key"] == "coders")["per_item"]["model"]
+    reviewer_model = next(x for x in q["questions"] if x["key"] == "reviewer")["per_item"]["model"]
+    assert reviewer_model == coder_model
+    assert "REQUIRED" in reviewer_model
 
 
 # --------------------------------------------------------------------------
