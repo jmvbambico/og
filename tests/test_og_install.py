@@ -486,10 +486,12 @@ def test_role_table_is_the_single_source_of_truth(monkeypatch):
     account_entries(), validate(), apply(), render_*() and emit_questions()
     that drifts from the others. Proven by moving the table and watching the
     plumbing follow it, not by restating the role list by hand."""
-    assert [r.key for r in m.ROLES] == ["orchestrator", "coders", "reviewer", "scout"]
+    assert [r.key for r in m.ROLES] == ["orchestrator", "coders", "reviewer",
+                                        "scout", "integrator"]
     # The spec-rendering subset is derived from the same rows, not a second list.
     assert m.SPEC_ROLES == [r for r in m.ROLES if r.spec]
-    assert [r.key for r in m.SPEC_ROLES] == ["coders", "reviewer", "scout"]
+    assert [r.key for r in m.SPEC_ROLES] == ["coders", "reviewer", "scout",
+                                             "integrator"]
     # Every registry role a row names is one some registry row actually offers.
     for r in m.ROLES:
         assert any(r.role in a["roles"] for a in m.REGISTRY["agents"]), r.key
@@ -500,14 +502,15 @@ def test_role_table_is_the_single_source_of_truth(monkeypatch):
     assert m.reviewer_names(plan) == m.role_names(plan, "reviewer")
 
     # A role added to the table is normalized and named with no other change...
-    extra = m.Role("integrator", "integrator", "integrator.yaml.tmpl",
+    # (a hypothetical role, since every real one now has a row of its own).
+    extra = m.Role("fuzzer", "fuzzer", "fuzzer.yaml.tmpl",
                    multi=False, spec=True, optional=True, ask="x")
     monkeypatch.setattr(m, "ROLES", [*m.ROLES, extra])
-    moved = {"orchestrator": "claude", "integrator": ["codex", "kiro"]}
+    moved = {"orchestrator": "claude", "fuzzer": ["codex", "kiro"]}
     m.normalize_plan(moved)
-    assert moved["integrator"] == [{"id": "codex", "priority": 1},
-                                   {"id": "kiro", "priority": 2}]
-    assert m.role_names(moved, "integrator") == ["integrator", "integrator_2"]
+    assert moved["fuzzer"] == [{"id": "codex", "priority": 1},
+                               {"id": "kiro", "priority": 2}]
+    assert m.role_names(moved, "fuzzer") == ["fuzzer", "fuzzer_2"]
     # ...and a key the table does NOT declare is left alone, never guessed at.
     untouched = {"mystery": "codex"}
     m.normalize_plan(untouched)

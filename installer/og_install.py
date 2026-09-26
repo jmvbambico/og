@@ -613,6 +613,17 @@ ROLES = [
          multi=False, spec=True, optional=True,
          ask="Which agents answer repo reading, search and git-state questions "
              "as a read-only scout, in preference order (first is tried first)?"),
+    # A worker for the orchestrator's own git and gate plumbing — measured at
+    # 727 git calls / 725 kB of result bytes (diff, log, status, worktree,
+    # merge) plus 185 gate calls / 84 kB across 30 audited sessions, all of it
+    # mechanical and all of it otherwise ingested whole. Optional because it
+    # spends prompt bytes; a user who omits it gets a bundle with no integrator
+    # spec and no dangling reference.
+    Role("integrator", "integrator", "integrator.yaml.tmpl",
+         multi=False, spec=True, optional=True,
+         ask="Which agents run git, worktree and gate plumbing for the "
+             "orchestrator (they never decide a merge), in preference order "
+             "(first is tried first)?"),
 ]
 
 # Roles that render a sub-agent spec under <bundle>/agents/<name>. The
@@ -1048,6 +1059,29 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "file dump), and it must say plainly when something was not found. The "
                            "generated `roster` skill tells the orchestrator to do exactly that."))
 
+    # The integrator's version of the same hazard, with its own remedy. A `none`
+    # integrator never sees integrator.yaml.tmpl, so its whole contract must be
+    # inlined on every dispatch: missing the BOUNDED-result rule it pastes a
+    # full diff or log back into the orchestrator's context (the bytes the role
+    # exists to keep out), and missing the never-decide-a-merge rule it can
+    # decide one. Every entry in the chain is checked: a BACKUP that never
+    # receives the contract is exactly as dangerous as a primary that does not.
+    for ig in chain(plan, "integrator"):
+        if reg[ig["id"]].get("prompt_delivery") == "none":
+            issues.append(("warn",
+                           f"{reg[ig['id']]['label']} never receives the integrator "
+                           "contract in integrator.yaml.tmpl — that harness does not deliver "
+                           "spec instructions. Every integrator dispatch must therefore inline "
+                           "the whole contract itself: git and gate plumbing on the "
+                           "orchestrator's behalf (worktrees, the gate commands, the combined "
+                           "diff for review, commit SHAs and branch state) returning a BOUNDED "
+                           "result (the verdict, the SHAs, and only the FAILING gate output — "
+                           "never a full diff, log or passing log); NEVER merging into a protected "
+                           "branch, never pushing, never opening or merging a PR, and never "
+                           "deciding whether a merge is allowed; and never running the "
+                           "integration suite while another integrator may be running it. The "
+                           "generated `roster` skill tells the orchestrator to do exactly that."))
+
     # A role a row marks `unverified_roles` clears validate()'s gates but has
     # never been driven here -- grok/devin as orchestrator. The registry used to
     # record that only in a free-text `roles_note` nothing read, so a user
@@ -1161,8 +1195,9 @@ def render_roster(plan: dict) -> str:
     ordinals = ["FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH", "SIXTH"]
     rev_names = role_names(plan, "reviewer")
     sc_names = role_names(plan, "scout")
+    ig_names = role_names(plan, "integrator")
     names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] \
-        + [f"`{n}`" for n in rev_names + sc_names]
+        + [f"`{n}`" for n in rev_names + sc_names + ig_names]
     width = max(len(n) for n in names) + 1
     lines = []
     for i, c in enumerate(plan["coders"]):
@@ -1192,6 +1227,16 @@ def render_roster(plan: dict) -> str:
         lines.append(f"  - {f'`{name}`'.ljust(width)}{sc['label']} "
                      f"(`{sc['harness']}`){pin}. Read-only; never edits, commits "
                      "or mutates. Bounded summary only.")
+    # The integrator's two hard rules change a decision made BEFORE anything is
+    # read: that its answer is bounded (so delegating is worth the round trip),
+    # and that the merge decision is still the orchestrator's. Both stay inline
+    # rather than behind the roster skill, for the same reason as the scout's.
+    for name, e in zip(ig_names, chain(plan, "integrator")):
+        ig = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        lines.append(f"  - {f'`{name}`'.ljust(width)}{ig['label']} "
+                     f"(`{ig['harness']}`){pin}. Git/gate plumbing; bounded "
+                     "result; never decides a merge.")
     return "\n".join(lines)
 
 
@@ -1474,6 +1519,86 @@ def render_roster_skill(plan: dict) -> str:
                            "file dump, and an explicit \"not found\" instead of a guess. Do not "
                            "assume it knows the read-only rule.")
             out.append("")
+    # The integrator chain, only when one is installed. Same chain rule and
+    # same per-entry voice as the scouts above, plus the two contracts that
+    # make the role safe to hand the orchestrator's git plumbing to: a BOUNDED
+    # result, and no merge decision. The concurrency rule is restated because
+    # getting it wrong produces flaky failures that look like real bugs.
+    ig_chain = chain(plan, "integrator")
+    if ig_chain:
+        ig_names = role_names(plan, "integrator")
+        listed = [f"`{n}` ({reg[e['id']]['label']})" for n, e in zip(ig_names, ig_chain)]
+        if len(listed) == 1:
+            order = f"{listed[0]} is the only integrator in this roster."
+        else:
+            verb = "backs it up" if len(listed) == 2 else "back it up"
+            order = (f"{listed[0]} is the primary; {', '.join(listed[1:])} "
+                     f"{verb}, in that order.")
+        out += ["## Integrators — git and gate plumbing", "",
+                order, "",
+                "Send `integrator` the git and gate plumbing you would otherwise do",
+                "yourself: creating and removing worktrees, running the gate commands,",
+                "collecting diffs and producing the combined diff text for a review,",
+                "and reporting commit SHAs and branch state. It answers with a BOUNDED",
+                "result — the verdict, the exact SHAs and branch names, and only the",
+                "FAILING gate output, never a full diff, log or passing log; an",
+                "integrator that pastes a full diff back has failed its purpose.",
+                "Take its result instead of re-running the plumbing.",
+                "",
+                "**The merge decision is yours, never the integrator's.** It never",
+                "merges into a protected branch, never pushes, and never opens or",
+                "merges a PR. It may merge task branches into an integration branch",
+                "only when you explicitly tell it to, and it reports what it did.",
+                "",
+                "**One integrator at a time.** Never dispatch two integrators against",
+                "one repo concurrently: the integration suite must run in exactly ONE",
+                "place at a time, and parallel runs against one database corrupt each",
+                "other's state and surface as flaky failures that look like real bugs.",
+                "An integrator must not run the integration suite while it believes",
+                "another is running it.",
+                "",
+                "Same chain rule as the reviewers: check `og stats` before the first",
+                "integrator dispatch and `og stats --agent <id> --json` before every",
+                "later one, take the earliest entry with capacity, and move down only",
+                "when one is dry, dropped for the run, or already failed this run —",
+                "never re-send a dispatch to an integrator that already failed.", ""]
+        for name, e in zip(ig_names, ig_chain):
+            ig = reg[e["id"]]
+            pin = f", pinned `{e['model']}`" if e.get("model") else ""
+            out += [f"## `{name}` — {ig['label']}{pin}", "",
+                    f"- harness `{ig['harness']}`, vendor `{vendor_of(ig, e)}`",
+                    quota_line(ig), *quota_failure_lines(ig),
+                    "- **Bounded result.** The verdict, the SHAs and branch names, and",
+                    "  only the FAILING gate output — never a full diff, log or passing",
+                    "  log.",
+                    "- **Never decides a merge.** It never merges into a protected",
+                    "  branch, never pushes, never opens or merges a PR. It merges task",
+                    "  branches into an integration branch only when explicitly told to,",
+                    "  and reports what it did.",
+                    "- **One at a time.** Never run the integration suite while another",
+                    "  integrator may be running it; it runs in exactly one place."]
+            if ig.get("silent_model_failure"):
+                out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
+                           "transcript with no error, which reads as \"nothing to report\" rather "
+                           "than \"misconfigured\" — check the pin before trusting an empty "
+                           "integrator report, and do not re-send the same dispatch.")
+            if ig.get("prompt_delivery") == "none":
+                # The same hazard as the scout bullet above, restated for the
+                # integrator's contract. Rendered per entry: a BACKUP that never
+                # receives the contract is exactly as dangerous as a primary.
+                out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                           "delivers spec instructions, so the integrator sees ONLY the text "
+                           "you send in `args.input`. Every integrator dispatch must therefore "
+                           "carry the whole contract itself: git and gate plumbing on your "
+                           "behalf — worktrees, the gate commands, the combined diff for review, "
+                           "commit SHAs and branch state — returning a BOUNDED result (the "
+                           "verdict, the SHAs, and only the FAILING gate output, never a full "
+                           "diff, log or passing log); NEVER merging into a protected branch, "
+                           "never pushing, never opening or merging a PR, never deciding whether "
+                           "a merge is allowed; and never running the integration suite while "
+                           "another integrator may be running it. Do not assume it knows any of "
+                           "this.")
+            out.append("")
     return "\n".join(out)
 
 
@@ -1552,6 +1677,29 @@ def scout_note(plan: dict) -> str:
             "  yourself.\n")
 
 
+def integrator_note(plan: dict) -> str:
+    """The integrator pointer for the prompt, or "" when none is installed.
+
+    Only what the orchestrator must know BEFORE it decides anything: that the
+    role exists, that it does the git/worktree/gate plumbing, and — the clause
+    that must not live behind an on-demand read — that the merge decision stays
+    with the orchestrator. An orchestrator that had to read a skill to learn it
+    could sail past a gate it is not allowed to delegate. Everything else (the
+    chain, the failover rule, the bounded-output and one-integrator-at-a-time
+    contracts) is in the generated `roster` skill, which costs no prompt bytes.
+
+    Trailing newline when present so the paragraph keeps its blank line before
+    the next section; empty otherwise, which leaves the template byte-identical
+    for a plan with no integrator.
+    """
+    if not chain(plan, "integrator"):
+        return ""
+    return ("  Git and gate plumbing — worktrees, the gate commands, the combined\n"
+            "  diff for review — goes to `integrator`, which returns a BOUNDED\n"
+            "  result, never a full diff or log. It NEVER decides a merge: that\n"
+            "  decision stays with you.\n")
+
+
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()
     s = tmpl("orchestrator.yaml.tmpl")
@@ -1573,6 +1721,7 @@ def render_orchestrator(plan: dict) -> str:
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{SCOUT_NOTE}}": scout_note(plan),
+        "{{INTEGRATOR_NOTE}}": integrator_note(plan),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
         "{{AGENT_COUNT_WORD}}": _count_word(sum(len(chain(plan, r.key))
@@ -1714,6 +1863,36 @@ def render_scout(plan: dict, entry: dict | None = None, name: str = "scout") -> 
     return s
 
 
+def render_integrator(plan: dict, entry: dict | None = None, name: str = "integrator") -> str:
+    """One integrator spec.
+
+    Same chain shape as the reviewer and the scout: the primary keeps the stable
+    `integrator` name and each backup appends its position. It writes, so it
+    keeps the coder's permission rule rather than the scout's read-only one:
+    an acp-user CLI relays every tool call as an approval request and `auto`
+    parks a human card for anything no policy opines on, which would stall a
+    worker whose first act is `git worktree add`. A native harness keeps the
+    reviewer's `auto`.
+    """
+    reg = agents_by_id()
+    entry = primary(plan, "integrator") if entry is None else entry
+    a = reg[entry["id"]]
+    perm = ("    permission_mode: bypassPermissions" if a["kind"] == "acp-user"
+            else "    permission_mode: auto")
+    s = tmpl("integrator.yaml.tmpl")
+    for k, v in {
+        "{{NAME}}": name,
+        "{{LABEL}}": a["label"],
+        "{{HARNESS}}": a["harness"],
+        "{{ORCHESTRATOR}}": plan["agent_name"],
+        "{{ACCOUNT_NOTE}}": account_note(plan, a, "integrator"),
+        "{{MODEL_BLOCK}}": model_block(entry.get("model")),
+        "{{PERMISSION_MODE_BLOCK}}": perm,
+    }.items():
+        s = s.replace(k, v)
+    return s
+
+
 # role.template -> the renderer for it. Keyed by the template string the ROLES
 # row names, so a role added to the table without a renderer fails loudly on
 # the first apply instead of writing an empty spec directory.
@@ -1721,6 +1900,7 @@ SPEC_RENDERERS = {
     "coder.yaml.tmpl": render_coder,
     "reviewer.yaml.tmpl": render_reviewer,
     "scout.yaml.tmpl": render_scout,
+    "integrator.yaml.tmpl": render_integrator,
 }
 
 
@@ -2120,6 +2300,13 @@ def apply(plan: dict, dry_run: bool = False) -> None:
             ok(f"scout         {reg[e['id']]['label']}{pin}")
         else:
             ok(f"scout #{e['priority']}      {name} ({reg[e['id']]['label']}){pin}")
+    for i, (name, e) in enumerate(zip(role_names(plan, "integrator"),
+                                      chain(plan, "integrator"))):
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            ok(f"integrator    {reg[e['id']]['label']}{pin}")
+        else:
+            ok(f"integrator #{e['priority']}   {name} ({reg[e['id']]['label']}){pin}")
     for line in changed:
         ok(f"config.yaml   {line}")
     if ocd:
@@ -2441,6 +2628,16 @@ def show(state: dict) -> None:
             say(f"{C['b']}scout{C['x']}         {reg[e['id']]['label']}{pin}{tail}{live}")
         else:
             say(f"{C['b']}scout #{e['priority']}{C['x']}     {reg[e['id']]['label']}"
+                f"{pin}{live}")
+    igs = chain(state, "integrator")
+    for i, e in enumerate(igs):
+        live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            tail = " (primary)" if len(igs) > 1 else ""
+            say(f"{C['b']}integrator{C['x']}    {reg[e['id']]['label']}{pin}{tail}{live}")
+        else:
+            say(f"{C['b']}integrator #{e['priority']}{C['x']} {reg[e['id']]['label']}"
                 f"{pin}{live}")
     for aid, path in (state.get("accounts") or {}).items():
         say(f"{C['b']}account{C['x']}       {reg[aid]['label']} → {path}")

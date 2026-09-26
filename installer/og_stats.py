@@ -2,8 +2,9 @@
 """og stats — per-agent quota/capacity reporter.
 
 Builds the lineup from og-install.json (orchestrator, coders by priority,
-reviewers and scouts in chain order), finds each agent's quota probe from the registry
-row's `quota` block, runs probes concurrently, and prints one row per agent.
+reviewers, scouts and integrators in chain order), finds each agent's quota
+probe from the registry row's `quota` block, runs probes concurrently, and
+prints one row per agent.
 Probes live in og_quota.py; this CLI owns presentation and the mark commands.
 
 Privacy: read-only everywhere, never prints token values, never refreshes
@@ -67,7 +68,7 @@ def _priority_key(p) -> tuple:
 
 def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     """[{role, agent, priority, probe, params, note}] in dispatch order:
-    orchestrator, coders by priority, reviewers in chain order, scouts in
+    orchestrator, coders by priority, reviewers, scouts and integrators in
     chain order."""
     try:
         inst = json.loads(install_path.read_text())
@@ -149,6 +150,11 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     # chosen on evidence and the failover the roster skill promises is lost.
     for aid in ids(inst.get("scout")):
         add(aid, "scout", None)
+    # Same rule again for the integrator chain, appended after the scouts: the
+    # earliest integrator with capacity is the one dispatched, so a backup
+    # missing here cannot be failed over to on evidence.
+    for aid in ids(inst.get("integrator")):
+        add(aid, "integrator", None)
     return entries
 
 
