@@ -414,6 +414,77 @@ def test_validate_and_render_accept_the_old_singleton_shape():
     assert m.render_reviewer(plan)
 
 
+def test_two_reviewer_chain_emits_a_spec_per_entry_with_its_own_pin(tmp_path, monkeypatch):
+    """`reviewer` for the primary, `reviewer_2` for the backup — the coder
+    convention (a stable name for the head, a distinct one per addition). Each
+    spec carries its own harness and pin, and both are listed in tools.agents:
+    that list is the only dispatch surface, so a backup missing from it cannot
+    be failed over to at all."""
+    plan = _chain_plan(
+        reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                  {"id": "kiro", "priority": 2, "model": "auto"}])
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    primary = yaml.safe_load((bundle / "agents" / "reviewer" / "config.yaml").read_text())
+    backup = yaml.safe_load((bundle / "agents" / "reviewer_2" / "config.yaml").read_text())
+    assert primary["name"] == "reviewer"
+    assert primary["executor"]["model"] == "gpt-5.5"
+    assert primary["executor"]["config"]["harness"] == "codex-native"
+    assert backup["name"] == "reviewer_2"
+    assert backup["executor"]["model"] == "auto"
+    assert backup["executor"]["config"]["harness"] == "acp:kiro-aws"
+    # The same review contract reaches the backup: the whole reason it exists is
+    # to be used when the primary is dry.
+    assert "Judge the diff ONLY against the contract" in backup["prompt"]
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert orch["tools"]["agents"] == ["coder_zen", "reviewer", "reviewer_2"]
+    assert "three sub-agents" in orch["prompt"]
+
+
+def test_reviewer_chain_apply_is_idempotent_and_prunes_a_dropped_backup(tmp_path, monkeypatch):
+    two = _chain_plan(reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                                {"id": "kiro", "priority": 2, "model": "auto"}])
+    _apply_into(tmp_path, monkeypatch, two)
+    first = _tree(tmp_path)
+    _apply_into(tmp_path, monkeypatch, two)
+    assert _tree(tmp_path) == first
+
+    one = _chain_plan(reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"}])
+    _apply_into(tmp_path, monkeypatch, one)
+    agents_dir = tmp_path / "agents" / "test-agent" / "agents"
+    assert not (agents_dir / "reviewer_2").exists(), "stale backup spec left behind"
+    assert (agents_dir / "reviewer").is_dir()
+
+
+def test_a_none_backup_reviewer_warns_and_gets_its_own_roster_bullet():
+    # cursor is prompt_delivery: none. As a BACKUP it drops the contract exactly
+    # like a primary would, and it is the entry the orchestrator reaches for
+    # when the primary is dry — so both the install-time warning and the
+    # skill's bullet must fire for it, not only for the head.
+    plan = _base_plan(reviewer=[{"id": "codex", "priority": 1, "model": None},
+                                {"id": "cursor", "priority": 2, "model": None}])
+    warnings = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert any("never receives the review contract" in msg and "Cursor" in msg
+               for msg in warnings), warnings
+    skill = m.render_roster_skill(plan)
+    assert "`reviewer_2` -> `cursor-native`" in skill
+    backup_section = skill.split("## `reviewer_2`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in backup_section
+    primary_section = skill.split("## `reviewer`")[1].split("## `reviewer_2`")[0]
+    assert "Does not receive" not in primary_section   # codex delivers its prompt
+
+
+def test_render_reviewer_can_target_a_chain_entry_by_name():
+    # The existing single-argument call still renders the primary; the explicit
+    # form is what apply() uses for each backup.
+    plan = _chain_plan(reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                                 {"id": "kiro", "priority": 2, "model": "auto"}])
+    assert yaml.safe_load(m.render_reviewer(plan))["name"] == "reviewer"
+    backup = yaml.safe_load(m.render_reviewer(plan, m.chain(plan, "reviewer")[1], "reviewer_2"))
+    assert backup["name"] == "reviewer_2"
+    assert backup["executor"]["model"] == "auto"
+
+
 def test_show_renders_both_chains_in_order_with_the_primary_first(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "devin": "/bin/devin",
                                             "codex": "/bin/codex", "kiro": "/bin/kiro"})

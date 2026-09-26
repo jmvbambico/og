@@ -969,7 +969,9 @@ def render_roster(plan: dict) -> str:
     """
     reg = agents_by_id()
     ordinals = ["FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH", "SIXTH"]
-    names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] + ["`reviewer`"]
+    rev_names = reviewer_names(plan)
+    names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] \
+        + [f"`{n}`" for n in rev_names]
     width = max(len(n) for n in names) + 1
     lines = []
     for i, c in enumerate(plan["coders"]):
@@ -986,9 +988,11 @@ def render_roster(plan: dict) -> str:
         tag = f" {'; '.join(tags)}." if tags else ""
         lines.append(f"  - {names[i].ljust(width)}{ordinals[min(i, 5)]}: {a['label']} "
                      f"(`{a['harness']}`){pin}.{tag}")
-    rv = reg[primary(plan, "reviewer")["id"]]
-    lines.append(f"  - {names[-1].ljust(width)}{rv['label']} (`{rv['harness']}`). "
-                 "Reviews only; never edits.")
+    for name, e in zip(rev_names, chain(plan, "reviewer")):
+        rv = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        lines.append(f"  - {f'`{name}`'.ljust(width)}{rv['label']} "
+                     f"(`{rv['harness']}`){pin}. Reviews only; never edits.")
     return "\n".join(lines)
 
 
@@ -1000,15 +1004,20 @@ def render_vendor_map(plan: dict) -> str:
     vendors that drift the moment the roster is reconfigured) would.
     """
     reg = agents_by_id()
-    rev = primary(plan, "reviewer")
-    rv = vendor_of(reg[rev["id"]], rev)
     lines = []
     for c in plan["coders"]:
-        cv = vendor_of(reg[c["id"]], c)
-        same = (f" — same vendor as `reviewer` ({rv}); that pairing is "
-                "degraded-review" if cv == rv else "")
-        lines.append(f"  - `{worker_name(c['id'])}` is {cv}{same}.")
-    lines.append(f"  - `reviewer` is {rv}.")
+        lines.append(f"  - `{worker_name(c['id'])}` is {vendor_of(reg[c['id']], c)}.")
+    # The collision note sits on the REVIEWER line now: with a chain, the same
+    # coder can be same-vendor with one reviewer and cross-vendor with the next,
+    # so the pairing belongs to the reviewer being named (and matches the
+    # `degraded-review` warning validate() raises for that entry).
+    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
+        rv = vendor_of(reg[e["id"]], e)
+        same = [f"`{worker_name(c['id'])}`" for c in plan["coders"]
+                if vendor_of(reg[c["id"]], c) == rv]
+        note = (f" — same vendor as {', '.join(same)}; that pairing is "
+                "degraded-review" if same else "")
+        lines.append(f"  - `{name}` is {rv}{note}.")
     return "\n".join(lines)
 
 
@@ -1139,27 +1148,35 @@ def render_roster_skill(plan: dict) -> str:
             out.append("- Not yet exercised in this project — verify its first dispatch produced "
                        "a real commit before trusting a completion report.")
         out.append("")
-    rv = reg[primary(plan, "reviewer")["id"]]
-    out += [f"## `reviewer` — {rv['label']}", "",
-            f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, primary(plan, 'reviewer'))}`",
-            quota_line(rv), *quota_failure_lines(rv),
-            "- Reviews only; never edits, never gets a worktree.",
-            "- Cross-vendor review is the point: never route a diff to a reviewer whose",
-            "  vendor matches the implementer's. If that is unavoidable, say so and label",
-            "  the PR `degraded-review`."]
-    if rv.get("prompt_delivery") == "none":
-        # The same hazard as the coder bullet above, but the reviewer's whole
-        # contract lives in reviewer.yaml.tmpl and is lost here — so this bullet
-        # restates that contract in the dispatch, keeping the two from drifting.
-        out.append("- **Does not receive its sub-agent prompt.** This harness never "
-                   "delivers spec instructions, so the reviewer sees ONLY the text you send "
-                   "in `args.input`. Every review dispatch must therefore carry the whole "
-                   "contract itself: the acceptance contract and the diff as TEXT (never a "
-                   "worktree), judge the diff ONLY against the contract, never edit code and "
-                   "never go looking for a worktree, and report in exactly three sections — "
-                   "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
-                   "evidence. Do not assume it knows the review format.")
-    out.append("")
+    # One section per reviewer in the chain, in failover order. A backup is
+    # reached exactly when the primary is dry — the moment nobody is watching
+    # for a surprise — so it gets the same contract, quota shape and caveats
+    # rather than a one-line mention.
+    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
+        rv = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        out += [f"## `{name}` — {rv['label']}{pin}", "",
+                f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, e)}`",
+                quota_line(rv), *quota_failure_lines(rv),
+                "- Reviews only; never edits, never gets a worktree.",
+                "- Cross-vendor review is the point: never route a diff to a reviewer whose",
+                "  vendor matches the implementer's. If that is unavoidable, say so and label",
+                "  the PR `degraded-review`."]
+        if rv.get("prompt_delivery") == "none":
+            # The same hazard as the coder bullet above, but the reviewer's whole
+            # contract lives in reviewer.yaml.tmpl and is lost here — so this
+            # bullet restates that contract in the dispatch, keeping the two from
+            # drifting. Rendered per entry: a BACKUP that never receives the
+            # contract is exactly as dangerous as a primary that does not.
+            out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                       "delivers spec instructions, so the reviewer sees ONLY the text you send "
+                       "in `args.input`. Every review dispatch must therefore carry the whole "
+                       "contract itself: the acceptance contract and the diff as TEXT (never a "
+                       "worktree), judge the diff ONLY against the contract, never edit code and "
+                       "never go looking for a worktree, and report in exactly three sections — "
+                       "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
+                       "evidence. Do not assume it knows the review format.")
+        out.append("")
     return "\n".join(out)
 
 
@@ -1190,7 +1207,8 @@ def render_preflight_map(plan: dict) -> str:
     """
     reg = agents_by_id()
     rows = [f"    `{worker_name(c['id'])}` -> `{reg[c['id']]['harness']}`" for c in plan["coders"]]
-    rows.append(f"    `reviewer` -> `{reg[primary(plan, 'reviewer')['id']]['harness']}`")
+    rows += [f"    `{name}` -> `{reg[e['id']]['harness']}`"
+             for name, e in zip(reviewer_names(plan), chain(plan, "reviewer"))]
     return "\n".join(rows)
 
 
@@ -1216,8 +1234,11 @@ def zen_preflight_note(name: str) -> str:
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()
     s = tmpl("orchestrator.yaml.tmpl")
+    # Every reviewer in the chain, not just the primary: tools.agents is the
+    # only dispatch surface, so a backup omitted here is unreachable and the
+    # failover the roster skill promises cannot happen.
     agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
-    agent_list += "\n    - reviewer"
+    agent_list += "".join(f"\n    - {n}" for n in reviewer_names(plan))
     subs = {
         "{{AGENT_NAME}}": plan["agent_name"],
         "{{ORCHESTRATOR_HARNESS}}": reg[primary(plan, "orchestrator")["id"]]["harness"],
@@ -1225,7 +1246,7 @@ def render_orchestrator(plan: dict) -> str:
         "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
-        "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + 1),
+        "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + len(chain(plan, "reviewer"))),
     }
     for k, v in subs.items():
         s = s.replace(k, v)
@@ -1293,9 +1314,17 @@ def render_coder(plan: dict, c: dict) -> str:
     return s
 
 
-def render_reviewer(plan: dict) -> str:
+def render_reviewer(plan: dict, entry: dict | None = None, name: str = "reviewer") -> str:
+    """One reviewer spec.
+
+    Defaults to the chain's primary as `reviewer` (the name the orchestrator
+    prompt, the cross-review skill and existing session history use); each
+    backup is rendered under its own name with its own model pin, so the
+    failover target carries the same review contract and harness as the head.
+    """
     reg = agents_by_id()
-    a = reg[primary(plan, "reviewer")["id"]]
+    entry = primary(plan, "reviewer") if entry is None else entry
+    a = reg[entry["id"]]
     acct = plan.get("accounts", {}).get(a["id"])
     note = ""
     if acct:
@@ -1305,11 +1334,12 @@ def render_reviewer(plan: dict) -> str:
                 f"# account your interactive sessions use.\n")
     s = tmpl("reviewer.yaml.tmpl")
     for k, v in {
+        "{{NAME}}": name,
         "{{LABEL}}": a["label"],
         "{{HARNESS}}": a["harness"],
         "{{ORCHESTRATOR}}": plan["agent_name"],
         "{{ACCOUNT_NOTE}}": note,
-        "{{MODEL_BLOCK}}": model_block(primary(plan, "reviewer").get("model")),
+        "{{MODEL_BLOCK}}": model_block(entry.get("model")),
     }.items():
         s = s.replace(k, v)
     return s
@@ -1647,9 +1677,10 @@ def apply(plan: dict, dry_run: bool = False) -> None:
         d = bundle / "agents" / worker_name(c["id"])
         d.mkdir(parents=True, exist_ok=True)
         (d / "config.yaml").write_text(render_coder(plan, c))
-    rd = bundle / "agents" / "reviewer"
-    rd.mkdir(parents=True, exist_ok=True)
-    (rd / "config.yaml").write_text(render_reviewer(plan))
+    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
+        d = bundle / "agents" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.yaml").write_text(render_reviewer(plan, e, name))
 
     # 2. skills (verbatim from the repo)
     skills_src = REPO / "agents" / "dev-lead" / "skills"
@@ -1692,7 +1723,12 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     for c in plan["coders"]:
         pin = f" → {c['model']}" if c.get("model") else ""
         ok(f"coder #{c['priority']}      {worker_name(c['id'])} ({reg[c['id']]['label']}){pin}")
-    ok(f"reviewer      {reg[primary(plan, 'reviewer')['id']]['label']}")
+    for i, (name, e) in enumerate(zip(reviewer_names(plan), chain(plan, "reviewer"))):
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            ok(f"reviewer      {reg[e['id']]['label']}{pin}")
+        else:
+            ok(f"reviewer #{e['priority']}   {name} ({reg[e['id']]['label']}){pin}")
     for line in changed:
         ok(f"config.yaml   {line}")
     if ocd:
