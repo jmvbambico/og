@@ -206,6 +206,25 @@ def test_validate_warns_same_vendor_reviewer():
     assert any("shares a vendor with" in msg for _, msg in issues)
 
 
+def test_primary_collision_warning_reads_as_immediate_not_failover():
+    # The head collides right away -- you never fail over TO the primary -- so
+    # its wording must not talk about failover; a BACKUP keeps that wording,
+    # because it is exactly the entry reached on failover.
+    primary = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}],
+                         reviewer={"id": "agy", "model": None})
+    msgs = [msg for _, msg in m.validate(primary) if "shares a vendor" in msg]
+    assert msgs, msgs
+    assert "failing over" not in msgs[0], msgs[0]
+    assert "same-vendor review" in msgs[0] and "degraded-review" in msgs[0]
+
+    backup = _base_plan(
+        coders=[{"id": "gemini", "priority": 1, "model": None}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "agy", "priority": 2, "model": None}])
+    bmsgs = [msg for _, msg in m.validate(backup) if "shares a vendor" in msg]
+    assert bmsgs and "failing over to `reviewer_2`" in bmsgs[0], bmsgs
+
+
 def test_validate_errors_when_orchestrator_cannot_relay():
     plan = _base_plan(orchestrator="cline")
     issues = m.validate(plan)

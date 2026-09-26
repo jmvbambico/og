@@ -865,17 +865,22 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # telling them plainly what they are getting. Checked for EVERY entry in the
     # chain: the one that gets used is the one the orchestrator reaches for when
     # the primary is dry.
-    for name, r in zip(reviewer_names(plan), reviewers):
+    for i, (name, r) in enumerate(zip(reviewer_names(plan), reviewers)):
         rv = vendor_of(reg[r["id"]], r)
         colliding = [f"`{worker_name(c['id'])}` ({reg[c['id']]['label']})"
                      for c in plan["coders"] if vendor_of(reg[c["id"]], c) == rv]
         if colliding:
+            # The PRIMARY collides immediately -- you never fail over TO the
+            # primary -- so the failover wording is right only for a backup.
+            tail = ("cross-vendor, so this is a same-vendor review — the PR must be "
+                    "labelled `degraded-review`." if i == 0 else
+                    f"cross-vendor, so failing over to `{name}` would produce a "
+                    "same-vendor review — the PR must then be labelled "
+                    "`degraded-review`.")
             issues.append(("warn",
                            f"reviewer `{name}` ({reg[r['id']]['label']}) shares a vendor with "
                            f"{', '.join(colliding)}: all are `{rv}`. Review is meant to be "
-                           f"cross-vendor, so failing over to `{name}` would produce a "
-                           "same-vendor review — the PR must then be labelled "
-                           "`degraded-review`."))
+                           + tail))
 
     for o in orchestrators:
         a = reg[o["id"]]
