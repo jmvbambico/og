@@ -1140,6 +1140,37 @@ def test_render_roster_skill_reviewer_mute_bullet_only_for_a_none_reviewer():
     assert "**Does not receive its sub-agent prompt.**" not in normal
 
 
+def test_roster_skill_names_the_reviewer_chain_in_order_and_states_the_failover_rule():
+    """The orchestrator must know who backs whom before it reads anything: the
+    moment it needs the backup is the moment the primary came back dry, which
+    is also the moment nobody is watching. Same rule as the coder chain."""
+    plan = _base_plan(reviewer=[{"id": "codex", "priority": 1, "model": None},
+                                {"id": "kiro", "priority": 2, "model": "auto"}])
+    skill = m.render_roster_skill(plan)
+    assert "## Reviewers — failover chain" in skill
+    assert "`reviewer` (Codex (OpenAI)) is the primary" in skill
+    assert "`reviewer_2` (Kiro (AWS)) backs it up, in that order." in skill
+    for phrase in ("og stats",
+                   "`og stats --agent <id> --json`",
+                   "earliest entry with capacity",
+                   "move down only when one is dry, dropped",
+                   "for the run, or already failed this run",
+                   "`reset_at`",
+                   "never re-send a diff to a",
+                   "reviewer that already failed this run."):
+        assert phrase in skill, phrase
+    # The per-entry sections follow the chain's order.
+    assert skill.index("## `reviewer`") < skill.index("## `reviewer_2`")
+
+
+def test_roster_skill_says_so_when_there_is_only_one_reviewer():
+    # No invented backup: with a single-entry chain the section says there is
+    # nothing to fail over to rather than implying one exists.
+    skill = m.render_roster_skill(_base_plan())
+    assert "`reviewer` (Codex (OpenAI)) is the only reviewer in this roster." in skill
+    assert "is the primary" not in skill
+
+
 # --------------------------------------------------------------------------
 # prompt diet: guidance moved out of the argv prompt into the roster skill
 #

@@ -1148,11 +1148,34 @@ def render_roster_skill(plan: dict) -> str:
             out.append("- Not yet exercised in this project — verify its first dispatch produced "
                        "a real commit before trusting a completion report.")
         out.append("")
+    # The reviewer chain, in the same voice as the coder roster above: the
+    # orchestrator has to know who backs whom BEFORE it reads anything, because
+    # the moment it is needed is the moment the primary comes back dry.
+    rev_chain = chain(plan, "reviewer")
+    rev_names = reviewer_names(plan)
+    listed = [f"`{n}` ({reg[e['id']]['label']})" for n, e in zip(rev_names, rev_chain)]
+    if len(listed) == 1:
+        order = f"{listed[0]} is the only reviewer in this roster."
+    else:
+        verb = "backs it up" if len(listed) == 2 else "back it up"
+        order = (f"{listed[0]} is the primary; {', '.join(listed[1:])} "
+                 f"{verb}, in that order.")
+    out += ["## Reviewers — failover chain", "",
+            order, "",
+            "Check `og stats` before the first review dispatch, and",
+            "`og stats --agent <id> --json` before every later one: take the",
+            "earliest entry with capacity and move down only when one is dry, dropped",
+            "for the run, or already failed this run. Preference order still wins —",
+            "`ok` outranks `unknown` only when two candidates are otherwise equal — and",
+            "a reviewer marked dry comes back after the `reset_at` `og stats` reports,",
+            "so re-check it before using it again. This is the same chain rule as the",
+            "coder roster above; the failsafe is too: never re-send a diff to a",
+            "reviewer that already failed this run.", ""]
     # One section per reviewer in the chain, in failover order. A backup is
     # reached exactly when the primary is dry — the moment nobody is watching
     # for a surprise — so it gets the same contract, quota shape and caveats
     # rather than a one-line mention.
-    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
+    for name, e in zip(rev_names, rev_chain):
         rv = reg[e["id"]]
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         out += [f"## `{name}` — {rv['label']}{pin}", "",
