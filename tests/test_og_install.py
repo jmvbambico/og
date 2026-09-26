@@ -615,11 +615,28 @@ def test_render_coder_acp_user_gets_permission_mode_or_not(monkeypatch):
     assert isinstance(cline_has, bool)
 
 
-def test_render_reviewer_is_valid_yaml():
+def test_reviewer_is_valid_yaml():
     plan = _rendering_plan()
     rendered = m.render_reviewer(plan)
     parsed = yaml.safe_load(rendered)
     assert parsed["executor"]["config"]["harness"] == "codex-native"
+
+
+def test_reviewer_contract_reports_a_missing_diff_instead_of_reading_the_repo():
+    """A reviewer handed a missing/empty/truncated diff once went and read the
+    repository instead of reporting the gap, which destroyed the independence
+    that is the whole reason a separate reviewer exists. The contract now says
+    plainly that reporting the gap is the correct answer."""
+    # Whitespace-normalized: the contract is wrapped prose, so a phrase may
+    # straddle a line break.
+    prompt = " ".join(yaml.safe_load(m.render_reviewer(_rendering_plan()))["prompt"].split())
+    assert "missing, empty, or truncated" in prompt
+    assert "SAY SO AND STOP" in prompt
+    assert "not given the diff" in prompt
+    # ...and it forbids the fallback that caused the failure.
+    assert "not go looking for it" in prompt
+    assert "do not open a repository" in prompt
+    assert "do not read files" in prompt
 
 
 # --------------------------------------------------------------------------

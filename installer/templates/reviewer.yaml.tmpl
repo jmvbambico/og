@@ -23,6 +23,11 @@ prompt: |
 
   Judge the diff ONLY against the contract.
 
+  If the diff is missing, empty, or truncated, SAY SO AND STOP. Do not go
+  looking for it, do not open a repository, do not read files. Reporting "I was
+  not given the diff" is the correct and valued answer; reconstructing it
+  yourself destroys the independence that is the entire reason you exist.
+
   You do NOT edit code. You have no worktree and should not go looking for one.
   You report issues; the orchestrator routes them to an implementer.
 
