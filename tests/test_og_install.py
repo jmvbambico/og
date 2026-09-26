@@ -414,6 +414,58 @@ def test_validate_and_render_accept_the_old_singleton_shape():
     assert m.render_reviewer(plan)
 
 
+def test_validate_warns_on_a_same_vendor_backup_anywhere_in_the_reviewer_chain():
+    """A WARNING, never an error: refusing would block a user whose only
+    available backup is same-vendor, which is worse than telling them plainly
+    what they are getting. Only a chain-aware check catches this — the primary
+    (codex/openai) is clean, the collision is on `reviewer_2`."""
+    plan = _base_plan(
+        coders=[{"id": "gemini", "priority": 1, "model": None}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "agy", "priority": 2, "model": None}])
+    issues = m.validate(plan)
+    warns = [(level, msg) for level, msg in issues if "shares a vendor" in msg]
+    assert len(warns) == 1, issues
+    assert all(level == "warn" for level, _ in warns)
+    msg = warns[0][1]
+    assert "`reviewer_2`" in msg and "Antigravity (Google)" in msg   # which reviewer
+    assert "`coder_gemini`" in msg and "`google`" in msg             # which coder, which vendor
+    assert "same-vendor review" in msg and "degraded-review" in msg
+
+    # The roster skill carries the same caveat on the affected entry, so the
+    # orchestrator knows at dispatch time and not only at install time.
+    skill = m.render_roster_skill(plan)
+    backup = skill.split("## `reviewer_2`")[1]
+    assert "**Same-vendor review (`google`).**" in backup
+    assert "`coder_gemini`" in backup and "degraded-review" in backup
+    primary = skill.split("## `reviewer`")[1].split("## `reviewer_2`")[0]
+    assert "**Same-vendor review" not in primary
+
+
+def test_validate_silent_when_every_reviewer_pairing_is_cross_vendor():
+    plan = _base_plan(
+        coders=[{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "kiro", "priority": 2, "model": None}])
+    assert not [msg for _, msg in m.validate(plan) if "shares a vendor" in msg]
+
+
+def test_validate_warns_same_vendor_through_a_pin_in_the_chain():
+    # Vendor follows the model pin, not the registry row: a freebuff deepseek/*
+    # pin collides with a reviewer pinned to a deepseek model, even though the
+    # reviewer's registry vendor is aws-kiro. Same rule as the singleton case,
+    # now applied per chain entry.
+    plan = _base_plan(
+        coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4.1-flash"}],
+        reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                  {"id": "kiro", "priority": 2, "model": "deepseek/deepseek-chat"}])
+    msgs = [msg for _, msg in m.validate(plan) if "shares a vendor" in msg]
+    assert msgs and all("`reviewer_2`" in m_ for m_ in msgs), msgs
+    assert "`deepseek`" in msgs[0]
+    plan["coders"][0]["model"] = None       # z-ai pin: no collision with deepseek
+    assert not [msg for _, msg in m.validate(plan) if "shares a vendor" in msg]
+
+
 def test_two_reviewer_chain_emits_a_spec_per_entry_with_its_own_pin(tmp_path, monkeypatch):
     """`reviewer` for the primary, `reviewer_2` for the backup — the coder
     convention (a stable name for the head, a distinct one per addition). Each

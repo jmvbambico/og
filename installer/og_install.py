@@ -834,14 +834,24 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "erroring. Verify the first dispatch produced a real commit — an "
                            "empty transcript means the pin is wrong, not that it refused."))
 
-    rev_vendor = vendor_of(reg[reviewers[0]["id"]], reviewers[0])
-    same = [reg[c["id"]]["label"] for c in plan["coders"]
-            if vendor_of(reg[c["id"]], c) == rev_vendor]
-    if same:
-        issues.append(("warn",
-                       f"reviewer ({reg[reviewers[0]['id']]['label']}) shares a vendor with "
-                       f"{', '.join(same)}. Same-vendor review shares blind spots — the "
-                       "orchestrator will mark those PRs `degraded-review`."))
+    # Cross-vendor review is the point of the reviewer role: an agent must never
+    # review code its own vendor wrote, and vendor follows the model pin, not
+    # the registry row. This WARNs rather than refuses -- refusing would block a
+    # user whose only available backup is same-vendor, which is worse than
+    # telling them plainly what they are getting. Checked for EVERY entry in the
+    # chain: the one that gets used is the one the orchestrator reaches for when
+    # the primary is dry.
+    for name, r in zip(reviewer_names(plan), reviewers):
+        rv = vendor_of(reg[r["id"]], r)
+        colliding = [f"`{worker_name(c['id'])}` ({reg[c['id']]['label']})"
+                     for c in plan["coders"] if vendor_of(reg[c["id"]], c) == rv]
+        if colliding:
+            issues.append(("warn",
+                           f"reviewer `{name}` ({reg[r['id']]['label']}) shares a vendor with "
+                           f"{', '.join(colliding)}: all are `{rv}`. Review is meant to be "
+                           f"cross-vendor, so failing over to `{name}` would produce a "
+                           "same-vendor review — the PR must then be labelled "
+                           "`degraded-review`."))
 
     for o in orchestrators:
         a = reg[o["id"]]
@@ -1180,8 +1190,19 @@ def render_roster_skill(plan: dict) -> str:
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         out += [f"## `{name}` — {rv['label']}{pin}", "",
                 f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, e)}`",
-                quota_line(rv), *quota_failure_lines(rv),
-                "- Reviews only; never edits, never gets a worktree.",
+                quota_line(rv), *quota_failure_lines(rv)]
+        # The same collision validate() warns about at install time, carried
+        # here so the orchestrator knows it at DISPATCH time too -- the moment
+        # it is deciding which entry to use, long after the install scrolled by.
+        colliding = [f"`{worker_name(c['id'])}`" for c in plan["coders"]
+                     if vendor_of(reg[c["id"]], c) == vendor_of(rv, e)]
+        if colliding:
+            out.append(f"- **Same-vendor review (`{vendor_of(rv, e)}`).** This reviewer shares "
+                       f"a vendor with {', '.join(colliding)}, so failing over to `{name}` "
+                       "produces a same-vendor review — it shares the blind spots that produced "
+                       "the diff. Use it only after saying so in chat, and label the PR "
+                       "`degraded-review`.")
+        out += ["- Reviews only; never edits, never gets a worktree.",
                 "- Cross-vendor review is the point: never route a diff to a reviewer whose",
                 "  vendor matches the implementer's. If that is unavoidable, say so and label",
                 "  the PR `degraded-review`."]
