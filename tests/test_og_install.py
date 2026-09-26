@@ -286,6 +286,38 @@ def test_validate_prompt_ceiling_ignored_for_non_argv_orchestrator():
     assert not any("ceiling" in msg for _, msg in issues)
 
 
+def test_validate_warns_when_the_orchestrator_is_unverified_for_that_role():
+    # grok/devin clear the gates validate() enforces for orchestrator, so the
+    # role is legal -- but no og run has ever been driven with either as the
+    # brain. The registry records that per role; the caveat must reach a user
+    # choosing one, as a WARN (a weak orchestrator at runtime, not a broken
+    # install), never as an error.
+    for aid in ("grok", "devin"):
+        issues = m.validate(_base_plan(orchestrator=aid))
+        warns = [msg for level, msg in issues if level == "warn"]
+        assert any("UNVERIFIED as orchestrator" in msg for msg in warns), (aid, issues)
+        assert not any(level == "error" for level, _ in issues), (aid, issues)
+
+
+def test_validate_no_unverified_warning_for_a_verified_role():
+    # claude is verified in every role it fills; nothing to warn about.
+    issues = m.validate(_base_plan())
+    assert not any("UNVERIFIED" in msg for _, msg in issues)
+
+
+def test_role_options_flag_a_role_the_row_marks_unverified():
+    # The per-role marker must reach the pick_one note (the picker's third
+    # per-option field) at SELECTION time -- and must not taint a role the row
+    # is verified for. Same row, two roles, opposite notes.
+    orch = {aid: note for aid, _, note in
+            m.role_options("orchestrator", {"grok": "/bin/grok", "claude": "/bin/claude"})}
+    assert "UNVERIFIED as orchestrator" in orch["grok"]
+    assert orch["claude"] is None
+    coder = {aid: note for aid, _, note in
+             m.role_options("coder", {"grok": "/bin/grok"})}
+    assert coder["grok"] is None
+
+
 # --------------------------------------------------------------------------
 # template rendering -> must always be valid, parseable YAML
 # --------------------------------------------------------------------------
@@ -1366,6 +1398,29 @@ def test_pick_model_choices_respect_prefer_default(monkeypatch):
     assert m.pick_model(reg["freebuff"], None) == "z-ai/glm-5.3-flash"
 
 
+def test_pick_model_no_list_cmd_row_emits_no_missing_listing_warning(monkeypatch):
+    """The "could not list models" warning is gated on having TRIED a listing.
+    A row that never declared `list_cmd` (agy) must reach manual entry silently
+    -- firing it there would report a command that was never run, telling the
+    user a listing failed when none was attempted."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
+    warned = []
+    monkeypatch.setattr(m, "warn", lambda msg: warned.append(msg))
+    assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
+    assert not any("could not list models" in w for w in warned), warned
+
+
+def test_pick_model_codex_accepts_a_hand_typed_unlisted_id(monkeypatch):
+    """codex's `choices` are a static convenience list, not a closed set: the
+    row's own note promises a newer id typed by hand is accepted through the
+    "pin it anyway?" confirmation, since the CLI cannot enumerate models."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gpt-6-codex")
+    monkeypatch.setattr(m, "ask_yes", lambda prompt, default=False: True)
+    assert m.pick_model(reg["codex"], None) == "gpt-6-codex"
+
+
 # --------------------------------------------------------------------------
 # emit_questions surfaces a row's static model choices
 # --------------------------------------------------------------------------
@@ -1381,6 +1436,28 @@ def test_emit_questions_carries_choices(monkeypatch, capsys):
         "z-ai/glm-5.3-flash", "mimo-2.5", "solar-pro-4", "deepseek-v4.1-flash"]
     # rows without choices are simply absent, not empty
     assert "cline" not in coder_q["per_item"]["choices"]
+
+
+def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
+    # AGENTS.md Part 1 has an AI installer drive its conversation from
+    # --questions and never offer an agent without the warning that applies to
+    # it. The caveat is per role, so it rides the question offering that role.
+    monkeypatch.setattr(m, "scan", lambda: {"grok": "/bin/grok", "devin": "/bin/devin",
+                                            "claude": "/bin/claude"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    orch_q = next(x for x in q["questions"] if x["key"] == "orchestrator")
+    assert "UNVERIFIED as orchestrator" in orch_q["notes"]["grok"]
+    assert "UNVERIFIED as orchestrator" in orch_q["notes"]["devin"]
+    assert "claude" not in orch_q["notes"]
+    # ...and the coder question carries nothing for them: verified in that role.
+    coder_q = next(x for x in q["questions"] if x["key"] == "coders")
+    assert "grok" not in coder_q["notes"] and "devin" not in coder_q["notes"]
+    # The raw field is in the embedded registry for a consumer that reads it.
+    grok_row = next(r for r in q["registry"] if r["id"] == "grok")
+    assert grok_row["unverified_roles"] == ["orchestrator"]
 
 
 # --------------------------------------------------------------------------
@@ -1607,6 +1684,25 @@ def test_list_models_drops_cmd_section_headings_and_docs_line(monkeypatch):
         assert junk not in got
 
 
+def test_validate_errors_on_an_impossible_required_and_unpinnable_model(monkeypatch):
+    """A row that both demands a pin (`model.required`) and forbids offering one
+    (`model.pinnable: false`) is self-contradictory: pick_model skips the
+    question, so the worker runs unpinned and inherits the orchestrator's model
+    id -- the exact failure `required` exists to prevent. No real row does this;
+    the guard is for the next registry edit, so a synthetic row exercises it."""
+    row = {
+        "id": "contradiction", "label": "Contradiction", "harness": "acp:contradiction",
+        "kind": "acp-user", "binary": "contradiction", "vendor": "test",
+        "roles": ["coder"], "relay": False, "silent_model_failure": False,
+        "prompt_delivery": "unknown",
+        "model": {"required": True, "pinnable": False, "pin_path": "executor.model"},
+    }
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], row]})
+    plan = _base_plan(coders=[{"id": "contradiction", "priority": 1, "model": None}])
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("model.required true and model.pinnable false" in msg for msg in errors), errors
+
+
 # --------------------------------------------------------------------------
 # unresolved {shim:...} tokens are refused + shim paths survive spaces
 # --------------------------------------------------------------------------
@@ -1685,3 +1781,13 @@ def test_acp_command_keeps_a_spaced_shim_path_as_one_argv_entry(monkeypatch):
     argv_plain = shlex.split(m.acp_command(row, None))
     assert "CMD_BIN=/Users/John Smith/.omnigent/shims/cmd-og" in argv_plain
 
+
+# --------------------------------------------------------------------------
+# the registry's $comment documents every field it expects a row to carry
+# --------------------------------------------------------------------------
+def test_registry_comment_documents_the_role_unverified_fields():
+    # A registry field absent from the $comment block is invisible to the next
+    # person editing the catalog (AGENTS.md: add vendors HERE, not in code).
+    comment = "\n".join(m.REGISTRY["$comment"])
+    assert "unverified_roles" in comment
+    assert "roles_note" in comment
