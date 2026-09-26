@@ -8,6 +8,7 @@ OMNI/STATE constants rather than the real ~/.omnigent.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import socket
 import subprocess
@@ -224,6 +225,46 @@ def test_validate_warns_when_a_coder_never_receives_its_prompt():
     assert any("never receive their sub-agent prompt" in msg for _, msg in issues)
 
 
+def test_validate_warns_when_a_reviewer_never_receives_its_prompt():
+    # cursor is prompt_delivery: none. As reviewer its whole contract lives in
+    # reviewer.yaml.tmpl and would be dropped, so validate must warn.
+    plan = _base_plan(reviewer={"id": "cursor", "model": None})
+    issues = m.validate(plan)
+    assert any(level == "warn" and "never receives the review contract" in msg
+               for level, msg in issues)
+
+
+def test_validate_no_reviewer_mute_warning_for_a_delivering_reviewer():
+    # argv (codex) and per_turn (opencode) both deliver the spec prompt, so
+    # neither triggers the reviewer warning.
+    for rid in ("codex", "opencode"):
+        plan = _base_plan(reviewer={"id": rid, "model": None})
+        assert not any("never receives the review contract" in msg
+                       for _, msg in m.validate(plan)), rid
+
+
+def test_validate_coder_and_reviewer_mute_warnings_are_independent():
+    # gemini is a `none` coder, cursor a `none` reviewer. Each warns on its own
+    # with distinct wording; when both apply, both messages appear.
+    coder_only = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}])
+    coder_msgs = [msg for _, msg in m.validate(coder_only)]
+    assert any("never receive their sub-agent prompt" in msg for msg in coder_msgs)
+    assert not any("never receives the review contract" in msg for msg in coder_msgs)
+
+    reviewer_only = _base_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}],
+        reviewer={"id": "cursor", "model": None})
+    rev_msgs = [msg for _, msg in m.validate(reviewer_only)]
+    assert not any("never receive their sub-agent prompt" in msg for msg in rev_msgs)
+    assert any("never receives the review contract" in msg for msg in rev_msgs)
+
+    both = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}],
+                      reviewer={"id": "cursor", "model": None})
+    both_msgs = [msg for _, msg in m.validate(both)]
+    assert any("never receive their sub-agent prompt" in msg for msg in both_msgs)
+    assert any("never receives the review contract" in msg for msg in both_msgs)
+
+
 def test_validate_prompt_ceiling_error_and_warn_boundaries():
     plan = _base_plan()
     under = "x" * (m.PROMPT_CEILING - 1000)
@@ -243,6 +284,38 @@ def test_validate_prompt_ceiling_ignored_for_non_argv_orchestrator():
     huge = "x" * (m.PROMPT_CEILING * 2)
     issues = m.validate(plan, huge)
     assert not any("ceiling" in msg for _, msg in issues)
+
+
+def test_validate_warns_when_the_orchestrator_is_unverified_for_that_role():
+    # grok/devin clear the gates validate() enforces for orchestrator, so the
+    # role is legal -- but no og run has ever been driven with either as the
+    # brain. The registry records that per role; the caveat must reach a user
+    # choosing one, as a WARN (a weak orchestrator at runtime, not a broken
+    # install), never as an error.
+    for aid in ("grok", "devin"):
+        issues = m.validate(_base_plan(orchestrator=aid))
+        warns = [msg for level, msg in issues if level == "warn"]
+        assert any("UNVERIFIED as orchestrator" in msg for msg in warns), (aid, issues)
+        assert not any(level == "error" for level, _ in issues), (aid, issues)
+
+
+def test_validate_no_unverified_warning_for_a_verified_role():
+    # claude is verified in every role it fills; nothing to warn about.
+    issues = m.validate(_base_plan())
+    assert not any("UNVERIFIED" in msg for _, msg in issues)
+
+
+def test_role_options_flag_a_role_the_row_marks_unverified():
+    # The per-role marker must reach the pick_one note (the picker's third
+    # per-option field) at SELECTION time -- and must not taint a role the row
+    # is verified for. Same row, two roles, opposite notes.
+    orch = {aid: note for aid, _, note in
+            m.role_options("orchestrator", {"grok": "/bin/grok", "claude": "/bin/claude"})}
+    assert "UNVERIFIED as orchestrator" in orch["grok"]
+    assert orch["claude"] is None
+    coder = {aid: note for aid, _, note in
+             m.role_options("coder", {"grok": "/bin/grok"})}
+    assert coder["grok"] is None
 
 
 # --------------------------------------------------------------------------
@@ -748,14 +821,15 @@ def test_grouped_models_features_auto_and_free_but_hides_nothing():
 
 
 def test_zen_preflight_only_for_a_free_zen_pin():
-    # The preflight tells the orchestrator to substitute a `-free` id when the
-    # pin rotates out. A paid Zen pin (a subscriber) or a user-added provider
-    # never rotates, so the section must be absent -- it would only invite an
-    # `args.model` override.
+    # The procedure tells the orchestrator to substitute a `-free` id when the
+    # pin rotates out. It MOVED into the generated roster skill to free argv
+    # bytes, so it is asserted there. A paid Zen pin (a subscriber) or a
+    # user-added provider never rotates, so the section must be absent -- it
+    # would only invite an `args.model` override.
     free = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}])
     paid = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": "opencode/claude-sonnet-5"}])
-    assert "Zen model preflight" in m.render_orchestrator(free)
-    assert "Zen model preflight" not in m.render_orchestrator(paid)
+    assert "Zen model preflight" in m.render_roster_skill(free)
+    assert "Zen model preflight" not in m.render_roster_skill(paid)
     assert "day-capped" in m.render_roster(free) and "day-capped" not in m.render_roster(paid)
 
 
@@ -853,6 +927,133 @@ def test_render_roster_skill_renders_cline_concurrency_note(monkeypatch):
     assert "never dispatch two tasks to `coder_cline` in the same turn" in rendered
 
 
+def test_render_roster_skill_reviewer_mute_bullet_only_for_a_none_reviewer():
+    """A `none` reviewer never sees reviewer.yaml.tmpl, so its section must
+    restate the contract (diff as text, judge only against it, no edits, the
+    three-section report). A delivering reviewer gets no such bullet."""
+    mute = m.render_roster_skill(_base_plan(reviewer={"id": "cursor", "model": None}))
+    rv_section = mute.split("## `reviewer`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in rv_section
+    assert "never go looking for a worktree" in rv_section
+    assert "BLOCKING / NON-BLOCKING / SUGGESTIONS" in rv_section
+    assert "file:line" in rv_section
+
+    normal = m.render_roster_skill(_base_plan(reviewer={"id": "codex", "model": None}))
+    assert "**Does not receive its sub-agent prompt.**" not in normal
+
+
+# --------------------------------------------------------------------------
+# prompt diet: guidance moved out of the argv prompt into the roster skill
+#
+# The orchestrator prompt is inlined into the harness command line and capped
+# at PROMPT_CEILING shell-quoted bytes, so mechanics are rendered into the
+# generated `roster` skill (free) instead. These tests pin BOTH halves: the
+# moved fact is in the skill, and the section that must be known before
+# anything is read is still in the prompt.
+# --------------------------------------------------------------------------
+FOUR_CODER_PLAN = {
+    "agent_name": "dev-lead", "orchestrator": "claude",
+    "coders": [{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"},
+               {"id": "opencode", "priority": 2, "model": "opencode/mimo-v2.6-flash-free"},
+               {"id": "kilo", "priority": 3, "model": "kilo/kilo-auto/free"},
+               {"id": "freebuff", "priority": 4, "model": "z-ai/glm-5.3-flash"}],
+    "reviewer": {"id": "codex"}, "port": 6767, "ngrok_domain": "", "max_dispatches": 4,
+}
+
+
+def _prompt_body(rendered: str) -> str:
+    return re.search(r"prompt:\s*\|(.*)", rendered, re.S).group(1)
+
+
+def test_roster_skill_carries_the_preflight_procedure_moved_out_of_the_prompt():
+    """The roster preflight is pure mechanics consulted while a dispatch is
+    being prepared, so it lives in the skill; only the fact that it is
+    MANDATORY on the first turn stays inline. Every procedural fact must have
+    MOVED, not vanished."""
+    skill = m.render_roster_skill(FOUR_CODER_PLAN)
+    for moved in ("## Preflight (FIRST turn, before any dispatch)",
+                  "sys_session_get_info({})", "configured_harnesses",
+                  "exactly `true`", "MISSING worker", "same turn you start planning",
+                  "`coder_cmdcode` -> `acp:command-code`",
+                  "`coder_zen` -> `opencode-native`",
+                  "`coder_kilo` -> `acp:kilo-code`",
+                  "`coder_freebuff` -> `acp:freebuff`",
+                  "`reviewer` -> `codex-native`"):
+        assert moved in skill, moved
+
+
+def test_roster_skill_preflight_mapping_is_generated_from_the_plan():
+    """The worker -> harness-id table is generated from the plan, so a
+    reconfigured roster produces a different table instead of a stale one."""
+    a = m.render_roster_skill(_base_plan(coders=[{"id": "cmdcode", "priority": 1,
+                                                  "model": "moonshotai/kimi-k3"}]))
+    b = m.render_roster_skill(_base_plan(coders=[{"id": "cline", "priority": 1,
+                                                  "model": "deepseek/deepseek-v4-flash"}]))
+    assert "`coder_cmdcode` -> `acp:command-code`" in a
+    assert "`coder_cmdcode` -> `acp:command-code`" not in b
+    assert "`coder_cline` -> `acp:cline`" in b
+    assert "`coder_cline` -> `acp:cline`" not in a
+
+
+def test_roster_skill_carries_the_per_worker_failure_shapes():
+    """The vendor-specific exhaustion strings and the exact mark-dry invocation
+    moved out of the prompt, generated from the registry `quota.note` /
+    `model.note` fields so they cannot drift from the catalog."""
+    skill = m.render_roster_skill(FOUR_CODER_PLAN)
+    assert "og stats --mark <id> dry --until" in skill
+    assert "Add credits to continue, or switch to a free model" in skill   # kilo model.note
+    assert "not enough Freebucks" in skill                                 # freebuff quota.note
+    assert "Rate limit exceeded" in skill                                  # opencode quota.note
+    assert "empty turn" in skill                                           # cline, Capacity
+    assert "You've reached your 5-hour usage limit" in skill               # cmdcode quota.note
+    assert "quota failure shape:" in skill
+
+
+def test_orchestrator_prompt_keeps_the_safety_critical_inline_sections():
+    """Whatever moved, these must survive in the prompt: each changes a
+    decision made BEFORE the orchestrator reads anything."""
+    rendered = m.render_orchestrator(FOUR_CODER_PLAN)
+    for needle in (
+            "you do NOT write product code",
+            "NEVER merge into a `protected` branch",
+            "Merge only into `auto_merge_target`",
+            "NEVER write the passed marker for a review that did not happen",
+            "`cross-vendor-review: passed`",
+            "`degraded-review`",
+            "DIFFERENT vendor",
+            "DROPPED turn",
+            "BOOT failure",
+            "Drop it for the run; never re-dispatch.",
+            "TASK failure",
+            "fresh attempt in a CLEAN worktree",
+            "QUOTA failure",
+            "FROM A CLEAN WORKTREE",
+            "MANDATORY before any dispatch",
+            "sys_session_get_info({})"):
+        assert needle in rendered, needle
+
+
+def test_orchestrator_prompt_left_the_moved_detail_to_the_skill():
+    """Guard against the moved detail creeping back into the argv prompt."""
+    rendered = m.render_orchestrator(FOUR_CODER_PLAN)
+    for moved in ("Add credits to continue", "not enough Freebucks",
+                  "Rate limit exceeded", "--until", "--reason", "og stats --agent"):
+        assert moved not in rendered, moved
+
+
+def test_orchestrator_prompt_leaves_headroom_for_a_four_coder_roster():
+    """The measured 4-coder roster must clear the 1,200-byte bar that the two
+    new sub-agent roles and the singleton failover entries are budgeted
+    against. A regression that re-inflates the prompt fails here, loudly."""
+    body = _prompt_body(m.render_orchestrator(FOUR_CODER_PLAN))
+    quoted = len(shlex.quote(body).encode())
+    headroom = m.PROMPT_CEILING - quoted
+    assert headroom >= 1200, f"{quoted} quoted, {headroom} headroom"
+    # The installer itself must not warn about the ceiling: its warn band starts
+    # 800 below it, so a 1,200-byte margin is comfortably outside.
+    assert not any("ceiling" in msg for _, msg in m.validate(FOUR_CODER_PLAN, body))
+
+
 def test_pick_model_offers_other_providers_by_number(monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", _fake_run(
         "opencode/mimo-v2.5-free\nopencode/glm-5\ndeepseek/deepseek-chat\n"))
@@ -926,11 +1127,11 @@ def test_validate_flags_same_vendor_through_a_reseller():
 def test_zen_preflight_only_for_zen_pins():
     plan = _rendering_plan()
     plan["coders"] = [{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}]
-    assert "Zen model preflight" in m.render_orchestrator(plan)
+    assert "Zen model preflight" in m.render_roster_skill(plan)
     plan["coders"][0]["model"] = "deepseek/deepseek-chat"
-    rendered = m.render_orchestrator(plan)
+    rendered = m.render_roster_skill(plan)
     assert "Zen model preflight" not in rendered
-    assert "day-capped" not in rendered
+    assert "day-capped" not in m.render_orchestrator(plan)
 
 
 # --------------------------------------------------------------------------
@@ -1107,15 +1308,85 @@ def test_pick_model_offers_choices_by_number(monkeypatch):
     assert m.pick_model(reg["freebuff"], None) == "deepseek-v4.1-flash"
 
 
-def test_pick_model_without_list_cmd_or_choices_keeps_current(monkeypatch):
-    # A required=false row with neither list_cmd nor choices is not pinnable:
-    # it must echo whatever is already set (today's behaviour), asking nothing.
+def test_pick_model_without_list_cmd_or_choices_still_prompts(monkeypatch):
+    # A required=false row with neither list_cmd nor choices IS pinnable: the
+    # old early return inferred "not pinnable" from that missing metadata and
+    # silently skipped the question -- the reviewer-pin bug. Now only a row that
+    # DECLARES `pinnable: false` is skipped, so this one reaches manual entry,
+    # where a blank answer means "harness default" and returns None.
     asked = []
-    monkeypatch.setattr(m, "ask", lambda prompt, default=None: asked.append(prompt) or "")
+
+    def fake_ask(prompt, default=None):
+        asked.append((prompt, default))
+        return ""
+
+    monkeypatch.setattr(m, "ask", fake_ask)
     agent = {"id": "agy", "label": "Antigravity", "vendor": "google",
              "model": {"required": False, "pin_path": "executor.model"}}
-    assert m.pick_model(agent, "opencode/mimo-v2.5-free") == "opencode/mimo-v2.5-free"
+    assert m.pick_model(agent, None) is None
+    assert len(asked) == 1
+    prompt, default = asked[0]
+    assert "model id" in prompt and "(blank = harness default)" in prompt
+    assert default == ""
+
+
+def test_pick_model_unpinnable_row_keeps_current_without_prompting(monkeypatch):
+    # claude declares model.pinnable=false (pinning the orchestrator also pins
+    # the family its workers route within). It must keep whatever is set and
+    # never prompt, whatever that value is.
+    asked = []
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: asked.append(prompt) or "")
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["claude"], "claude-opus-5") == "claude-opus-5"
     assert asked == []
+
+
+def test_pick_model_prompts_for_agy_and_blank_means_no_pin(monkeypatch):
+    # The real agy row (required=false, no list_cmd, no choices, not marked
+    # pinnable:false) now reaches the manual prompt; blank -> None.
+    seen = {}
+
+    def fake_ask(prompt, default=None):
+        seen["prompt"], seen["default"] = prompt, default
+        return ""
+
+    monkeypatch.setattr(m, "ask", fake_ask)
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["agy"], None) is None
+    assert "model id" in seen["prompt"] and "(blank = harness default)" in seen["prompt"]
+    assert seen["default"] == ""
+
+
+def test_pick_model_manual_entry_returns_the_typed_id(monkeypatch):
+    # The same no-listing row accepts a hand-typed id verbatim.
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
+
+
+def test_pick_model_codex_menu_resolves_by_number(monkeypatch):
+    # codex has no live listing, so its static `choices` drive the same numbered
+    # menu; a number resolves to the id at that position.
+    reg = m.agents_by_id()
+    assert reg["codex"]["model"]["choices"] == [
+        "gpt-5.5-codex", "gpt-5.5", "gpt-5.5-codex-mini", "o4-mini"]
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "3")
+    assert m.pick_model(reg["codex"], None) == "gpt-5.5-codex-mini"
+
+
+def test_pick_model_offers_an_existing_pin_as_default(monkeypatch):
+    # An existing pin is the menu default; pressing enter (ask returns the
+    # default) keeps it rather than snapping back to the registry's `prefer`.
+    seen = {}
+
+    def fake_ask(prompt, default=None):
+        seen["default"] = default
+        return default
+
+    monkeypatch.setattr(m, "ask", fake_ask)
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["codex"], "gpt-5.5") == "gpt-5.5"
+    assert seen["default"] == "gpt-5.5"
 
 
 def test_pick_model_choices_respect_prefer_default(monkeypatch):
@@ -1125,6 +1396,29 @@ def test_pick_model_choices_respect_prefer_default(monkeypatch):
     # freebuff's `prefer` (z-ai/glm-5.3-flash) is in choices, so an empty
     # enter (returns default) pins the preferred model rather than the first.
     assert m.pick_model(reg["freebuff"], None) == "z-ai/glm-5.3-flash"
+
+
+def test_pick_model_no_list_cmd_row_emits_no_missing_listing_warning(monkeypatch):
+    """The "could not list models" warning is gated on having TRIED a listing.
+    A row that never declared `list_cmd` (agy) must reach manual entry silently
+    -- firing it there would report a command that was never run, telling the
+    user a listing failed when none was attempted."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
+    warned = []
+    monkeypatch.setattr(m, "warn", lambda msg: warned.append(msg))
+    assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
+    assert not any("could not list models" in w for w in warned), warned
+
+
+def test_pick_model_codex_accepts_a_hand_typed_unlisted_id(monkeypatch):
+    """codex's `choices` are a static convenience list, not a closed set: the
+    row's own note promises a newer id typed by hand is accepted through the
+    "pin it anyway?" confirmation, since the CLI cannot enumerate models."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gpt-6-codex")
+    monkeypatch.setattr(m, "ask_yes", lambda prompt, default=False: True)
+    assert m.pick_model(reg["codex"], None) == "gpt-6-codex"
 
 
 # --------------------------------------------------------------------------
@@ -1142,6 +1436,28 @@ def test_emit_questions_carries_choices(monkeypatch, capsys):
         "z-ai/glm-5.3-flash", "mimo-2.5", "solar-pro-4", "deepseek-v4.1-flash"]
     # rows without choices are simply absent, not empty
     assert "cline" not in coder_q["per_item"]["choices"]
+
+
+def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
+    # AGENTS.md Part 1 has an AI installer drive its conversation from
+    # --questions and never offer an agent without the warning that applies to
+    # it. The caveat is per role, so it rides the question offering that role.
+    monkeypatch.setattr(m, "scan", lambda: {"grok": "/bin/grok", "devin": "/bin/devin",
+                                            "claude": "/bin/claude"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    orch_q = next(x for x in q["questions"] if x["key"] == "orchestrator")
+    assert "UNVERIFIED as orchestrator" in orch_q["notes"]["grok"]
+    assert "UNVERIFIED as orchestrator" in orch_q["notes"]["devin"]
+    assert "claude" not in orch_q["notes"]
+    # ...and the coder question carries nothing for them: verified in that role.
+    coder_q = next(x for x in q["questions"] if x["key"] == "coders")
+    assert "grok" not in coder_q["notes"] and "devin" not in coder_q["notes"]
+    # The raw field is in the embedded registry for a consumer that reads it.
+    grok_row = next(r for r in q["registry"] if r["id"] == "grok")
+    assert grok_row["unverified_roles"] == ["orchestrator"]
 
 
 # --------------------------------------------------------------------------
@@ -1368,6 +1684,25 @@ def test_list_models_drops_cmd_section_headings_and_docs_line(monkeypatch):
         assert junk not in got
 
 
+def test_validate_errors_on_an_impossible_required_and_unpinnable_model(monkeypatch):
+    """A row that both demands a pin (`model.required`) and forbids offering one
+    (`model.pinnable: false`) is self-contradictory: pick_model skips the
+    question, so the worker runs unpinned and inherits the orchestrator's model
+    id -- the exact failure `required` exists to prevent. No real row does this;
+    the guard is for the next registry edit, so a synthetic row exercises it."""
+    row = {
+        "id": "contradiction", "label": "Contradiction", "harness": "acp:contradiction",
+        "kind": "acp-user", "binary": "contradiction", "vendor": "test",
+        "roles": ["coder"], "relay": False, "silent_model_failure": False,
+        "prompt_delivery": "unknown",
+        "model": {"required": True, "pinnable": False, "pin_path": "executor.model"},
+    }
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], row]})
+    plan = _base_plan(coders=[{"id": "contradiction", "priority": 1, "model": None}])
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("model.required true and model.pinnable false" in msg for msg in errors), errors
+
+
 # --------------------------------------------------------------------------
 # unresolved {shim:...} tokens are refused + shim paths survive spaces
 # --------------------------------------------------------------------------
@@ -1446,3 +1781,13 @@ def test_acp_command_keeps_a_spaced_shim_path_as_one_argv_entry(monkeypatch):
     argv_plain = shlex.split(m.acp_command(row, None))
     assert "CMD_BIN=/Users/John Smith/.omnigent/shims/cmd-og" in argv_plain
 
+
+# --------------------------------------------------------------------------
+# the registry's $comment documents every field it expects a row to carry
+# --------------------------------------------------------------------------
+def test_registry_comment_documents_the_role_unverified_fields():
+    # A registry field absent from the $comment block is invisible to the next
+    # person editing the catalog (AGENTS.md: add vendors HERE, not in code).
+    comment = "\n".join(m.REGISTRY["$comment"])
+    assert "unverified_roles" in comment
+    assert "roles_note" in comment

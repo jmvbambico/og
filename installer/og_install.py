@@ -437,11 +437,14 @@ def pick_model(agent: dict, current: str | None) -> str | None:
     """Resolve the model pin for one agent."""
     spec = agent.get("model") or {}
     required = spec.get("required", False)
-    # Required=false rows with no live model listing AND no static `choices`
-    # are not pinnable: offer nothing and keep whatever is already set. A row
-    # with `choices` (e.g. freebuff/blink's splash models) IS pinnable, so fall
-    # through to the menu below -- for required=false and required=true alike.
-    if not required and not spec.get("list_cmd") and not spec.get("choices"):
+    # Unpinnable is DECLARED (model.pinnable: false), not inferred from missing
+    # metadata. Inferring it meant a required=false row with no live listing and
+    # no static `choices` -- codex, agy -- silently skipped the question, so a
+    # user who wanted a reviewer model pin (the reported bug) was never asked.
+    # Only a row that says so is skipped; every other row reaches the prompt,
+    # and with no listing or choices it falls to manual entry (blank = harness
+    # default). `pinnable` defaults to true, so an absent key is pinnable.
+    if not spec.get("pinnable", True):
         note = spec.get("note")
         if note:
             say(f"  {C['dim']}{agent['label']}: {note}{C['x']}")
@@ -521,6 +524,64 @@ def load_state() -> dict:
     return {}
 
 
+def role_caveat(agent: dict, role: str) -> str | None:
+    """The UNVERIFIED-in-this-role caveat for `agent`, or None.
+
+    A row records the roles it has never been driven in as a structured list
+    rather than free text: grok and devin are verified coders but unverified
+    ORCHESTRATORS, so the whole-row `unverified` flag (which condemns a row in
+    the detected-CLI list) would be wrong here. This is the field CODE reads,
+    so the caveat reaches the picker, validate() and --questions instead of
+    sitting in the registry unread the way a `roles_note` did.
+    """
+    if role not in (agent.get("unverified_roles") or []):
+        return None
+    return (f"{agent['label']} is UNVERIFIED as {role}: it clears the bars "
+            "validate() enforces, but no og run has been driven with it in that "
+            "role, so the first real dispatch is the only proof. Demote it to a "
+            "verified role if that dispatch cannot perform the role.")
+
+
+def role_options(role: str, found: dict | None = None) -> list:
+    """(id, label, note) for every detected agent that may fill `role`.
+
+    Extracted from build_plan_interactive so the per-role caveat can be asserted
+    without a terminal: `pick_one` renders the third field under the option, so
+    a caveat that only lived in the registry was invisible at exactly the moment
+    the user chose.
+    """
+    if found is None:
+        found = scan()
+    out = []
+    for a in REGISTRY["agents"]:
+        if a["id"] not in found or role not in a["roles"]:
+            continue
+        notes = []
+        if role == "reviewer" and a.get("reviewer_warning"):
+            notes.append(a["reviewer_warning"])
+        caveat = role_caveat(a, role)
+        if caveat:
+            notes.append(caveat)
+        out.append((a["id"], a["label"], " ".join(notes) or None))
+    return out
+
+
+def role_notes(role: str) -> dict:
+    """agent id -> per-role caveat, for the `--questions` surface.
+
+    AGENTS.md Part 1 has an AI installer drive its conversation from that
+    output, and it must never offer an agent without the warning that applies to
+    it. The caveat is per role -- grok/devin are verified coders and unverified
+    orchestrators -- so it is keyed by id under the question that offers them.
+    """
+    out = {}
+    for a in REGISTRY["agents"]:
+        caveat = role_caveat(a, role)
+        if caveat:
+            out[a["id"]] = caveat
+    return out
+
+
 def build_plan_interactive(state: dict) -> dict:
     reg = agents_by_id()
     found = scan()
@@ -538,10 +599,10 @@ def build_plan_interactive(state: dict) -> dict:
         say(f"  {C['dim']}not found: {', '.join(a['label'] for a in missing)}{C['x']}")
 
     def opts(role):
-        return [(a["id"], reg[a["id"]]["label"],
-                 reg[a["id"]].get("reviewer_warning") if role == "reviewer" else None)
-                for a in REGISTRY["agents"]
-                if a["id"] in found and role in a["roles"]]
+        # role_options carries the reviewer warning AND the per-role UNVERIFIED
+        # caveat into the note pick_one renders under each option, so a caveat
+        # is visible while choosing rather than after the install.
+        return role_options(role, found)
 
     # --- orchestrator ---
     orch_opts = opts("orchestrator")
@@ -659,6 +720,23 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     reg = agents_by_id()
     issues = []
 
+    # A row declaring both `model.required` (a dispatch MUST pin a model) and
+    # `model.pinnable: false` (the installer must never offer one) is
+    # self-contradictory: `pick_model` skips the question, so the worker runs
+    # unpinned and inherits the ORCHESTRATOR's model id -- the exact failure
+    # `required` exists to prevent, now silent. Refuse it. No row does this
+    # today; the guard is here so the next registry edit cannot slip it past.
+    for aid in sorted({plan["orchestrator"], plan["reviewer"]["id"]}
+                      | {c["id"] for c in plan["coders"]}):
+        spec = reg[aid].get("model") or {}
+        if spec.get("required") and not spec.get("pinnable", True):
+            issues.append(("error",
+                           f"{reg[aid]['label']} declares model.required true and "
+                           "model.pinnable false. The installer would never ask "
+                           "for the pin, so the worker runs unpinned and inherits "
+                           "the orchestrator's model id. Drop one of the two in "
+                           "the registry row."))
+
     for c in plan["coders"]:
         spec = reg[c["id"]].get("model") or {}
         if spec.get("required") and not c.get("model"):
@@ -704,6 +782,35 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                        "does not deliver spec instructions. Their operating rules must be "
                        "inlined into args.input on every dispatch; the generated `roster` "
                        "skill tells the orchestrator to do exactly that."))
+
+    # A `none` reviewer never sees the whole review contract that lives in
+    # reviewer.yaml.tmpl, and no warning covered it until this one. Kept separate
+    # from the coder `mute` warning above because the remedy differs: a coder
+    # needs its scope and gate rules inlined, a reviewer needs the review
+    # contract and the exact three-section report format. Folding the two would
+    # lose which set of rules the orchestrator must supply.
+    if reg[plan["reviewer"]["id"]].get("prompt_delivery") == "none":
+        issues.append(("warn",
+                       f"{reg[plan['reviewer']['id']]['label']} never receives the review "
+                       "contract in reviewer.yaml.tmpl — that harness does not deliver spec "
+                       "instructions. The whole contract (judge only against the acceptance "
+                       "contract, never edit code, report in exactly three sections BLOCKING / "
+                       "NON-BLOCKING / SUGGESTIONS with file:line evidence) must be inlined "
+                       "into args.input on every review dispatch; the generated `roster` skill "
+                       "tells the orchestrator to do exactly that."))
+
+    # A role a row marks `unverified_roles` clears validate()'s gates but has
+    # never been driven here -- grok/devin as orchestrator. The registry used to
+    # record that only in a free-text `roles_note` nothing read, so a user
+    # selecting one as the brain was never shown the caveat. The config is legal
+    # (a weak orchestrator at runtime, not a broken install), so this WARNs
+    # rather than refuses; the first real dispatch is the proof.
+    for role, aid in ([("orchestrator", plan["orchestrator"])]
+                      + [("coder", c["id"]) for c in plan["coders"]]
+                      + [("reviewer", plan["reviewer"]["id"])]):
+        caveat = role_caveat(reg[aid], role)
+        if caveat:
+            issues.append(("warn", caveat))
 
     # A `{shim:<name>}` token with no matching shim block renders a path to
     # a file nothing ever writes. The launch then fails with an exec error
@@ -826,9 +933,33 @@ def quota_line(a: dict) -> str:
             f"- quota: not measurable{'' if q else ' (no quota block in the registry)'}")
 
 
+def quota_failure_lines(a: dict) -> list:
+    """The vendor-specific failure strings for a row, from its `quota.note`.
+
+    Generated rather than frozen into the prompt: the exact message a worker
+    prints when it is dry is what the orchestrator matches to mark it dry, and a
+    hand-copied string drifts the moment a registry row is reworded. A row with
+    no quota block, or a null note, has no known failure shape to name.
+    """
+    note = (a.get("quota") or {}).get("note")
+    return [f"- quota failure shape: {note}"] if note else []
+
+
 def render_roster_skill(plan: dict) -> str:
-    """The long-form roster notes, as a skill file rather than prompt bytes."""
+    """The long-form roster notes, as a skill file rather than prompt bytes.
+
+    The preflight procedure and the per-worker failure strings live here rather
+    than in the prompt: both are consulted while a dispatch is already being
+    prepared or has just failed, which is when an on-demand read is affordable.
+    What stays in the prompt is the part that changes a decision made BEFORE
+    anything is read (that a preflight is mandatory, and the three-way BOOT /
+    TASK / QUOTA classification). The mapping and the failure shapes are
+    generated from the plan and the registry so they cannot drift.
+    """
     reg = agents_by_id()
+    oc = next((c for c in plan["coders"] if c["id"] == "opencode"), None)
+    zen = ([zen_preflight_note(worker_name("opencode")), ""]
+           if oc and is_zen_free(oc.get("model")) else [])
     out = [
         "---", "name: roster",
         "description: What each worker in this orchestrator's roster actually is — "
@@ -841,6 +972,14 @@ def render_roster_skill(plan: dict) -> str:
         "go down only when the one above is unavailable, out of quota, or has already",
         "failed this run. Every worker pins its own model in its spec — never pass",
         "`args.model`.", "",
+        "## Preflight (FIRST turn, before any dispatch)", "",
+        "Run ONE `sys_session_get_info({})` and read `configured_harnesses`. Each",
+        "worker maps to exactly one harness id:", "",
+        render_preflight_map(plan), "",
+        "A worker is available ONLY when its value is exactly `true`. Route only to",
+        "the available set. Do not announce a clean result; a MISSING worker is the",
+        "only fact worth words. Do this in the same turn you start planning.", "",
+        *zen,
         "## Capacity", "",
         "Run `og stats --json` (og is on PATH) before the FIRST dispatch of this run,",
         "and `og stats --agent <id> --json` before every later one. If `og` is missing",
@@ -878,6 +1017,7 @@ def render_roster_skill(plan: dict) -> str:
                 f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
                 f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}",
                 quota_line(a)]
+        out += quota_failure_lines(a)
         if a.get("relay") is False:
             out.append("- **Leaf worker.** Runs without Omnigent's `sys_*` tool relay, so it "
                        "cannot orchestrate or dispatch. Implementation and exploration only.")
@@ -909,11 +1049,24 @@ def render_roster_skill(plan: dict) -> str:
     rv = reg[plan["reviewer"]["id"]]
     out += [f"## `reviewer` — {rv['label']}", "",
             f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, plan['reviewer'])}`",
-            quota_line(rv),
+            quota_line(rv), *quota_failure_lines(rv),
             "- Reviews only; never edits, never gets a worktree.",
             "- Cross-vendor review is the point: never route a diff to a reviewer whose",
             "  vendor matches the implementer's. If that is unavoidable, say so and label",
-            "  the PR `degraded-review`.", ""]
+            "  the PR `degraded-review`."]
+    if rv.get("prompt_delivery") == "none":
+        # The same hazard as the coder bullet above, but the reviewer's whole
+        # contract lives in reviewer.yaml.tmpl and is lost here — so this bullet
+        # restates that contract in the dispatch, keeping the two from drifting.
+        out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                   "delivers spec instructions, so the reviewer sees ONLY the text you send "
+                   "in `args.input`. Every review dispatch must therefore carry the whole "
+                   "contract itself: the acceptance contract and the diff as TEXT (never a "
+                   "worktree), judge the diff ONLY against the contract, never edit code and "
+                   "never go looking for a worktree, and report in exactly three sections — "
+                   "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
+                   "evidence. Do not assume it knows the review format.")
+    out.append("")
     return "\n".join(out)
 
 
@@ -936,27 +1089,40 @@ def _wrap(text: str, width: int) -> list:
 
 
 def render_preflight_map(plan: dict) -> str:
+    """The worker -> harness-id table the roster skill's preflight uses.
+
+    Generated from the plan rather than frozen into the prompt: the mapping
+    must match the roster the user actually chose, and a hardcoded table
+    silently drifts the moment a coder is added, dropped or renamed.
+    """
     reg = agents_by_id()
     rows = [f"    `{worker_name(c['id'])}` -> `{reg[c['id']]['harness']}`" for c in plan["coders"]]
     rows.append(f"    `reviewer` -> `{reg[plan['reviewer']['id']]['harness']}`")
     return "\n".join(rows)
 
 
-OPENCODE_PREFLIGHT = """  ### Zen model preflight (once per run, only if dispatching {name})
-  A CHECK, not a choice: `args.model` replaces a verified free pin with a
-  guess, which is how a paid model hits OpenCode's "No payment method" wall.
-  Call `sys_list_models` once. Pinned id listed, or query failed -> dispatch
-  with no `args.model`, say nothing. Gone (Zen rotates its lineup) -> pick the
-  strongest replacement ending in `-free`, pass it as `args.model` this run
-  only, and tell the human the pin needs updating. A non-`-free` id is a
-  failed dispatch, not a slower one.
+def zen_preflight_note(name: str) -> str:
+    """The Zen free-tier preflight, as roster-skill prose.
 
-"""
+    Moved out of the prompt, where it cost ~570 shell-quoted bytes inline: it
+    is a procedure consulted while already dispatching, not a fact that changes
+    a decision made before reading anything. Generated rather than frozen so it
+    names the worker this plan actually wires the harness to.
+    """
+    return (
+        f"### Zen model preflight (once per run, only if dispatching `{name}`)\n\n"
+        "A CHECK, not a choice: `args.model` replaces a verified free pin with a\n"
+        "guess, which is how a paid model hits OpenCode's \"No payment method\" wall.\n"
+        "Call `sys_list_models` once. Pinned id listed, or query failed -> dispatch\n"
+        "with no `args.model`, say nothing. Gone (Zen rotates its lineup) -> pick the\n"
+        "strongest replacement ending in `-free`, pass it as `args.model` this run\n"
+        "only, and tell the human the pin needs updating. A non-`-free` id is a\n"
+        "failed dispatch, not a slower one.")
+
 
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()
     s = tmpl("orchestrator.yaml.tmpl")
-    oc = next((c for c in plan["coders"] if c["id"] == "opencode"), None)
     agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
     agent_list += "\n    - reviewer"
     subs = {
@@ -964,12 +1130,6 @@ def render_orchestrator(plan: dict) -> str:
         "{{ORCHESTRATOR_HARNESS}}": reg[plan["orchestrator"]]["harness"],
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
-        "{{PREFLIGHT_MAP}}": render_preflight_map(plan),
-        # The Zen preflight guards against a rotated FREE-tier id; a paid Zen
-        # pin or a provider the user added (deepseek/..., anthropic/...) has no
-        # such rotation, so the check would only invite an `args.model` override.
-        "{{OPENCODE_PREFLIGHT}}": (OPENCODE_PREFLIGHT.format(name=worker_name("opencode"))
-                                   if oc and is_zen_free(oc.get("model")) else ""),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
         "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + 1),
@@ -1662,10 +1822,15 @@ def emit_questions() -> None:
             {"key": "orchestrator", "type": "choice",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "orchestrator" in a["roles"]],
+             # The per-role UNVERIFIED caveat travels with the choice: AGENTS.md
+             # Part 1 has the AI installer drive its conversation from this
+             # output, and it must never offer a role without the warning.
+             "notes": role_notes("orchestrator"),
              "ask": "Which agent plans and delegates (never writes product code)?"},
             {"key": "coders", "type": "ordered_multi",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "coder" in a["roles"]],
+             "notes": role_notes("coder"),
              "ask": "Which agents implement code, in preference order (first is tried first)?",
              "per_item": {"model": "Model id to pin. REQUIRED for agents where "
                                   "registry.model.required is true.",
@@ -1675,6 +1840,7 @@ def emit_questions() -> None:
             {"key": "reviewer", "type": "choice",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "reviewer" in a["roles"]],
+             "notes": role_notes("reviewer"),
              "ask": "Which agent reviews the batched diff? Prefer a vendor that "
                     "differs from every coder."},
             {"key": "accounts", "type": "map",

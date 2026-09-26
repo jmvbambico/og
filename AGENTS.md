@@ -23,6 +23,12 @@ are actually present*, the current state if there is one, and the full agent
 registry. Drive your conversation from that output — never offer an agent whose
 CLI is missing.
 
+A choice question may also carry a `notes` map, keyed by agent id. A note is a
+caveat that applies to that agent *in that role only* — an agent verified as a
+coder can be unverified as an orchestrator. **Relay every note that applies to
+an option you offer.** Dropping one hands the user a role that looks fully
+supported and fails at the first real dispatch.
+
 ### 2. Ask
 
 Ask the user, in this order. Each maps to a key in the plan JSON.
