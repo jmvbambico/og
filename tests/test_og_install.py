@@ -1107,15 +1107,85 @@ def test_pick_model_offers_choices_by_number(monkeypatch):
     assert m.pick_model(reg["freebuff"], None) == "deepseek-v4.1-flash"
 
 
-def test_pick_model_without_list_cmd_or_choices_keeps_current(monkeypatch):
-    # A required=false row with neither list_cmd nor choices is not pinnable:
-    # it must echo whatever is already set (today's behaviour), asking nothing.
+def test_pick_model_without_list_cmd_or_choices_still_prompts(monkeypatch):
+    # A required=false row with neither list_cmd nor choices IS pinnable: the
+    # old early return inferred "not pinnable" from that missing metadata and
+    # silently skipped the question -- the reviewer-pin bug. Now only a row that
+    # DECLARES `pinnable: false` is skipped, so this one reaches manual entry,
+    # where a blank answer means "harness default" and returns None.
     asked = []
-    monkeypatch.setattr(m, "ask", lambda prompt, default=None: asked.append(prompt) or "")
+
+    def fake_ask(prompt, default=None):
+        asked.append((prompt, default))
+        return ""
+
+    monkeypatch.setattr(m, "ask", fake_ask)
     agent = {"id": "agy", "label": "Antigravity", "vendor": "google",
              "model": {"required": False, "pin_path": "executor.model"}}
-    assert m.pick_model(agent, "opencode/mimo-v2.5-free") == "opencode/mimo-v2.5-free"
+    assert m.pick_model(agent, None) is None
+    assert len(asked) == 1
+    prompt, default = asked[0]
+    assert "model id" in prompt and "(blank = harness default)" in prompt
+    assert default == ""
+
+
+def test_pick_model_unpinnable_row_keeps_current_without_prompting(monkeypatch):
+    # claude declares model.pinnable=false (pinning the orchestrator also pins
+    # the family its workers route within). It must keep whatever is set and
+    # never prompt, whatever that value is.
+    asked = []
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: asked.append(prompt) or "")
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["claude"], "claude-opus-5") == "claude-opus-5"
     assert asked == []
+
+
+def test_pick_model_prompts_for_agy_and_blank_means_no_pin(monkeypatch):
+    # The real agy row (required=false, no list_cmd, no choices, not marked
+    # pinnable:false) now reaches the manual prompt; blank -> None.
+    seen = {}
+
+    def fake_ask(prompt, default=None):
+        seen["prompt"], seen["default"] = prompt, default
+        return ""
+
+    monkeypatch.setattr(m, "ask", fake_ask)
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["agy"], None) is None
+    assert "model id" in seen["prompt"] and "(blank = harness default)" in seen["prompt"]
+    assert seen["default"] == ""
+
+
+def test_pick_model_manual_entry_returns_the_typed_id(monkeypatch):
+    # The same no-listing row accepts a hand-typed id verbatim.
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
+
+
+def test_pick_model_codex_menu_resolves_by_number(monkeypatch):
+    # codex has no live listing, so its static `choices` drive the same numbered
+    # menu; a number resolves to the id at that position.
+    reg = m.agents_by_id()
+    assert reg["codex"]["model"]["choices"] == [
+        "gpt-5.5-codex", "gpt-5.5", "gpt-5.5-codex-mini", "o4-mini"]
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "3")
+    assert m.pick_model(reg["codex"], None) == "gpt-5.5-codex-mini"
+
+
+def test_pick_model_offers_an_existing_pin_as_default(monkeypatch):
+    # An existing pin is the menu default; pressing enter (ask returns the
+    # default) keeps it rather than snapping back to the registry's `prefer`.
+    seen = {}
+
+    def fake_ask(prompt, default=None):
+        seen["default"] = default
+        return default
+
+    monkeypatch.setattr(m, "ask", fake_ask)
+    reg = m.agents_by_id()
+    assert m.pick_model(reg["codex"], "gpt-5.5") == "gpt-5.5"
+    assert seen["default"] == "gpt-5.5"
 
 
 def test_pick_model_choices_respect_prefer_default(monkeypatch):

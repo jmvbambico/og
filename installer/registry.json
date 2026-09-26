@@ -25,6 +25,10 @@
     "  model.pin_path  where the pin goes in the sub-agent spec. Always",
     "                  executor.model — executor.config is a free-form dict",
     "                  and a model placed there is silently ignored.",
+    "  model.pinnable  false when the row must NOT offer a model pin at all",
+    "                  (default: true). Only claude sets it: pinning the",
+    "                  ORCHESTRATOR also pins the model family its workers",
+    "                  route within, which strands non-Claude workers.",
     "  relay         false when the agent runs without Omnigent's sys_* tool",
     "                relay (leaf worker only; cannot orchestrate)",
     "  silent_model_failure  true when a bad model id produces an empty",
@@ -56,6 +60,7 @@
       "model": {
         "required": false,
         "pin_path": "executor.model",
+        "pinnable": false,
         "note": "Subscription login picks the model. Pinning the ORCHESTRATOR also pins the family its workers route within, which strands non-Claude workers — leave it unset."
       },
       "install": {
@@ -160,7 +165,15 @@
       "silent_model_failure": false,
       "model": {
         "required": false,
-        "pin_path": "executor.model"
+        "pin_path": "executor.model",
+        "choices": [
+          "gpt-5.5-codex",
+          "gpt-5.5",
+          "gpt-5.5-codex-mini",
+          "o4-mini"
+        ],
+        "prefer": "gpt-5.5-codex",
+        "note": "Codex's subscription login already selects a default model, so a blank answer is fine. The CLI does not enumerate models, so this list is static — a newer id typed by hand is accepted (the picker offers to pin an unlisted id)."
       },
       "install": {
         "npm": "npm i -g @openai/codex",
