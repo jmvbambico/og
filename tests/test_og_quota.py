@@ -998,6 +998,28 @@ def test_lineup_list_registry(tmp_path):
         "anthropic-oauth"
 
 
+def test_lineup_expands_orchestrator_and_reviewer_chains(tmp_path):
+    """A role is an ordered chain now. `og stats` is the evidence the
+    orchestrator reads to pick the earliest reviewer with capacity, so every
+    entry must get its own row -- a backup missing here cannot be failed over
+    to on anything better than a guess."""
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "orchestrator": [{"id": "claude", "priority": 1},
+                         {"id": "codex", "priority": 2}],
+        "coders": [{"id": "opencode", "priority": 1}],
+        "reviewer": [{"id": "codex", "priority": 1},
+                     {"id": "kiro", "priority": 2}],
+    }))
+    _write_registry(reg)
+    rows = st.lineup(inst, reg)
+    assert [(r["role"], r["agent"]) for r in rows] == [
+        ("orchestrator", "claude"), ("orchestrator", "codex"),
+        ("coder", "opencode"),
+        ("reviewer", "codex"), ("reviewer", "kiro")]
+
+
 def test_table_and_json_shape(tmp_path, capsys):
     state_path = tmp_path / "og-quota.json"
     rec = q.make_record("ok", "measured", 60, 100, "percent",

@@ -2,9 +2,9 @@
 """og stats — per-agent quota/capacity reporter.
 
 Builds the lineup from og-install.json (orchestrator, coders by priority,
-reviewer), finds each agent's quota probe from the registry row's `quota`
-block, runs probes concurrently, and prints one row per agent. Probes live in
-og_quota.py; this CLI owns presentation and the mark commands.
+reviewers in chain order), finds each agent's quota probe from the registry
+row's `quota` block, runs probes concurrently, and prints one row per agent.
+Probes live in og_quota.py; this CLI owns presentation and the mark commands.
 
 Privacy: read-only everywhere, never prints token values, never refreshes
 tokens (see docs/STATS.md).
@@ -52,7 +52,7 @@ def _agents_map(reg: dict) -> dict:
 
 def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     """[{role, agent, priority, probe, params, note}] in dispatch order:
-    orchestrator, coders by priority, reviewer last."""
+    orchestrator, coders by priority, reviewers in chain order."""
     try:
         inst = json.loads(install_path.read_text())
     except FileNotFoundError:
@@ -75,19 +75,31 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
                 "probe": probe, "params": params,
                 "note": quota.get("note") or ""}
 
+    def ids(value) -> list:
+        """The agent ids in a role's plan value.
+
+        A role is an ORDERED chain, so it may be a list of entries; the older
+        shapes (a bare id string, a single {"id": ...} object) still appear in
+        state files written before the chain existed and must keep reporting.
+        """
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [value.get("id")]
+        if isinstance(value, list):
+            return [e if isinstance(e, str) else (e or {}).get("id") for e in value]
+        return []
+
     entries: list[dict] = []
-    orch = inst.get("orchestrator")
-    if isinstance(orch, str):
-        entries.append(entry(orch, "orchestrator", None))
-    elif isinstance(orch, dict):
-        entries.append(entry(orch.get("id"), "orchestrator", None))
+    for aid in ids(inst.get("orchestrator")):
+        entries.append(entry(aid, "orchestrator", None))
     for c in sorted(inst.get("coders") or [], key=lambda c: c.get("priority", 999)):
         entries.append(entry(c.get("id"), "coder", c.get("priority")))
-    rv = inst.get("reviewer")
-    if isinstance(rv, str):
-        entries.append(entry(rv, "reviewer", None))
-    elif isinstance(rv, dict):
-        entries.append(entry(rv.get("id"), "reviewer", None))
+    # One row per reviewer, in chain order: this is the probe surface the
+    # orchestrator reads to pick the earliest entry with capacity, so a backup
+    # that is absent here cannot be failed over to on evidence.
+    for aid in ids(inst.get("reviewer")):
+        entries.append(entry(aid, "reviewer", None))
     return entries
 
 
