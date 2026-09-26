@@ -1547,6 +1547,173 @@ def test_a_none_scout_backup_gets_its_own_roster_bullet():
 
 
 # --------------------------------------------------------------------------
+# integrator -- an optional git/gate plumbing worker, a chain like the scout
+# --------------------------------------------------------------------------
+def test_plan_without_an_integrator_installs_with_none(tmp_path, monkeypatch):
+    """integrator is OPTIONAL: omitting the key must produce a correct bundle
+    with no integrator spec on disk and no dangling reference in the
+    orchestrator's agent list or prompt, so a user who does not want one is
+    never charged for it."""
+    plan = _chain_plan()
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    assert not (bundle / "agents" / "integrator").exists()
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert "integrator" not in orch["tools"]["agents"]
+    assert "integrator" not in m.render_orchestrator(plan)
+    assert "integrator" not in m.render_roster(plan)
+
+
+def test_an_old_install_with_no_integrator_key_still_loads():
+    # Backward compatibility, as for the scout: a plan written before the role
+    # existed carries no integrator key and must keep loading, validating and
+    # rendering unchanged rather than erroring on a missing role.
+    plan = _base_plan()
+    assert "integrator" not in plan
+    assert m.chain(plan, "integrator") == []
+    assert m.role_names(plan, "integrator") == []
+    assert "integrator" not in m.normalize_plan(dict(plan))
+    assert not [msg for _, msg in m.validate(plan) if "integrator" in msg]
+
+
+def test_two_integrator_chain_emits_a_spec_per_entry_with_its_own_pin(tmp_path, monkeypatch,
+                                                                     capsys):
+    plan = _chain_plan(integrator=[{"id": "cmdcode", "priority": 1,
+                                    "model": "moonshotai/kimi-k3"},
+                                   {"id": "codex", "priority": 2, "model": "gpt-5.5"}])
+    _apply_into(tmp_path, monkeypatch, plan)
+    out = capsys.readouterr().out
+    # The apply summary names both entries, so a user sees the chain they got.
+    assert "integrator    Command Code → moonshotai/kimi-k3" in out, out
+    assert "integrator #2   integrator_2 (Codex (OpenAI)) → gpt-5.5" in out, out
+    bundle = tmp_path / "agents" / "test-agent"
+    primary = yaml.safe_load((bundle / "agents" / "integrator" / "config.yaml").read_text())
+    backup = yaml.safe_load((bundle / "agents" / "integrator_2" / "config.yaml").read_text())
+    assert primary["name"] == "integrator"
+    assert primary["executor"]["model"] == "moonshotai/kimi-k3"
+    assert primary["executor"]["config"]["harness"] == "acp:command-code"
+    assert backup["name"] == "integrator_2"
+    assert backup["executor"]["model"] == "gpt-5.5"
+    assert backup["executor"]["config"]["harness"] == "codex-native"
+    # Both are reachable: tools.agents is the only dispatch surface, and the
+    # count in the prompt must match what is actually listed.
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert orch["tools"]["agents"] == ["coder_zen", "reviewer", "integrator", "integrator_2"]
+    assert "four sub-agents" in orch["prompt"]
+
+
+def test_integrator_template_carries_the_bounded_and_never_merge_contract():
+    plan = _base_plan(integrator=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+    parsed = yaml.safe_load(m.render_integrator(plan))
+    prompt = " ".join(parsed["prompt"].split())
+    # The bounded result IS the role: an integrator that pastes a full diff back
+    # has re-inflated the context it exists to keep clear.
+    assert "BOUNDED" in prompt
+    assert "a full `git log` or a full passing log back has FAILED ITS PURPOSE" in prompt
+    assert "ONLY the failing output" in prompt
+    # The merge boundary: it never decides, and never pushes or opens a PR.
+    assert "THE MERGE DECISION IS NOT YOURS" in prompt
+    assert "NEVER merge into a protected branch" in prompt
+    assert "never `git push`" in prompt
+    assert "never open or merge a pull request" in prompt
+    assert "only when" in prompt and "explicitly told to" in prompt
+    # The concurrency hazard: the integration suite runs in exactly one place.
+    assert "EXACTLY ONE PLACE AT A TIME" in prompt
+    assert "another integrator" in prompt
+    # ...and it is a normal write worker: pinned model, named harness, skills off.
+    assert parsed["executor"]["model"] == "moonshotai/kimi-k3"
+    assert parsed["skills"] == "none"
+
+
+def test_a_none_integrator_warns_for_the_primary_and_the_backup():
+    # cursor and gemini are prompt_delivery: none. As integrator entries they
+    # never see integrator.yaml.tmpl, so BOTH the bounded-result rule and the
+    # never-decide-a-merge rule must be inlined -- and the backup is reached
+    # exactly when the primary is dry, so it must warn too, not only the head.
+    plan = _base_plan(integrator=[{"id": "cursor", "priority": 1, "model": None},
+                                  {"id": "gemini", "priority": 2, "model": None}])
+    warnings = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert sum("never receives the integrator contract" in msg for msg in warnings) == 2, warnings
+    # An integrator on a delivering harness gets no such warning.
+    quiet = _base_plan(integrator=[{"id": "codex", "model": None}])
+    assert not [msg for _, msg in m.validate(quiet) if "integrator contract" in msg]
+
+
+def test_integrator_gets_an_inline_roster_bullet_only_when_installed():
+    roster = m.render_roster(_base_plan(integrator=[{"id": "codex", "model": None}]))
+    assert "`integrator`" in roster and "never decides a merge" in roster
+    assert "`integrator`" not in m.render_roster(_base_plan())
+
+
+def test_emit_questions_offers_integrator_as_an_ordered_chain(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex", "cmdcode": "/bin/cmd"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    ig = next(x for x in q["questions"] if x["key"] == "integrator")
+    assert ig["type"] == "ordered_multi"
+    assert set(ig["choices"]) == {"codex", "cmdcode"}
+    # ...with the same model-pin surface as coders, the reviewer and the scout.
+    assert "choices" in ig["per_item"]
+
+
+def test_roster_skill_names_the_integrator_chain_in_order_and_states_the_rules():
+    """The integrator's contract has to be in the skill because it is what
+    makes the role safe: a bounded result, no merge decision, and one integrator
+    at a time. Same chain and failover rule as the reviewers and scouts."""
+    plan = _base_plan(integrator=[{"id": "cmdcode", "priority": 1,
+                                   "model": "moonshotai/kimi-k3"},
+                                  {"id": "kiro", "priority": 2, "model": "auto"}])
+    skill = m.render_roster_skill(plan)
+    assert "## Integrators — git and gate plumbing" in skill
+    assert "`integrator` (Command Code) is the primary" in skill
+    assert "`integrator_2` (Kiro (AWS)) backs it up, in that order." in skill
+    for phrase in ("BOUNDED", "only the", "FAILING gate output",
+                   "**The merge decision is yours, never the integrator's.**",
+                   "merges into a protected branch, never pushes", "never opens or",
+                   "**One integrator at a time.**", "exactly ONE",
+                   "`og stats --agent <id> --json`", "earliest entry with capacity",
+                   "never re-send a dispatch"):
+        assert phrase in skill, phrase
+    assert skill.index("## `integrator`") < skill.index("## `integrator_2`")
+    # Each entry section carries its own harness, pin and quota shape.
+    assert "harness `acp:command-code`" in skill
+    assert "pinned `moonshotai/kimi-k3`" in skill
+    assert "`integrator` -> `acp:command-code`" in skill
+    assert "`integrator_2` -> `acp:kiro-aws`" in skill
+
+
+def test_roster_skill_has_no_integrator_section_without_one():
+    skill = m.render_roster_skill(_base_plan())
+    assert "## Integrators" not in skill
+    assert "is the only integrator" not in skill
+    assert "## `integrator" not in skill
+
+
+def test_roster_skill_integrator_section_is_single_when_there_is_only_one():
+    skill = m.render_roster_skill(_base_plan(integrator=[{"id": "codex", "model": None}]))
+    assert "`integrator` (Codex (OpenAI)) is the only integrator in this roster." in skill
+    assert "backs it up" not in skill
+
+
+def test_a_none_integrator_backup_gets_its_own_roster_bullet():
+    # cursor is prompt_delivery: none. A BACKUP integrator drops the contract
+    # exactly like a primary would, so its section must restate the bounded
+    # result, the never-decide-a-merge rule and the one-at-a-time rule.
+    plan = _base_plan(integrator=[{"id": "codex", "priority": 1, "model": None},
+                                  {"id": "cursor", "priority": 2, "model": None}])
+    skill = m.render_roster_skill(plan)
+    backup = skill.split("## `integrator_2`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in backup
+    assert "BOUNDED result" in backup
+    assert "never opening or merging a PR" in backup
+    assert "never running the integration suite while" in backup
+    primary = skill.split("## `integrator`")[1].split("## `integrator_2`")[0]
+    assert "Does not receive" not in primary     # codex delivers its prompt
+
+
+# --------------------------------------------------------------------------
 # prompt diet: guidance moved out of the argv prompt into the roster skill
 #
 # The orchestrator prompt is inlined into the harness command line and capped
@@ -1682,6 +1849,37 @@ def test_orchestrator_prompt_names_scout_only_when_installed():
     # fine, so the prompt does not tell the brain to delegate every read.
     assert "quick look at a file or two" in with_scout
     assert "`scout`" not in m.render_orchestrator(FOUR_CODER_PLAN)
+
+
+FOUR_CODER_PLAN_INTEGRATOR = dict(
+    FOUR_CODER_PLAN_SCOUT, integrator=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+
+
+def test_orchestrator_prompt_keeps_the_merge_decision_and_leaves_headroom():
+    """The acceptance bar for the integrator task: a four-coder roster PLUS the
+    optional scout AND integrator must still clear 550 bytes of headroom, and
+    the one safety-critical clause stays INLINE — an orchestrator that had to
+    read a skill to learn it must not delegate a merge could delegate one."""
+    rendered = m.render_orchestrator(FOUR_CODER_PLAN_INTEGRATOR)
+    assert "`integrator`" in rendered
+    assert "NEVER decides a merge" in rendered
+    assert "that\n  decision stays with you" in rendered or \
+        "decision stays with you" in rendered
+    body = _prompt_body(rendered)
+    quoted = len(shlex.quote(body).encode())
+    headroom = m.PROMPT_CEILING - quoted
+    assert headroom >= 550, f"{quoted} quoted, {headroom} headroom"
+    # It works and is NOT refused, but it spends into the 800-byte warn band:
+    # the installer must SAY SO rather than refuse, and the harness still
+    # launches. A regression that re-inflates the prompt silently would not.
+    msgs = [msg for _, msg in m.validate(FOUR_CODER_PLAN_INTEGRATOR, body)]
+    assert any("ceiling" in msg for msg in msgs), msgs
+    assert not any("over the" in msg for msg in msgs), msgs
+
+
+def test_orchestrator_prompt_names_integrator_only_when_installed():
+    assert "`integrator`" not in m.render_orchestrator(FOUR_CODER_PLAN_SCOUT)
+    assert "`integrator`" in m.render_orchestrator(FOUR_CODER_PLAN_INTEGRATOR)
 
 
 def test_pick_model_offers_other_providers_by_number(monkeypatch):

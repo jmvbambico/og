@@ -1081,6 +1081,30 @@ def test_lineup_reports_the_scout_chain_in_order(tmp_path):
         ("scout", "cmdcode"), ("scout", "kiro")]
 
 
+def test_lineup_reports_the_integrator_chain_after_the_scouts(tmp_path):
+    """integrator is an ordered failover chain like scout, appended after it.
+    `og stats` is the evidence the orchestrator reads to pick the earliest
+    integrator with capacity, so an entry absent here cannot be failed over
+    to on anything but a guess."""
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "orchestrator": {"id": "claude"},
+        "coders": [{"id": "opencode", "priority": 1}],
+        "reviewer": {"id": "codex"},
+        "scout": [{"id": "cmdcode", "priority": 1}],
+        "integrator": [{"id": "cmdcode", "priority": 1},
+                       {"id": "kiro", "priority": 2}],
+    }))
+    _write_registry(reg)
+    rows = st.lineup(inst, reg)
+    assert [(r["role"], r["agent"]) for r in rows] == [
+        ("orchestrator", "claude"), ("coder", "opencode"),
+        ("reviewer", "codex"),
+        ("scout", "cmdcode"),
+        ("integrator", "cmdcode"), ("integrator", "kiro")]
+
+
 def test_lineup_tolerates_a_non_iterable_coders_value(tmp_path):
     # A hand-edited "coders": 5 raised TypeError: 'int' object is not iterable.
     # og stats runs interactively right before a dispatch decision, so it must
