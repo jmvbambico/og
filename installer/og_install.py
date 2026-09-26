@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     import yaml
@@ -570,16 +571,81 @@ def primary(plan: dict, role: str) -> dict:
     return chain(plan, role)[0]
 
 
+# --------------------------------------------------------------------------
+# the role table
+# --------------------------------------------------------------------------
+# ONE table declares every role this installer wires. Every per-role loop
+# below iterates it rather than naming the roles again: normalize_plan(),
+# account_entries(), validate(), write_shims(), patch_global_config(),
+# render_orchestrator(), apply(), show(), emit_questions() and og_stats's
+# lineup(). Adding a role used to mean editing seven of those in lockstep, and
+# two roles added that way drift apart the moment one of them is touched: a
+# role copy-pasted through ten call sites looks correct until a branch is
+# missed. A row here is the whole change.
+class Role(NamedTuple):
+    key: str        # plan key, and the spec-name stem of a singleton chain
+    role: str       # the name a registry row lists in its `roles` array
+    template: str   # the template that renders it
+    multi: bool     # True: many parallel workers; False: one-at-a-time chain
+    spec: bool      # True: renders a sub-agent dir; False: the root config
+    optional: bool  # True: the plan may omit it and the bundle stays correct
+    ask: str        # the --questions prompt that offers this role
+
+
+ROLES = [
+    Role("orchestrator", "orchestrator", "orchestrator.yaml.tmpl",
+         multi=False, spec=False, optional=False,
+         ask="Which agent plans and delegates (never writes product code), "
+             "in preference order (first is tried first)?"),
+    Role("coders", "coder", "coder.yaml.tmpl",
+         multi=True, spec=True, optional=False,
+         ask="Which agents implement code, in preference order (first is tried first)?"),
+    Role("reviewer", "reviewer", "reviewer.yaml.tmpl",
+         multi=False, spec=True, optional=False,
+         ask="Which agents review the batched diff, in preference order (first "
+             "is tried first; the next takes over when one is out of quota)? "
+             "Prefer a vendor that differs from every coder."),
+]
+
+# Roles that render a sub-agent spec under <bundle>/agents/<name>. The
+# orchestrator is the one excluded: its spec IS the bundle's root config.
+SPEC_ROLES = [r for r in ROLES if r.spec]
+
+
+def role_of(key: str) -> Role:
+    return next(r for r in ROLES if r.key == key)
+
+
+def role_names(plan: dict, key: str) -> list:
+    """Spec names for a role, in chain order.
+
+    A singleton chain keeps its own name for the head (`reviewer`, `scout`) and
+    appends the position for each backup — the rule `reviewer_names` has always
+    used, and the same rule the coder specs follow (a stable name for the head,
+    a distinct one per addition, so renaming nothing that already exists in a
+    session history). A multi role names each worker by its registry `worker`
+    override or `coder_<id>` instead, so two roles can wire the same agent
+    without their spec directories colliding.
+    """
+    r = role_of(key)
+    entries = chain(plan, key)
+    if r.multi:
+        return [worker_name(e["id"]) for e in entries]
+    return [key if i == 1 else f"{key}_{i}" for i in range(1, len(entries) + 1)]
+
+
 def normalize_plan(plan: dict) -> dict:
     """Rewrite every role to the ordered-list shape, in place.
 
     Applied once before a plan is persisted, so og-install.json always holds
     the new shape going forward. Readers go through chain()/primary() and stay
     correct for either, which is what lets an old state file skip a migration.
+    The set of roles comes from ROLES, so a role the table does not declare (a
+    hand-added key) is left exactly as it was rather than guessed at.
     """
-    for role in ("orchestrator", "coders", "reviewer"):
-        if plan.get(role) is not None:
-            plan[role] = chain_entries(plan[role])
+    for r in ROLES:
+        if plan.get(r.key) is not None:
+            plan[r.key] = chain_entries(plan[r.key])
     return plan
 
 
@@ -593,23 +659,25 @@ def reviewer_names(plan: dict) -> list:
     rows pinning `worker` explicitly to keep a name stable across an id
     change): the head keeps its name, additions get a distinct one.
     """
-    return ["reviewer" if i == 1 else f"reviewer_{i}"
-            for i in range(1, len(chain(plan, "reviewer")) + 1)]
+    return role_names(plan, "reviewer")
 
 
-def account_entries(plan: dict) -> list:
+def account_entries(plan: dict, reg: dict | None = None) -> list:
     """(agent_id, env_var, config_dir) for every installed id that has an account.
 
     `accounts` is keyed by agent id, and interactive collects it for every id in
-    every chain -- orchestrator, each reviewer, each coder -- not just the head.
+    every chain — orchestrator, each reviewer, each coder — not just the head.
     Only a row whose registry `multi_account.env` names the variable can be
     wired; a stray accounts key is ignored rather than guessed at. Chain order,
     first occurrence of a repeated id wins.
+
+    `reg` is passed in by validate(), which already holds the catalog; reloading
+    it here was a second agents_by_id() per call for no reason.
     """
-    reg = agents_by_id()
+    reg = reg or agents_by_id()
     out, seen = [], set()
-    for role in ("orchestrator", "reviewer", "coders"):
-        for e in chain(plan, role):
+    for r in ROLES:
+        for e in chain(plan, r.key):
             aid = e["id"]
             if aid in seen:
                 continue
@@ -834,8 +902,7 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # unpinned and inherits the ORCHESTRATOR's model id -- the exact failure
     # `required` exists to prevent, now silent. Refuse it. No row does this
     # today; the guard is here so the next registry edit cannot slip it past.
-    for aid in sorted({e["id"] for e in orchestrators + reviewers}
-                      | {c["id"] for c in plan["coders"]}):
+    for aid in sorted({e["id"] for r in ROLES for e in chain(plan, r.key)}):
         spec = reg[aid].get("model") or {}
         if spec.get("required") and not spec.get("pinnable", True):
             issues.append(("error",
@@ -936,29 +1003,29 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # selecting one as the brain was never shown the caveat. The config is legal
     # (a weak orchestrator at runtime, not a broken install), so this WARNs
     # rather than refuses; the first real dispatch is the proof.
-    for role, aid in ([("orchestrator", o["id"]) for o in orchestrators]
-                      + [("coder", c["id"]) for c in plan["coders"]]
-                      + [("reviewer", r["id"]) for r in reviewers]):
-        caveat = role_caveat(reg[aid], role)
-        if caveat:
-            issues.append(("warn", caveat))
+    for r in ROLES:
+        for e in chain(plan, r.key):
+            caveat = role_caveat(reg[e["id"]], r.role)
+            if caveat:
+                issues.append(("warn", caveat))
 
     # A `{shim:<name>}` token with no matching shim block renders a path to
     # a file nothing ever writes. The launch then fails with an exec error
     # pointing nowhere near the installer, so refuse it here instead.
-    for c in list(plan["coders"]) + reviewers:
-        a = reg.get(c["id"])
-        if not a:
-            continue
-        declared = (a.get("shim") or {}).get("name")
-        for tok in sorted(set(SHIM_TOKEN.findall(a.get("acp_command") or ""))):
-            if tok != declared:
-                issues.append(("error",
-                               f"{a['label']} ({c['id']}) references {{shim:{tok}}} in "
-                               f"acp_command but declares no shim named '{tok}'. The "
-                               "expanded path points at a file nothing writes and the "
-                               "launch fails — declare shim.name == "
-                               f"'{tok}' or fix the token."))
+    for r in SPEC_ROLES:
+        for c in chain(plan, r.key):
+            a = reg.get(c["id"])
+            if not a:
+                continue
+            declared = (a.get("shim") or {}).get("name")
+            for tok in sorted(set(SHIM_TOKEN.findall(a.get("acp_command") or ""))):
+                if tok != declared:
+                    issues.append(("error",
+                                   f"{a['label']} ({c['id']}) references {{shim:{tok}}} in "
+                                   f"acp_command but declares no shim named '{tok}'. The "
+                                   "expanded path points at a file nothing writes and the "
+                                   "launch fails — declare shim.name == "
+                                   f"'{tok}' or fix the token."))
 
     # og launches ONE server with ONE environment, so a single env var cannot
     # name two config dirs. Two installed ids can share a `multi_account.env`
@@ -967,7 +1034,7 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # the wrong account. Refuse rather than write a file where one account is
     # quietly dropped.
     by_env = {}
-    for aid, var, acct in account_entries(plan):
+    for aid, var, acct in account_entries(plan, reg):
         prev = by_env.get(var)
         if prev and prev[1] != acct:
             issues.append(("error",
@@ -1307,9 +1374,9 @@ def render_preflight_map(plan: dict) -> str:
     silently drifts the moment a coder is added, dropped or renamed.
     """
     reg = agents_by_id()
-    rows = [f"    `{worker_name(c['id'])}` -> `{reg[c['id']]['harness']}`" for c in plan["coders"]]
-    rows += [f"    `{name}` -> `{reg[e['id']]['harness']}`"
-             for name, e in zip(reviewer_names(plan), chain(plan, "reviewer"))]
+    rows = [f"    `{name}` -> `{reg[e['id']]['harness']}`"
+            for r in SPEC_ROLES
+            for name, e in zip(role_names(plan, r.key), chain(plan, r.key))]
     return "\n".join(rows)
 
 
@@ -1343,8 +1410,8 @@ def render_orchestrator(plan: dict) -> str:
     # (1,401 bytes left with the measured four-coder roster). validate() refuses
     # an argv chain over the ceiling, so the hazard stays guarded -- but a new
     # chain entry spends bytes the prompt has to have.
-    agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
-    agent_list += "".join(f"\n    - {n}" for n in reviewer_names(plan))
+    agent_list = "\n".join(f"    - {name}" for r in SPEC_ROLES
+                           for name in role_names(plan, r.key))
     subs = {
         "{{AGENT_NAME}}": plan["agent_name"],
         "{{ORCHESTRATOR_HARNESS}}": reg[primary(plan, "orchestrator")["id"]]["harness"],
@@ -1352,7 +1419,8 @@ def render_orchestrator(plan: dict) -> str:
         "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
-        "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + len(chain(plan, "reviewer"))),
+        "{{AGENT_COUNT_WORD}}": _count_word(sum(len(chain(plan, r.key))
+                                                 for r in SPEC_ROLES)),
     }
     for k, v in subs.items():
         s = s.replace(k, v)
@@ -1382,7 +1450,7 @@ def model_block(model: str | None) -> str:
     )
 
 
-def render_coder(plan: dict, c: dict) -> str:
+def render_coder(plan: dict, c: dict, name: str | None = None) -> str:
     reg = agents_by_id()
     a = reg[c["id"]]
     notes = []
@@ -1406,7 +1474,7 @@ def render_coder(plan: dict, c: dict) -> str:
         permission_mode_block = "    permission_mode: bypassPermissions"
     s = tmpl("coder.yaml.tmpl")
     for k, v in {
-        "{{NAME}}": worker_name(c["id"]),
+        "{{NAME}}": name or worker_name(c["id"]),
         "{{LABEL}}": a["label"],
         "{{PRIORITY}}": str(c["priority"]),
         "{{HARNESS}}": a["harness"],
@@ -1449,6 +1517,20 @@ def render_reviewer(plan: dict, entry: dict | None = None, name: str = "reviewer
     }.items():
         s = s.replace(k, v)
     return s
+
+
+# role.template -> the renderer for it. Keyed by the template string the ROLES
+# row names, so a role added to the table without a renderer fails loudly on
+# the first apply instead of writing an empty spec directory.
+SPEC_RENDERERS = {
+    "coder.yaml.tmpl": render_coder,
+    "reviewer.yaml.tmpl": render_reviewer,
+}
+
+
+def render_spec(plan: dict, role: Role, entry: dict, name: str) -> str:
+    """Render one sub-agent spec through the role's own renderer."""
+    return SPEC_RENDERERS[role.template](plan, entry, name)
 
 
 # --------------------------------------------------------------------------
@@ -1518,21 +1600,22 @@ def write_shims(plan: dict) -> list:
     """
     reg = agents_by_id()
     changed = []
-    for c in list(plan["coders"]) + chain(plan, "reviewer"):
-        shim = reg[c["id"]].get("shim")
-        if not shim:
-            continue
-        dest = OMNI / "shims" / shim["name"]
-        if dest.is_file() and dest.read_text() == shim["script"]:
-            if dest.stat().st_mode & 0o777 == 0o755:
+    for r in SPEC_ROLES:
+        for c in chain(plan, r.key):
+            shim = reg[c["id"]].get("shim")
+            if not shim:
                 continue
+            dest = OMNI / "shims" / shim["name"]
+            if dest.is_file() and dest.read_text() == shim["script"]:
+                if dest.stat().st_mode & 0o777 == 0o755:
+                    continue
+                dest.chmod(0o755)
+                changed.append(f"shims[{shim['name']}] mode -> 0o755 ({dest})")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(shim["script"])
             dest.chmod(0o755)
-            changed.append(f"shims[{shim['name']}] mode -> 0o755 ({dest})")
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(shim["script"])
-        dest.chmod(0o755)
-        changed.append(f"shims[{shim['name']}] = {dest}")
+            changed.append(f"shims[{shim['name']}] = {dest}")
     return changed
 
 
@@ -1558,8 +1641,8 @@ def patch_global_config(plan: dict) -> list:
     # resolves an unknown acp:<slug> to the FIRST configured row, so an ACP
     # reviewer with no row of its own would silently run as whichever coder is
     # listed first.
-    want = [c for c in plan["coders"] if reg[c["id"]]["kind"] == "acp-user"]
-    want += [r for r in chain(plan, "reviewer") if reg[r["id"]]["kind"] == "acp-user"]
+    want = [c for r in SPEC_ROLES for c in chain(plan, r.key)
+            if reg[c["id"]]["kind"] == "acp-user"]
     if want:
         acp = cfg.get("acp") or {}
         rows = list(acp.get("agents") or [])
@@ -1777,19 +1860,16 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # tools.agents) but indistinguishable on disk from a live worker, which is
     # exactly the kind of stale state that makes a rerunnable installer
     # untrustworthy.
-    keep = {worker_name(c["id"]) for c in plan["coders"]} | set(reviewer_names(plan))
+    keep = {name for r in SPEC_ROLES for name in role_names(plan, r.key)}
     for d in sorted((bundle / "agents").iterdir()):
         if d.is_dir() and d.name not in keep:
             shutil.rmtree(d)
             say(f"{C['dim']}  pruned stale worker: {d.name}{C['x']}")
-    for c in plan["coders"]:
-        d = bundle / "agents" / worker_name(c["id"])
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "config.yaml").write_text(render_coder(plan, c))
-    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
-        d = bundle / "agents" / name
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "config.yaml").write_text(render_reviewer(plan, e, name))
+    for r in SPEC_ROLES:
+        for name, e in zip(role_names(plan, r.key), chain(plan, r.key)):
+            d = bundle / "agents" / name
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.yaml").write_text(render_spec(plan, r, e, name))
 
     # 2. skills (verbatim from the repo)
     skills_src = REPO / "agents" / "dev-lead" / "skills"
@@ -1861,9 +1941,7 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # worker and let the user confirm it themselves.
     # Every agent in the roster, chains included: a backup that is not logged in
     # is only discovered when the primary goes dry and the failover dies too.
-    login_agents = [reg[o["id"]] for o in chain(plan, "orchestrator")] \
-        + [reg[c["id"]] for c in plan["coders"]] \
-        + [reg[r["id"]] for r in chain(plan, "reviewer")]
+    login_agents = [reg[e["id"]] for r in ROLES for e in chain(plan, r.key)]
     seen_ids = set()
     login_lines = []
     for a in login_agents:
@@ -2063,6 +2141,29 @@ def emit_questions() -> None:
     model_choices = {a["id"]: (a.get("model") or {}).get("choices")
                      for a in REGISTRY["agents"]
                      if (a.get("model") or {}).get("choices")}
+    # One question per role, in table order. Orchestrator and reviewer are
+    # ordered chains, exactly like coders: the entries after the first are the
+    # failover used when the one above is out of quota. A single id is still
+    # accepted (it normalizes to a one-element chain), so a consumer that
+    # answers with one value does not have to change. The per-role UNVERIFIED
+    # caveat rides the question: AGENTS.md Part 1 has the AI installer drive its
+    # conversation from this output, and it must never offer a role without the
+    # warning that applies to it.
+    role_questions = []
+    for r in ROLES:
+        q = {"key": r.key, "type": "ordered_multi",
+             "choices": [a["id"] for a in REGISTRY["agents"]
+                         if a["id"] in found and r.role in a["roles"]],
+             "notes": role_notes(r.role),
+             "ask": r.ask}
+        if r.spec:
+            # The same static model list under every role that pins one, so an
+            # AI installer can answer for each entry of the chain.
+            q["per_item"] = {
+                "model": "Model id to pin. REQUIRED for agents where "
+                         "registry.model.required is true.",
+                "choices": model_choices}
+        role_questions.append(q)
     say(json.dumps({
         "detected": {k: reg[k]["label"] for k in found},
         "state_file": str(STATE),
@@ -2071,38 +2172,7 @@ def emit_questions() -> None:
         "questions": [
             {"key": "agent_name", "type": "string", "default": "dev-lead",
              "ask": "What should the orchestrator bundle be called?"},
-            # Orchestrator and reviewer are ordered chains, exactly like coders:
-            # the entries after the first are the failover used when the one
-            # above is out of quota. A single id is still accepted (it normalizes
-            # to a one-element chain), so a consumer that answers with one value
-            # does not have to change.
-            {"key": "orchestrator", "type": "ordered_multi",
-             "choices": [a["id"] for a in REGISTRY["agents"]
-                         if a["id"] in found and "orchestrator" in a["roles"]],
-             # The per-role UNVERIFIED caveat travels with the choice: AGENTS.md
-             # Part 1 has the AI installer drive its conversation from this
-             # output, and it must never offer a role without the warning.
-             "notes": role_notes("orchestrator"),
-             "ask": "Which agent plans and delegates (never writes product code), "
-                    "in preference order (first is tried first)?"},
-            {"key": "coders", "type": "ordered_multi",
-             "choices": [a["id"] for a in REGISTRY["agents"]
-                         if a["id"] in found and "coder" in a["roles"]],
-             "notes": role_notes("coder"),
-             "ask": "Which agents implement code, in preference order (first is tried first)?",
-             "per_item": {"model": "Model id to pin. REQUIRED for agents where "
-                                  "registry.model.required is true.",
-                          "choices": model_choices}},
-            {"key": "reviewer", "type": "ordered_multi",
-             "choices": [a["id"] for a in REGISTRY["agents"]
-                         if a["id"] in found and "reviewer" in a["roles"]],
-             "notes": role_notes("reviewer"),
-             "ask": "Which agents review the batched diff, in preference order (first "
-                    "is tried first; the next takes over when one is out of quota)? "
-                    "Prefer a vendor that differs from every coder.",
-             "per_item": {"model": "Model id to pin. REQUIRED for agents where "
-                                   "registry.model.required is true.",
-                          "choices": model_choices}},
+            *role_questions,
             {"key": "accounts", "type": "map",
              "ask": "For any agent with registry.multi_account.supported, should the "
                     "reviewer run on a second account? Value is the config dir path.",
