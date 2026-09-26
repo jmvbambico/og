@@ -862,14 +862,14 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "orchestrator."))
 
         # A harness that never receives the spec prompt cannot orchestrate: the
-        # whole orchestration contract lives in that prompt.
+        # whole orchestration contract lives in that prompt. Checked for EVERY
+        # entry in the chain -- a `none` BACKUP is exactly as unusable as a
+        # `none` primary, and it is the one reached for when the primary is dry.
         if a.get("prompt_delivery") == "none":
             issues.append(("error",
                            f"{a['label']} never receives a spec prompt "
                            "(Omnigent reports instruction delivery NOT_DELIVERED), so the "
                            "orchestration contract would be silently discarded."))
-
-    od = reg[orchestrators[0]["id"]].get("prompt_delivery")
 
     # Workers on such a harness only ever see the dispatch text.
     mute = [reg[c["id"]]["label"] for c in plan["coders"]
@@ -931,14 +931,23 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                                "launch fails — declare shim.name == "
                                f"'{tok}' or fix the token."))
 
-    # The tmux command-string ceiling only binds when the prompt rides on argv.
-    if rendered_prompt is not None and od == "argv":
+    # The tmux command-string ceiling binds whenever ANY orchestrator in the
+    # chain rides on argv -- NOT just the head. Reading only orchestrators[0]
+    # meant a per_turn primary (OpenCode) hid an argv BACKUP (claude, codex):
+    # the config validated clean, then the backup -- the entry that actually
+    # launches once the primary is dry -- died at launch with 'command too long'
+    # (surfacing as a native terminal that failed to start). Name every argv
+    # entry so a two-orchestrator chain says WHICH one is over the ceiling.
+    argv_orchestrators = [o for o in orchestrators
+                          if reg[o["id"]].get("prompt_delivery") == "argv"]
+    if rendered_prompt is not None and argv_orchestrators:
         quoted = len(shlex.quote(rendered_prompt))
+        names = ", ".join(reg[o["id"]]["label"] for o in argv_orchestrators)
         if quoted > PROMPT_CEILING:
             issues.append(("error",
                            f"orchestrator prompt is {quoted} bytes shell-quoted, over the "
                            f"{PROMPT_CEILING} ceiling for an argv-delivered harness "
-                           f"({reg[orchestrators[0]['id']]['label']}). tmux refuses the launch "
+                           f"({names}). tmux refuses the launch "
                            "with 'command too long'. Options: drop a coder, move guidance into "
                            "a skill file, or pick an orchestrator whose harness composes the "
                            "prompt per turn (OpenCode) and has no ceiling."))

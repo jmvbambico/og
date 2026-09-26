@@ -286,6 +286,41 @@ def test_validate_prompt_ceiling_ignored_for_non_argv_orchestrator():
     assert not any("ceiling" in msg for _, msg in issues)
 
 
+def test_validate_prompt_ceiling_fires_for_an_argv_backup_behind_a_per_turn_primary():
+    # A per_turn primary (OpenCode) has no ceiling, so reading only
+    # orchestrators[0] skipped the refusal entirely. The BACKUP (claude) is an
+    # argv harness -- the entry that launches when the primary is dry -- so an
+    # over-ceiling prompt must be refused for IT, and the message must name it.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1},
+                                    {"id": "claude", "priority": 2}])
+    over = "x" * (m.PROMPT_CEILING + 500)
+    msgs = [msg for level, msg in m.validate(plan, over) if level == "error"]
+    assert any("over the" in msg and "Claude Code" in msg for msg in msgs), msgs
+
+
+def test_validate_prompt_ceiling_warns_for_an_argv_backup_behind_a_per_turn_primary():
+    # Same chain inside the 800-byte warn band: the hazard is real (that backup
+    # is the one that launches) and must surface even though the head has no
+    # ceiling at all.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1},
+                                    {"id": "claude", "priority": 2}])
+    near = "x" * (m.PROMPT_CEILING - 500)
+    assert any(level == "warn" and "tmux ceiling" in msg
+               for level, msg in m.validate(plan, near))
+
+
+def test_validate_errors_when_a_backup_orchestrator_never_receives_its_prompt():
+    # cursor is prompt_delivery: none. As a BACKUP orchestrator it drops the
+    # whole orchestration contract exactly like a primary would, and it is the
+    # entry reached for when the primary is dry -- so the error must fire for
+    # it, not only for the head.
+    plan = _base_plan(orchestrator=[{"id": "claude", "priority": 1},
+                                    {"id": "cursor", "priority": 2}])
+    msgs = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("never receives a spec prompt" in msg and "Cursor" in msg
+               for msg in msgs), msgs
+
+
 def test_validate_warns_when_the_orchestrator_is_unverified_for_that_role():
     # grok/devin clear the gates validate() enforces for orchestrator, so the
     # role is legal -- but no og run has ever been driven with either as the
