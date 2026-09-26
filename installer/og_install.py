@@ -437,11 +437,14 @@ def pick_model(agent: dict, current: str | None) -> str | None:
     """Resolve the model pin for one agent."""
     spec = agent.get("model") or {}
     required = spec.get("required", False)
-    # Required=false rows with no live model listing AND no static `choices`
-    # are not pinnable: offer nothing and keep whatever is already set. A row
-    # with `choices` (e.g. freebuff/blink's splash models) IS pinnable, so fall
-    # through to the menu below -- for required=false and required=true alike.
-    if not required and not spec.get("list_cmd") and not spec.get("choices"):
+    # Unpinnable is DECLARED (model.pinnable: false), not inferred from missing
+    # metadata. Inferring it meant a required=false row with no live listing and
+    # no static `choices` -- codex, agy -- silently skipped the question, so a
+    # user who wanted a reviewer model pin (the reported bug) was never asked.
+    # Only a row that says so is skipped; every other row reaches the prompt,
+    # and with no listing or choices it falls to manual entry (blank = harness
+    # default). `pinnable` defaults to true, so an absent key is pinnable.
+    if not spec.get("pinnable", True):
         note = spec.get("note")
         if note:
             say(f"  {C['dim']}{agent['label']}: {note}{C['x']}")
