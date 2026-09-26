@@ -1398,6 +1398,29 @@ def test_pick_model_choices_respect_prefer_default(monkeypatch):
     assert m.pick_model(reg["freebuff"], None) == "z-ai/glm-5.3-flash"
 
 
+def test_pick_model_no_list_cmd_row_emits_no_missing_listing_warning(monkeypatch):
+    """The "could not list models" warning is gated on having TRIED a listing.
+    A row that never declared `list_cmd` (agy) must reach manual entry silently
+    -- firing it there would report a command that was never run, telling the
+    user a listing failed when none was attempted."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
+    warned = []
+    monkeypatch.setattr(m, "warn", lambda msg: warned.append(msg))
+    assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
+    assert not any("could not list models" in w for w in warned), warned
+
+
+def test_pick_model_codex_accepts_a_hand_typed_unlisted_id(monkeypatch):
+    """codex's `choices` are a static convenience list, not a closed set: the
+    row's own note promises a newer id typed by hand is accepted through the
+    "pin it anyway?" confirmation, since the CLI cannot enumerate models."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gpt-6-codex")
+    monkeypatch.setattr(m, "ask_yes", lambda prompt, default=False: True)
+    assert m.pick_model(reg["codex"], None) == "gpt-6-codex"
+
+
 # --------------------------------------------------------------------------
 # emit_questions surfaces a row's static model choices
 # --------------------------------------------------------------------------
