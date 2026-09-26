@@ -146,7 +146,7 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | Freebuff | `acp:freebuff` | coder | optional — 4 rotating choices; needs a blink that honours BLINK_MODEL | via [`blink`](https://github.com/jmvbambico/bufflink) ≥ v0.1.2, an ACP bridge over freebuff's TUI; one hour billed per launch at the model's rate (5/hr default GLM, up to 15/hr DeepSeek) from 25 free daily; silent until the turn ends; **verified** (5 backlog tasks, 3/3 first-try since v0.1.2); close the session then SIGTERM `blink` to release freebuff's lock |
 | Command Code | `acp:command-code` | coder | **required** | via [`cmd-acp`](https://github.com/toolsHelp/cmd-acp) plus a **generated shim** (see below); one `cmd -p` per prompt, nothing to reap; rolling 5h + weekly credit windows, no quota API; **verified** (control/treatment run, 2026-09-24) |
 | Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
-| Grok, Devin | various | orch / coder | optional | orchestrator-capable on the two bars `validate()` enforces (`relay`, prompt delivered) but **unverified in that role** — see each row's `roles_note` |
+| Grok, Devin | various | orch / coder | optional | orchestrator-capable on the two bars `validate()` enforces (`relay`, prompt delivered) but **unverified in that role** — flagged by `unverified_roles` in the picker, `validate()` and `--questions`; the rationale is in each row's `roles_note` |
 | Goose, Hermes, Gemini | various | coder | optional | |
 
 Each row may declare a `quota` block; these power `og stats` (see [docs/STATS.md](docs/STATS.md), written by a sibling task) — `probe: null` marks a known limit with no queryable API.
