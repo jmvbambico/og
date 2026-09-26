@@ -317,6 +317,27 @@ def test_validate_prompt_ceiling_fires_for_an_argv_backup_behind_a_per_turn_prim
     assert any("over the" in msg and "Claude Code" in msg for msg in msgs), msgs
 
 
+def test_ceiling_error_pluralizes_when_two_argv_harnesses_are_named():
+    # Two argv entries are both bound by the tmux ceiling; "an argv-delivered
+    # harness (A, B)" reads as though only one were over it.
+    plan = _base_plan(orchestrator=[{"id": "claude", "priority": 1},
+                                    {"id": "codex", "priority": 2}])
+    over = "x" * (m.PROMPT_CEILING + 500)
+    msg = next(msg for level, msg in m.validate(plan, over)
+               if level == "error" and "over the" in msg)
+    assert "for argv-delivered harnesses (Claude Code, Codex (OpenAI))" in msg
+    assert "an argv-delivered harnesses" not in msg
+
+
+def test_ceiling_error_stays_singular_for_one_argv_harness():
+    plan = _base_plan(orchestrator="claude")
+    over = "x" * (m.PROMPT_CEILING + 500)
+    msg = next(msg for level, msg in m.validate(plan, over)
+               if level == "error" and "over the" in msg)
+    assert "for an argv-delivered harness (Claude Code)" in msg
+    assert "harnesses" not in msg
+
+
 def test_validate_prompt_ceiling_warns_for_an_argv_backup_behind_a_per_turn_primary():
     # Same chain inside the 800-byte warn band: the hazard is real (that backup
     # is the one that launches) and must surface even though the head has no

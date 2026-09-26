@@ -1109,10 +1109,15 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     if rendered_prompt is not None and argv_orchestrators:
         quoted = len(shlex.quote(rendered_prompt))
         names = ", ".join(reg[o["id"]]["label"] for o in argv_orchestrators)
+        # A two-entry argv chain names two harnesses; "an argv-delivered harness
+        # (A, B)" reads as if only one were over the ceiling. Pluralize both the
+        # noun and the article so WHICH entries are bound is never misread.
+        phrase = ("an argv-delivered harness" if len(argv_orchestrators) == 1
+                  else "argv-delivered harnesses")
         if quoted > PROMPT_CEILING:
             issues.append(("error",
                            f"orchestrator prompt is {quoted} bytes shell-quoted, over the "
-                           f"{PROMPT_CEILING} ceiling for an argv-delivered harness "
+                           f"{PROMPT_CEILING} ceiling for {phrase} "
                            f"({names}). tmux refuses the launch "
                            "with 'command too long'. Options: drop a coder, move guidance into "
                            "a skill file, or pick an orchestrator whose harness composes the "
@@ -1554,10 +1559,12 @@ def render_orchestrator(plan: dict) -> str:
     # only dispatch surface, so a backup omitted here is unreachable and the
     # failover the roster skill promises cannot happen. EACH backup grows the
     # rendered prompt by an agent-list line here plus its roster lines in
-    # {{ROSTER_BULLETS}}, so headroom against PROMPT_CEILING shrinks per entry
-    # (1,401 bytes left with the measured four-coder roster). validate() refuses
-    # an argv chain over the ceiling, so the hazard stays guarded -- but a new
-    # chain entry spends bytes the prompt has to have.
+    # {{ROSTER_BULLETS}}, so headroom against PROMPT_CEILING shrinks per entry.
+    # Run --dry-run for the current shell-quoted size and the bytes left; a
+    # hardcoded figure here went stale the moment the prompt changed (it read
+    # 1,401 while the measured roster sat at 1,004). validate() refuses an argv
+    # chain over the ceiling, so the hazard stays guarded -- but a new chain
+    # entry spends bytes the prompt has to have.
     agent_list = "\n".join(f"    - {name}" for r in SPEC_ROLES
                            for name in role_names(plan, r.key))
     subs = {
