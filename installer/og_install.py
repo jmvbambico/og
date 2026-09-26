@@ -583,15 +583,23 @@ def primary(plan: dict, role: str) -> dict:
 # looks correct until a branch is missed. A row here is the whole change -- for
 # THOSE eight.
 #
-# Two per-role sites are NOT table-driven and still need a hand-edit when a
+# Four per-role sites are NOT table-driven and still need a hand-edit when a
 # role is added; this comment names them rather than implying coverage:
 #   * show() prints each role with its own label and column width, so its
 #     presentation loops are hand-written per role.
-#   * og_stats.lineup() hardcodes the same role order. That module is run as
-#     `og stats` by the PATH python3 (bin/og: `exec python3 .../og_stats.py`),
-#     so it must not import this installer -- doing so would pull PyYAML into a
-#     command that needs only the stdlib today, the exact interpreter gap
-#     install.sh's fallback exists to paper over.
+#   * og_stats.lineup() hardcodes the same role order -- for now. It must not
+#     import this installer, which would pull PyYAML into `og stats`, a command
+#     the PATH python3 runs with only the stdlib (bin/og: `exec python3
+#     .../og_stats.py`), the interpreter gap install.sh's fallback exists to
+#     paper over. Two routes would make it table-driven cleanly: a stdlib-only
+#     shared module both can import, or the role order carried in
+#     og-install.json, which `og stats` already parses as JSON without PyYAML.
+#   * render_roster() hand-writes a bullet per singleton role, each with
+#     bespoke prose -- the reviewer's "reviews only", the scout's read-only
+#     contract, the integrator's merge rule -- that no table row carries.
+#   * render_roster_skill() hand-writes each role's section as bespoke prose
+#     describing what that role does and how to dispatch it, which cannot be
+#     generated from a table row.
 class Role(NamedTuple):
     key: str        # plan key, and the spec-name stem of a singleton chain
     role: str       # the name a registry row lists in its `roles` array
