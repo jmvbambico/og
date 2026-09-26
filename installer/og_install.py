@@ -574,14 +574,24 @@ def primary(plan: dict, role: str) -> dict:
 # --------------------------------------------------------------------------
 # the role table
 # --------------------------------------------------------------------------
-# ONE table declares every role this installer wires. Every per-role loop
-# below iterates it rather than naming the roles again: normalize_plan(),
+# ONE table declares every role this installer wires. The per-role loops below
+# iterate it rather than naming the roles again: normalize_plan(),
 # account_entries(), validate(), write_shims(), patch_global_config(),
-# render_orchestrator(), apply(), show(), emit_questions() and og_stats's
-# lineup(). Adding a role used to mean editing seven of those in lockstep, and
-# two roles added that way drift apart the moment one of them is touched: a
-# role copy-pasted through ten call sites looks correct until a branch is
-# missed. A row here is the whole change.
+# render_orchestrator(), apply() and emit_questions(). Adding a role used to
+# mean editing those in lockstep, and roles added that way drift apart the
+# moment one of them is touched: a role copy-pasted through many call sites
+# looks correct until a branch is missed. A row here is the whole change -- for
+# THOSE eight.
+#
+# Two per-role sites are NOT table-driven and still need a hand-edit when a
+# role is added; this comment names them rather than implying coverage:
+#   * show() prints each role with its own label and column width, so its
+#     presentation loops are hand-written per role.
+#   * og_stats.lineup() hardcodes the same role order. That module is run as
+#     `og stats` by the PATH python3 (bin/og: `exec python3 .../og_stats.py`),
+#     so it must not import this installer -- doing so would pull PyYAML into a
+#     command that needs only the stdlib today, the exact interpreter gap
+#     install.sh's fallback exists to paper over.
 class Role(NamedTuple):
     key: str        # plan key, and the spec-name stem of a singleton chain
     role: str       # the name a registry row lists in its `roles` array
@@ -685,10 +695,15 @@ def account_entries(plan: dict, reg: dict | None = None) -> list:
     """(agent_id, env_var, config_dir) for every installed id that has an account.
 
     `accounts` is keyed by agent id, and interactive collects it for every id in
-    every chain — orchestrator, each reviewer, each coder — not just the head.
-    Only a row whose registry `multi_account.env` names the variable can be
-    wired; a stray accounts key is ignored rather than guessed at. Chain order,
-    first occurrence of a repeated id wins.
+    every chain — orchestrator, each coder, each reviewer, each scout, each
+    integrator — not just the head. Only a row whose registry `multi_account.env`
+    names the variable can be wired; a stray accounts key is ignored rather than
+    guessed at. Chain order, first occurrence of a repeated id wins.
+
+    The ORDER follows the role table (orchestrator, coders, reviewers, scouts,
+    integrators), not the old orchestrator/reviewer/coders sequence. The rows
+    are id-derived, so the same accounts come out either way; a consumer must
+    not depend on the old order or on a kind of role sorting before another.
 
     `reg` is passed in by validate(), which already holds the catalog; reloading
     it here was a second agents_by_id() per call for no reason.
@@ -1303,6 +1318,10 @@ def render_roster_skill(plan: dict) -> str:
     generated from the plan and the registry so they cannot drift.
     """
     reg = agents_by_id()
+    # The singleton chain roles og stats reports by name; generated from the
+    # table so a new one cannot leave this sentence stale the way it read
+    # `reviewer`/`scout` after integrator landed.
+    stats_chain_roles = "/".join(f"`{r.key}`" for r in SPEC_ROLES if not r.multi)
     oc = next((c for c in plan["coders"] if c["id"] == "opencode"), None)
     zen = ([zen_preflight_note(worker_name("opencode")), ""]
            if oc and is_zen_free(oc.get("model")) else [])
@@ -1331,7 +1350,7 @@ def render_roster_skill(plan: dict) -> str:
         "and `og stats --agent <id> --json` before every later one. If `og` is missing",
         "or errors, proceed as today and say so once — do not stall the run on it.",
         "Map the stats output's agent ids back to workers by id: `coder_<id>` maps",
-        "to `<id>`, and `reviewer`/`scout` map to their chain's agent ids. A worker",
+        f"to `<id>`, and {stats_chain_roles} map to their chain's agent ids. A worker",
         "whose state is `dry` while `reset_at` is in the future is out of capacity —",
         "skip it and take the next worker. Preference order still wins: only when two",
         "candidates are otherwise equal does `ok` outrank `unknown`. `og stats` reports",
@@ -1479,7 +1498,9 @@ def render_roster_skill(plan: dict) -> str:
                 "re-reading the files. It is READ-ONLY: it never edits, creates or deletes",
                 "a file, never commits, and never runs a command that mutates the repo or",
                 "the working tree, so when the answer needs a change it reports that",
-                "instead of making it.", "",
+                "instead of making it. That rule is TRUSTED, not sandboxed — nothing",
+                "mechanically stops a scout from writing — so never give a scout",
+                "dispatch a task whose success depends on it not writing.", "",
                 "Same chain rule as the reviewers: check `og stats` before the first",
                 "scout dispatch and `og stats --agent <id> --json` before every later one,",
                 "take the earliest entry with capacity, and move down only when one is",
@@ -2541,6 +2562,10 @@ def emit_questions() -> None:
     role_questions = []
     for r in ROLES:
         q = {"key": r.key, "type": "ordered_multi",
+             # An AI driving from --questions must see that a role may be
+             # omitted: the interactive path asks yes/no, but this JSON is the
+             # only signal AGENTS.md Part 1's installer gets.
+             "optional": r.optional,
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and r.role in a["roles"]],
              "notes": role_notes(r.role),
@@ -2563,8 +2588,8 @@ def emit_questions() -> None:
              "ask": "What should the orchestrator bundle be called?"},
             *role_questions,
             {"key": "accounts", "type": "map",
-             "ask": "For any agent with registry.multi_account.supported, should the "
-                    "reviewer run on a second account? Value is the config dir path.",
+             "ask": "For any agent with registry.multi_account.supported, should it "
+                    "run on a second account? Value is the config dir path.",
              "applies_to": [a["id"] for a in REGISTRY["agents"]
                             if (a.get("multi_account") or {}).get("supported")]},
             {"key": "port", "type": "int", "default": 6767, "ask": "Omnigent server port?"},
