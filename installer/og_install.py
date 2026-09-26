@@ -524,6 +524,103 @@ def load_state() -> dict:
     return {}
 
 
+# A role's plan value is an ORDERED list of entries, first tried first. `coders`
+# has always been that; `orchestrator` and `reviewer` were singletons, which is
+# why a quota-dry Codex reviewer had nowhere to fail over to. The list order IS
+# the failover order, so `priority` is assigned from array position exactly as
+# `main()` has always done for coders.
+def chain_entries(value) -> list:
+    """A role's plan value as an ordered entry list.
+
+    Accepts the old singleton shapes (`"orchestrator": "claude"`, `"reviewer":
+    {"id": ...}`) because a live og-install.json holds them and MUST keep
+    loading and installing unchanged — a bare string or a single object
+    normalizes to a one-element chain on read rather than being rejected.
+    """
+    if isinstance(value, str):
+        items = [{"id": value}]
+    elif isinstance(value, dict):
+        items = [value]
+    elif isinstance(value, list):
+        items = [{"id": raw} if isinstance(raw, str) else raw for raw in value]
+    else:
+        return []
+    out = []
+    for i, raw in enumerate(items, 1):
+        entry = dict(raw)
+        entry.setdefault("priority", i)
+        # Canonical key order — id, priority, model, then anything else. The
+        # state file is written back on every apply and compared across
+        # machines, so an old singleton entry and the chain form it normalizes
+        # to must serialize byte-identically, not merely decode equal.
+        canonical = {k: entry[k] for k in ("id", "priority", "model") if k in entry}
+        canonical.update({k: v for k, v in entry.items()
+                          if k not in ("id", "priority", "model")})
+        out.append(canonical)
+    return out
+
+
+def chain(plan: dict, role: str) -> list:
+    """The ordered failover chain for a role, whatever shape it was saved in."""
+    return chain_entries(plan.get(role))
+
+
+def primary(plan: dict, role: str) -> dict:
+    """The entry tried first in a role's chain — the head."""
+    return chain(plan, role)[0]
+
+
+def normalize_plan(plan: dict) -> dict:
+    """Rewrite every role to the ordered-list shape, in place.
+
+    Applied once before a plan is persisted, so og-install.json always holds
+    the new shape going forward. Readers go through chain()/primary() and stay
+    correct for either, which is what lets an old state file skip a migration.
+    """
+    for role in ("orchestrator", "coders", "reviewer"):
+        if plan.get(role) is not None:
+            plan[role] = chain_entries(plan[role])
+    return plan
+
+
+def reviewer_names(plan: dict) -> list:
+    """Spec names for the reviewer chain, in order.
+
+    The primary keeps the established `reviewer` name — the orchestrator
+    prompt's agent list, the cross-review skill and every existing session
+    history all refer to it — and each backup appends its chain position. That
+    is the same rule the coder specs follow (`coder_<id>`, with some registry
+    rows pinning `worker` explicitly to keep a name stable across an id
+    change): the head keeps its name, additions get a distinct one.
+    """
+    return ["reviewer" if i == 1 else f"reviewer_{i}"
+            for i in range(1, len(chain(plan, "reviewer")) + 1)]
+
+
+def account_entries(plan: dict) -> list:
+    """(agent_id, env_var, config_dir) for every installed id that has an account.
+
+    `accounts` is keyed by agent id, and interactive collects it for every id in
+    every chain -- orchestrator, each reviewer, each coder -- not just the head.
+    Only a row whose registry `multi_account.env` names the variable can be
+    wired; a stray accounts key is ignored rather than guessed at. Chain order,
+    first occurrence of a repeated id wins.
+    """
+    reg = agents_by_id()
+    out, seen = [], set()
+    for role in ("orchestrator", "reviewer", "coders"):
+        for e in chain(plan, role):
+            aid = e["id"]
+            if aid in seen:
+                continue
+            seen.add(aid)
+            acct = (plan.get("accounts") or {}).get(aid)
+            env = (reg.get(aid, {}).get("multi_account") or {}).get("env")
+            if acct and env:
+                out.append((aid, f"OG_{env}", acct))
+    return out
+
+
 def role_caveat(agent: dict, role: str) -> str | None:
     """The UNVERIFIED-in-this-role caveat for `agent`, or None.
 
@@ -609,9 +706,14 @@ def build_plan_interactive(state: dict) -> dict:
     if not orch_opts:
         die("none of the detected CLIs can act as an orchestrator "
             "(needs Omnigent's sys_* tool relay).")
-    orchestrator = pick_one(
-        "Which agent runs the ORCHESTRATOR? (plans, delegates, never writes product code)",
-        orch_opts, state.get("orchestrator"))
+    # A chain, like the coders: the later entries are the failover a launch
+    # takes when the brain above them is out of quota.
+    orchestrator_ids = pick_many_ordered(
+        "Which agent runs the ORCHESTRATOR? (plans, delegates, never writes "
+        "product code — preference order, first is tried first)",
+        orch_opts, [e["id"] for e in chain(state, "orchestrator")])
+    orchestrators = [{"id": aid, "priority": i}
+                     for i, aid in enumerate(orchestrator_ids, 1)]
 
     agent_name = ask("Name for the orchestrator bundle", state.get("agent_name", "dev-lead"))
 
@@ -633,15 +735,17 @@ def build_plan_interactive(state: dict) -> dict:
     rev_opts = opts("reviewer")
     if not rev_opts:
         die("no detected CLI can act as a reviewer.")
-    reviewer_id = pick_one(
-        "Which agent REVIEWS the batched diff? (reads only, never edits)",
-        rev_opts, (state.get("reviewer") or {}).get("id"))
-    reviewer = {"id": reviewer_id,
-                "model": pick_model(reg[reviewer_id], (state.get("reviewer") or {}).get("model"))}
+    rev_prev = {e["id"]: e.get("model") for e in chain(state, "reviewer")}
+    reviewer_ids = pick_many_ordered(
+        "Which agents REVIEW the batched diff? (reads only, never edits — "
+        "preference order, the next takes over when one is out of quota)",
+        rev_opts, [e["id"] for e in chain(state, "reviewer")])
+    reviewers = [{"id": rid, "priority": i, "model": pick_model(reg[rid], rev_prev.get(rid))}
+                 for i, rid in enumerate(reviewer_ids, 1)]
 
     # --- multi-account, for any selected agent that supports it ---
     accounts = dict(state.get("accounts") or {})
-    involved = {orchestrator, reviewer_id} | {c["id"] for c in coders}
+    involved = set(orchestrator_ids) | set(reviewer_ids) | {c["id"] for c in coders}
     for aid in sorted(involved):
         ma = reg[aid].get("multi_account") or {}
         if not ma.get("supported"):
@@ -699,9 +803,9 @@ def build_plan_interactive(state: dict) -> dict:
     return {
         "version": 1,
         "agent_name": agent_name,
-        "orchestrator": orchestrator,
+        "orchestrator": orchestrators,
         "coders": coders,
-        "reviewer": reviewer,
+        "reviewer": reviewers,
         "accounts": accounts,
         "port": int(port),
         "ngrok_domain": domain,
@@ -719,6 +823,10 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     """Return a list of (level, message). level in {'error','warn'}."""
     reg = agents_by_id()
     issues = []
+    # A role may now be a chain; chain() normalizes the old singleton shape so a
+    # saved og-install.json validates exactly as it always did.
+    orchestrators = chain(plan, "orchestrator")
+    reviewers = chain(plan, "reviewer")
 
     # A row declaring both `model.required` (a dispatch MUST pin a model) and
     # `model.pinnable: false` (the installer must never offer one) is
@@ -726,7 +834,7 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # unpinned and inherits the ORCHESTRATOR's model id -- the exact failure
     # `required` exists to prevent, now silent. Refuse it. No row does this
     # today; the guard is here so the next registry edit cannot slip it past.
-    for aid in sorted({plan["orchestrator"], plan["reviewer"]["id"]}
+    for aid in sorted({e["id"] for e in orchestrators + reviewers}
                       | {c["id"] for c in plan["coders"]}):
         spec = reg[aid].get("model") or {}
         if spec.get("required") and not spec.get("pinnable", True):
@@ -750,28 +858,47 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "erroring. Verify the first dispatch produced a real commit — an "
                            "empty transcript means the pin is wrong, not that it refused."))
 
-    rev_vendor = vendor_of(reg[plan["reviewer"]["id"]], plan["reviewer"])
-    same = [reg[c["id"]]["label"] for c in plan["coders"]
-            if vendor_of(reg[c["id"]], c) == rev_vendor]
-    if same:
-        issues.append(("warn",
-                       f"reviewer ({reg[plan['reviewer']['id']]['label']}) shares a vendor with "
-                       f"{', '.join(same)}. Same-vendor review shares blind spots — the "
-                       "orchestrator will mark those PRs `degraded-review`."))
+    # Cross-vendor review is the point of the reviewer role: an agent must never
+    # review code its own vendor wrote, and vendor follows the model pin, not
+    # the registry row. This WARNs rather than refuses -- refusing would block a
+    # user whose only available backup is same-vendor, which is worse than
+    # telling them plainly what they are getting. Checked for EVERY entry in the
+    # chain: the one that gets used is the one the orchestrator reaches for when
+    # the primary is dry.
+    for i, (name, r) in enumerate(zip(reviewer_names(plan), reviewers)):
+        rv = vendor_of(reg[r["id"]], r)
+        colliding = [f"`{worker_name(c['id'])}` ({reg[c['id']]['label']})"
+                     for c in plan["coders"] if vendor_of(reg[c["id"]], c) == rv]
+        if colliding:
+            # The PRIMARY collides immediately -- you never fail over TO the
+            # primary -- so the failover wording is right only for a backup.
+            tail = ("cross-vendor, so this is a same-vendor review — the PR must be "
+                    "labelled `degraded-review`." if i == 0 else
+                    f"cross-vendor, so failing over to `{name}` would produce a "
+                    "same-vendor review — the PR must then be labelled "
+                    "`degraded-review`.")
+            issues.append(("warn",
+                           f"reviewer `{name}` ({reg[r['id']]['label']}) shares a vendor with "
+                           f"{', '.join(colliding)}: all are `{rv}`. Review is meant to be "
+                           + tail))
 
-    if reg[plan["orchestrator"]].get("relay") is False:
-        issues.append(("error",
-                       f"{reg[plan['orchestrator']]['label']} runs without Omnigent's sys_* tool "
-                       "relay, so it cannot dispatch sub-agents. Pick a different orchestrator."))
+    for o in orchestrators:
+        a = reg[o["id"]]
+        if a.get("relay") is False:
+            issues.append(("error",
+                           f"{a['label']} runs without Omnigent's sys_* tool "
+                           "relay, so it cannot dispatch sub-agents. Pick a different "
+                           "orchestrator."))
 
-    # A harness that never receives the spec prompt cannot orchestrate: the
-    # whole orchestration contract lives in that prompt.
-    od = reg[plan["orchestrator"]].get("prompt_delivery")
-    if od == "none":
-        issues.append(("error",
-                       f"{reg[plan['orchestrator']]['label']} never receives a spec prompt "
-                       "(Omnigent reports instruction delivery NOT_DELIVERED), so the "
-                       "orchestration contract would be silently discarded."))
+        # A harness that never receives the spec prompt cannot orchestrate: the
+        # whole orchestration contract lives in that prompt. Checked for EVERY
+        # entry in the chain -- a `none` BACKUP is exactly as unusable as a
+        # `none` primary, and it is the one reached for when the primary is dry.
+        if a.get("prompt_delivery") == "none":
+            issues.append(("error",
+                           f"{a['label']} never receives a spec prompt "
+                           "(Omnigent reports instruction delivery NOT_DELIVERED), so the "
+                           "orchestration contract would be silently discarded."))
 
     # Workers on such a harness only ever see the dispatch text.
     mute = [reg[c["id"]]["label"] for c in plan["coders"]
@@ -788,16 +915,20 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # from the coder `mute` warning above because the remedy differs: a coder
     # needs its scope and gate rules inlined, a reviewer needs the review
     # contract and the exact three-section report format. Folding the two would
-    # lose which set of rules the orchestrator must supply.
-    if reg[plan["reviewer"]["id"]].get("prompt_delivery") == "none":
-        issues.append(("warn",
-                       f"{reg[plan['reviewer']['id']]['label']} never receives the review "
-                       "contract in reviewer.yaml.tmpl — that harness does not deliver spec "
-                       "instructions. The whole contract (judge only against the acceptance "
-                       "contract, never edit code, report in exactly three sections BLOCKING / "
-                       "NON-BLOCKING / SUGGESTIONS with file:line evidence) must be inlined "
-                       "into args.input on every review dispatch; the generated `roster` skill "
-                       "tells the orchestrator to do exactly that."))
+    # lose which set of rules the orchestrator must supply. Every entry in the
+    # chain is checked: a BACKUP that never receives the contract is exactly as
+    # dangerous as a primary that does not, and it is the one the orchestrator
+    # reaches for when the primary is dry.
+    for r in reviewers:
+        if reg[r["id"]].get("prompt_delivery") == "none":
+            issues.append(("warn",
+                           f"{reg[r['id']]['label']} never receives the review "
+                           "contract in reviewer.yaml.tmpl — that harness does not deliver spec "
+                           "instructions. The whole contract (judge only against the acceptance "
+                           "contract, never edit code, report in exactly three sections BLOCKING / "
+                           "NON-BLOCKING / SUGGESTIONS with file:line evidence) must be inlined "
+                           "into args.input on every review dispatch; the generated `roster` skill "
+                           "tells the orchestrator to do exactly that."))
 
     # A role a row marks `unverified_roles` clears validate()'s gates but has
     # never been driven here -- grok/devin as orchestrator. The registry used to
@@ -805,9 +936,9 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # selecting one as the brain was never shown the caveat. The config is legal
     # (a weak orchestrator at runtime, not a broken install), so this WARNs
     # rather than refuses; the first real dispatch is the proof.
-    for role, aid in ([("orchestrator", plan["orchestrator"])]
+    for role, aid in ([("orchestrator", o["id"]) for o in orchestrators]
                       + [("coder", c["id"]) for c in plan["coders"]]
-                      + [("reviewer", plan["reviewer"]["id"])]):
+                      + [("reviewer", r["id"]) for r in reviewers]):
         caveat = role_caveat(reg[aid], role)
         if caveat:
             issues.append(("warn", caveat))
@@ -815,7 +946,7 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # A `{shim:<name>}` token with no matching shim block renders a path to
     # a file nothing ever writes. The launch then fails with an exec error
     # pointing nowhere near the installer, so refuse it here instead.
-    for c in list(plan["coders"]) + [plan["reviewer"]]:
+    for c in list(plan["coders"]) + reviewers:
         a = reg.get(c["id"])
         if not a:
             continue
@@ -829,14 +960,42 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                                "launch fails — declare shim.name == "
                                f"'{tok}' or fix the token."))
 
-    # The tmux command-string ceiling only binds when the prompt rides on argv.
-    if rendered_prompt is not None and od == "argv":
+    # og launches ONE server with ONE environment, so a single env var cannot
+    # name two config dirs. Two installed ids can share a `multi_account.env`
+    # (nothing in the registry forbids it) and each be given a different
+    # account; whichever og.env line won would silently run the other agent on
+    # the wrong account. Refuse rather than write a file where one account is
+    # quietly dropped.
+    by_env = {}
+    for aid, var, acct in account_entries(plan):
+        prev = by_env.get(var)
+        if prev and prev[1] != acct:
+            issues.append(("error",
+                           f"{reg[aid]['label']} and {reg[prev[0]]['label']} both need "
+                           f"{var}, but og launches one server with one value. Two "
+                           f"accounts ({prev[1]} and {acct}) cannot both be set. Give "
+                           "them different multi_account.env values in the registry, or "
+                           "drop one of the accounts."))
+        else:
+            by_env[var] = (aid, acct)
+
+    # The tmux command-string ceiling binds whenever ANY orchestrator in the
+    # chain rides on argv -- NOT just the head. Reading only orchestrators[0]
+    # meant a per_turn primary (OpenCode) hid an argv BACKUP (claude, codex):
+    # the config validated clean, then the backup -- the entry that actually
+    # launches once the primary is dry -- died at launch with 'command too long'
+    # (surfacing as a native terminal that failed to start). Name every argv
+    # entry so a two-orchestrator chain says WHICH one is over the ceiling.
+    argv_orchestrators = [o for o in orchestrators
+                          if reg[o["id"]].get("prompt_delivery") == "argv"]
+    if rendered_prompt is not None and argv_orchestrators:
         quoted = len(shlex.quote(rendered_prompt))
+        names = ", ".join(reg[o["id"]]["label"] for o in argv_orchestrators)
         if quoted > PROMPT_CEILING:
             issues.append(("error",
                            f"orchestrator prompt is {quoted} bytes shell-quoted, over the "
                            f"{PROMPT_CEILING} ceiling for an argv-delivered harness "
-                           f"({reg[plan['orchestrator']]['label']}). tmux refuses the launch "
+                           f"({names}). tmux refuses the launch "
                            "with 'command too long'. Options: drop a coder, move guidance into "
                            "a skill file, or pick an orchestrator whose harness composes the "
                            "prompt per turn (OpenCode) and has no ceiling."))
@@ -877,7 +1036,9 @@ def render_roster(plan: dict) -> str:
     """
     reg = agents_by_id()
     ordinals = ["FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH", "SIXTH"]
-    names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] + ["`reviewer`"]
+    rev_names = reviewer_names(plan)
+    names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] \
+        + [f"`{n}`" for n in rev_names]
     width = max(len(n) for n in names) + 1
     lines = []
     for i, c in enumerate(plan["coders"]):
@@ -894,9 +1055,11 @@ def render_roster(plan: dict) -> str:
         tag = f" {'; '.join(tags)}." if tags else ""
         lines.append(f"  - {names[i].ljust(width)}{ordinals[min(i, 5)]}: {a['label']} "
                      f"(`{a['harness']}`){pin}.{tag}")
-    rv = reg[plan["reviewer"]["id"]]
-    lines.append(f"  - {names[-1].ljust(width)}{rv['label']} (`{rv['harness']}`). "
-                 "Reviews only; never edits.")
+    for name, e in zip(rev_names, chain(plan, "reviewer")):
+        rv = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        lines.append(f"  - {f'`{name}`'.ljust(width)}{rv['label']} "
+                     f"(`{rv['harness']}`){pin}. Reviews only; never edits.")
     return "\n".join(lines)
 
 
@@ -908,14 +1071,20 @@ def render_vendor_map(plan: dict) -> str:
     vendors that drift the moment the roster is reconfigured) would.
     """
     reg = agents_by_id()
-    rv = vendor_of(reg[plan["reviewer"]["id"]], plan["reviewer"])
     lines = []
     for c in plan["coders"]:
-        cv = vendor_of(reg[c["id"]], c)
-        same = (f" — same vendor as `reviewer` ({rv}); that pairing is "
-                "degraded-review" if cv == rv else "")
-        lines.append(f"  - `{worker_name(c['id'])}` is {cv}{same}.")
-    lines.append(f"  - `reviewer` is {rv}.")
+        lines.append(f"  - `{worker_name(c['id'])}` is {vendor_of(reg[c['id']], c)}.")
+    # The collision note sits on the REVIEWER line now: with a chain, the same
+    # coder can be same-vendor with one reviewer and cross-vendor with the next,
+    # so the pairing belongs to the reviewer being named (and matches the
+    # `degraded-review` warning validate() raises for that entry).
+    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
+        rv = vendor_of(reg[e["id"]], e)
+        same = [f"`{worker_name(c['id'])}`" for c in plan["coders"]
+                if vendor_of(reg[c["id"]], c) == rv]
+        note = (f" — same vendor as {', '.join(same)}; that pairing is "
+                "degraded-review" if same else "")
+        lines.append(f"  - `{name}` is {rv}{note}.")
     return "\n".join(lines)
 
 
@@ -1046,27 +1215,69 @@ def render_roster_skill(plan: dict) -> str:
             out.append("- Not yet exercised in this project — verify its first dispatch produced "
                        "a real commit before trusting a completion report.")
         out.append("")
-    rv = reg[plan["reviewer"]["id"]]
-    out += [f"## `reviewer` — {rv['label']}", "",
-            f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, plan['reviewer'])}`",
-            quota_line(rv), *quota_failure_lines(rv),
-            "- Reviews only; never edits, never gets a worktree.",
-            "- Cross-vendor review is the point: never route a diff to a reviewer whose",
-            "  vendor matches the implementer's. If that is unavoidable, say so and label",
-            "  the PR `degraded-review`."]
-    if rv.get("prompt_delivery") == "none":
-        # The same hazard as the coder bullet above, but the reviewer's whole
-        # contract lives in reviewer.yaml.tmpl and is lost here — so this bullet
-        # restates that contract in the dispatch, keeping the two from drifting.
-        out.append("- **Does not receive its sub-agent prompt.** This harness never "
-                   "delivers spec instructions, so the reviewer sees ONLY the text you send "
-                   "in `args.input`. Every review dispatch must therefore carry the whole "
-                   "contract itself: the acceptance contract and the diff as TEXT (never a "
-                   "worktree), judge the diff ONLY against the contract, never edit code and "
-                   "never go looking for a worktree, and report in exactly three sections — "
-                   "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
-                   "evidence. Do not assume it knows the review format.")
-    out.append("")
+    # The reviewer chain, in the same voice as the coder roster above: the
+    # orchestrator has to know who backs whom BEFORE it reads anything, because
+    # the moment it is needed is the moment the primary comes back dry.
+    rev_chain = chain(plan, "reviewer")
+    rev_names = reviewer_names(plan)
+    listed = [f"`{n}` ({reg[e['id']]['label']})" for n, e in zip(rev_names, rev_chain)]
+    if len(listed) == 1:
+        order = f"{listed[0]} is the only reviewer in this roster."
+    else:
+        verb = "backs it up" if len(listed) == 2 else "back it up"
+        order = (f"{listed[0]} is the primary; {', '.join(listed[1:])} "
+                 f"{verb}, in that order.")
+    out += ["## Reviewers — failover chain", "",
+            order, "",
+            "Check `og stats` before the first review dispatch, and",
+            "`og stats --agent <id> --json` before every later one: take the",
+            "earliest entry with capacity and move down only when one is dry, dropped",
+            "for the run, or already failed this run. Preference order still wins —",
+            "`ok` outranks `unknown` only when two candidates are otherwise equal — and",
+            "a reviewer marked dry comes back after the `reset_at` `og stats` reports,",
+            "so re-check it before using it again. This is the same chain rule as the",
+            "coder roster above; the failsafe is too: never re-send a diff to a",
+            "reviewer that already failed this run.", ""]
+    # One section per reviewer in the chain, in failover order. A backup is
+    # reached exactly when the primary is dry — the moment nobody is watching
+    # for a surprise — so it gets the same contract, quota shape and caveats
+    # rather than a one-line mention.
+    for name, e in zip(rev_names, rev_chain):
+        rv = reg[e["id"]]
+        pin = f", pinned `{e['model']}`" if e.get("model") else ""
+        out += [f"## `{name}` — {rv['label']}{pin}", "",
+                f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, e)}`",
+                quota_line(rv), *quota_failure_lines(rv)]
+        # The same collision validate() warns about at install time, carried
+        # here so the orchestrator knows it at DISPATCH time too -- the moment
+        # it is deciding which entry to use, long after the install scrolled by.
+        colliding = [f"`{worker_name(c['id'])}`" for c in plan["coders"]
+                     if vendor_of(reg[c["id"]], c) == vendor_of(rv, e)]
+        if colliding:
+            out.append(f"- **Same-vendor review (`{vendor_of(rv, e)}`).** This reviewer shares "
+                       f"a vendor with {', '.join(colliding)}, so failing over to `{name}` "
+                       "produces a same-vendor review — it shares the blind spots that produced "
+                       "the diff. Use it only after saying so in chat, and label the PR "
+                       "`degraded-review`.")
+        out += ["- Reviews only; never edits, never gets a worktree.",
+                "- Cross-vendor review is the point: never route a diff to a reviewer whose",
+                "  vendor matches the implementer's. If that is unavoidable, say so and label",
+                "  the PR `degraded-review`."]
+        if rv.get("prompt_delivery") == "none":
+            # The same hazard as the coder bullet above, but the reviewer's whole
+            # contract lives in reviewer.yaml.tmpl and is lost here — so this
+            # bullet restates that contract in the dispatch, keeping the two from
+            # drifting. Rendered per entry: a BACKUP that never receives the
+            # contract is exactly as dangerous as a primary that does not.
+            out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                       "delivers spec instructions, so the reviewer sees ONLY the text you send "
+                       "in `args.input`. Every review dispatch must therefore carry the whole "
+                       "contract itself: the acceptance contract and the diff as TEXT (never a "
+                       "worktree), judge the diff ONLY against the contract, never edit code and "
+                       "never go looking for a worktree, and report in exactly three sections — "
+                       "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
+                       "evidence. Do not assume it knows the review format.")
+        out.append("")
     return "\n".join(out)
 
 
@@ -1097,7 +1308,8 @@ def render_preflight_map(plan: dict) -> str:
     """
     reg = agents_by_id()
     rows = [f"    `{worker_name(c['id'])}` -> `{reg[c['id']]['harness']}`" for c in plan["coders"]]
-    rows.append(f"    `reviewer` -> `{reg[plan['reviewer']['id']]['harness']}`")
+    rows += [f"    `{name}` -> `{reg[e['id']]['harness']}`"
+             for name, e in zip(reviewer_names(plan), chain(plan, "reviewer"))]
     return "\n".join(rows)
 
 
@@ -1123,16 +1335,24 @@ def zen_preflight_note(name: str) -> str:
 def render_orchestrator(plan: dict) -> str:
     reg = agents_by_id()
     s = tmpl("orchestrator.yaml.tmpl")
+    # Every reviewer in the chain, not just the primary: tools.agents is the
+    # only dispatch surface, so a backup omitted here is unreachable and the
+    # failover the roster skill promises cannot happen. EACH backup grows the
+    # rendered prompt by an agent-list line here plus its roster lines in
+    # {{ROSTER_BULLETS}}, so headroom against PROMPT_CEILING shrinks per entry
+    # (1,401 bytes left with the measured four-coder roster). validate() refuses
+    # an argv chain over the ceiling, so the hazard stays guarded -- but a new
+    # chain entry spends bytes the prompt has to have.
     agent_list = "\n".join(f"    - {worker_name(c['id'])}" for c in plan["coders"])
-    agent_list += "\n    - reviewer"
+    agent_list += "".join(f"\n    - {n}" for n in reviewer_names(plan))
     subs = {
         "{{AGENT_NAME}}": plan["agent_name"],
-        "{{ORCHESTRATOR_HARNESS}}": reg[plan["orchestrator"]]["harness"],
+        "{{ORCHESTRATOR_HARNESS}}": reg[primary(plan, "orchestrator")["id"]]["harness"],
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{AGENT_LIST}}": agent_list,
         "{{MAX_DISPATCHES}}": str(plan["max_dispatches"]),
-        "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + 1),
+        "{{AGENT_COUNT_WORD}}": _count_word(len(plan["coders"]) + len(chain(plan, "reviewer"))),
     }
     for k, v in subs.items():
         s = s.replace(k, v)
@@ -1200,9 +1420,17 @@ def render_coder(plan: dict, c: dict) -> str:
     return s
 
 
-def render_reviewer(plan: dict) -> str:
+def render_reviewer(plan: dict, entry: dict | None = None, name: str = "reviewer") -> str:
+    """One reviewer spec.
+
+    Defaults to the chain's primary as `reviewer` (the name the orchestrator
+    prompt, the cross-review skill and existing session history use); each
+    backup is rendered under its own name with its own model pin, so the
+    failover target carries the same review contract and harness as the head.
+    """
     reg = agents_by_id()
-    a = reg[plan["reviewer"]["id"]]
+    entry = primary(plan, "reviewer") if entry is None else entry
+    a = reg[entry["id"]]
     acct = plan.get("accounts", {}).get(a["id"])
     note = ""
     if acct:
@@ -1212,11 +1440,12 @@ def render_reviewer(plan: dict) -> str:
                 f"# account your interactive sessions use.\n")
     s = tmpl("reviewer.yaml.tmpl")
     for k, v in {
+        "{{NAME}}": name,
         "{{LABEL}}": a["label"],
         "{{HARNESS}}": a["harness"],
         "{{ORCHESTRATOR}}": plan["agent_name"],
         "{{ACCOUNT_NOTE}}": note,
-        "{{MODEL_BLOCK}}": model_block(plan["reviewer"].get("model")),
+        "{{MODEL_BLOCK}}": model_block(entry.get("model")),
     }.items():
         s = s.replace(k, v)
     return s
@@ -1278,18 +1507,18 @@ def write_shims(plan: dict) -> list:
     block ({"name": ..., "script": ...}) to OMNI/"shims"/<name>, mode 0o755.
 
     Covers the same selected set patch_global_config renders rows for --
-    plan["coders"] plus plan["reviewer"] -- so a `{shim:<name>}` token in any
-    rendered command line already exists on disk. Rerunnable: a script whose
-    on-disk content AND mode already match is left alone and reported as no
-    change. Converges both: a script with right content but wrong mode gets
-    its mode repaired (and reported), because the bridge exec's this path
-    directly and a non-executable shim fails at launch with nothing pointing
-    back at the installer. Returns human-readable entries in
+    plan["coders"] plus every reviewer in the chain -- so a `{shim:<name>}`
+    token in any rendered command line already exists on disk. Rerunnable: a
+    script whose on-disk content AND mode already match is left alone and
+    reported as no change. Converges both: a script with right content but
+    wrong mode gets its mode repaired (and reported), because the bridge exec's
+    this path directly and a non-executable shim fails at launch with nothing
+    pointing back at the installer. Returns human-readable entries in
     patch_global_config's style.
     """
     reg = agents_by_id()
     changed = []
-    for c in list(plan["coders"]) + [plan["reviewer"]]:
+    for c in list(plan["coders"]) + chain(plan, "reviewer"):
         shim = reg[c["id"]].get("shim")
         if not shim:
             continue
@@ -1324,13 +1553,13 @@ def patch_global_config(plan: dict) -> list:
         cfg["policy_modules"] = mods
         changed.append("policy_modules += omnigent_local_policies")
 
-    # acp.agents entries for every acp-user agent we selected -- the reviewer
-    # included. A missing row does not fail loudly: Omnigent resolves an
-    # unknown acp:<slug> to the FIRST configured row, so an ACP reviewer with
-    # no row of its own would silently run as whichever coder is listed first.
+    # acp.agents entries for every acp-user agent we selected -- every reviewer
+    # in the chain included. A missing row does not fail loudly: Omnigent
+    # resolves an unknown acp:<slug> to the FIRST configured row, so an ACP
+    # reviewer with no row of its own would silently run as whichever coder is
+    # listed first.
     want = [c for c in plan["coders"] if reg[c["id"]]["kind"] == "acp-user"]
-    if reg[plan["reviewer"]["id"]]["kind"] == "acp-user":
-        want.append(plan["reviewer"])
+    want += [r for r in chain(plan, "reviewer") if reg[r["id"]]["kind"] == "acp-user"]
     if want:
         acp = cfg.get("acp") or {}
         rows = list(acp.get("agents") or [])
@@ -1410,7 +1639,10 @@ def opencode_worker_config_dir(plan: dict) -> Path | None:
     `question` for its plan gate.
     """
     is_coder = any(c["id"] == "opencode" for c in plan["coders"])
-    if not is_coder or plan["orchestrator"] == "opencode":
+    # ANY orchestrator in the chain, not just the primary: the override applies
+    # to every OpenCode session og launches, and a failover to an OpenCode brain
+    # needs `question` for its plan gate too.
+    if not is_coder or any(o["id"] == "opencode" for o in chain(plan, "orchestrator")):
         return None
     return OMNI / "opencode"
 
@@ -1451,7 +1683,6 @@ def installed_version() -> str:
 
 
 def write_og_env(plan: dict) -> None:
-    reg = agents_by_id()
     lines = [
         "# Generated by og install.sh. Sourced by `og` at startup.",
         "",
@@ -1481,13 +1712,17 @@ def write_og_env(plan: dict) -> None:
     else:
         lines += ["# OG_NGROK_DOMAIN=your-name.ngrok.app   # a reserved domain keeps",
                   "#   invite links and session cookies working across restarts."]
-    rev = plan["reviewer"]["id"]
-    acct = plan.get("accounts", {}).get(rev)
-    if acct:
-        env = (reg[rev].get("multi_account") or {}).get("env")
-        if env == "CLAUDE_CONFIG_DIR":
-            lines += ["", "# The reviewer runs on this account, separate from your interactive one.",
-                      f"OG_CLAUDE_CONFIG_DIR={acct}"]
+    # Every id with its own account gets an env line, not just the primary
+    # reviewer. Interactive now collects `accounts` for every id in every chain,
+    # but this only ever emitted the head's -- so a BACKUP reviewer configured
+    # with its own account silently ran on the primary's (or the user's
+    # interactive) login. Same failure shape as the ceiling gate: the config
+    # looked right and the backup ran wrong.
+    accts = account_entries(plan)
+    if accts:
+        lines += ["", "# Each agent below runs on this account, separate from your",
+                  "# interactive login for that agent."]
+        lines += [f"{var}={acct}" for _aid, var, acct in accts]
     ocd = opencode_worker_config_dir(plan)
     if ocd:
         lines += ["", "# OpenCode worker overrides (drops the blocking `question` tool). og start",
@@ -1514,6 +1749,10 @@ def install_og_script(dest: Path) -> None:
 
 def apply(plan: dict, dry_run: bool = False) -> None:
     reg = agents_by_id()
+    # Canonicalize on the way in: an old-shape state file (a bare
+    # "orchestrator"/"reviewer" singleton) installs exactly as it always did,
+    # and what gets written back to og-install.json is the new chain shape.
+    normalize_plan(plan)
     bundle = OMNI / "agents" / plan["agent_name"]
     prompt = yaml.safe_load(render_orchestrator(plan)).get("prompt", "")
 
@@ -1538,7 +1777,7 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # tools.agents) but indistinguishable on disk from a live worker, which is
     # exactly the kind of stale state that makes a rerunnable installer
     # untrustworthy.
-    keep = {worker_name(c["id"]) for c in plan["coders"]} | {"reviewer"}
+    keep = {worker_name(c["id"]) for c in plan["coders"]} | set(reviewer_names(plan))
     for d in sorted((bundle / "agents").iterdir()):
         if d.is_dir() and d.name not in keep:
             shutil.rmtree(d)
@@ -1547,9 +1786,10 @@ def apply(plan: dict, dry_run: bool = False) -> None:
         d = bundle / "agents" / worker_name(c["id"])
         d.mkdir(parents=True, exist_ok=True)
         (d / "config.yaml").write_text(render_coder(plan, c))
-    rd = bundle / "agents" / "reviewer"
-    rd.mkdir(parents=True, exist_ok=True)
-    (rd / "config.yaml").write_text(render_reviewer(plan))
+    for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
+        d = bundle / "agents" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.yaml").write_text(render_reviewer(plan, e, name))
 
     # 2. skills (verbatim from the repo)
     skills_src = REPO / "agents" / "dev-lead" / "skills"
@@ -1588,17 +1828,22 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     STATE.write_text(json.dumps(plan, indent=2) + "\n")
 
     say()
-    ok(f"orchestrator  {plan['agent_name']} ({reg[plan['orchestrator']]['label']})")
+    ok(f"orchestrator  {plan['agent_name']} ({reg[primary(plan, 'orchestrator')['id']]['label']})")
     for c in plan["coders"]:
         pin = f" → {c['model']}" if c.get("model") else ""
         ok(f"coder #{c['priority']}      {worker_name(c['id'])} ({reg[c['id']]['label']}){pin}")
-    ok(f"reviewer      {reg[plan['reviewer']['id']]['label']}")
+    for i, (name, e) in enumerate(zip(reviewer_names(plan), chain(plan, "reviewer"))):
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            ok(f"reviewer      {reg[e['id']]['label']}{pin}")
+        else:
+            ok(f"reviewer #{e['priority']}   {name} ({reg[e['id']]['label']}){pin}")
     for line in changed:
         ok(f"config.yaml   {line}")
     if ocd:
         wired = ", ".join(sorted(opencode_worker_config().get("mcp", {}))) or "none found"
         ok(f"opencode      {ocd/'opencode.json'} (question tool off; code-intel MCP: {wired})")
-    elif any(c["id"] == "opencode" for c in plan["coders"]):
+    elif any(o["id"] == "opencode" for o in chain(plan, "orchestrator")):
         warn("OpenCode is the orchestrator AND a coder: its `question` tool stays on for "
              "both, so a coder that asks will park the run until you answer.")
     ok(f"og            {bindir/'og'}")
@@ -1614,8 +1859,11 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     # (a credential file, a `whoami`, a token expiry...) and not worth
     # guessing at generically, so just list the command for each active
     # worker and let the user confirm it themselves.
-    login_agents = [reg[plan["orchestrator"]]] + [reg[c["id"]] for c in plan["coders"]] \
-        + [reg[plan["reviewer"]["id"]]]
+    # Every agent in the roster, chains included: a backup that is not logged in
+    # is only discovered when the primary goes dry and the failover dies too.
+    login_agents = [reg[o["id"]] for o in chain(plan, "orchestrator")] \
+        + [reg[c["id"]] for c in plan["coders"]] \
+        + [reg[r["id"]] for r in chain(plan, "reviewer")]
     seen_ids = set()
     login_lines = []
     for a in login_agents:
@@ -1811,6 +2059,10 @@ def install_pth(pol_dir: Path) -> None:
 def emit_questions() -> None:
     reg = agents_by_id()
     found = scan()
+    # The static per-agent model list, offered under every role that can pin one.
+    model_choices = {a["id"]: (a.get("model") or {}).get("choices")
+                     for a in REGISTRY["agents"]
+                     if (a.get("model") or {}).get("choices")}
     say(json.dumps({
         "detected": {k: reg[k]["label"] for k in found},
         "state_file": str(STATE),
@@ -1819,14 +2071,20 @@ def emit_questions() -> None:
         "questions": [
             {"key": "agent_name", "type": "string", "default": "dev-lead",
              "ask": "What should the orchestrator bundle be called?"},
-            {"key": "orchestrator", "type": "choice",
+            # Orchestrator and reviewer are ordered chains, exactly like coders:
+            # the entries after the first are the failover used when the one
+            # above is out of quota. A single id is still accepted (it normalizes
+            # to a one-element chain), so a consumer that answers with one value
+            # does not have to change.
+            {"key": "orchestrator", "type": "ordered_multi",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "orchestrator" in a["roles"]],
              # The per-role UNVERIFIED caveat travels with the choice: AGENTS.md
              # Part 1 has the AI installer drive its conversation from this
              # output, and it must never offer a role without the warning.
              "notes": role_notes("orchestrator"),
-             "ask": "Which agent plans and delegates (never writes product code)?"},
+             "ask": "Which agent plans and delegates (never writes product code), "
+                    "in preference order (first is tried first)?"},
             {"key": "coders", "type": "ordered_multi",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "coder" in a["roles"]],
@@ -1834,15 +2092,17 @@ def emit_questions() -> None:
              "ask": "Which agents implement code, in preference order (first is tried first)?",
              "per_item": {"model": "Model id to pin. REQUIRED for agents where "
                                   "registry.model.required is true.",
-                          "choices": {a["id"]: a.get("model", {}).get("choices")
-                                      for a in REGISTRY["agents"]
-                                      if (a.get("model") or {}).get("choices")}}},
-            {"key": "reviewer", "type": "choice",
+                          "choices": model_choices}},
+            {"key": "reviewer", "type": "ordered_multi",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "reviewer" in a["roles"]],
              "notes": role_notes("reviewer"),
-             "ask": "Which agent reviews the batched diff? Prefer a vendor that "
-                    "differs from every coder."},
+             "ask": "Which agents review the batched diff, in preference order (first "
+                    "is tried first; the next takes over when one is out of quota)? "
+                    "Prefer a vendor that differs from every coder.",
+             "per_item": {"model": "Model id to pin. REQUIRED for agents where "
+                                   "registry.model.required is true.",
+                          "choices": model_choices}},
             {"key": "accounts", "type": "map",
              "ask": "For any agent with registry.multi_account.supported, should the "
                     "reviewer run on a second account? Value is the config dir path.",
@@ -1876,14 +2136,30 @@ def show(state: dict) -> None:
         return
     reg = agents_by_id()
     found = scan()
+    # Both roles render as a chain in order, primary first. The `(primary)`
+    # tag only appears when there IS a chain, so a single-entry install reads
+    # exactly as it always has.
+    orch = chain(state, "orchestrator")
+    revs = chain(state, "reviewer")
     say(f"{C['b']}orchestrator{C['x']}  {state['agent_name']} "
-        f"({reg[state['orchestrator']]['label']})")
+        f"({reg[orch[0]['id']]['label']}){' (primary)' if len(orch) > 1 else ''}")
+    for e in orch[1:]:
+        say(f"{C['b']}  backup #{e['priority']}{C['x']}  {reg[e['id']]['label']} "
+            f"{C['dim']}— failover for the orchestrator{C['x']}")
     for c in state["coders"]:
         live = "" if c["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {c['model']}" if c.get("model") else ""
         say(f"{C['b']}coder #{c['priority']}{C['x']}      "
             f"{worker_name(c['id'])} ({reg[c['id']]['label']}){pin}{live}")
-    say(f"{C['b']}reviewer{C['x']}      {reg[state['reviewer']['id']]['label']}")
+    for i, e in enumerate(revs):
+        live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
+        pin = f" → {e['model']}" if e.get("model") else ""
+        if i == 0:
+            tail = " (primary)" if len(revs) > 1 else ""
+            say(f"{C['b']}reviewer{C['x']}      {reg[e['id']]['label']}{pin}{tail}{live}")
+        else:
+            say(f"{C['b']}  backup #{e['priority']}{C['x']}  {reg[e['id']]['label']}"
+                f"{pin}{live}")
     for aid, path in (state.get("accounts") or {}).items():
         say(f"{C['b']}account{C['x']}       {reg[aid]['label']} → {path}")
     say(f"{C['b']}port{C['x']}          {state['port']}")
@@ -1947,9 +2223,10 @@ def main() -> None:
         plan = json.loads(Path(args.plan).read_text())
         plan.setdefault("version", 1)
         plan.setdefault("auto_update", True)
-        for i, c in enumerate(plan.get("coders", []), 1):
-            c.setdefault("priority", i)
-        return apply(plan, dry_run=args.dry_run)
+        # Every role to the ordered-chain shape, so an old singleton plan and a
+        # new one take the identical path from here on. `priority` still comes
+        # from array order, exactly as the coder loop here always set it.
+        return apply(normalize_plan(plan), dry_run=args.dry_run)
 
     state = load_state()
     if state:

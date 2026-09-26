@@ -206,6 +206,25 @@ def test_validate_warns_same_vendor_reviewer():
     assert any("shares a vendor with" in msg for _, msg in issues)
 
 
+def test_primary_collision_warning_reads_as_immediate_not_failover():
+    # The head collides right away -- you never fail over TO the primary -- so
+    # its wording must not talk about failover; a BACKUP keeps that wording,
+    # because it is exactly the entry reached on failover.
+    primary = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}],
+                         reviewer={"id": "agy", "model": None})
+    msgs = [msg for _, msg in m.validate(primary) if "shares a vendor" in msg]
+    assert msgs, msgs
+    assert "failing over" not in msgs[0], msgs[0]
+    assert "same-vendor review" in msgs[0] and "degraded-review" in msgs[0]
+
+    backup = _base_plan(
+        coders=[{"id": "gemini", "priority": 1, "model": None}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "agy", "priority": 2, "model": None}])
+    bmsgs = [msg for _, msg in m.validate(backup) if "shares a vendor" in msg]
+    assert bmsgs and "failing over to `reviewer_2`" in bmsgs[0], bmsgs
+
+
 def test_validate_errors_when_orchestrator_cannot_relay():
     plan = _base_plan(orchestrator="cline")
     issues = m.validate(plan)
@@ -286,6 +305,41 @@ def test_validate_prompt_ceiling_ignored_for_non_argv_orchestrator():
     assert not any("ceiling" in msg for _, msg in issues)
 
 
+def test_validate_prompt_ceiling_fires_for_an_argv_backup_behind_a_per_turn_primary():
+    # A per_turn primary (OpenCode) has no ceiling, so reading only
+    # orchestrators[0] skipped the refusal entirely. The BACKUP (claude) is an
+    # argv harness -- the entry that launches when the primary is dry -- so an
+    # over-ceiling prompt must be refused for IT, and the message must name it.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1},
+                                    {"id": "claude", "priority": 2}])
+    over = "x" * (m.PROMPT_CEILING + 500)
+    msgs = [msg for level, msg in m.validate(plan, over) if level == "error"]
+    assert any("over the" in msg and "Claude Code" in msg for msg in msgs), msgs
+
+
+def test_validate_prompt_ceiling_warns_for_an_argv_backup_behind_a_per_turn_primary():
+    # Same chain inside the 800-byte warn band: the hazard is real (that backup
+    # is the one that launches) and must surface even though the head has no
+    # ceiling at all.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1},
+                                    {"id": "claude", "priority": 2}])
+    near = "x" * (m.PROMPT_CEILING - 500)
+    assert any(level == "warn" and "tmux ceiling" in msg
+               for level, msg in m.validate(plan, near))
+
+
+def test_validate_errors_when_a_backup_orchestrator_never_receives_its_prompt():
+    # cursor is prompt_delivery: none. As a BACKUP orchestrator it drops the
+    # whole orchestration contract exactly like a primary would, and it is the
+    # entry reached for when the primary is dry -- so the error must fire for
+    # it, not only for the head.
+    plan = _base_plan(orchestrator=[{"id": "claude", "priority": 1},
+                                    {"id": "cursor", "priority": 2}])
+    msgs = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("never receives a spec prompt" in msg and "Cursor" in msg
+               for msg in msgs), msgs
+
+
 def test_validate_warns_when_the_orchestrator_is_unverified_for_that_role():
     # grok/devin clear the gates validate() enforces for orchestrator, so the
     # role is legal -- but no og run has ever been driven with either as the
@@ -316,6 +370,262 @@ def test_role_options_flag_a_role_the_row_marks_unverified():
     coder = {aid: note for aid, _, note in
              m.role_options("coder", {"grok": "/bin/grok"})}
     assert coder["grok"] is None
+
+
+# --------------------------------------------------------------------------
+# role chains: orchestrator/reviewer are ordered lists, like coders
+# --------------------------------------------------------------------------
+def _chain_plan(**overrides):
+    """The same roster as _base_plan, in the new chain shape."""
+    plan = _base_plan(
+        orchestrator=[{"id": "claude", "priority": 1}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None}],
+    )
+    plan.update(overrides)
+    return plan
+
+
+def _apply_into(tmp_path, monkeypatch, plan):
+    """A real apply() into a throwaway OMNI.
+
+    install_pth is stubbed: it resolves the interpreter omnigent runs under and
+    would write a .pth into the REAL site-packages (the sandbox guard only
+    trips when $HOME is redirected, which pytest does not do), so nothing that
+    wants a real tree may leave it live.
+    """
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    monkeypatch.setattr(m, "STATE", tmp_path / "og-install.json")
+    monkeypatch.setattr(m, "install_pth", lambda *a, **k: None)
+    plan = dict(plan, bin_dir=str(tmp_path / "bin"))
+    m.apply(plan)
+    return plan
+
+
+def _tree(root):
+    return {str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_old_singleton_shape_installs_identically_to_the_chain_shape(tmp_path, monkeypatch):
+    """The live-state regression. Every existing og-install.json holds a bare
+    "orchestrator" string and a single-object "reviewer"; it must keep loading
+    and produce a byte-identical install, or a reconfigure (and `og update`,
+    which re-applies the saved plan) would silently change a working setup."""
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    monkeypatch.setattr(m, "STATE", tmp_path / "og-install.json")
+    monkeypatch.setattr(m, "install_pth", lambda *a, **k: None)
+    m.apply(dict(_base_plan(), bin_dir=str(tmp_path / "bin")))
+    old_tree = _tree(tmp_path)
+    assert (tmp_path / "agents" / "test-agent" / "agents" / "reviewer" /
+            "config.yaml").is_file()
+
+    m.apply(dict(_chain_plan(), bin_dir=str(tmp_path / "bin")))
+    assert _tree(tmp_path) == old_tree, "the new shape changed the generated install"
+
+
+def test_chain_shape_round_trips_through_save_and_load(tmp_path, monkeypatch):
+    """og-install.json is the source of truth and must be rerunnable: what
+    apply() persists is the chain shape, and normalizing it again is a no-op."""
+    _apply_into(tmp_path, monkeypatch, _chain_plan())
+    state = json.loads((tmp_path / "og-install.json").read_text())
+    assert state["orchestrator"] == [{"id": "claude", "priority": 1}]
+    assert state["reviewer"] == [{"id": "codex", "priority": 1, "model": None}]
+    assert state["coders"] == [{"id": "opencode", "priority": 1,
+                                "model": "opencode/mimo-v2.5-free"}]
+    assert m.normalize_plan(json.loads(json.dumps(state))) == state
+
+
+def test_chain_entries_normalizes_every_old_shape():
+    # bare string (orchestrator), single object (reviewer), list of strings,
+    # and an already-canonical list -- all reach the one entry shape.
+    assert m.chain_entries("claude") == [{"id": "claude", "priority": 1}]
+    assert m.chain_entries({"id": "codex", "model": None}) == [
+        {"id": "codex", "model": None, "priority": 1}]
+    assert m.chain_entries(["a", "b"]) == [{"id": "a", "priority": 1},
+                                           {"id": "b", "priority": 2}]
+    assert m.chain_entries([{"id": "a", "priority": 7, "model": "m"}]) == [
+        {"id": "a", "priority": 7, "model": "m"}]
+    assert m.chain_entries(None) == []
+
+
+def test_chain_priority_comes_from_array_order():
+    # Same rule as coders: position IS preference, so a stale explicit
+    # `priority` on an entry keeps its place rather than being renumbered.
+    plan = {"orchestrator": ["claude", "codex"], "reviewer": ["codex", "kiro"],
+            "coders": [{"id": "opencode"}, {"id": "cline"}]}
+    m.normalize_plan(plan)
+    assert [e["priority"] for e in plan["orchestrator"]] == [1, 2]
+    assert [e["priority"] for e in plan["reviewer"]] == [1, 2]
+    assert [e["priority"] for e in plan["coders"]] == [1, 2]
+
+
+def test_validate_and_render_accept_the_old_singleton_shape():
+    # The read path never mutates the caller's plan into a list; readers
+    # normalize on the way in, so a legacy dict keeps validating and rendering.
+    plan = _base_plan()
+    assert not any(level == "error" for level, _ in m.validate(plan))
+    assert yaml.safe_load(m.render_orchestrator(plan))["name"] == "test-agent"
+    assert m.render_reviewer(plan)
+
+
+def test_validate_warns_on_a_same_vendor_backup_anywhere_in_the_reviewer_chain():
+    """A WARNING, never an error: refusing would block a user whose only
+    available backup is same-vendor, which is worse than telling them plainly
+    what they are getting. Only a chain-aware check catches this — the primary
+    (codex/openai) is clean, the collision is on `reviewer_2`."""
+    plan = _base_plan(
+        coders=[{"id": "gemini", "priority": 1, "model": None}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "agy", "priority": 2, "model": None}])
+    issues = m.validate(plan)
+    warns = [(level, msg) for level, msg in issues if "shares a vendor" in msg]
+    assert len(warns) == 1, issues
+    assert all(level == "warn" for level, _ in warns)
+    msg = warns[0][1]
+    assert "`reviewer_2`" in msg and "Antigravity (Google)" in msg   # which reviewer
+    assert "`coder_gemini`" in msg and "`google`" in msg             # which coder, which vendor
+    assert "same-vendor review" in msg and "degraded-review" in msg
+
+    # The roster skill carries the same caveat on the affected entry, so the
+    # orchestrator knows at dispatch time and not only at install time.
+    skill = m.render_roster_skill(plan)
+    backup = skill.split("## `reviewer_2`")[1]
+    assert "**Same-vendor review (`google`).**" in backup
+    assert "`coder_gemini`" in backup and "degraded-review" in backup
+    primary = skill.split("## `reviewer`")[1].split("## `reviewer_2`")[0]
+    assert "**Same-vendor review" not in primary
+
+
+def test_validate_silent_when_every_reviewer_pairing_is_cross_vendor():
+    plan = _base_plan(
+        coders=[{"id": "cmdcode", "priority": 1, "model": "moonshotai/kimi-k3"}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "kiro", "priority": 2, "model": None}])
+    assert not [msg for _, msg in m.validate(plan) if "shares a vendor" in msg]
+
+
+def test_validate_warns_same_vendor_through_a_pin_in_the_chain():
+    # Vendor follows the model pin, not the registry row: a freebuff deepseek/*
+    # pin collides with a reviewer pinned to a deepseek model, even though the
+    # reviewer's registry vendor is aws-kiro. Same rule as the singleton case,
+    # now applied per chain entry.
+    plan = _base_plan(
+        coders=[{"id": "freebuff", "priority": 1, "model": "deepseek/deepseek-v4.1-flash"}],
+        reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                  {"id": "kiro", "priority": 2, "model": "deepseek/deepseek-chat"}])
+    msgs = [msg for _, msg in m.validate(plan) if "shares a vendor" in msg]
+    assert msgs and all("`reviewer_2`" in m_ for m_ in msgs), msgs
+    assert "`deepseek`" in msgs[0]
+    plan["coders"][0]["model"] = None       # z-ai pin: no collision with deepseek
+    assert not [msg for _, msg in m.validate(plan) if "shares a vendor" in msg]
+
+
+def test_two_reviewer_chain_emits_a_spec_per_entry_with_its_own_pin(tmp_path, monkeypatch):
+    """`reviewer` for the primary, `reviewer_2` for the backup — the coder
+    convention (a stable name for the head, a distinct one per addition). Each
+    spec carries its own harness and pin, and both are listed in tools.agents:
+    that list is the only dispatch surface, so a backup missing from it cannot
+    be failed over to at all."""
+    plan = _chain_plan(
+        reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                  {"id": "kiro", "priority": 2, "model": "auto"}])
+    _apply_into(tmp_path, monkeypatch, plan)
+    bundle = tmp_path / "agents" / "test-agent"
+    primary = yaml.safe_load((bundle / "agents" / "reviewer" / "config.yaml").read_text())
+    backup = yaml.safe_load((bundle / "agents" / "reviewer_2" / "config.yaml").read_text())
+    assert primary["name"] == "reviewer"
+    assert primary["executor"]["model"] == "gpt-5.5"
+    assert primary["executor"]["config"]["harness"] == "codex-native"
+    assert backup["name"] == "reviewer_2"
+    assert backup["executor"]["model"] == "auto"
+    assert backup["executor"]["config"]["harness"] == "acp:kiro-aws"
+    # The same review contract reaches the backup: the whole reason it exists is
+    # to be used when the primary is dry.
+    assert "Judge the diff ONLY against the contract" in backup["prompt"]
+    orch = yaml.safe_load((bundle / "config.yaml").read_text())
+    assert orch["tools"]["agents"] == ["coder_zen", "reviewer", "reviewer_2"]
+    assert "three sub-agents" in orch["prompt"]
+
+
+def test_reviewer_chain_apply_is_idempotent_and_prunes_a_dropped_backup(tmp_path, monkeypatch):
+    two = _chain_plan(reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                                {"id": "kiro", "priority": 2, "model": "auto"}])
+    _apply_into(tmp_path, monkeypatch, two)
+    first = _tree(tmp_path)
+    _apply_into(tmp_path, monkeypatch, two)
+    assert _tree(tmp_path) == first
+
+    one = _chain_plan(reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"}])
+    _apply_into(tmp_path, monkeypatch, one)
+    agents_dir = tmp_path / "agents" / "test-agent" / "agents"
+    assert not (agents_dir / "reviewer_2").exists(), "stale backup spec left behind"
+    assert (agents_dir / "reviewer").is_dir()
+
+
+def test_a_none_backup_reviewer_warns_and_gets_its_own_roster_bullet():
+    # cursor is prompt_delivery: none. As a BACKUP it drops the contract exactly
+    # like a primary would, and it is the entry the orchestrator reaches for
+    # when the primary is dry — so both the install-time warning and the
+    # skill's bullet must fire for it, not only for the head.
+    plan = _base_plan(reviewer=[{"id": "codex", "priority": 1, "model": None},
+                                {"id": "cursor", "priority": 2, "model": None}])
+    warnings = [msg for level, msg in m.validate(plan) if level == "warn"]
+    assert any("never receives the review contract" in msg and "Cursor" in msg
+               for msg in warnings), warnings
+    skill = m.render_roster_skill(plan)
+    assert "`reviewer_2` -> `cursor-native`" in skill
+    backup_section = skill.split("## `reviewer_2`")[1]
+    assert "**Does not receive its sub-agent prompt.**" in backup_section
+    primary_section = skill.split("## `reviewer`")[1].split("## `reviewer_2`")[0]
+    assert "Does not receive" not in primary_section   # codex delivers its prompt
+
+
+def test_render_reviewer_can_target_a_chain_entry_by_name():
+    # The existing single-argument call still renders the primary; the explicit
+    # form is what apply() uses for each backup.
+    plan = _chain_plan(reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                                 {"id": "kiro", "priority": 2, "model": "auto"}])
+    assert yaml.safe_load(m.render_reviewer(plan))["name"] == "reviewer"
+    backup = yaml.safe_load(m.render_reviewer(plan, m.chain(plan, "reviewer")[1], "reviewer_2"))
+    assert backup["name"] == "reviewer_2"
+    assert backup["executor"]["model"] == "auto"
+
+
+def test_show_renders_both_chains_in_order_with_the_primary_first(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "devin": "/bin/devin",
+                                            "codex": "/bin/codex", "kiro": "/bin/kiro"})
+    state = _base_plan(
+        orchestrator=[{"id": "claude", "priority": 1}, {"id": "devin", "priority": 2}],
+        reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                  {"id": "kiro", "priority": 2, "model": "auto"}],
+    )
+    m.show(state)
+    out = capsys.readouterr().out
+    order = [out.index(x) for x in ("Claude Code", "Devin", "Codex (OpenAI)", "Kiro (AWS)")]
+    assert order == sorted(order), out
+    assert out.count("(primary)") == 2        # both chains mark their head
+    assert "→ auto" in out                    # the backup's own pin is shown
+
+
+def test_emit_questions_offers_orchestrator_and_reviewer_as_ordered_chains(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "codex": "/bin/codex"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    for key in ("orchestrator", "reviewer"):
+        question = next(x for x in q["questions"] if x["key"] == key)
+        assert question["type"] == "ordered_multi", key
+    # The reviewer question carries the same static model list as coders, so an
+    # AI installer can pin each entry of the chain.
+    assert "choices" in next(x for x in q["questions"]
+                             if x["key"] == "reviewer")["per_item"]
+    # ...and the same model REQUIREMENT wording: a reviewer pin is required
+    # exactly where a coder's is, so the prompt must carry the caveat too.
+    coder_model = next(x for x in q["questions"] if x["key"] == "coders")["per_item"]["model"]
+    reviewer_model = next(x for x in q["questions"] if x["key"] == "reviewer")["per_item"]["model"]
+    assert reviewer_model == coder_model
+    assert "REQUIRED" in reviewer_model
 
 
 # --------------------------------------------------------------------------
@@ -365,11 +675,28 @@ def test_render_coder_acp_user_gets_permission_mode_or_not(monkeypatch):
     assert isinstance(cline_has, bool)
 
 
-def test_render_reviewer_is_valid_yaml():
+def test_reviewer_is_valid_yaml():
     plan = _rendering_plan()
     rendered = m.render_reviewer(plan)
     parsed = yaml.safe_load(rendered)
     assert parsed["executor"]["config"]["harness"] == "codex-native"
+
+
+def test_reviewer_contract_reports_a_missing_diff_instead_of_reading_the_repo():
+    """A reviewer handed a missing/empty/truncated diff once went and read the
+    repository instead of reporting the gap, which destroyed the independence
+    that is the whole reason a separate reviewer exists. The contract now says
+    plainly that reporting the gap is the correct answer."""
+    # Whitespace-normalized: the contract is wrapped prose, so a phrase may
+    # straddle a line break.
+    prompt = " ".join(yaml.safe_load(m.render_reviewer(_rendering_plan()))["prompt"].split())
+    assert "missing, empty, or truncated" in prompt
+    assert "SAY SO AND STOP" in prompt
+    assert "not given the diff" in prompt
+    # ...and it forbids the fallback that caused the failure.
+    assert "not go looking for it" in prompt
+    assert "do not open a repository" in prompt
+    assert "do not read files" in prompt
 
 
 # --------------------------------------------------------------------------
@@ -500,6 +827,46 @@ def test_og_env_auto_update_off_is_zero_not_absent(tmp_path, monkeypatch):
     env = _og_env(tmp_path, monkeypatch, _base_plan(auto_update=False))
     assert "OG_AUTO_UPDATE=0\n" in env
     assert "og update" in env
+
+
+def test_og_env_wires_a_backup_reviewers_own_account(tmp_path, monkeypatch):
+    # Interactive collects `accounts` for every id in the reviewer chain, so a
+    # BACKUP can have its own. write_og_env emitted the env line for the primary
+    # only, so that backup silently ran on the wrong account -- the failure the
+    # separate account exists to prevent.
+    plan = _base_plan(
+        orchestrator="codex",
+        reviewer=[{"id": "codex", "priority": 1, "model": None},
+                  {"id": "claude", "priority": 2, "model": None}],
+        accounts={"claude": "/tmp/claude-work"})
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-work\n" in env
+
+
+def test_og_env_wires_the_primary_reviewers_account(tmp_path, monkeypatch):
+    # The head's account keeps working exactly as before.
+    plan = _base_plan(reviewer={"id": "claude", "model": None},
+                      accounts={"claude": "/tmp/claude-primary"})
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-primary\n" in env
+
+
+def test_validate_errors_when_two_agents_share_an_env_but_need_different_accounts(monkeypatch):
+    # Nothing in the registry forbids two rows sharing `multi_account.env`, and
+    # og launches ONE server with ONE value: a second account for each means one
+    # og.env line silently overwrites the other and an agent runs on the wrong
+    # login. Refuse rather than write a file where one account is dropped.
+    row = next(a for a in m.REGISTRY["agents"] if a["id"] == "claude")
+    twin = {**row, "id": "claude2", "label": "Claude Two"}
+    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], twin]})
+    plan = _base_plan(
+        orchestrator="codex",
+        reviewer=[{"id": "claude", "priority": 1, "model": None},
+                  {"id": "claude2", "priority": 2, "model": None}],
+        accounts={"claude": "/tmp/a", "claude2": "/tmp/b"})
+    msgs = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("OG_CLAUDE_CONFIG_DIR" in msg and "/tmp/a" in msg and "/tmp/b" in msg
+               for msg in msgs), msgs
 
 
 # --------------------------------------------------------------------------
@@ -940,6 +1307,37 @@ def test_render_roster_skill_reviewer_mute_bullet_only_for_a_none_reviewer():
 
     normal = m.render_roster_skill(_base_plan(reviewer={"id": "codex", "model": None}))
     assert "**Does not receive its sub-agent prompt.**" not in normal
+
+
+def test_roster_skill_names_the_reviewer_chain_in_order_and_states_the_failover_rule():
+    """The orchestrator must know who backs whom before it reads anything: the
+    moment it needs the backup is the moment the primary came back dry, which
+    is also the moment nobody is watching. Same rule as the coder chain."""
+    plan = _base_plan(reviewer=[{"id": "codex", "priority": 1, "model": None},
+                                {"id": "kiro", "priority": 2, "model": "auto"}])
+    skill = m.render_roster_skill(plan)
+    assert "## Reviewers — failover chain" in skill
+    assert "`reviewer` (Codex (OpenAI)) is the primary" in skill
+    assert "`reviewer_2` (Kiro (AWS)) backs it up, in that order." in skill
+    for phrase in ("og stats",
+                   "`og stats --agent <id> --json`",
+                   "earliest entry with capacity",
+                   "move down only when one is dry, dropped",
+                   "for the run, or already failed this run",
+                   "`reset_at`",
+                   "never re-send a diff to a",
+                   "reviewer that already failed this run."):
+        assert phrase in skill, phrase
+    # The per-entry sections follow the chain's order.
+    assert skill.index("## `reviewer`") < skill.index("## `reviewer_2`")
+
+
+def test_roster_skill_says_so_when_there_is_only_one_reviewer():
+    # No invented backup: with a single-entry chain the section says there is
+    # nothing to fail over to rather than implying one exists.
+    skill = m.render_roster_skill(_base_plan())
+    assert "`reviewer` (Codex (OpenAI)) is the only reviewer in this roster." in skill
+    assert "is the primary" not in skill
 
 
 # --------------------------------------------------------------------------
