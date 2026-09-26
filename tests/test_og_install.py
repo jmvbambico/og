@@ -286,6 +286,38 @@ def test_validate_prompt_ceiling_ignored_for_non_argv_orchestrator():
     assert not any("ceiling" in msg for _, msg in issues)
 
 
+def test_validate_warns_when_the_orchestrator_is_unverified_for_that_role():
+    # grok/devin clear the gates validate() enforces for orchestrator, so the
+    # role is legal -- but no og run has ever been driven with either as the
+    # brain. The registry records that per role; the caveat must reach a user
+    # choosing one, as a WARN (a weak orchestrator at runtime, not a broken
+    # install), never as an error.
+    for aid in ("grok", "devin"):
+        issues = m.validate(_base_plan(orchestrator=aid))
+        warns = [msg for level, msg in issues if level == "warn"]
+        assert any("UNVERIFIED as orchestrator" in msg for msg in warns), (aid, issues)
+        assert not any(level == "error" for level, _ in issues), (aid, issues)
+
+
+def test_validate_no_unverified_warning_for_a_verified_role():
+    # claude is verified in every role it fills; nothing to warn about.
+    issues = m.validate(_base_plan())
+    assert not any("UNVERIFIED" in msg for _, msg in issues)
+
+
+def test_role_options_flag_a_role_the_row_marks_unverified():
+    # The per-role marker must reach the pick_one note (the picker's third
+    # per-option field) at SELECTION time -- and must not taint a role the row
+    # is verified for. Same row, two roles, opposite notes.
+    orch = {aid: note for aid, _, note in
+            m.role_options("orchestrator", {"grok": "/bin/grok", "claude": "/bin/claude"})}
+    assert "UNVERIFIED as orchestrator" in orch["grok"]
+    assert orch["claude"] is None
+    coder = {aid: note for aid, _, note in
+             m.role_options("coder", {"grok": "/bin/grok"})}
+    assert coder["grok"] is None
+
+
 # --------------------------------------------------------------------------
 # template rendering -> must always be valid, parseable YAML
 # --------------------------------------------------------------------------
@@ -1381,6 +1413,28 @@ def test_emit_questions_carries_choices(monkeypatch, capsys):
         "z-ai/glm-5.3-flash", "mimo-2.5", "solar-pro-4", "deepseek-v4.1-flash"]
     # rows without choices are simply absent, not empty
     assert "cline" not in coder_q["per_item"]["choices"]
+
+
+def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
+    # AGENTS.md Part 1 has an AI installer drive its conversation from
+    # --questions and never offer an agent without the warning that applies to
+    # it. The caveat is per role, so it rides the question offering that role.
+    monkeypatch.setattr(m, "scan", lambda: {"grok": "/bin/grok", "devin": "/bin/devin",
+                                            "claude": "/bin/claude"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    orch_q = next(x for x in q["questions"] if x["key"] == "orchestrator")
+    assert "UNVERIFIED as orchestrator" in orch_q["notes"]["grok"]
+    assert "UNVERIFIED as orchestrator" in orch_q["notes"]["devin"]
+    assert "claude" not in orch_q["notes"]
+    # ...and the coder question carries nothing for them: verified in that role.
+    coder_q = next(x for x in q["questions"] if x["key"] == "coders")
+    assert "grok" not in coder_q["notes"] and "devin" not in coder_q["notes"]
+    # The raw field is in the embedded registry for a consumer that reads it.
+    grok_row = next(r for r in q["registry"] if r["id"] == "grok")
+    assert grok_row["unverified_roles"] == ["orchestrator"]
 
 
 # --------------------------------------------------------------------------

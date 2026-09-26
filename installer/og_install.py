@@ -524,6 +524,64 @@ def load_state() -> dict:
     return {}
 
 
+def role_caveat(agent: dict, role: str) -> str | None:
+    """The UNVERIFIED-in-this-role caveat for `agent`, or None.
+
+    A row records the roles it has never been driven in as a structured list
+    rather than free text: grok and devin are verified coders but unverified
+    ORCHESTRATORS, so the whole-row `unverified` flag (which condemns a row in
+    the detected-CLI list) would be wrong here. This is the field CODE reads,
+    so the caveat reaches the picker, validate() and --questions instead of
+    sitting in the registry unread the way a `roles_note` did.
+    """
+    if role not in (agent.get("unverified_roles") or []):
+        return None
+    return (f"{agent['label']} is UNVERIFIED as {role}: it clears the bars "
+            "validate() enforces, but no og run has been driven with it in that "
+            "role, so the first real dispatch is the only proof. Demote it to a "
+            "verified role if that dispatch cannot perform the role.")
+
+
+def role_options(role: str, found: dict | None = None) -> list:
+    """(id, label, note) for every detected agent that may fill `role`.
+
+    Extracted from build_plan_interactive so the per-role caveat can be asserted
+    without a terminal: `pick_one` renders the third field under the option, so
+    a caveat that only lived in the registry was invisible at exactly the moment
+    the user chose.
+    """
+    if found is None:
+        found = scan()
+    out = []
+    for a in REGISTRY["agents"]:
+        if a["id"] not in found or role not in a["roles"]:
+            continue
+        notes = []
+        if role == "reviewer" and a.get("reviewer_warning"):
+            notes.append(a["reviewer_warning"])
+        caveat = role_caveat(a, role)
+        if caveat:
+            notes.append(caveat)
+        out.append((a["id"], a["label"], " ".join(notes) or None))
+    return out
+
+
+def role_notes(role: str) -> dict:
+    """agent id -> per-role caveat, for the `--questions` surface.
+
+    AGENTS.md Part 1 has an AI installer drive its conversation from that
+    output, and it must never offer an agent without the warning that applies to
+    it. The caveat is per role -- grok/devin are verified coders and unverified
+    orchestrators -- so it is keyed by id under the question that offers them.
+    """
+    out = {}
+    for a in REGISTRY["agents"]:
+        caveat = role_caveat(a, role)
+        if caveat:
+            out[a["id"]] = caveat
+    return out
+
+
 def build_plan_interactive(state: dict) -> dict:
     reg = agents_by_id()
     found = scan()
@@ -541,10 +599,10 @@ def build_plan_interactive(state: dict) -> dict:
         say(f"  {C['dim']}not found: {', '.join(a['label'] for a in missing)}{C['x']}")
 
     def opts(role):
-        return [(a["id"], reg[a["id"]]["label"],
-                 reg[a["id"]].get("reviewer_warning") if role == "reviewer" else None)
-                for a in REGISTRY["agents"]
-                if a["id"] in found and role in a["roles"]]
+        # role_options carries the reviewer warning AND the per-role UNVERIFIED
+        # caveat into the note pick_one renders under each option, so a caveat
+        # is visible while choosing rather than after the install.
+        return role_options(role, found)
 
     # --- orchestrator ---
     orch_opts = opts("orchestrator")
@@ -723,6 +781,19 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                        "NON-BLOCKING / SUGGESTIONS with file:line evidence) must be inlined "
                        "into args.input on every review dispatch; the generated `roster` skill "
                        "tells the orchestrator to do exactly that."))
+
+    # A role a row marks `unverified_roles` clears validate()'s gates but has
+    # never been driven here -- grok/devin as orchestrator. The registry used to
+    # record that only in a free-text `roles_note` nothing read, so a user
+    # selecting one as the brain was never shown the caveat. The config is legal
+    # (a weak orchestrator at runtime, not a broken install), so this WARNs
+    # rather than refuses; the first real dispatch is the proof.
+    for role, aid in ([("orchestrator", plan["orchestrator"])]
+                      + [("coder", c["id"]) for c in plan["coders"]]
+                      + [("reviewer", plan["reviewer"]["id"])]):
+        caveat = role_caveat(reg[aid], role)
+        if caveat:
+            issues.append(("warn", caveat))
 
     # A `{shim:<name>}` token with no matching shim block renders a path to
     # a file nothing ever writes. The launch then fails with an exec error
@@ -1734,10 +1805,15 @@ def emit_questions() -> None:
             {"key": "orchestrator", "type": "choice",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "orchestrator" in a["roles"]],
+             # The per-role UNVERIFIED caveat travels with the choice: AGENTS.md
+             # Part 1 has the AI installer drive its conversation from this
+             # output, and it must never offer a role without the warning.
+             "notes": role_notes("orchestrator"),
              "ask": "Which agent plans and delegates (never writes product code)?"},
             {"key": "coders", "type": "ordered_multi",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "coder" in a["roles"]],
+             "notes": role_notes("coder"),
              "ask": "Which agents implement code, in preference order (first is tried first)?",
              "per_item": {"model": "Model id to pin. REQUIRED for agents where "
                                   "registry.model.required is true.",
@@ -1747,6 +1823,7 @@ def emit_questions() -> None:
             {"key": "reviewer", "type": "choice",
              "choices": [a["id"] for a in REGISTRY["agents"]
                          if a["id"] in found and "reviewer" in a["roles"]],
+             "notes": role_notes("reviewer"),
              "ask": "Which agent reviews the batched diff? Prefer a vendor that "
                     "differs from every coder."},
             {"key": "accounts", "type": "map",
