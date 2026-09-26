@@ -319,6 +319,133 @@ def test_role_options_flag_a_role_the_row_marks_unverified():
 
 
 # --------------------------------------------------------------------------
+# role chains: orchestrator/reviewer are ordered lists, like coders
+# --------------------------------------------------------------------------
+def _chain_plan(**overrides):
+    """The same roster as _base_plan, in the new chain shape."""
+    plan = _base_plan(
+        orchestrator=[{"id": "claude", "priority": 1}],
+        reviewer=[{"id": "codex", "priority": 1, "model": None}],
+    )
+    plan.update(overrides)
+    return plan
+
+
+def _apply_into(tmp_path, monkeypatch, plan):
+    """A real apply() into a throwaway OMNI.
+
+    install_pth is stubbed: it resolves the interpreter omnigent runs under and
+    would write a .pth into the REAL site-packages (the sandbox guard only
+    trips when $HOME is redirected, which pytest does not do), so nothing that
+    wants a real tree may leave it live.
+    """
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    monkeypatch.setattr(m, "STATE", tmp_path / "og-install.json")
+    monkeypatch.setattr(m, "install_pth", lambda *a, **k: None)
+    plan = dict(plan, bin_dir=str(tmp_path / "bin"))
+    m.apply(plan)
+    return plan
+
+
+def _tree(root):
+    return {str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_old_singleton_shape_installs_identically_to_the_chain_shape(tmp_path, monkeypatch):
+    """The live-state regression. Every existing og-install.json holds a bare
+    "orchestrator" string and a single-object "reviewer"; it must keep loading
+    and produce a byte-identical install, or a reconfigure (and `og update`,
+    which re-applies the saved plan) would silently change a working setup."""
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    monkeypatch.setattr(m, "STATE", tmp_path / "og-install.json")
+    monkeypatch.setattr(m, "install_pth", lambda *a, **k: None)
+    m.apply(dict(_base_plan(), bin_dir=str(tmp_path / "bin")))
+    old_tree = _tree(tmp_path)
+    assert (tmp_path / "agents" / "test-agent" / "agents" / "reviewer" /
+            "config.yaml").is_file()
+
+    m.apply(dict(_chain_plan(), bin_dir=str(tmp_path / "bin")))
+    assert _tree(tmp_path) == old_tree, "the new shape changed the generated install"
+
+
+def test_chain_shape_round_trips_through_save_and_load(tmp_path, monkeypatch):
+    """og-install.json is the source of truth and must be rerunnable: what
+    apply() persists is the chain shape, and normalizing it again is a no-op."""
+    _apply_into(tmp_path, monkeypatch, _chain_plan())
+    state = json.loads((tmp_path / "og-install.json").read_text())
+    assert state["orchestrator"] == [{"id": "claude", "priority": 1}]
+    assert state["reviewer"] == [{"id": "codex", "priority": 1, "model": None}]
+    assert state["coders"] == [{"id": "opencode", "priority": 1,
+                                "model": "opencode/mimo-v2.5-free"}]
+    assert m.normalize_plan(json.loads(json.dumps(state))) == state
+
+
+def test_chain_entries_normalizes_every_old_shape():
+    # bare string (orchestrator), single object (reviewer), list of strings,
+    # and an already-canonical list -- all reach the one entry shape.
+    assert m.chain_entries("claude") == [{"id": "claude", "priority": 1}]
+    assert m.chain_entries({"id": "codex", "model": None}) == [
+        {"id": "codex", "model": None, "priority": 1}]
+    assert m.chain_entries(["a", "b"]) == [{"id": "a", "priority": 1},
+                                           {"id": "b", "priority": 2}]
+    assert m.chain_entries([{"id": "a", "priority": 7, "model": "m"}]) == [
+        {"id": "a", "priority": 7, "model": "m"}]
+    assert m.chain_entries(None) == []
+
+
+def test_chain_priority_comes_from_array_order():
+    # Same rule as coders: position IS preference, so a stale explicit
+    # `priority` on an entry keeps its place rather than being renumbered.
+    plan = {"orchestrator": ["claude", "codex"], "reviewer": ["codex", "kiro"],
+            "coders": [{"id": "opencode"}, {"id": "cline"}]}
+    m.normalize_plan(plan)
+    assert [e["priority"] for e in plan["orchestrator"]] == [1, 2]
+    assert [e["priority"] for e in plan["reviewer"]] == [1, 2]
+    assert [e["priority"] for e in plan["coders"]] == [1, 2]
+
+
+def test_validate_and_render_accept_the_old_singleton_shape():
+    # The read path never mutates the caller's plan into a list; readers
+    # normalize on the way in, so a legacy dict keeps validating and rendering.
+    plan = _base_plan()
+    assert not any(level == "error" for level, _ in m.validate(plan))
+    assert yaml.safe_load(m.render_orchestrator(plan))["name"] == "test-agent"
+    assert m.render_reviewer(plan)
+
+
+def test_show_renders_both_chains_in_order_with_the_primary_first(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "devin": "/bin/devin",
+                                            "codex": "/bin/codex", "kiro": "/bin/kiro"})
+    state = _base_plan(
+        orchestrator=[{"id": "claude", "priority": 1}, {"id": "devin", "priority": 2}],
+        reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
+                  {"id": "kiro", "priority": 2, "model": "auto"}],
+    )
+    m.show(state)
+    out = capsys.readouterr().out
+    order = [out.index(x) for x in ("Claude Code", "Devin", "Codex (OpenAI)", "Kiro (AWS)")]
+    assert order == sorted(order), out
+    assert out.count("(primary)") == 2        # both chains mark their head
+    assert "→ auto" in out                    # the backup's own pin is shown
+
+
+def test_emit_questions_offers_orchestrator_and_reviewer_as_ordered_chains(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "codex": "/bin/codex"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    for key in ("orchestrator", "reviewer"):
+        question = next(x for x in q["questions"] if x["key"] == key)
+        assert question["type"] == "ordered_multi", key
+    # The reviewer question carries the same static model list as coders, so an
+    # AI installer can pin each entry of the chain.
+    assert "choices" in next(x for x in q["questions"]
+                             if x["key"] == "reviewer")["per_item"]
+
+
+# --------------------------------------------------------------------------
 # template rendering -> must always be valid, parseable YAML
 # --------------------------------------------------------------------------
 def _rendering_plan():
