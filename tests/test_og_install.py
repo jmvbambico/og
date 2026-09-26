@@ -1781,3 +1781,13 @@ def test_acp_command_keeps_a_spaced_shim_path_as_one_argv_entry(monkeypatch):
     argv_plain = shlex.split(m.acp_command(row, None))
     assert "CMD_BIN=/Users/John Smith/.omnigent/shims/cmd-og" in argv_plain
 
+
+# --------------------------------------------------------------------------
+# the registry's $comment documents every field it expects a row to carry
+# --------------------------------------------------------------------------
+def test_registry_comment_documents_the_role_unverified_fields():
+    # A registry field absent from the $comment block is invisible to the next
+    # person editing the catalog (AGENTS.md: add vendors HERE, not in code).
+    comment = "\n".join(m.REGISTRY["$comment"])
+    assert "unverified_roles" in comment
+    assert "roles_note" in comment
