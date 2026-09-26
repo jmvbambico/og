@@ -2676,15 +2676,19 @@ def test_registry_comment_documents_the_role_unverified_fields():
 # rots by construction -- each version was true of the code its author read and
 # wrong about the rest -- so this test stops describing the set and asserts it.
 #
-# It parses each module and collects every top-level function whose body names
-# a role key. Adding a role that introduces a NEW hand-written site fails here,
-# forcing the author to either generalize the site or add it to the pin below
-# deliberately. Deliberately over-broad: an accessor such as role_names(plan,
-# "scout") counts as a site too, because a false positive that forces a look
-# beats a false negative that hides a site. Excluded: the ROLES table itself
-# (a declaration, not a branch), and it is not a function, so the scan skips it
-# for free.
-ROLE_KEYS = {"orchestrator", "coders", "reviewer", "scout", "integrator"}
+# It parses each module and collects every function -- at any nesting depth,
+# including class methods -- whose body names a role key. Adding a role that
+# introduces a NEW hand-written site fails here, forcing the author to either
+# generalize the site or add it to the pin below deliberately. Deliberately
+# over-broad: an accessor such as role_names(plan, "scout") counts as a site
+# too, because a false positive that forces a look beats a false negative that
+# hides a site. Excluded: the ROLES table itself (a declaration, not a branch),
+# and it is not a function, so the scan skips it for free.
+#
+# ROLE_KEYS is derived from ROLES, never hardcoded: a hardcoded set is blind to
+# the exact case this test exists for, since a NEW role's key would not be in it
+# and its hand-written sites would be invisible to the scan.
+ROLE_KEYS = {r.key for r in m.ROLES}
 PER_ROLE_SITES = {
     "og_install.py": {
         "apply",
@@ -2711,7 +2715,7 @@ PER_ROLE_SITES = {
 
 def _functions_naming_a_role(path):
     found = set()
-    for node in ast.parse(Path(path).read_text()).body:
+    for node in ast.walk(ast.parse(Path(path).read_text())):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for sub in ast.walk(node):
@@ -2726,4 +2730,8 @@ def test_per_role_sites_are_pinned():
         module: _functions_naming_a_role(REPO / "installer" / module)
         for module in PER_ROLE_SITES
     }
-    assert measured == PER_ROLE_SITES
+    assert measured == PER_ROLE_SITES, (
+        "the per-role site set changed. A new hand-written site names a role key: "
+        "generalize it, or add its function to PER_ROLE_SITES. Or a pinned site "
+        "was renamed or removed: update PER_ROLE_SITES to match."
+    )
