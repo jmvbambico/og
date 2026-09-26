@@ -1060,6 +1060,77 @@ def test_lineup_malformed_entries_survive_the_table_render(tmp_path):
     assert "codex" in table
 
 
+def test_lineup_reports_the_scout_chain_in_order(tmp_path):
+    """scout is an ordered failover chain, exactly like reviewer. `og stats` is
+    the evidence the orchestrator reads to pick the earliest scout with capacity,
+    so an entry absent here cannot be failed over to on anything but a guess."""
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "orchestrator": {"id": "claude"},
+        "coders": [{"id": "opencode", "priority": 1}],
+        "reviewer": {"id": "codex"},
+        "scout": [{"id": "cmdcode", "priority": 1},
+                  {"id": "kiro", "priority": 2}],
+    }))
+    _write_registry(reg)
+    rows = st.lineup(inst, reg)
+    assert [(r["role"], r["agent"]) for r in rows] == [
+        ("orchestrator", "claude"), ("coder", "opencode"),
+        ("reviewer", "codex"),
+        ("scout", "cmdcode"), ("scout", "kiro")]
+
+
+def test_lineup_tolerates_a_non_iterable_coders_value(tmp_path):
+    # A hand-edited "coders": 5 raised TypeError: 'int' object is not iterable.
+    # og stats runs interactively right before a dispatch decision, so it must
+    # skip what it cannot read rather than trace back.
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    _write_registry(reg)
+    for bad in (5, None, "opencode", {"id": "opencode"}):
+        inst.write_text(json.dumps({"orchestrator": {"id": "claude"},
+                                    "coders": bad,
+                                    "reviewer": {"id": "codex"}}))
+        assert [r["agent"] for r in st.lineup(inst, reg)] == ["claude", "codex"]
+
+
+def test_lineup_skips_unreadable_coder_elements_and_bad_priorities(tmp_path):
+    # None/{} elements name no agent; a null priority used to raise TypeError:
+    # '<' not supported between instances of 'int' and 'NoneType' in the sort.
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    _write_registry(reg)
+    inst.write_text(json.dumps({
+        "orchestrator": {"id": "claude"},
+        "coders": [None, {}, {"id": "opencode", "priority": None},
+                   {"id": "kilo", "priority": 2}],
+        "reviewer": {"id": "codex"},
+    }))
+    rows = st.lineup(inst, reg)
+    assert all(isinstance(r["agent"], str) for r in rows)
+    assert [r["agent"] for r in rows if r["role"] == "coder"] == ["kilo", "opencode"]
+
+
+def test_lineup_non_int_priorities_sort_after_real_ones(tmp_path):
+    # sorted() is stable, so malformed (null/str) priorities land AFTER every
+    # int priority but keep their original array order among themselves.
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    _write_registry(reg)
+    inst.write_text(json.dumps({
+        "orchestrator": {"id": "claude"},
+        "coders": [{"id": "opencode", "priority": None},
+                   {"id": "kilo", "priority": "high"},
+                   {"id": "codex", "priority": 2},
+                   {"id": "claude", "priority": 1}],
+        "reviewer": {"id": "codex"},
+    }))
+    rows = st.lineup(inst, reg)
+    assert [r["agent"] for r in rows if r["role"] == "coder"] == [
+        "claude", "codex", "opencode", "kilo"]
+
+
 def test_table_and_json_shape(tmp_path, capsys):
     state_path = tmp_path / "og-quota.json"
     rec = q.make_record("ok", "measured", 60, 100, "percent",
