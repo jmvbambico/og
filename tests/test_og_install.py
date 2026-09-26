@@ -714,6 +714,21 @@ def test_scout_template_carries_the_read_only_contract():
     assert parsed["skills"] == "none"
 
 
+def test_scout_read_only_is_stated_as_trusted_not_sandboxed():
+    """The read-only rule is a CONTRACT the scout honours, not a policy that
+    stops it: blast_radius only denies force-push/rm -rf/hard-reset, gate_pushes
+    only blocks pushes, and an acp-user scout runs bypassPermissions. So the spec
+    prompt must say so to the scout, and the roster must tell the orchestrator it
+    cannot rely on the sandbox to keep a scout from writing."""
+    plan = _base_plan(scout=[{"id": "codex", "model": None}])
+    prompt = " ".join(yaml.safe_load(m.render_scout(plan))["prompt"].split())
+    assert "READ-ONLY IS A CONTRACT, NOT A SANDBOX" in prompt
+    assert "bug in your own reasoning" in prompt
+    skill = m.render_roster_skill(plan)
+    assert "TRUSTED, not sandboxed" in skill
+    assert "depends on it not writing" in skill
+
+
 def test_a_none_scout_warns_for_the_primary_and_the_backup():
     # cursor and gemini are prompt_delivery: none. As scout entries they never
     # see scout.yaml.tmpl, so BOTH the read-only and the bounded-answer rules
@@ -1658,6 +1673,23 @@ def test_emit_questions_offers_integrator_as_an_ordered_chain(monkeypatch, capsy
     assert "choices" in ig["per_item"]
 
 
+def test_emit_questions_marks_the_optional_roles_optional(monkeypatch, capsys):
+    """AGENTS.md Part 1 drives an AI install from --questions. The interactive
+    path asks yes/no for an optional role, so that JSON is the only signal a
+    non-interactive installer gets that scout and integrator may be omitted."""
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    opts = {x["key"]: x.get("optional") for x in q["questions"] if x["key"] in
+            {r.key for r in m.ROLES}}
+    assert opts == {"orchestrator": False, "coders": False, "reviewer": False,
+                    "scout": True, "integrator": True}
+    # Only role questions carry the field -- no other question invents one.
+    assert sum("optional" in x for x in q["questions"]) == len(m.ROLES)
+
+
 def test_roster_skill_names_the_integrator_chain_in_order_and_states_the_rules():
     """The integrator's contract has to be in the skill because it is what
     makes the role safe: a bounded result, no merge decision, and one integrator
@@ -1711,6 +1743,19 @@ def test_a_none_integrator_backup_gets_its_own_roster_bullet():
     assert "never running the integration suite while" in backup
     primary = skill.split("## `integrator`")[1].split("## `integrator_2`")[0]
     assert "Does not receive" not in primary     # codex delivers its prompt
+
+
+def test_roster_skill_stats_id_map_names_every_chain_role():
+    """The og-stats id-mapping sentence is generated from the role table, so a
+    chain role added later cannot leave it stale -- it read
+    `reviewer`/`scout` once integrator landed."""
+    skill = m.render_roster_skill(_base_plan(
+        scout=[{"id": "codex", "model": None}],
+        integrator=[{"id": "cmdcode", "model": None}]))
+    assert "`reviewer`/`scout`/`integrator` map to their chain's agent ids" in skill
+    # Generated, not hardcoded: the table's singleton spec roles, in order.
+    expected = "/".join(f"`{r.key}`" for r in m.SPEC_ROLES if not r.multi)
+    assert expected == "`reviewer`/`scout`/`integrator`"
 
 
 # --------------------------------------------------------------------------
