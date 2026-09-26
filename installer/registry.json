@@ -408,8 +408,10 @@
       "binary": "grok",
       "kind": "acp-builtin",
       "roles": [
+        "orchestrator",
         "coder"
       ],
+      "roles_note": "`orchestrator` added on the only two bars validate() enforces for that role: `relay: true` (the sys_* relay can dispatch) and `prompt_delivery` not `none` — `first_user` prepends the spec prompt to the first user message, so the orchestration contract IS delivered. UNVERIFIED as an orchestrator: no og run has been driven with grok as the brain. Demote to `coder` if the first real dispatch cannot orchestrate.",
       "vendor": "xai",
       "relay": true,
       "silent_model_failure": false,
@@ -432,8 +434,10 @@
       "binary": "devin",
       "kind": "acp-builtin",
       "roles": [
+        "orchestrator",
         "coder"
       ],
+      "roles_note": "`orchestrator` added on the only two bars validate() enforces for that role: `relay: true` (the sys_* relay can dispatch) and `prompt_delivery` not `none` — `first_user` prepends the spec prompt to the first user message, so the orchestration contract IS delivered. UNVERIFIED as an orchestrator: no og run has been driven with devin as the brain. Demote to `coder` if the first real dispatch cannot orchestrate.",
       "vendor": "cognition",
       "relay": true,
       "silent_model_failure": false,

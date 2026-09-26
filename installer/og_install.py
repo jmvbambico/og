@@ -708,6 +708,22 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                        "inlined into args.input on every dispatch; the generated `roster` "
                        "skill tells the orchestrator to do exactly that."))
 
+    # A `none` reviewer never sees the whole review contract that lives in
+    # reviewer.yaml.tmpl, and no warning covered it until this one. Kept separate
+    # from the coder `mute` warning above because the remedy differs: a coder
+    # needs its scope and gate rules inlined, a reviewer needs the review
+    # contract and the exact three-section report format. Folding the two would
+    # lose which set of rules the orchestrator must supply.
+    if reg[plan["reviewer"]["id"]].get("prompt_delivery") == "none":
+        issues.append(("warn",
+                       f"{reg[plan['reviewer']['id']]['label']} never receives the review "
+                       "contract in reviewer.yaml.tmpl — that harness does not deliver spec "
+                       "instructions. The whole contract (judge only against the acceptance "
+                       "contract, never edit code, report in exactly three sections BLOCKING / "
+                       "NON-BLOCKING / SUGGESTIONS with file:line evidence) must be inlined "
+                       "into args.input on every review dispatch; the generated `roster` skill "
+                       "tells the orchestrator to do exactly that."))
+
     # A `{shim:<name>}` token with no matching shim block renders a path to
     # a file nothing ever writes. The launch then fails with an exec error
     # pointing nowhere near the installer, so refuse it here instead.
@@ -916,7 +932,20 @@ def render_roster_skill(plan: dict) -> str:
             "- Reviews only; never edits, never gets a worktree.",
             "- Cross-vendor review is the point: never route a diff to a reviewer whose",
             "  vendor matches the implementer's. If that is unavoidable, say so and label",
-            "  the PR `degraded-review`.", ""]
+            "  the PR `degraded-review`."]
+    if rv.get("prompt_delivery") == "none":
+        # The same hazard as the coder bullet above, but the reviewer's whole
+        # contract lives in reviewer.yaml.tmpl and is lost here — so this bullet
+        # restates that contract in the dispatch, keeping the two from drifting.
+        out.append("- **Does not receive its sub-agent prompt.** This harness never "
+                   "delivers spec instructions, so the reviewer sees ONLY the text you send "
+                   "in `args.input`. Every review dispatch must therefore carry the whole "
+                   "contract itself: the acceptance contract and the diff as TEXT (never a "
+                   "worktree), judge the diff ONLY against the contract, never edit code and "
+                   "never go looking for a worktree, and report in exactly three sections — "
+                   "BLOCKING / NON-BLOCKING / SUGGESTIONS — each finding with file:line "
+                   "evidence. Do not assume it knows the review format.")
+    out.append("")
     return "\n".join(out)
 
 
