@@ -7,6 +7,7 @@ OMNI/STATE constants rather than the real ~/.omnigent.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shlex
@@ -2664,3 +2665,65 @@ def test_registry_comment_documents_the_role_unverified_fields():
     comment = "\n".join(m.REGISTRY["$comment"])
     assert "unverified_roles" in comment
     assert "roles_note" in comment
+
+
+# --------------------------------------------------------------------------
+# the ROLES table is not the whole story: pin the hand-written per-role sites
+# --------------------------------------------------------------------------
+# A prose count in the ROLES comment of the per-role sites the table does NOT
+# drive was wrong three times running (two, then four, then "eight" that also
+# misclassified two table-driven functions). A count of a scattered invariant
+# rots by construction -- each version was true of the code its author read and
+# wrong about the rest -- so this test stops describing the set and asserts it.
+#
+# It parses each module and collects every top-level function whose body names
+# a role key. Adding a role that introduces a NEW hand-written site fails here,
+# forcing the author to either generalize the site or add it to the pin below
+# deliberately. Deliberately over-broad: an accessor such as role_names(plan,
+# "scout") counts as a site too, because a false positive that forces a look
+# beats a false negative that hides a site. Excluded: the ROLES table itself
+# (a declaration, not a branch), and it is not a function, so the scan skips it
+# for free.
+ROLE_KEYS = {"orchestrator", "coders", "reviewer", "scout", "integrator"}
+PER_ROLE_SITES = {
+    "og_install.py": {
+        "apply",
+        "build_plan_interactive",
+        "integrator_note",
+        "opencode_worker_config_dir",
+        "patch_global_config",
+        "render_integrator",
+        "render_orchestrator",
+        "render_reviewer",
+        "render_roster",
+        "render_roster_skill",
+        "render_scout",
+        "render_vendor_map",
+        "reviewer_names",
+        "role_options",
+        "scout_note",
+        "show",
+        "validate",
+    },
+    "og_stats.py": {"lineup"},
+}
+
+
+def _functions_naming_a_role(path):
+    found = set()
+    for node in ast.parse(Path(path).read_text()).body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and sub.value in ROLE_KEYS:
+                found.add(node.name)
+                break
+    return found
+
+
+def test_per_role_sites_are_pinned():
+    measured = {
+        module: _functions_naming_a_role(REPO / "installer" / module)
+        for module in PER_ROLE_SITES
+    }
+    assert measured == PER_ROLE_SITES
