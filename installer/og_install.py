@@ -984,13 +984,51 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "the orchestrator's model id. Drop one of the two in "
                            "the registry row."))
 
-    for c in plan["coders"]:
-        spec = reg[c["id"]].get("model") or {}
-        if spec.get("required") and not c.get("model"):
+    # A registry row with `model.required` must be pinned in EVERY role it can
+    # serve, not only as a coder. This check used to run over `plan["coders"]`
+    # alone, so a hand-authored or scripted plan JSON naming an unpinned
+    # reviewer, scout or integrator passed validation, wrote a config with no
+    # `model:` key, and resolved to None at dispatch -- the field failure that
+    # started all of this: `model: null`, the harness launched with no model,
+    # and every dispatch died with "Runner disconnected unexpectedly". Driven by
+    # SPEC_ROLES -- the roles that render a dispatched sub-agent -- rather than
+    # a hand-written list of four role names, so a role added to ROLES later is
+    # covered without a new branch here. The orchestrator is excluded on
+    # purpose: its spec IS the bundle's root config, it inherits no parent's
+    # model, render_orchestrator writes no model block, and the interactive
+    # path never pins it either. An absent role is legal -- chain() returns []
+    # for a key the plan omits -- so an omitted optional role contributes
+    # nothing rather than crashing.
+    for r in SPEC_ROLES:
+        for e in chain(plan, r.key):
+            agent = reg[e["id"]]
+            spec = agent.get("model") or {}
+            if not (spec.get("required") and not e.get("model")):
+                continue
+            # The consequence is the same dead dispatch for every worker, but a
+            # reviewer loses a different thing worth naming -- the batched
+            # diff's independent review -- so it reads its own sentence. The
+            # coder wording is kept verbatim: it is the one already in users'
+            # bug reports, and "worker" still reads correctly for scout and
+            # integrator, which die the same way.
+            if r.role == "reviewer":
+                tail = ("An unpinned reviewer inherits the orchestrator's model id, so the "
+                        "batched diff silently loses its independent review.")
+            elif r.role == "coder":
+                tail = ("An unpinned worker inherits the orchestrator's model id and the "
+                        "dispatch dies (loudly on OpenCode, SILENTLY on ACP agents).")
+            else:
+                tail = (f"An unpinned {r.role} inherits the orchestrator's model id and the "
+                        "dispatch dies (loudly on OpenCode, SILENTLY on ACP agents).")
             issues.append(("error",
-                           f"{reg[c['id']]['label']} requires a pinned model but none is set. "
-                           "An unpinned worker inherits the orchestrator's model id and the "
-                           "dispatch dies (loudly on OpenCode, SILENTLY on ACP agents)."))
+                           f"{agent['label']} requires a pinned model but none is set. {tail}"))
+
+    # Coder-only, and deliberately left beside the role loop rather than folded
+    # into it: this warning names a COMMIT as the proof a pin held, and only a
+    # coder produces one. No registry row that can review declares
+    # silent_model_failure anyway, so folding it in would mean inventing a
+    # second, weaker sentence for roles that can never reach it.
+    for c in plan["coders"]:
         if reg[c["id"]].get("silent_model_failure") and c.get("model"):
             issues.append(("warn",
                            f"{reg[c['id']]['label']} accepts a model it cannot serve without "

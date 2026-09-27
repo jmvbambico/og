@@ -198,6 +198,73 @@ def test_validate_warns_on_silent_model_failure_agent():
     assert any("accepts a model it cannot serve" in msg for _, msg in issues)
 
 
+# --------------------------------------------------------------------------
+# model.required is enforced for every DISPATCHED role, not just coders
+# --------------------------------------------------------------------------
+# The field failure this guards: a plan named an unpinned reviewer whose
+# registry row is model.required, and validate -- which checked coders only --
+# passed it, so the config was written with no `model:` key, the pin resolved
+# to None at dispatch, and every dispatch died with "Runner disconnected
+# unexpectedly". The same silence hit scouts and integrators. agy is the
+# fixture because its row is now model.required: true.
+
+def test_validate_errors_when_required_reviewer_model_missing():
+    plan = _base_plan(reviewer={"id": "agy", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("reviewer" in msg and "Antigravity (Google)" in msg for msg in errors), errors
+
+
+def test_validate_errors_when_required_scout_model_missing():
+    plan = _base_plan(scout={"id": "agy", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("scout" in msg and "Antigravity (Google)" in msg for msg in errors), errors
+
+
+def test_validate_errors_when_required_integrator_model_missing():
+    plan = _base_plan(integrator={"id": "agy", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("integrator" in msg and "Antigravity (Google)" in msg for msg in errors), errors
+
+
+def test_validate_reviewer_object_and_list_shapes_are_both_enforced():
+    # The documented plan shape allows "reviewer": {"id": ...} as a single
+    # object as well as a list. chain_entries() normalises both, so the
+    # generalization must not assume one shape: an unpinned object and an
+    # unpinned one-element list must both be refused, and both must clear once
+    # a model is pinned.
+    unpinned = ({"id": "agy", "model": None},
+                [{"id": "agy", "priority": 1, "model": None}])
+    for shape in unpinned:
+        errors = [msg for level, msg in m.validate(_base_plan(reviewer=shape)) if level == "error"]
+        assert any("reviewer" in msg and "requires a pinned model" in msg for msg in errors), (shape, errors)
+
+    pinned = ({"id": "agy", "model": "gemini-3.8-flash-medium"},
+              [{"id": "agy", "priority": 1, "model": "gemini-3.8-flash-medium"}])
+    for shape in pinned:
+        errors = [msg for level, msg in m.validate(_base_plan(reviewer=shape)) if level == "error"]
+        assert not any("requires a pinned model" in msg for msg in errors), (shape, errors)
+
+
+def test_validate_no_error_when_an_optional_role_is_absent():
+    # scout and integrator are optional: a plan that omits them is legal, and
+    # chain() returns [] for an absent key rather than raising. _base_plan
+    # never sets them, so this is the plain absent-role case.
+    plan = _base_plan()
+    assert "scout" not in plan and "integrator" not in plan
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert errors == [], errors
+
+
+def test_validate_no_error_when_a_required_false_row_is_unpinned():
+    # The generalization must refuse only rows the registry marks required. A
+    # required: false row (codex as reviewer, gemini as coder) may stay
+    # unpinned without an error.
+    plan = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}],
+                      reviewer={"id": "codex", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert not any("requires a pinned model" in msg for msg in errors), errors
+
+
 def test_validate_warns_same_vendor_reviewer():
     plan = _base_plan(
         coders=[{"id": "kiro", "priority": 1, "model": "auto"}],
