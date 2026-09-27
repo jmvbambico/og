@@ -337,6 +337,36 @@ def _codex_token(ctx: Ctx) -> tuple[str | None, str | None]:
     return None, None
 
 
+# The three independent quota pools an antigravity account reports. A model
+# draws on exactly one of them (see _agy_family).
+_AGY_FAMILIES = ("claude", "gemini-pro", "gemini-flash")
+
+
+def _agy_family(model_id: str | None) -> str | None:
+    """The quota family a pinned model draws on, or None when the id is
+    unpinned or names no family this probe tracks.
+
+    Derived from the id's SHAPE, never a version list, so a future
+    `gemini-4.0-flash-low` maps without a code change. WHY this exists
+    (2026-09-27): the probe reported the MINIMUM across all three families as
+    the agent's single remaining/state, so a 0% `claude` family marked a
+    `gemini-3.8-flash-medium` worker `dry` and stamped it with the claude
+    family's stale reset date — a true fact about a binding the worker does
+    not use. The orchestrator never dispatches to a `dry` worker, so a healthy
+    reviewer was permanently blacklisted.
+    """
+    if not model_id:
+        return None
+    m = str(model_id).strip().lower()
+    if m.startswith("claude"):
+        return "claude"
+    if re.search(r"^gemini-.*-flash-", m):
+        return "gemini-flash"
+    if re.search(r"^gemini-.*-pro-", m):
+        return "gemini-pro"
+    return None
+
+
 def _probe_antigravity(params: dict, ctx: Ctx) -> dict:
     path = Path.home() / ".config/opencode/antigravity-accounts.json"
     try:
@@ -355,7 +385,7 @@ def _probe_antigravity(params: dict, ctx: Ctx) -> dict:
     windows: list[dict] = []
     for acct in accounts:
         cq = acct.get("cachedQuota") or {}
-        for fam in ("claude", "gemini-pro", "gemini-flash"):
+        for fam in _AGY_FAMILIES:
             q = cq.get(fam) or {}
             frac = q.get("remainingFraction")
             if frac is None:
@@ -372,15 +402,32 @@ def _probe_antigravity(params: dict, ctx: Ctx) -> dict:
                                     "reset_at": rt})
     if not families:
         return unknown_record("no cachedQuota data in accounts")
-    fam = min(families, key=families.get)
+    # Bind the report to the family the PINNED model actually draws on, so an
+    # exhausted family the worker does not use cannot mark it dry. A pin that
+    # is absent or names no tracked family falls back to the min across all of
+    # them — pessimism is right when the family is unknown, and only wrong
+    # when it is.
+    pinned = params.get("model")
+    fam = _agy_family(pinned)
+    if fam is not None and fam in families:
+        why = f"pinned {pinned} -> family {fam}"
+    else:
+        fam = min(families, key=families.get)
+        why = (f"no pinned model, worst family {fam}"
+               if not pinned else
+               f"pin {pinned!r} names no tracked family, worst family {fam}")
+        why += " (pessimistic)"
     remaining = families[fam]
-    # worst first: the binding family heads the table row's window list.
-    windows.sort(key=lambda w: w.get("used_percent", 0), reverse=True)
+    # The reported family heads the window list, and the state is judged on
+    # ITS window only: an exhausted family the pin does not use must not force
+    # `dry` through _state_from_windows' any-window rule.
+    binding = [w for w in windows if w["name"] == fam]
+    windows.sort(key=lambda w: (w["name"] != fam, -w.get("used_percent", 0)))
     return make_record(
-        _state_from_windows("ok", windows, remaining), "measured",
+        _state_from_windows("ok", binding, remaining), "measured",
         remaining, 100, "percent", windows, _reset_of(windows, fam),
         "antigravity", checked_at,
-        f"{len(accounts)} account(s); binding family {fam}")
+        f"{len(accounts)} account(s); {why}")
 
 
 def _reset_of(windows: list[dict], name: str) -> str | None:

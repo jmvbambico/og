@@ -1724,6 +1724,25 @@ def test_roster_skill_has_no_integrator_section_without_one():
     assert "## `integrator" not in skill
 
 
+def test_roster_skill_gives_the_antigravity_worker_its_completion_workaround():
+    """Omnigent's antigravity-native harness never signals turn completion, so
+    an agy-backed worker needs the documented poll-and-capture workaround
+    wherever it appears in the roster (the field case was a reviewer)."""
+    coder = _base_plan(coders=[{"id": "agy", "priority": 1,
+                                "model": "gemini-3.8-flash-medium"}])
+    skill = m.render_roster_skill(coder)
+    assert "**Never signals completion.**" in skill
+    assert "active_turn_id" in skill
+    assert "capture-pane -p -S -100000 -t main" in skill
+    assert "antigravity-native" in skill
+    # it follows the worker through the reviewer role too
+    reviewer = _base_plan(reviewer={"id": "agy",
+                                    "model": "gemini-3.8-flash-medium"})
+    assert "**Never signals completion.**" in m.render_roster_skill(reviewer)
+    # and is absent when no agy-backed worker is installed
+    assert "Never signals completion" not in m.render_roster_skill(_base_plan())
+
+
 def test_roster_skill_integrator_section_is_single_when_there_is_only_one():
     skill = m.render_roster_skill(_base_plan(integrator=[{"id": "codex", "model": None}]))
     assert "`integrator` (Codex (OpenAI)) is the only integrator in this roster." in skill
@@ -2215,24 +2234,29 @@ def test_pick_model_unpinnable_row_keeps_current_without_prompting(monkeypatch):
     assert asked == []
 
 
-def test_pick_model_prompts_for_agy_and_blank_means_no_pin(monkeypatch):
-    # The real agy row (required=false, no list_cmd, no choices, not marked
-    # pinnable:false) now reaches the manual prompt; blank -> None.
+def test_pick_model_refuses_a_blank_agy_pin(monkeypatch):
+    # The real agy row is model.required with a live `agy models` listing. An
+    # unpinned agy resolves model:null and the dispatch dies on launch, so a
+    # blank answer must be a LOUD refusal, not a silent no-pin.
     seen = {}
 
     def fake_ask(prompt, default=None):
-        seen["prompt"], seen["default"] = prompt, default
+        seen["prompt"] = prompt
         return ""
 
+    monkeypatch.setattr(m, "list_models", lambda agent: [])
     monkeypatch.setattr(m, "ask", fake_ask)
+    monkeypatch.setattr(m, "warn", lambda msg: None)
     reg = m.agents_by_id()
-    assert m.pick_model(reg["agy"], None) is None
-    assert "model id" in seen["prompt"] and "(blank = harness default)" in seen["prompt"]
-    assert seen["default"] == ""
+    with pytest.raises(SystemExit):
+        m.pick_model(reg["agy"], None)
+    assert "(REQUIRED)" in seen["prompt"]
 
 
 def test_pick_model_manual_entry_returns_the_typed_id(monkeypatch):
-    # The same no-listing row accepts a hand-typed id verbatim.
+    # A row with no usable listing accepts a hand-typed id verbatim. Stub the
+    # listing so the test never shells out to the vendor CLI.
+    monkeypatch.setattr(m, "list_models", lambda agent: [])
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
     reg = m.agents_by_id()
     assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
@@ -2274,14 +2298,15 @@ def test_pick_model_choices_respect_prefer_default(monkeypatch):
 
 def test_pick_model_no_list_cmd_row_emits_no_missing_listing_warning(monkeypatch):
     """The "could not list models" warning is gated on having TRIED a listing.
-    A row that never declared `list_cmd` (agy) must reach manual entry silently
-    -- firing it there would report a command that was never run, telling the
-    user a listing failed when none was attempted."""
+    A row that never declared `list_cmd` (gemini, which also has no `choices`)
+    must reach manual entry silently -- firing it there would report a command
+    that was never run, telling the user a listing failed when none was
+    attempted. (agy now declares `list_cmd`, so it no longer exemplifies this.)"""
     reg = m.agents_by_id()
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
     warned = []
     monkeypatch.setattr(m, "warn", lambda msg: warned.append(msg))
-    assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
+    assert m.pick_model(reg["gemini"], None) == "gemini-3-pro"
     assert not any("could not list models" in w for w in warned), warned
 
 

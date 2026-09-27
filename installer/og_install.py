@@ -1318,6 +1318,34 @@ def quota_failure_lines(a: dict) -> list:
     return [f"- quota failure shape: {note}"] if note else []
 
 
+def agy_completion_lines(a: dict) -> list:
+    """The completion workaround for antigravity-native, or [] for any other
+    harness.
+
+    WHY: antigravity-native drives `agy` through a tmux pane and screen-scrapes
+    its interactive TUI, which on completion just returns to its `>` prompt
+    with no completion marker. The session therefore stays `running` with
+    `runner_online: true` forever and nothing lands in the inbox even though
+    the answer is finished — the result is only on screen (2026-09-27). The
+    harness already knows the turn ended: it writes `"active_turn_id": null`
+    into its own state file, which is what the poll below reads. agy answers
+    correctly; the missing signal is a harness bug in Omnigent, not in this
+    worker. Both steps below were verified by hand recovering a full review.
+    """
+    if a.get("harness") != "antigravity-native":
+        return []
+    return ["- **Never signals completion.** This harness drives `agy` through a tmux "
+            "pane and screen-scrapes its TUI, which on completion just returns to its "
+            "`>` prompt with no marker — so the session stays `running` with "
+            "`runner_online: true` forever and nothing lands in the inbox even though "
+            "the answer is done. Do not wait on the turn and do not read it as a hang or "
+            "a failure. Detect completion by polling "
+            "`~/.omnigent/antigravity-native/<id>/state.json` for "
+            "`\"active_turn_id\": null`, then read the answer with "
+            "`tmux -S <socket_path from tmux.json> capture-pane -p -S -100000 -t main` "
+            "(the `<id>` and the socket path are this worker's own)."]
+
+
 def render_roster_skill(plan: dict) -> str:
     """The long-form roster notes, as a skill file rather than prompt bytes.
 
@@ -1394,6 +1422,7 @@ def render_roster_skill(plan: dict) -> str:
                 f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
                 f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}",
                 quota_line(a)]
+        out += agy_completion_lines(a)
         out += quota_failure_lines(a)
         if a.get("relay") is False:
             out.append("- **Leaf worker.** Runs without Omnigent's `sys_*` tool relay, so it "
@@ -1456,6 +1485,7 @@ def render_roster_skill(plan: dict) -> str:
         out += [f"## `{name}` — {rv['label']}{pin}", "",
                 f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, e)}`",
                 quota_line(rv), *quota_failure_lines(rv)]
+        out += agy_completion_lines(rv)
         # The same collision validate() warns about at install time, carried
         # here so the orchestrator knows it at DISPATCH time too -- the moment
         # it is deciding which entry to use, long after the install scrolled by.
@@ -1533,6 +1563,7 @@ def render_roster_skill(plan: dict) -> str:
                     "- **Says what it did not find.** It says so plainly rather than",
                     "  guessing; a confident wrong answer is worse than \"not found\",",
                     "  because you cannot tell the two apart."]
+            out += agy_completion_lines(sc)
             if sc.get("silent_model_failure"):
                 out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
                            "transcript with no error, which reads as \"found nothing\" rather than "
@@ -1610,6 +1641,7 @@ def render_roster_skill(plan: dict) -> str:
                     "  and reports what it did.",
                     "- **One at a time.** Never run the integration suite while another",
                     "  integrator may be running it; it runs in exactly one place."]
+            out += agy_completion_lines(ig)
             if ig.get("silent_model_failure"):
                 out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
                            "transcript with no error, which reads as \"nothing to report\" rather "

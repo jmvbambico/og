@@ -83,7 +83,8 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     except json.JSONDecodeError as e:
         sys.exit(f"{registry_path} is not valid JSON: {e}")
 
-    def entry(agent_id, role: str, priority: int | None) -> dict | None:
+    def entry(agent_id, role: str, priority: int | None,
+              model: str | None = None) -> dict | None:
         # A malformed entry -- a bare number, a null, an object with no id --
         # names no agent, and a row for it would carry agent=None and crash the
         # table render. og stats runs interactively before a dispatch decision,
@@ -94,12 +95,20 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
         quota = row.get("quota") or {}
         probe = quota.get("probe")
         params = {k: v for k, v in quota.items() if k not in ("probe", "note")}
+        if model:
+            # The pinned model travels with the request so a probe can report
+            # the capacity that actually binds the worker. WHY (2026-09-27):
+            # the antigravity probe reported the min across its three quota
+            # families, so a dry family the pin did not use marked a healthy
+            # worker `dry` (see og_quota._agy_family). params is the established
+            # channel -- agent_id already arrives this way.
+            params["model"] = model
         return {"role": role, "agent": agent_id, "priority": priority,
                 "probe": probe, "params": params,
                 "note": quota.get("note") or ""}
 
-    def ids(value) -> list:
-        """The agent ids in a role's plan value.
+    def _role_entries(value) -> list[dict]:
+        """A role's plan value as ordered {"id", "model", ...} entries.
 
         A role is an ORDERED chain, so it may be a list of entries; the older
         shapes (a bare id string, a single {"id": ...} object) still appear in
@@ -107,30 +116,33 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
         A hand-edited file can also carry a malformed element -- `"reviewer":
         [5]` used to raise AttributeError on `5.get`. Anything that is neither
         an id string nor an object carrying one is skipped, never guessed at.
+        The model rides along so the probe layer can bind its report to the
+        family the pinned model uses.
         """
         if isinstance(value, str):
-            return [value]
+            return [{"id": value}]
         if isinstance(value, dict):
-            return [value["id"]] if isinstance(value.get("id"), str) else []
+            return [value] if isinstance(value.get("id"), str) else []
         if isinstance(value, list):
             out = []
             for e in value:
                 if isinstance(e, str):
-                    out.append(e)
+                    out.append({"id": e})
                 elif isinstance(e, dict) and isinstance(e.get("id"), str):
-                    out.append(e["id"])
+                    out.append(e)
             return out
         return []
 
     entries: list[dict] = []
 
-    def add(agent_id, role: str, priority: int | None) -> None:
-        e = entry(agent_id, role, priority)
+    def add(agent_id, role: str, priority: int | None,
+            model: str | None = None) -> None:
+        e = entry(agent_id, role, priority, model)
         if e is not None:
             entries.append(e)
 
-    for aid in ids(inst.get("orchestrator")):
-        add(aid, "orchestrator", None)
+    for e in _role_entries(inst.get("orchestrator")):
+        add(e["id"], "orchestrator", None, e.get("model"))
     coders = inst.get("coders")
     if not isinstance(coders, list):
         # A hand-edited "coders": 5 is not iterable and used to raise
@@ -139,22 +151,22 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
         coders = []
     for c in sorted((c for c in coders if isinstance(c, dict)),
                     key=lambda c: _priority_key(c.get("priority", 999))):
-        add(c.get("id"), "coder", c.get("priority"))
+        add(c.get("id"), "coder", c.get("priority"), c.get("model"))
     # One row per reviewer, in chain order: this is the probe surface the
     # orchestrator reads to pick the earliest entry with capacity, so a backup
     # that is absent here cannot be failed over to on evidence.
-    for aid in ids(inst.get("reviewer")):
-        add(aid, "reviewer", None)
+    for e in _role_entries(inst.get("reviewer")):
+        add(e["id"], "reviewer", None, e.get("model"))
     # Same rule for the scout chain, appended after the reviewers: the earliest
     # scout WITH CAPACITY is the one dispatched, so an absent entry cannot be
     # chosen on evidence and the failover the roster skill promises is lost.
-    for aid in ids(inst.get("scout")):
-        add(aid, "scout", None)
+    for e in _role_entries(inst.get("scout")):
+        add(e["id"], "scout", None, e.get("model"))
     # Same rule again for the integrator chain, appended after the scouts: the
     # earliest integrator with capacity is the one dispatched, so a backup
     # missing here cannot be failed over to on evidence.
-    for aid in ids(inst.get("integrator")):
-        add(aid, "integrator", None)
+    for e in _role_entries(inst.get("integrator")):
+        add(e["id"], "integrator", None, e.get("model"))
     return entries
 
 
