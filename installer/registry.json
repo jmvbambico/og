@@ -159,9 +159,14 @@
       "relay": true,
       "silent_model_failure": false,
       "model": {
-        "required": false,
+        "required": true,
         "pin_path": "executor.model",
-        "note": "Picks its own model from the signed-in Google account."
+        "list_cmd": [
+          "agy",
+          "models"
+        ],
+        "prefer": "gemini-3.8-flash-medium",
+        "note": "Under Omnigent agy does NOT pick its own model: with no pin the dispatched model resolves to null, the harness starts agy with no `--model`, and every dispatch dies on launch with `Runner disconnected unexpectedly` — a blank answer is a dead worker, not `let it choose`. `agy models` lists the lineup (gemini-3.8/3.7/3.6-flash-{high,medium,low}, gemini-3.1-pro-{high,low}, claude-*, gpt-oss-*). Prefer gemini-3.8-flash-medium: reviews are bounded and read-only, and the pro/high tiers take far longer to answer even a trivial prompt. Vendor follows the pinned model, exactly as the freebuff row says — a `claude-*` pin makes agy same-vendor with Claude Code for review purposes, so the registry's `vendor: google` no longer describes it."
       },
       "install": {
         "note": "Ships with the Antigravity editor; `agy` lands in ~/.local/bin."

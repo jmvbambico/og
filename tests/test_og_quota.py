@@ -287,6 +287,110 @@ def test_antigravity_missing(tmp_path, monkeypatch):
     assert rec["state"] == "unknown"
 
 
+def _agy_accounts(home: Path, quotas: dict):
+    cfg = home / ".config/opencode"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "antigravity-accounts.json").write_text(json.dumps({
+        "accounts": [{"cachedQuota": {
+            fam: {"remainingFraction": frac, "resetTime": reset}
+            for fam, (frac, reset) in quotas.items()}}]}))
+
+
+def test_agy_family_maps_by_id_shape():
+    # shape-derived, so a future version maps without a code change
+    assert q._agy_family("gemini-3.8-flash-medium") == "gemini-flash"
+    assert q._agy_family("gemini-4.0-flash-low") == "gemini-flash"
+    assert q._agy_family("gemini-3.1-pro-high") == "gemini-pro"
+    assert q._agy_family("claude-opus-4-6-thinking") == "claude"
+    # The tier suffix is OPTIONAL: an untiered id of the same shape must map
+    # too, or it falls to the pessimistic min() and a healthy worker is
+    # marked dry the moment an unrelated family is exhausted.
+    assert q._agy_family("gemini-4.0-flash") == "gemini-flash"
+    assert q._agy_family("gemini-2.5-pro") == "gemini-pro"
+    # The family word must not claim the other branch: neither id above is a
+    # `-pro-`/`-flash-` of the other.
+    assert q._agy_family("gemini-4.0-flash") != "gemini-pro"
+    assert q._agy_family("gemini-2.5-pro") != "gemini-flash"
+    # A genuinely unknown id still maps to None and keeps the pessimistic path.
+    assert q._agy_family("gpt-oss-120b-medium") is None
+    assert q._agy_family("") is None
+    assert q._agy_family(None) is None
+
+
+def test_antigravity_pinned_flash_ignores_exhausted_claude(tmp_path, monkeypatch):
+    """The field bug: a pinned flash model read `dry` on the claude family's
+    exhaustion, so the orchestrator (never dispatch to a `dry` worker)
+    permanently blacklisted a healthy reviewer that does not use claude."""
+    home = fake_home(tmp_path, monkeypatch)
+    _agy_accounts(home, {
+        "claude": (0.0, "2026-06-06T00:00:00Z"),
+        "gemini-flash": (1.0, "2026-09-28T00:00:00Z"),
+    })
+    rec = q._probe_antigravity({"model": "gemini-3.8-flash-medium"},
+                               ctx(now=lambda: NOW))
+    assert rec["state"] == "ok"
+    assert rec["remaining"] == pytest.approx(100.0)
+    # the reset is the reported family's, not the exhausted claude family's
+    assert rec["reset_at"] == "2026-09-28T00:00:00Z"
+    assert "gemini-flash" in rec["detail"] and "pinned" in rec["detail"]
+
+
+def test_antigravity_pinned_claude_exhausted_reads_dry(tmp_path, monkeypatch):
+    home = fake_home(tmp_path, monkeypatch)
+    _agy_accounts(home, {
+        "claude": (0.0, "2026-06-06T00:00:00Z"),
+        "gemini-flash": (1.0, "2026-09-28T00:00:00Z"),
+    })
+    rec = q._probe_antigravity({"model": "claude-opus-4-6-thinking"},
+                               ctx(now=lambda: NOW))
+    assert rec["state"] == "dry"
+    assert rec["remaining"] == pytest.approx(0.0)
+    assert rec["reset_at"] == "2026-06-06T00:00:00Z"
+    assert "claude" in rec["detail"] and "pinned" in rec["detail"]
+
+
+def test_antigravity_unpinned_keeps_the_pessimistic_min(tmp_path, monkeypatch):
+    home = fake_home(tmp_path, monkeypatch)
+    _agy_accounts(home, {
+        "claude": (0.0, "2026-06-06T00:00:00Z"),
+        "gemini-flash": (1.0, "2026-09-28T00:00:00Z"),
+    })
+    rec = q._probe_antigravity({}, ctx(now=lambda: NOW))
+    assert rec["state"] == "dry"
+    assert rec["remaining"] == pytest.approx(0.0)
+    assert "pessimistic" in rec["detail"]
+
+
+def test_antigravity_unrecognized_pin_stays_pessimistic(tmp_path, monkeypatch):
+    home = fake_home(tmp_path, monkeypatch)
+    _agy_accounts(home, {
+        "claude": (0.9, "2026-06-06T00:00:00Z"),
+        "gemini-flash": (0.5, "2026-09-28T00:00:00Z"),
+    })
+    rec = q._probe_antigravity({"model": "gpt-oss-120b-medium"},
+                               ctx(now=lambda: NOW))
+    assert rec["state"] == "ok"
+    assert rec["remaining"] == pytest.approx(50.0)  # min(90, 50)
+    assert "pessimistic" in rec["detail"]
+
+
+def test_antigravity_suffixless_pin_binds_to_its_family(tmp_path, monkeypatch):
+    """An untiered id (`gemini-2.5-pro`) must bind to its own family, not fall
+    to the pessimistic min(). The field bug: a family the worker does not use
+    (here claude, exhausted) would otherwise mark it `dry`."""
+    home = fake_home(tmp_path, monkeypatch)
+    _agy_accounts(home, {
+        "claude": (0.0, "2026-06-06T00:00:00Z"),
+        "gemini-pro": (1.0, "2026-09-28T00:00:00Z"),
+    })
+    rec = q._probe_antigravity({"model": "gemini-2.5-pro"},
+                               ctx(now=lambda: NOW))
+    assert rec["state"] == "ok"
+    assert rec["remaining"] == pytest.approx(100.0)
+    assert "gemini-pro" in rec["detail"] and "pinned" in rec["detail"]
+    assert "pessimistic" not in rec["detail"]
+
+
 # --------------------------------------------------------------------------
 # kilo-profile
 # --------------------------------------------------------------------------
@@ -976,6 +1080,43 @@ def test_lineup_order(tmp_path):
     assert [(r["role"], r["agent"]) for r in rows] == [
         ("orchestrator", "claude"), ("coder", "opencode"),
         ("coder", "kilo"), ("reviewer", "codex")]
+
+
+def _agy_registry(path: Path):
+    path.write_text(json.dumps({"agents": {
+        "agy": {"label": "Antigravity (Google)", "roles": ["coder", "reviewer"],
+                "quota": {"probe": "antigravity"}}}}))
+
+
+def test_lineup_threads_the_pinned_model_into_the_probe_params(tmp_path):
+    """The probe cannot report the right quota family unless the pin reaches
+    it: the pinned model travels in the request params, per role and chain."""
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "coders": [{"id": "agy", "priority": 1,
+                    "model": "gemini-3.8-flash-medium"}],
+        "reviewer": [{"id": "agy", "priority": 1,
+                      "model": "gemini-3.1-pro-high"}],
+    }))
+    _agy_registry(reg)
+    rows = st.lineup(inst, reg)
+    by_role = {(r["role"], r["agent"]): r for r in rows}
+    assert by_role[("coder", "agy")]["params"]["model"] == "gemini-3.8-flash-medium"
+    assert by_role[("reviewer", "agy")]["params"]["model"] == "gemini-3.1-pro-high"
+
+
+def test_lineup_omits_the_model_param_when_unpinned(tmp_path):
+    # an unpinned worker must reach the probe with no model, so it keeps the
+    # pessimistic minimum rather than binding to a family it may not use.
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "coders": [{"id": "agy", "priority": 1, "model": None}],
+    }))
+    _agy_registry(reg)
+    rows = st.lineup(inst, reg)
+    assert "model" not in rows[0]["params"]
 
 
 def test_lineup_list_registry(tmp_path):

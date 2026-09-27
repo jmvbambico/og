@@ -984,13 +984,64 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "the orchestrator's model id. Drop one of the two in "
                            "the registry row."))
 
-    for c in plan["coders"]:
-        spec = reg[c["id"]].get("model") or {}
-        if spec.get("required") and not c.get("model"):
+    # A registry row with `model.required` must be pinned in EVERY role it can
+    # serve, not only as a coder. This check used to run over `plan["coders"]`
+    # alone, so a hand-authored or scripted plan JSON naming an unpinned
+    # reviewer, scout or integrator passed validation, wrote a config with no
+    # `model:` key, and resolved to None at dispatch -- the field failure that
+    # started all of this: `model: null`, the harness launched with no model,
+    # and every dispatch died with "Runner disconnected unexpectedly". Driven by
+    # SPEC_ROLES -- the roles that render a dispatched sub-agent -- rather than
+    # a hand-written list of four role names, so a role added to ROLES later is
+    # covered without a new branch here. The orchestrator is excluded on
+    # purpose: its spec IS the bundle's root config, it inherits no parent's
+    # model, render_orchestrator writes no model block, and the interactive
+    # path never pins it either. An absent role is legal -- chain() returns []
+    # for a key the plan omits -- so an omitted optional role contributes
+    # nothing rather than crashing.
+    for r in SPEC_ROLES:
+        for e in chain(plan, r.key):
+            agent = reg[e["id"]]
+            spec = agent.get("model") or {}
+            if not (spec.get("required") and not e.get("model")):
+                continue
+            # The consequence is the same dead dispatch for every worker, but a
+            # reviewer loses a different thing worth naming -- the batched
+            # diff's independent review -- so it reads its own sentence. The
+            # coder wording is kept verbatim: it is the one already in users'
+            # bug reports, and "worker" still reads correctly for scout and
+            # integrator, which die the same way.
+            #
+            # The reviewer sentence names the CONSEQUENCE, not a mechanism, on
+            # purpose. "Inherits the orchestrator's model id" is what happens to
+            # an ACP/OpenCode worker, and it was wrong for the row this message
+            # is actually read for: an unpinned agy resolves `model: null` and
+            # the harness dies at launch with "Runner disconnected unexpectedly"
+            # (verified 2026-09-27) -- it does not run on the orchestrator's
+            # model and quietly review with the wrong brain; it does not run at
+            # all. Across the roster the shape differs by harness (loud death on
+            # the native rows, a silent no-op on the ACP ones), so any single
+            # mechanism misdescribes some row. What is true for every shape is
+            # that no usable review comes back, and the loss the user must weigh
+            # before skipping the pin is the batch's independent review.
+            if r.role == "reviewer":
+                tail = ("An unpinned reviewer produces no usable review, so the "
+                        "batched diff loses its independent review.")
+            elif r.role == "coder":
+                tail = ("An unpinned worker inherits the orchestrator's model id and the "
+                        "dispatch dies (loudly on OpenCode, SILENTLY on ACP agents).")
+            else:
+                tail = (f"An unpinned {r.role} inherits the orchestrator's model id and the "
+                        "dispatch dies (loudly on OpenCode, SILENTLY on ACP agents).")
             issues.append(("error",
-                           f"{reg[c['id']]['label']} requires a pinned model but none is set. "
-                           "An unpinned worker inherits the orchestrator's model id and the "
-                           "dispatch dies (loudly on OpenCode, SILENTLY on ACP agents)."))
+                           f"{agent['label']} requires a pinned model but none is set. {tail}"))
+
+    # Coder-only, and deliberately left beside the role loop rather than folded
+    # into it: this warning names a COMMIT as the proof a pin held, and only a
+    # coder produces one. No registry row that can review declares
+    # silent_model_failure anyway, so folding it in would mean inventing a
+    # second, weaker sentence for roles that can never reach it.
+    for c in plan["coders"]:
         if reg[c["id"]].get("silent_model_failure") and c.get("model"):
             issues.append(("warn",
                            f"{reg[c['id']]['label']} accepts a model it cannot serve without "
@@ -1318,6 +1369,34 @@ def quota_failure_lines(a: dict) -> list:
     return [f"- quota failure shape: {note}"] if note else []
 
 
+def agy_completion_lines(a: dict) -> list:
+    """The completion workaround for antigravity-native, or [] for any other
+    harness.
+
+    WHY: antigravity-native drives `agy` through a tmux pane and screen-scrapes
+    its interactive TUI, which on completion just returns to its `>` prompt
+    with no completion marker. The session therefore stays `running` with
+    `runner_online: true` forever and nothing lands in the inbox even though
+    the answer is finished — the result is only on screen (2026-09-27). The
+    harness already knows the turn ended: it writes `"active_turn_id": null`
+    into its own state file, which is what the poll below reads. agy answers
+    correctly; the missing signal is a harness bug in Omnigent, not in this
+    worker. Both steps below were verified by hand recovering a full review.
+    """
+    if a.get("harness") != "antigravity-native":
+        return []
+    return ["- **Never signals completion.** This harness drives `agy` through a tmux "
+            "pane and screen-scrapes its TUI, which on completion just returns to its "
+            "`>` prompt with no marker — so the session stays `running` with "
+            "`runner_online: true` forever and nothing lands in the inbox even though "
+            "the answer is done. Do not wait on the turn and do not read it as a hang or "
+            "a failure. Detect completion by polling "
+            "`~/.omnigent/antigravity-native/<id>/state.json` for "
+            "`\"active_turn_id\": null`, then read the answer with "
+            "`tmux -S <socket_path from tmux.json> capture-pane -p -S -100000 -t main` "
+            "(the `<id>` and the socket path are this worker's own)."]
+
+
 def render_roster_skill(plan: dict) -> str:
     """The long-form roster notes, as a skill file rather than prompt bytes.
 
@@ -1394,6 +1473,7 @@ def render_roster_skill(plan: dict) -> str:
                 f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
                 f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}",
                 quota_line(a)]
+        out += agy_completion_lines(a)
         out += quota_failure_lines(a)
         if a.get("relay") is False:
             out.append("- **Leaf worker.** Runs without Omnigent's `sys_*` tool relay, so it "
@@ -1456,6 +1536,7 @@ def render_roster_skill(plan: dict) -> str:
         out += [f"## `{name}` — {rv['label']}{pin}", "",
                 f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, e)}`",
                 quota_line(rv), *quota_failure_lines(rv)]
+        out += agy_completion_lines(rv)
         # The same collision validate() warns about at install time, carried
         # here so the orchestrator knows it at DISPATCH time too -- the moment
         # it is deciding which entry to use, long after the install scrolled by.
@@ -1533,6 +1614,7 @@ def render_roster_skill(plan: dict) -> str:
                     "- **Says what it did not find.** It says so plainly rather than",
                     "  guessing; a confident wrong answer is worse than \"not found\",",
                     "  because you cannot tell the two apart."]
+            out += agy_completion_lines(sc)
             if sc.get("silent_model_failure"):
                 out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
                            "transcript with no error, which reads as \"found nothing\" rather than "
@@ -1610,6 +1692,7 @@ def render_roster_skill(plan: dict) -> str:
                     "  and reports what it did.",
                     "- **One at a time.** Never run the integration suite while another",
                     "  integrator may be running it; it runs in exactly one place."]
+            out += agy_completion_lines(ig)
             if ig.get("silent_model_failure"):
                 out.append("- **Fails silently on a bad model.** A wrong pin returns an empty "
                            "transcript with no error, which reads as \"nothing to report\" rather "

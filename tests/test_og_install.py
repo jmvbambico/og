@@ -198,6 +198,94 @@ def test_validate_warns_on_silent_model_failure_agent():
     assert any("accepts a model it cannot serve" in msg for _, msg in issues)
 
 
+# --------------------------------------------------------------------------
+# model.required is enforced for every DISPATCHED role, not just coders
+# --------------------------------------------------------------------------
+# The field failure this guards: a plan named an unpinned reviewer whose
+# registry row is model.required, and validate -- which checked coders only --
+# passed it, so the config was written with no `model:` key, the pin resolved
+# to None at dispatch, and every dispatch died with "Runner disconnected
+# unexpectedly". The same silence hit scouts and integrators. agy is the
+# fixture because its row is now model.required: true.
+
+def test_validate_errors_when_required_reviewer_model_missing():
+    plan = _base_plan(reviewer={"id": "agy", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("reviewer" in msg and "Antigravity (Google)" in msg for msg in errors), errors
+    # The reviewer sentence must name the loss (the batch's independent review)
+    # and must NOT claim a mechanism. Unpinned agy resolves `model: null` and
+    # the harness dies at launch -- it does NOT inherit the orchestrator's
+    # model id and quietly review with the wrong brain, which is what the old
+    # wording ("inherits the orchestrator's model id, so the batched diff
+    # silently loses its independent review") told the user.
+    msg = next(msg for msg in errors if "Antigravity (Google)" in msg)
+    assert "loses its independent review" in msg
+    assert "inherits the orchestrator's model id" not in msg
+    assert "silently" not in msg
+
+
+def test_validate_coder_sentence_is_byte_identical():
+    # The coder wording is the one already in users' bug reports; a rewrite here
+    # is a regression even when a rewrite of the reviewer sentence is not.
+    plan = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": None}])
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any(msg == (
+        "OpenCode (Zen) requires a pinned model but none is set. An unpinned "
+        "worker inherits the orchestrator's model id and the dispatch dies "
+        "(loudly on OpenCode, SILENTLY on ACP agents).") for msg in errors), errors
+
+
+def test_validate_errors_when_required_scout_model_missing():
+    plan = _base_plan(scout={"id": "agy", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("scout" in msg and "Antigravity (Google)" in msg for msg in errors), errors
+
+
+def test_validate_errors_when_required_integrator_model_missing():
+    plan = _base_plan(integrator={"id": "agy", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("integrator" in msg and "Antigravity (Google)" in msg for msg in errors), errors
+
+
+def test_validate_reviewer_object_and_list_shapes_are_both_enforced():
+    # The documented plan shape allows "reviewer": {"id": ...} as a single
+    # object as well as a list. chain_entries() normalises both, so the
+    # generalization must not assume one shape: an unpinned object and an
+    # unpinned one-element list must both be refused, and both must clear once
+    # a model is pinned.
+    unpinned = ({"id": "agy", "model": None},
+                [{"id": "agy", "priority": 1, "model": None}])
+    for shape in unpinned:
+        errors = [msg for level, msg in m.validate(_base_plan(reviewer=shape)) if level == "error"]
+        assert any("reviewer" in msg and "requires a pinned model" in msg for msg in errors), (shape, errors)
+
+    pinned = ({"id": "agy", "model": "gemini-3.8-flash-medium"},
+              [{"id": "agy", "priority": 1, "model": "gemini-3.8-flash-medium"}])
+    for shape in pinned:
+        errors = [msg for level, msg in m.validate(_base_plan(reviewer=shape)) if level == "error"]
+        assert not any("requires a pinned model" in msg for msg in errors), (shape, errors)
+
+
+def test_validate_no_error_when_an_optional_role_is_absent():
+    # scout and integrator are optional: a plan that omits them is legal, and
+    # chain() returns [] for an absent key rather than raising. _base_plan
+    # never sets them, so this is the plain absent-role case.
+    plan = _base_plan()
+    assert "scout" not in plan and "integrator" not in plan
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert errors == [], errors
+
+
+def test_validate_no_error_when_a_required_false_row_is_unpinned():
+    # The generalization must refuse only rows the registry marks required. A
+    # required: false row (codex as reviewer, gemini as coder) may stay
+    # unpinned without an error.
+    plan = _base_plan(coders=[{"id": "gemini", "priority": 1, "model": None}],
+                      reviewer={"id": "codex", "model": None})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert not any("requires a pinned model" in msg for msg in errors), errors
+
+
 def test_validate_warns_same_vendor_reviewer():
     plan = _base_plan(
         coders=[{"id": "kiro", "priority": 1, "model": "auto"}],
@@ -1724,6 +1812,25 @@ def test_roster_skill_has_no_integrator_section_without_one():
     assert "## `integrator" not in skill
 
 
+def test_roster_skill_gives_the_antigravity_worker_its_completion_workaround():
+    """Omnigent's antigravity-native harness never signals turn completion, so
+    an agy-backed worker needs the documented poll-and-capture workaround
+    wherever it appears in the roster (the field case was a reviewer)."""
+    coder = _base_plan(coders=[{"id": "agy", "priority": 1,
+                                "model": "gemini-3.8-flash-medium"}])
+    skill = m.render_roster_skill(coder)
+    assert "**Never signals completion.**" in skill
+    assert "active_turn_id" in skill
+    assert "capture-pane -p -S -100000 -t main" in skill
+    assert "antigravity-native" in skill
+    # it follows the worker through the reviewer role too
+    reviewer = _base_plan(reviewer={"id": "agy",
+                                    "model": "gemini-3.8-flash-medium"})
+    assert "**Never signals completion.**" in m.render_roster_skill(reviewer)
+    # and is absent when no agy-backed worker is installed
+    assert "Never signals completion" not in m.render_roster_skill(_base_plan())
+
+
 def test_roster_skill_integrator_section_is_single_when_there_is_only_one():
     skill = m.render_roster_skill(_base_plan(integrator=[{"id": "codex", "model": None}]))
     assert "`integrator` (Codex (OpenAI)) is the only integrator in this roster." in skill
@@ -2215,24 +2322,29 @@ def test_pick_model_unpinnable_row_keeps_current_without_prompting(monkeypatch):
     assert asked == []
 
 
-def test_pick_model_prompts_for_agy_and_blank_means_no_pin(monkeypatch):
-    # The real agy row (required=false, no list_cmd, no choices, not marked
-    # pinnable:false) now reaches the manual prompt; blank -> None.
+def test_pick_model_refuses_a_blank_agy_pin(monkeypatch):
+    # The real agy row is model.required with a live `agy models` listing. An
+    # unpinned agy resolves model:null and the dispatch dies on launch, so a
+    # blank answer must be a LOUD refusal, not a silent no-pin.
     seen = {}
 
     def fake_ask(prompt, default=None):
-        seen["prompt"], seen["default"] = prompt, default
+        seen["prompt"] = prompt
         return ""
 
+    monkeypatch.setattr(m, "list_models", lambda agent: [])
     monkeypatch.setattr(m, "ask", fake_ask)
+    monkeypatch.setattr(m, "warn", lambda msg: None)
     reg = m.agents_by_id()
-    assert m.pick_model(reg["agy"], None) is None
-    assert "model id" in seen["prompt"] and "(blank = harness default)" in seen["prompt"]
-    assert seen["default"] == ""
+    with pytest.raises(SystemExit):
+        m.pick_model(reg["agy"], None)
+    assert "(REQUIRED)" in seen["prompt"]
 
 
 def test_pick_model_manual_entry_returns_the_typed_id(monkeypatch):
-    # The same no-listing row accepts a hand-typed id verbatim.
+    # A row with no usable listing accepts a hand-typed id verbatim. Stub the
+    # listing so the test never shells out to the vendor CLI.
+    monkeypatch.setattr(m, "list_models", lambda agent: [])
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
     reg = m.agents_by_id()
     assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
@@ -2274,14 +2386,15 @@ def test_pick_model_choices_respect_prefer_default(monkeypatch):
 
 def test_pick_model_no_list_cmd_row_emits_no_missing_listing_warning(monkeypatch):
     """The "could not list models" warning is gated on having TRIED a listing.
-    A row that never declared `list_cmd` (agy) must reach manual entry silently
-    -- firing it there would report a command that was never run, telling the
-    user a listing failed when none was attempted."""
+    A row that never declared `list_cmd` (gemini, which also has no `choices`)
+    must reach manual entry silently -- firing it there would report a command
+    that was never run, telling the user a listing failed when none was
+    attempted. (agy now declares `list_cmd`, so it no longer exemplifies this.)"""
     reg = m.agents_by_id()
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: "gemini-3-pro")
     warned = []
     monkeypatch.setattr(m, "warn", lambda msg: warned.append(msg))
-    assert m.pick_model(reg["agy"], None) == "gemini-3-pro"
+    assert m.pick_model(reg["gemini"], None) == "gemini-3-pro"
     assert not any("could not list models" in w for w in warned), warned
 
 
