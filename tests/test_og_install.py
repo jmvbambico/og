@@ -212,6 +212,27 @@ def test_validate_errors_when_required_reviewer_model_missing():
     plan = _base_plan(reviewer={"id": "agy", "model": None})
     errors = [msg for level, msg in m.validate(plan) if level == "error"]
     assert any("reviewer" in msg and "Antigravity (Google)" in msg for msg in errors), errors
+    # The reviewer sentence must name the loss (the batch's independent review)
+    # and must NOT claim a mechanism. Unpinned agy resolves `model: null` and
+    # the harness dies at launch -- it does NOT inherit the orchestrator's
+    # model id and quietly review with the wrong brain, which is what the old
+    # wording ("inherits the orchestrator's model id, so the batched diff
+    # silently loses its independent review") told the user.
+    msg = next(msg for msg in errors if "Antigravity (Google)" in msg)
+    assert "loses its independent review" in msg
+    assert "inherits the orchestrator's model id" not in msg
+    assert "silently" not in msg
+
+
+def test_validate_coder_sentence_is_byte_identical():
+    # The coder wording is the one already in users' bug reports; a rewrite here
+    # is a regression even when a rewrite of the reviewer sentence is not.
+    plan = _base_plan(coders=[{"id": "opencode", "priority": 1, "model": None}])
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any(msg == (
+        "OpenCode (Zen) requires a pinned model but none is set. An unpinned "
+        "worker inherits the orchestrator's model id and the dispatch dies "
+        "(loudly on OpenCode, SILENTLY on ACP agents).") for msg in errors), errors
 
 
 def test_validate_errors_when_required_scout_model_missing():

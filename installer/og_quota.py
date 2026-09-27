@@ -360,9 +360,16 @@ def _agy_family(model_id: str | None) -> str | None:
     m = str(model_id).strip().lower()
     if m.startswith("claude"):
         return "claude"
-    if re.search(r"^gemini-.*-flash-", m):
+    # The tier suffix is OPTIONAL -- `(?:-|$)`, not a bare `-`. Requiring a
+    # hyphen after the family word matched only ids that carry a tier
+    # (`gemini-3.8-flash-medium`), so a plausible untiered id of the same
+    # shape (`gemini-4.0-flash`, `gemini-2.5-pro`) fell through to `None` and
+    # took the pessimistic min() path -- `dry` the moment an unrelated family
+    # was exhausted. The family word still ends the match or is followed by
+    # more, so flash never claims a `-pro-` id or vice versa.
+    if re.search(r"^gemini-.*-flash(?:-|$)", m):
         return "gemini-flash"
-    if re.search(r"^gemini-.*-pro-", m):
+    if re.search(r"^gemini-.*-pro(?:-|$)", m):
         return "gemini-pro"
     return None
 

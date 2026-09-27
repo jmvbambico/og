@@ -1011,9 +1011,22 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
             # coder wording is kept verbatim: it is the one already in users'
             # bug reports, and "worker" still reads correctly for scout and
             # integrator, which die the same way.
+            #
+            # The reviewer sentence names the CONSEQUENCE, not a mechanism, on
+            # purpose. "Inherits the orchestrator's model id" is what happens to
+            # an ACP/OpenCode worker, and it was wrong for the row this message
+            # is actually read for: an unpinned agy resolves `model: null` and
+            # the harness dies at launch with "Runner disconnected unexpectedly"
+            # (verified 2026-09-27) -- it does not run on the orchestrator's
+            # model and quietly review with the wrong brain; it does not run at
+            # all. Across the roster the shape differs by harness (loud death on
+            # the native rows, a silent no-op on the ACP ones), so any single
+            # mechanism misdescribes some row. What is true for every shape is
+            # that no usable review comes back, and the loss the user must weigh
+            # before skipping the pin is the batch's independent review.
             if r.role == "reviewer":
-                tail = ("An unpinned reviewer inherits the orchestrator's model id, so the "
-                        "batched diff silently loses its independent review.")
+                tail = ("An unpinned reviewer produces no usable review, so the "
+                        "batched diff loses its independent review.")
             elif r.role == "coder":
                 tail = ("An unpinned worker inherits the orchestrator's model id and the "
                         "dispatch dies (loudly on OpenCode, SILENTLY on ACP agents).")

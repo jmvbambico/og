@@ -302,6 +302,16 @@ def test_agy_family_maps_by_id_shape():
     assert q._agy_family("gemini-4.0-flash-low") == "gemini-flash"
     assert q._agy_family("gemini-3.1-pro-high") == "gemini-pro"
     assert q._agy_family("claude-opus-4-6-thinking") == "claude"
+    # The tier suffix is OPTIONAL: an untiered id of the same shape must map
+    # too, or it falls to the pessimistic min() and a healthy worker is
+    # marked dry the moment an unrelated family is exhausted.
+    assert q._agy_family("gemini-4.0-flash") == "gemini-flash"
+    assert q._agy_family("gemini-2.5-pro") == "gemini-pro"
+    # The family word must not claim the other branch: neither id above is a
+    # `-pro-`/`-flash-` of the other.
+    assert q._agy_family("gemini-4.0-flash") != "gemini-pro"
+    assert q._agy_family("gemini-2.5-pro") != "gemini-flash"
+    # A genuinely unknown id still maps to None and keeps the pessimistic path.
     assert q._agy_family("gpt-oss-120b-medium") is None
     assert q._agy_family("") is None
     assert q._agy_family(None) is None
@@ -362,6 +372,23 @@ def test_antigravity_unrecognized_pin_stays_pessimistic(tmp_path, monkeypatch):
     assert rec["state"] == "ok"
     assert rec["remaining"] == pytest.approx(50.0)  # min(90, 50)
     assert "pessimistic" in rec["detail"]
+
+
+def test_antigravity_suffixless_pin_binds_to_its_family(tmp_path, monkeypatch):
+    """An untiered id (`gemini-2.5-pro`) must bind to its own family, not fall
+    to the pessimistic min(). The field bug: a family the worker does not use
+    (here claude, exhausted) would otherwise mark it `dry`."""
+    home = fake_home(tmp_path, monkeypatch)
+    _agy_accounts(home, {
+        "claude": (0.0, "2026-06-06T00:00:00Z"),
+        "gemini-pro": (1.0, "2026-09-28T00:00:00Z"),
+    })
+    rec = q._probe_antigravity({"model": "gemini-2.5-pro"},
+                               ctx(now=lambda: NOW))
+    assert rec["state"] == "ok"
+    assert rec["remaining"] == pytest.approx(100.0)
+    assert "gemini-pro" in rec["detail"] and "pinned" in rec["detail"]
+    assert "pessimistic" not in rec["detail"]
 
 
 # --------------------------------------------------------------------------
