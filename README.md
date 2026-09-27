@@ -65,6 +65,9 @@ Omnigent gives you the runtime. This repo is the *opinionated setup on top*:
         └────────────────┘ └──────────────┘ └──────────────┘
              vendor X          vendor Y,Z        vendor ≠ Y,Z
 
+      + optional:  SCOUT       reads, greps, git state; never edits
+                   INTEGRATOR  git, worktrees, gates; never decides a merge
+
    worktrees:  ~/projects/.worktrees/<repo>/<task>   (one per coder, parallel)
    delivery:   feature/* ──merge──► integration/* ──gate once──► one PR
 ```
@@ -74,10 +77,34 @@ dispatches coders in parallel, collects their commits onto one integration
 branch, runs the full gate there exactly once, sends the combined diff to the
 reviewer, and opens a single PR. It writes no product code itself.
 
+Two **optional** roles exist because the orchestrator's own hands were the
+bottleneck. Across 30 audited sessions, reading and searching a repo itself
+accounted for **52% of its result bytes**, and git plus gate plumbing for
+**727 git calls (725 kB)** and **185 gate calls (84 kB)** — all mechanical, all
+otherwise ingested whole. A `scout` absorbs the first, an `integrator` the
+second. Both cost prompt bytes, so both are opt-in; omit one and the bundle
+simply has no spec for it and no dangling reference.
+
 **Where the rules come from.** Nothing above is hardcoded per project. Each
 repo carries its own `AGENTS.md` (the constitution) and optionally
 `.agents/orchestration.yaml` (machine-readable branches, gate commands,
 `never_write` paths, merge policy). One global agent serves every project.
+
+### Roles
+
+| Role | Writes code? | Required | What it is for |
+|---|---|---|---|
+| `orchestrator` | **never** | yes | plans, decomposes, dispatches, decides merges |
+| `coder` | yes | yes | implements one task in its own worktree; several, in preference order |
+| `reviewer` | **never** | yes | judges the batched diff; prefer a vendor differing from every coder |
+| `scout` | **never** | optional | repo reading, search and git-state questions, read-only |
+| `integrator` | no product code | optional | git, worktree and gate plumbing; **never decides a merge** |
+
+Every role but `orchestrator` renders its own sub-agent spec and so takes its
+own model pin. `validate()` refuses a config that leaves a `required` pin unset
+on **any** of them — an unpinned worker either inherits the orchestrator's model
+id or resolves to none at all, and both are a dead dispatch rather than a slow
+one.
 
 ---
 
@@ -87,7 +114,7 @@ repo carries its own `AGENTS.md` (the constitution) and optionally
 |---|---|
 | `<bin_dir>/og` | control script — you choose where (default: first of `~/.local/bin` / `~/bin` already on `PATH`) |
 | `~/.omnigent/agents/<name>/config.yaml` | orchestrator (generated) |
-| `~/.omnigent/agents/<name>/agents/*/config.yaml` | one per coder + reviewer (generated) |
+| `~/.omnigent/agents/<name>/agents/*/config.yaml` | one per coder, reviewer, and each optional role you picked (generated) |
 | `~/.omnigent/agents/<name>/skills/` | `fanout`, `cross-review`, `investigate`, `roster` |
 | `~/.omnigent/policies/omnigent_local_policies.py` | merge gate + branch-cleanup blast radius |
 | `<omnigent venv>/site-packages/omnigent-local-policies.pth` | puts that directory on **omnigent's** `sys.path` (resolved from the `omnigent` entry point, verified by importing) |
@@ -134,6 +161,9 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 
 `installer/registry.json` is the catalog — adding a vendor is a row, not code.
 
+**Every agent below can also serve as `scout` and `integrator`** (see
+[Roles](#roles)), so the Roles column lists only what distinguishes them.
+
 | Agent | Harness | Roles | Model pin | Notes |
 |---|---|---|---|---|
 | Claude Code | `claude-native` | orch / coder / reviewer | optional | multi-account via `CLAUDE_CONFIG_DIR` |
@@ -142,16 +172,17 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model**; runs with `--auto-approve true` (see below) |
 | Kilo Code | `acp:kilo-code` | coder | **required** | via `kilo acp`; unverified here |
 | Kiro (AWS) | `acp:kiro-aws` | coder / reviewer | optional | via `kiro-cli acp --trust-all-tools` (see below); 50 free credits/mo; unverified here |
-| Cursor | `cursor-native` | coder / reviewer | optional | |
+| Cursor | `cursor-native` | coder / reviewer | **required** | with no pin the id passed is the *orchestrator's*, which `cursor-agent` rejects (`Cannot use this model`) and exits 1 — the pane dies before the first prompt and every dispatch reports `Harness stream connection error` |
 | Freebuff | `acp:freebuff` | coder | optional — 4 rotating choices; needs a blink that honours BLINK_MODEL | via [`blink`](https://github.com/jmvbambico/bufflink) ≥ v0.1.2, an ACP bridge over freebuff's TUI; one hour billed per launch at the model's rate (5/hr default GLM, up to 15/hr DeepSeek) from 25 free daily; silent until the turn ends; **verified** (5 backlog tasks, 3/3 first-try since v0.1.2); close the session then SIGTERM `blink` to release freebuff's lock |
 | Command Code | `acp:command-code` | coder | **required** | via [`cmd-acp`](https://github.com/toolsHelp/cmd-acp) plus a **generated shim** (see below); one `cmd -p` per prompt, nothing to reap; rolling 5h + weekly credit windows, no quota API; **verified** (control/treatment run, 2026-09-24) |
-| Antigravity | `antigravity-native` | coder / reviewer | optional | prompt **not delivered** — see below |
+| Antigravity | `antigravity-native` | coder / reviewer | **required** | prompt **not delivered**, and it **never signals turn completion** — see below |
 | Grok, Devin | various | orch / coder | optional | orchestrator-capable on the two bars `validate()` enforces (`relay`, prompt delivered) but **unverified in that role** — flagged by `unverified_roles` in the picker, `validate()` and `--questions`; the rationale is in each row's `roles_note` |
-| Goose, Hermes, Gemini | various | coder | optional | |
+| Goose, Gemini | various | coder | optional | |
+| Hermes | various | coder / reviewer | optional | |
 
 Each row may declare a `quota` block; these power `og stats` (see [docs/STATS.md](docs/STATS.md), written by a sibling task) — `probe: null` marks a known limit with no queryable API.
 
-### Five properties worth understanding
+### Six properties worth understanding
 
 **Cline runs with `--auto-approve true`.** Cline's ACP mode (used for editor
 integration, which is how it's invoked here) defaults tool auto-approval to
@@ -227,6 +258,24 @@ actually reaches the CLI:
   The generated `roster` skill instructs the orchestrator to do that, and these
   harnesses are barred from the orchestrator role entirely.
 
+**Antigravity never signals turn completion.** A dispatch to an `agy`-backed
+worker produces its answer and then nothing: the task sits `status: running`
+with `runner_online: true` indefinitely, no result reaches the orchestrator's
+inbox, and the answer is visible only on screen. The harness already knows the
+turn is over — it writes `{"active_turn_id": null, …}` into its own
+`~/.omnigent/antigravity-native/<id>/state.json` — and still posts nothing. The
+cause is that it drives `agy` through a **tmux pane** and scrapes the
+interactive TUI, which on completion just returns to its `>` prompt with no
+marker to scrape; in `--print` mode the CLI exits cleanly on its own.
+
+That harness lives in Omnigent, not here, so this repo does not fix it. The
+generated `roster` skill carries the workaround for every role `agy` can take:
+poll that state file for `active_turn_id: null`, then read the result with
+`tmux -S <socket_path> capture-pane -p -S -100000 -t main`. Both are
+load-bearing today — the cross-vendor review of the change that added them was
+recovered exactly that way. See
+[docs/ANTIGRAVITY-NATIVE-COMPLETION.md](docs/ANTIGRAVITY-NATIVE-COMPLETION.md).
+
 ---
 
 ## Install
@@ -247,7 +296,7 @@ The installer will ask you to:
 2. pick which agent **orchestrates**
 3. pick which agents **implement**, *in preference order* — the first is tried
    first, later ones absorb overflow
-4. pin a **model** per coder — the installer runs the CLI's own listing
+4. pin a **model** per worker — the installer runs the CLI's own listing
    (`opencode models`, `kilo models`, `cursor-agent models`,
    `cmd --list-models`), grouped by
    provider in the tool's own order; type part of a name to search a long
@@ -257,21 +306,28 @@ The installer will ask you to:
    A login that yields no models (typically an OAuth *subscription* session,
    which OpenCode only routes through a vendor auth plugin) is called out with
    the fix — see [Troubleshooting](docs/TROUBLESHOOTING.md#opencode-a-provider-i-logged-into-is-missing-from-the-installers-model-list).
+   A row whose pin is **required** is refused if you leave it blank, in any
+   role — that is a dead dispatch, not a slower one.
 5. pick the **reviewer** — it warns if the reviewer shares a vendor with a
    coder. The vendor is read from the model pin where it says something
    (`opencode/claude-sonnet-5` is Anthropic, whoever bills for it), and from
    the registry otherwise
-6. for Claude, whether the reviewer runs on a **second account**
+6. optionally pick a **scout** — a read-only worker that answers repo reading,
+   search and git-state questions so the orchestrator stops doing it by hand.
+   Skip it and the bundle has no scout spec at all
+7. optionally pick an **integrator** — runs git, worktree and gate plumbing and
+   **never decides a merge**. Also skippable
+8. for Claude, whether the reviewer runs on a **second account**
    (`CLAUDE_CONFIG_DIR`, e.g. `~/.claude-work`) so it is independent of your
    interactive login
-7. port (checked for availability — suggests a free one if the default is
+9. port (checked for availability — suggests a free one if the default is
    taken), ngrok domain, max dispatches per turn
-8. **where the `og` command is installed** — defaults to a directory already on
-   your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
-   isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
-   or `"bin_dir"` in a plan.
-9. whether `og start` should **auto-update** (default yes) — see
-   [Updating](#updating). Off, it only warns when a newer og exists.
+10. **where the `og` command is installed** — defaults to a directory already on
+    your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
+    isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
+    or `"bin_dir"` in a plan.
+11. whether `og start` should **auto-update** (default yes) — see
+    [Updating](#updating). Off, it only warns when a newer og exists.
 
 Then:
 
@@ -283,7 +339,7 @@ og start
 ## Reconfigure
 
 Re-running is the supported way to change anything — orchestrator, a new coder,
-a model, priority order, the reviewer:
+a model, priority order, the reviewer, or adding/dropping a scout or integrator:
 
 ```bash
 og setup                # same as ./install.sh, from anywhere
@@ -527,3 +583,7 @@ Generated and derived documentation belongs in `docs/`.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — failures seen in the
   wild and what they actually meant
+- [docs/STATS.md](docs/STATS.md) — what `og stats` measures, per agent
+- [docs/CMDCODE.md](docs/CMDCODE.md) — the Command Code shim, in detail
+- [docs/ANTIGRAVITY-NATIVE-COMPLETION.md](docs/ANTIGRAVITY-NATIVE-COMPLETION.md)
+  — an Omnigent harness finding: `agy` never signals turn completion
