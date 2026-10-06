@@ -317,31 +317,81 @@ tunnel_scrape() {
     *) return 1 ;;
   esac
 }
+# How long og waits for its own ngrok to log its web-interface address before it
+# gives up and reads 4040. An ngrok that never emits the record must still work,
+# so the fallback is delayed, not removed — but bounded, so it lands well inside
+# cmd_start's 20s (40 x 0.5s) poll budget with time to spare.
+NGROK_ADDR_GRACE=6
+
+# File mtime as epoch seconds. -c is GNU, -f is BSD/macOS; tried in that order
+# so macOS (which rejects -c with a nonzero exit) falls through to -f. Empty
+# output means "unknown", which the caller reads as "do not wait".
+ngrok_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# True while og's OWN ngrok may still be about to log where its web service
+# listens: the process is alive, its logfile exists, but no valid `addr` record
+# is in it yet. Returning failure in this window is what stops the caller from
+# falling back to 4040 — where a second, unrelated ngrok agent may be holding
+# another project's tunnels — before our own agent has had a chance to speak.
+# Bounded by NGROK_ADDR_GRACE from spawn so a version that never logs the record
+# still reaches the 4040 fallback: waiting past the grace is clearly futile.
+ngrok_addr_pending() {
+  local pidfile log started now
+  tunnel_pid ngrok >/dev/null || return 1
+  log="$(tunnel_logfile ngrok)"
+  [[ -f "$log" ]] || return 1
+  pidfile="$(tunnel_pidfile ngrok)"
+  started="$(ngrok_mtime "$pidfile" || true)"
+  [[ -n "$started" ]] || return 1
+  now="$(date +%s)"
+  (( now - started < NGROK_ADDR_GRACE ))
+}
+
 # The web-interface address of OG'S OWN ngrok, read from the logfile it writes
 # (launched below with --log=stdout --log-format=logfmt). ngrok emits a
 # `starting web service` logfmt record carrying `addr=<host:port>`; taking the
 # address from that record ties the API query to the agent og started rather
-# than to whatever agent grabbed 4040. Empty when the record is absent, so the
-# caller falls back to 4040.
+# than to whatever agent grabbed 4040. The MOST RECENT record wins: a log can
+# carry records from more than one run, and only the latest addresses the
+# process being polled. logfmt may quote the value and a CRLF log leaves a
+# trailing CR, so both are stripped, and the result must look like host:port —
+# a non-empty but malformed address would build a URL curl can never reach and
+# fail a start that 4040 would have served. Empty output means "not discovered",
+# so the caller's fallback logic still applies.
 ngrok_web_addr() {
-  local log; log="$(tunnel_logfile ngrok)"
+  local log addr
+  log="$(tunnel_logfile ngrok)"
   [[ -f "$log" ]] || return 1
-  grep -m1 'starting web service' "$log" 2>/dev/null \
+  addr="$(grep 'starting web service' "$log" 2>/dev/null \
     | grep -oE 'addr=[^[:space:]]+' \
-    | head -1 \
-    | cut -d= -f2-
+    | tail -1 \
+    | cut -d= -f2-)"
+  addr="${addr%$'\r'}"
+  addr="${addr%\"}"; addr="${addr#\"}"
+  [[ "$addr" =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || return 1
+  printf '%s' "$addr"
 }
 # Read the public https URL out of ngrok's local API. This moved out of the old
 # singleton tunnel_url() so a second unrelated ngrok agent on 4040 can no longer
 # make og adopt another project's URL. Which API to query: an explicit NGROK_API
-# override wins; otherwise og's own agent's address (ngrok_web_addr) when it can
-# be discovered; otherwise 4040. In the single-agent case the discovered address
+# override wins; otherwise og's own agent's address (ngrok_web_addr) once it is
+# discovered; otherwise 4040. 4040 is NOT used while discovery may still
+# succeed — see ngrok_addr_pending — because that fallback is the very race this
+# indirection exists to close. In the single-agent case the discovered address
 # IS 4040, so behaviour is unchanged.
 tunnel_scrape_ngrok() {
-  local api="$NGROK_API" addr
+  local api="$NGROK_API" addr=""
   if [[ -z "$NGROK_API_OVERRIDE" ]]; then
     addr="$(ngrok_web_addr || true)"
-    [[ -n "$addr" ]] && api="http://$addr/api/tunnels"
+    if [[ -n "$addr" ]]; then
+      api="http://$addr/api/tunnels"
+    elif ngrok_addr_pending; then
+      # Our own ngrok has not logged its address yet; failing here keeps the
+      # poll loop waiting instead of reading another agent's tunnel list.
+      return 1
+    fi
   fi
   curl -fsS --max-time 3 "$api" 2>/dev/null | python3 -c '
 import json, sys
