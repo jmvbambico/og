@@ -2884,9 +2884,18 @@ def test_emit_questions_asks_the_tunnel_provider_before_the_ngrok_domain(monkeyp
 
 def test_no_account_wiring_survives_anywhere(tmp_path, monkeypatch, capsys):
     # The second-account feature is removed completely. Guard every surface an
-    # installer or a user can see -- emitted questions, the registry, the
-    # templates on disk, the generated worker specs and og.env -- so it cannot
-    # creep back through one of them.
+    # installer or a user can see -- the installer source and bin/og themselves,
+    # emitted questions, the registry, the templates on disk, the generated
+    # worker specs and og.env -- so it cannot creep back through one of them.
+    # The docs are deliberately NOT scanned: prose may legitimately mention a
+    # removed feature, and scanning it would make this test brittle.
+    feature_terms = ("CLAUDE_CONFIG_DIR", "OG_CLAUDE_CONFIG_DIR", "multi_account",
+                     "account_entries", "account_note", "ACCOUNT_NOTE")
+    for rel in ("installer/og_install.py", "bin/og"):
+        text = (REPO / rel).read_text()
+        for term in feature_terms:
+            assert term not in text, f"{rel}: {term}"
+
     monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex", "claude": "/bin/claude"})
     monkeypatch.setattr(m, "load_state", lambda: {})
     m.emit_questions()
@@ -2968,6 +2977,20 @@ def test_interactive_tunnl_carries_a_stored_ngrok_domain_through(monkeypatch):
         "tunnel_provider": "tunnl", "ngrok_domain": "me.ngrok.app"})
     assert plan["tunnel_provider"] == "tunnl"
     assert plan["ngrok_domain"] == "me.ngrok.app"
+
+
+def test_interactive_tunnl_does_not_prompt_for_an_ngrok_domain(monkeypatch):
+    # tunnl has no use for a reserved ngrok domain, so the prompt must not be
+    # issued at all -- not merely defaulted. `_run_interactive` captures every
+    # prompt verbatim, so its absence there proves the question was skipped;
+    # the ngrok path still asks it, so the absence is meaningful.
+    _plan, tunnl_events = _run_interactive(monkeypatch, state={"tunnel_provider": "tunnl"})
+    assert not any("Reserved ngrok domain" in prompt
+                   for _kind, prompt, _default in tunnl_events)
+
+    _plan, ngrok_events = _run_interactive(monkeypatch, state={"tunnel_provider": "ngrok"})
+    assert any("Reserved ngrok domain" in prompt
+               for _kind, prompt, _default in ngrok_events)
 
 
 def test_interactive_auto_update_defaults_yes_even_when_state_says_no(monkeypatch):
