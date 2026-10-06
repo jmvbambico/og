@@ -18,10 +18,6 @@ executor:
   type: omnigent
   context_window: 1000000
   config:
-    # claude-native (the real Claude Code CLI), NOT claude-sdk. Native honors
-    # $CLAUDE_CONFIG_DIR, so launching the server with CLAUDE_CONFIG_DIR set
-    # scopes this brain to that account; it also inherits settings.json (and
-    # therefore shell hooks) and can be opened/taken over in a real terminal.
     harness: {{ORCHESTRATOR_HARNESS}}
     permission_mode: auto
     # Do not pin a model: pinning the brain also pins the family its workers

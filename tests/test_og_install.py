@@ -169,7 +169,6 @@ def _base_plan(**overrides):
         "orchestrator": "claude",
         "coders": [{"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.5-free"}],
         "reviewer": {"id": "codex", "model": None},
-        "accounts": {},
         "port": 6767,
         "ngrok_domain": "",
         "tunnel_provider": "ngrok",
@@ -547,6 +546,19 @@ def test_chain_shape_round_trips_through_save_and_load(tmp_path, monkeypatch):
     assert m.normalize_plan(json.loads(json.dumps(state))) == state
 
 
+def test_a_stale_accounts_key_is_ignored_not_refused(tmp_path, monkeypatch):
+    # Existing og-install.json files (and some hand-written plans) still carry
+    # an "accounts" key. The feature is gone, so the key is neither read nor
+    # validated: re-running over such a state must still install, just with no
+    # account wiring.
+    plan = _base_plan(accounts={"claude": "/tmp/claude-work"})
+    assert not any(level == "error" for level, _ in m.validate(plan))
+    _apply_into(tmp_path, monkeypatch, plan)
+    env = (tmp_path / "og.env").read_text()
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert "ACCOUNT" not in env
+
+
 def test_chain_entries_normalizes_every_old_shape():
     # bare string (orchestrator), single object (reviewer), list of strings,
     # and an already-canonical list -- all reach the one entry shape.
@@ -574,7 +586,7 @@ def test_chain_priority_comes_from_array_order():
 def test_role_table_is_the_single_source_of_truth(monkeypatch):
     """One declarative table (ROLES) is what every per-role branch reads, so a
     new role is a row rather than a new literal tuple in normalize_plan(),
-    account_entries(), validate(), apply(), render_*() and emit_questions()
+    validate(), apply(), render_*() and emit_questions()
     that drifts from the others. Proven by moving the table and watching the
     plumbing follow it, not by restating the role list by hand."""
     assert [r.key for r in m.ROLES] == ["orchestrator", "coders", "reviewer",
@@ -1089,46 +1101,6 @@ def test_og_env_auto_update_off_is_zero_not_absent(tmp_path, monkeypatch):
     env = _og_env(tmp_path, monkeypatch, _base_plan(auto_update=False))
     assert "OG_AUTO_UPDATE=0\n" in env
     assert "og update" in env
-
-
-def test_og_env_wires_a_backup_reviewers_own_account(tmp_path, monkeypatch):
-    # Interactive collects `accounts` for every id in the reviewer chain, so a
-    # BACKUP can have its own. write_og_env emitted the env line for the primary
-    # only, so that backup silently ran on the wrong account -- the failure the
-    # separate account exists to prevent.
-    plan = _base_plan(
-        orchestrator="codex",
-        reviewer=[{"id": "codex", "priority": 1, "model": None},
-                  {"id": "claude", "priority": 2, "model": None}],
-        accounts={"claude": "/tmp/claude-work"})
-    env = _og_env(tmp_path, monkeypatch, plan)
-    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-work\n" in env
-
-
-def test_og_env_wires_the_primary_reviewers_account(tmp_path, monkeypatch):
-    # The head's account keeps working exactly as before.
-    plan = _base_plan(reviewer={"id": "claude", "model": None},
-                      accounts={"claude": "/tmp/claude-primary"})
-    env = _og_env(tmp_path, monkeypatch, plan)
-    assert "OG_CLAUDE_CONFIG_DIR=/tmp/claude-primary\n" in env
-
-
-def test_validate_errors_when_two_agents_share_an_env_but_need_different_accounts(monkeypatch):
-    # Nothing in the registry forbids two rows sharing `multi_account.env`, and
-    # og launches ONE server with ONE value: a second account for each means one
-    # og.env line silently overwrites the other and an agent runs on the wrong
-    # login. Refuse rather than write a file where one account is dropped.
-    row = next(a for a in m.REGISTRY["agents"] if a["id"] == "claude")
-    twin = {**row, "id": "claude2", "label": "Claude Two"}
-    monkeypatch.setattr(m, "REGISTRY", {"agents": [*m.REGISTRY["agents"], twin]})
-    plan = _base_plan(
-        orchestrator="codex",
-        reviewer=[{"id": "claude", "priority": 1, "model": None},
-                  {"id": "claude2", "priority": 2, "model": None}],
-        accounts={"claude": "/tmp/a", "claude2": "/tmp/b"})
-    msgs = [msg for level, msg in m.validate(plan) if level == "error"]
-    assert any("OG_CLAUDE_CONFIG_DIR" in msg and "/tmp/a" in msg and "/tmp/b" in msg
-               for msg in msgs), msgs
 
 
 # --------------------------------------------------------------------------
@@ -2895,6 +2867,118 @@ def test_show_displays_the_tunnel_provider_and_key(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "tunnl" in out
     assert "/sandbox/tunnl_ed25519" in out
+
+
+def test_emit_questions_asks_the_tunnel_provider_before_the_ngrok_domain(monkeypatch, capsys):
+    # An AI driving --questions asks in the emitted order, and the domain is an
+    # ngrok-only setting: the provider choice must come first, or the AI asks
+    # for a reserved domain before knowing whether ngrok is even wanted.
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    keys = [x["key"] for x in q["questions"]]
+    assert keys.index("tunnel_provider") < keys.index("ngrok_domain")
+
+
+def test_no_account_wiring_survives_anywhere(tmp_path, monkeypatch, capsys):
+    # The second-account feature is removed completely. Guard every surface an
+    # installer or a user can see -- emitted questions, the registry, the
+    # templates on disk, the generated worker specs and og.env -- so it cannot
+    # creep back through one of them.
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex", "claude": "/bin/claude"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    questions = capsys.readouterr().out
+    assert "accounts" not in questions
+    assert "multi_account" not in questions
+    assert "CLAUDE_CONFIG_DIR" not in questions
+
+    for a in m.REGISTRY["agents"]:
+        assert "multi_account" not in a, a["id"]
+
+    for tmpl_name in ("orchestrator.yaml.tmpl", "reviewer.yaml.tmpl",
+                      "scout.yaml.tmpl", "integrator.yaml.tmpl"):
+        text = (REPO / "installer" / "templates" / tmpl_name).read_text()
+        assert "ACCOUNT_NOTE" not in text, tmpl_name
+        assert "CLAUDE_CONFIG_DIR" not in text, tmpl_name
+
+    plan = _base_plan(reviewer={"id": "claude", "model": None},
+                      scout=[{"id": "codex", "model": None}],
+                      integrator=[{"id": "claude", "model": None}])
+    for spec in (m.render_reviewer(plan), m.render_scout(plan), m.render_integrator(plan)):
+        assert "ACCOUNT_NOTE" not in spec
+        assert "CLAUDE_CONFIG_DIR" not in spec
+
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "ACCOUNT" not in env
+    assert "CLAUDE_CONFIG_DIR" not in env
+
+
+def _run_interactive(monkeypatch, state=None):
+    """Drive build_plan_interactive headlessly by stubbing its prompts.
+
+    Every prompt answers with its own default, so the flow takes the "press
+    Enter" path. `events` records (kind, prompt, default) in call order, which
+    is how the prompt ORDER is asserted without a terminal.
+    """
+    state = state or {}
+    events = []
+
+    def fake_ask(prompt, default=""):
+        events.append(("ask", prompt, default))
+        return default
+
+    def fake_ask_yes(prompt, default=False):
+        events.append(("ask_yes", prompt, default))
+        return default
+
+    def fake_pick_one(prompt, options, current=None):
+        events.append(("pick_one", prompt, current))
+        return current or options[0][0]
+
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "codex": "/bin/codex"})
+    monkeypatch.setattr(m, "say", lambda *a, **k: None)
+    monkeypatch.setattr(m, "warn", lambda *a, **k: None)
+    monkeypatch.setattr(m, "err", lambda *a, **k: None)
+    monkeypatch.setattr(m, "port_available", lambda p: True)
+    monkeypatch.setattr(m, "default_bin_dir", lambda: Path("/tmp/bin"))
+    monkeypatch.setattr(m, "ask", fake_ask)
+    monkeypatch.setattr(m, "ask_yes", fake_ask_yes)
+    monkeypatch.setattr(m, "pick_one", fake_pick_one)
+    monkeypatch.setattr(m, "pick_many_ordered",
+                        lambda prompt, options, current=None: [options[0][0]])
+    monkeypatch.setattr(m, "pick_model", lambda agent, current=None: None)
+    return m.build_plan_interactive(state), events
+
+
+def test_interactive_asks_the_tunnel_provider_before_the_ngrok_domain(monkeypatch):
+    _plan, events = _run_interactive(monkeypatch)
+    order = [prompt for _kind, prompt, _default in events]
+    provider = next(i for i, p in enumerate(order) if "tunnel provider" in p)
+    domain = next(i for i, p in enumerate(order) if "Reserved ngrok domain" in p)
+    assert provider < domain
+
+
+def test_interactive_tunnl_carries_a_stored_ngrok_domain_through(monkeypatch):
+    # Switching to tunnl must not blank a reserved ngrok domain: switching back
+    # would then have lost it. The stored value is carried through untouched.
+    plan, _events = _run_interactive(monkeypatch, state={
+        "tunnel_provider": "tunnl", "ngrok_domain": "me.ngrok.app"})
+    assert plan["tunnel_provider"] == "tunnl"
+    assert plan["ngrok_domain"] == "me.ngrok.app"
+
+
+def test_interactive_auto_update_defaults_yes_even_when_state_says_no(monkeypatch):
+    # A user who once answered `n` used to be shown (y/N) on every later re-run,
+    # so pressing Enter silently kept auto-update off. The prompt now always
+    # defaults to yes; only an explicit `n` turns it off.
+    plan, events = _run_interactive(monkeypatch, state={"auto_update": False})
+    auto = next(default for kind, prompt, default in events
+                if kind == "ask_yes" and "Auto-update" in prompt)
+    assert auto is True
+    assert plan["auto_update"] is True
 
 
 # --------------------------------------------------------------------------

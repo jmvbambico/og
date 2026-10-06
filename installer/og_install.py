@@ -703,38 +703,6 @@ def reviewer_names(plan: dict) -> list:
     return role_names(plan, "reviewer")
 
 
-def account_entries(plan: dict, reg: dict | None = None) -> list:
-    """(agent_id, env_var, config_dir) for every installed id that has an account.
-
-    `accounts` is keyed by agent id, and interactive collects it for every id in
-    every chain — orchestrator, each coder, each reviewer, each scout, each
-    integrator — not just the head. Only a row whose registry `multi_account.env`
-    names the variable can be wired; a stray accounts key is ignored rather than
-    guessed at. Chain order, first occurrence of a repeated id wins.
-
-    The ORDER follows the role table (orchestrator, coders, reviewers, scouts,
-    integrators), not the old orchestrator/reviewer/coders sequence. The rows
-    are id-derived, so the same accounts come out either way; a consumer must
-    not depend on the old order or on a kind of role sorting before another.
-
-    `reg` is passed in by validate(), which already holds the catalog; reloading
-    it here was a second agents_by_id() per call for no reason.
-    """
-    reg = reg or agents_by_id()
-    out, seen = [], set()
-    for r in ROLES:
-        for e in chain(plan, r.key):
-            aid = e["id"]
-            if aid in seen:
-                continue
-            seen.add(aid)
-            acct = (plan.get("accounts") or {}).get(aid)
-            env = (reg.get(aid, {}).get("multi_account") or {}).get("env")
-            if acct and env:
-                out.append((aid, f"OG_{env}", acct))
-    return out
-
-
 def role_caveat(agent: dict, role: str) -> str | None:
     """The UNVERIFIED-in-this-role caveat for `agent`, or None.
 
@@ -881,24 +849,6 @@ def build_plan_interactive(state: dict) -> dict:
             {"id": oid, "priority": i, "model": pick_model(reg[oid], prev_models.get(oid))}
             for i, oid in enumerate(pick_many_ordered(r.ask, o_opts, cur), 1)]
 
-    # --- multi-account, for any selected agent that supports it ---
-    accounts = dict(state.get("accounts") or {})
-    involved = set(orchestrator_ids) | set(reviewer_ids) | {c["id"] for c in coders} \
-        | {e["id"] for chain_ in optional.values() for e in chain_}
-    for aid in sorted(involved):
-        ma = reg[aid].get("multi_account") or {}
-        if not ma.get("supported"):
-            continue
-        say()
-        say(f"{C['b']}{reg[aid]['label']} — separate account for the reviewer?{C['x']}")
-        say(f"  {C['dim']}{ma['note']}{C['x']}")
-        cur = accounts.get(aid)
-        if ask_yes(f"Use a second {reg[aid]['label']} account?", default=bool(cur)):
-            accounts[aid] = ask(f"{ma['env']} path",
-                                cur or os.path.expandvars(ma["default_dir"]))
-        else:
-            accounts.pop(aid, None)
-
     # --- runtime knobs ---
     say()
     say(f"{C['b']}Runtime{C['x']}")
@@ -919,8 +869,9 @@ def build_plan_interactive(state: dict) -> dict:
             break
         if ask_yes(f"port {port} looks like it's already in use — use it anyway?", default=False):
             break
-    domain = ask("Reserved ngrok domain — ngrok only (blank = ephemeral URL each start)",
-                 state.get("ngrok_domain", ""))
+    # Provider first: the domain question is ngrok-only, so asking it before the
+    # user has said whether they want ngrok was asking for an ngrok setting on a
+    # tunnl install.
     say()
     say(f"{C['dim']}  ngrok = public URL via ngrok; needs a free ngrok account{C['x']}")
     say(f"{C['dim']}  tunnl = public URL via tunnl.gg; a dedicated key keeps one URL{C['x']}")
@@ -929,6 +880,14 @@ def build_plan_interactive(state: dict) -> dict:
         [("ngrok", "ngrok — reserved or ephemeral ngrok domain (recommended)", None),
          ("tunnl", "tunnl.gg — SSH tunnel with a stable key-derived URL", None)],
         state.get("tunnel_provider", "ngrok"))
+    if tunnel_provider == "ngrok":
+        domain = ask("Reserved ngrok domain — ngrok only (blank = ephemeral URL each start)",
+                     state.get("ngrok_domain", ""))
+    else:
+        # tunnl does not use an ngrok domain, but a reserved one the user already
+        # saved must survive switching to tunnl and back: carry the stored value
+        # through rather than blanking it.
+        domain = state.get("ngrok_domain", "")
     if tunnel_provider == "tunnl":
         tunnl_ssh_key = ask("tunnl.gg SSH key path (dedicated — it names your stable URL)",
                             state.get("tunnl_ssh_key") or default_tunnl_key())
@@ -950,7 +909,11 @@ def build_plan_interactive(state: dict) -> dict:
     say(f"{C['dim']}  `og` is copied out of this checkout; a `git pull` here changes nothing{C['x']}")
     say(f"{C['dim']}  until the install is re-applied. Auto-update does that on every `og start`;{C['x']}")
     say(f"{C['dim']}  off, `og start` only warns and you run `og update` yourself.{C['x']}")
-    auto_update = ask_yes("Auto-update og on `og start`?", state.get("auto_update", True))
+    # Default to a literal True, not state.get("auto_update", True): a user who
+    # once answered `n` was shown (y/N) on every later re-run, so pressing Enter
+    # silently kept auto-update off. The prompt always reads (Y/n); only an
+    # explicit `n` turns it off.
+    auto_update = ask_yes("Auto-update og on `og start`?", True)
 
     return {
         "version": 1,
@@ -959,7 +922,6 @@ def build_plan_interactive(state: dict) -> dict:
         "coders": coders,
         "reviewer": reviewers,
         **optional,
-        "accounts": accounts,
         "port": int(port),
         "ngrok_domain": domain,
         "tunnel_provider": tunnel_provider,
@@ -1204,25 +1166,6 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                                    "expanded path points at a file nothing writes and the "
                                    "launch fails — declare shim.name == "
                                    f"'{tok}' or fix the token."))
-
-    # og launches ONE server with ONE environment, so a single env var cannot
-    # name two config dirs. Two installed ids can share a `multi_account.env`
-    # (nothing in the registry forbids it) and each be given a different
-    # account; whichever og.env line won would silently run the other agent on
-    # the wrong account. Refuse rather than write a file where one account is
-    # quietly dropped.
-    by_env = {}
-    for aid, var, acct in account_entries(plan, reg):
-        prev = by_env.get(var)
-        if prev and prev[1] != acct:
-            issues.append(("error",
-                           f"{reg[aid]['label']} and {reg[prev[0]]['label']} both need "
-                           f"{var}, but og launches one server with one value. Two "
-                           f"accounts ({prev[1]} and {acct}) cannot both be set. Give "
-                           "them different multi_account.env values in the registry, or "
-                           "drop one of the accounts."))
-        else:
-            by_env[var] = (aid, acct)
 
     # The tmux command-string ceiling binds whenever ANY orchestrator in the
     # chain rides on argv -- NOT just the head. Reading only orchestrators[0]
@@ -1953,27 +1896,10 @@ def render_reviewer(plan: dict, entry: dict | None = None, name: str = "reviewer
         "{{LABEL}}": a["label"],
         "{{HARNESS}}": a["harness"],
         "{{ORCHESTRATOR}}": plan["agent_name"],
-        "{{ACCOUNT_NOTE}}": account_note(plan, a, "reviewer"),
         "{{MODEL_BLOCK}}": model_block(entry.get("model")),
     }.items():
         s = s.replace(k, v)
     return s
-
-
-def account_note(plan: dict, a: dict, what: str) -> str:
-    """The `# Runs on a SEPARATE account` comment for an agent that has one.
-
-    Shared by every worker spec that can be given its own account, so the
-    reviewer's and the scout's notes cannot drift apart. `what` names the role
-    in the prose, so the generated sentence still reads as the role it lands in.
-    """
-    acct = (plan.get("accounts") or {}).get(a["id"])
-    if not acct:
-        return ""
-    env = (a.get("multi_account") or {}).get("env", "CONFIG_DIR")
-    return (f"# Runs on a SEPARATE account: the server is launched with\n"
-            f"# {env}={acct}, so this {what} is independent of the\n"
-            f"# account your interactive sessions use.\n")
 
 
 def render_scout(plan: dict, entry: dict | None = None, name: str = "scout") -> str:
@@ -1998,7 +1924,6 @@ def render_scout(plan: dict, entry: dict | None = None, name: str = "scout") -> 
         "{{LABEL}}": a["label"],
         "{{HARNESS}}": a["harness"],
         "{{ORCHESTRATOR}}": plan["agent_name"],
-        "{{ACCOUNT_NOTE}}": account_note(plan, a, "scout"),
         "{{MODEL_BLOCK}}": model_block(entry.get("model")),
         "{{PERMISSION_MODE_BLOCK}}": perm,
     }.items():
@@ -2028,7 +1953,6 @@ def render_integrator(plan: dict, entry: dict | None = None, name: str = "integr
         "{{LABEL}}": a["label"],
         "{{HARNESS}}": a["harness"],
         "{{ORCHESTRATOR}}": plan["agent_name"],
-        "{{ACCOUNT_NOTE}}": account_note(plan, a, "integrator"),
         "{{MODEL_BLOCK}}": model_block(entry.get("model")),
         "{{PERMISSION_MODE_BLOCK}}": perm,
     }.items():
@@ -2319,17 +2243,6 @@ def write_og_env(plan: dict) -> None:
               "# The dedicated tunnl.gg key. tunnl.gg derives the stable URL from",
               "# it, so do not point this at your personal key or regenerate it.",
               f"OG_TUNNL_SSH_KEY={resolve_tunnl_key(plan)}"]
-    # Every id with its own account gets an env line, not just the primary
-    # reviewer. Interactive now collects `accounts` for every id in every chain,
-    # but this only ever emitted the head's -- so a BACKUP reviewer configured
-    # with its own account silently ran on the primary's (or the user's
-    # interactive) login. Same failure shape as the ceiling gate: the config
-    # looked right and the backup ran wrong.
-    accts = account_entries(plan)
-    if accts:
-        lines += ["", "# Each agent below runs on this account, separate from your",
-                  "# interactive login for that agent."]
-        lines += [f"{var}={acct}" for _aid, var, acct in accts]
     ocd = opencode_worker_config_dir(plan)
     if ocd:
         lines += ["", "# OpenCode worker overrides (drops the blocking `question` tool). og start",
@@ -2767,19 +2680,14 @@ def emit_questions() -> None:
             {"key": "agent_name", "type": "string", "default": "dev-lead",
              "ask": "What should the orchestrator bundle be called?"},
             *role_questions,
-            {"key": "accounts", "type": "map",
-             "ask": "For any agent with registry.multi_account.supported, should it "
-                    "run on a second account? Value is the config dir path.",
-             "applies_to": [a["id"] for a in REGISTRY["agents"]
-                            if (a.get("multi_account") or {}).get("supported")]},
             {"key": "port", "type": "int", "default": 6767, "ask": "Omnigent server port?"},
-            {"key": "ngrok_domain", "type": "string", "default": "",
-             "ask": "Reserved ngrok domain? Blank means a new URL each start. "
-                    "Applies to ngrok only."},
             {"key": "tunnel_provider", "type": "choice", "choices": ["ngrok", "tunnl"],
              "default": "ngrok",
              "ask": "Which tunnel provider should `og start tunneled` use? ngrok is "
                     "the default; tunnl.gg needs a dedicated SSH key."},
+            {"key": "ngrok_domain", "type": "string", "default": "",
+             "ask": "Reserved ngrok domain? Blank means a new URL each start. "
+                    "Applies to ngrok only."},
             {"key": "tunnl_ssh_key", "type": "path", "default": default_tunnl_key(),
              "ask": "Path to the dedicated tunnl.gg SSH key. It names the stable URL, "
                     "so keep it; ngrok installs can leave the default."},
@@ -2852,8 +2760,6 @@ def show(state: dict) -> None:
         else:
             say(f"{C['b']}integrator #{e['priority']}{C['x']} {reg[e['id']]['label']}"
                 f"{pin}{live}")
-    for aid, path in (state.get("accounts") or {}).items():
-        say(f"{C['b']}account{C['x']}       {reg[aid]['label']} → {path}")
     say(f"{C['b']}port{C['x']}          {state['port']}")
     say(f"{C['b']}ngrok{C['x']}         {state.get('ngrok_domain') or '(ephemeral)'}")
     say(f"{C['b']}tunnel{C['x']}        {state.get('tunnel_provider', 'ngrok')}")

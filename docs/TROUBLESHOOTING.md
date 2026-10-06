@@ -735,37 +735,6 @@ the model's tool list; the `tools` form does not.
 
 ---
 
-## The reviewer runs on my main Claude account, not the second one
-
-`og-install.json` names `accounts.claude: ~/.claude-work`, `og start` prints
-`account: CLAUDE_CONFIG_DIR=~/.claude-work`, and yet the runner log says:
-
-```
-claude_native.status_file  claude status file resolved: path=/Users/me/.claude/sessions/72881.json
-```
-
-**Cause.** The host daemon builds each runner's environment from an allowlist
-(`omnigent/host/connect.py`, `_build_runner_env`), not from its own. Neither
-`CLAUDE_CONFIG_DIR` nor `OPENCODE_*` is on it, so og's exports stopped at the
-daemon. The same gap meant `OPENCODE_DISABLE_EXTERNAL_SKILLS` never reached
-the Zen worker either.
-
-**Fix — two hops, both needed.** (1) og names them in
-`OMNIGENT_RUNNER_ENV_PASSTHROUGH` (the operator-controlled daemon→runner
-forward, itself allowlisted). (2) That alone did nothing: `omnigent host
---background --server …` builds the *daemon's* env from a second allowlist
-(`cli.py`, `_build_host_daemon_env`) that keeps the passthrough list but
-strips the variables it names — verified by reading the daemon's environment:
-none of og's exports were there. og now runs the host in the foreground under
-`nohup` with its own pidfile (`~/.omnigent/og-host.pid`, the pattern the
-server already used), so the daemon inherits og's full environment and hop (1)
-has something to forward. Re-apply (`./install.sh --plan
-~/.omnigent/og-install.json` or `og setup`), then `og restart`; `og status`
-shows `og host: pid N online`. Verify on the next reviewer dispatch: the
-status-file line should resolve under the second account's dir.
-
----
-
 ## Workers burn tokens re-reading the codebase
 
 A coder transcript shows the same file read forty or fifty times and a hundred
