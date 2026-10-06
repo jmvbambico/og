@@ -2,8 +2,8 @@
 # og — one-word control for an Omnigent orchestrator agent.
 #
 #   og start [local]    start on the LAN: server on 0.0.0.0, QR of your LAN IP
-#   og start tunneled [domain]
-#                       start ngrok first, then the server behind that origin
+#   og start tunneled [domain] [--use ngrok|tunnl]
+#                       start the tunnel first, then the server behind that origin
 #   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
 #   og restart [mode]   og stop, then og start with the same arguments
@@ -21,12 +21,13 @@
 #
 # Works from any directory: every path here is absolute.
 #
-# Why ngrok starts FIRST: the server needs its public origin at boot.
+# Why the tunnel starts FIRST: the server needs its public origin at boot.
 # OMNIGENT_ACCOUNTS_BASE_URL and OMNIGENT_WS_ALLOWED_ORIGINS must match the
 # origin the browser actually uses, or the phone gets WebSocket close 4403 and
 # HTTP 403 on chat — which reads as a broken install rather than a config gap.
-# With an ephemeral tunnel the URL is not knowable until ngrok is up, so we
-# start it, read the URL from ngrok's local API, and only then boot the server.
+# With an ephemeral tunnel the URL is not knowable until the tunnel is up, so we
+# start it, read the URL (ngrok's local API, or tunnl's stdout), and only then
+# boot the server.
 #
 # Why --agent matters: it pre-registers the agent bundle with the server.
 # Plain `omnigent start` registers nothing, so sessions open on the default
@@ -34,8 +35,22 @@
 set -euo pipefail
 
 OMNI_HOME="$HOME/.omnigent"
-NGROK_PIDFILE="$OMNI_HOME/og-ngrok.pid"
-NGROK_LOG="$OMNI_HOME/logs/ngrok.log"
+# Per-provider tunnel pidfiles and a provider-agnostic URL cache. The legacy
+# og-ngrok.pid is still detected so a tunnel started by an older og is stopped,
+# not orphaned. tunnl holds its stdin open on a FIFO so ssh -tt does not see EOF
+# (which kills the tunnel seconds after it prints its URL).
+LEGACY_NGROK_PIDFILE="$OMNI_HOME/og-ngrok.pid"
+TUNNEL_URL_FILE="$OMNI_HOME/og-tunnel.url"
+# Which provider wrote $TUNNEL_URL_FILE. A cached URL is only valid while the
+# tunnel that wrote it is alive, and "alive" must be checked against the RIGHT
+# pidfile — so the provider is recorded beside the URL rather than inside it,
+# keeping $TUNNEL_URL_FILE a bare URL (`og url` still prints just the URL).
+TUNNEL_PROVIDER_FILE="$OMNI_HOME/og-tunnel.provider"
+TUNNEL_EXPIRY_FILE="$OMNI_HOME/og-tunnel.expiry"
+TUNNL_FIFO="$OMNI_HOME/og-tunnl.fifo"
+# tunnl prints a request-table row per request for the tunnel's whole life, so a
+# plain logfile would grow without bound; keep at most this many bytes on disk.
+TUNNL_LOG_CAP=262144
 SECRET_FILE="$OMNI_HOME/.cookie-secret"
 CONF_FILE="$OMNI_HOME/og.env"
 SERVER_PIDFILE="$OMNI_HOME/og-server.pid"
@@ -43,8 +58,9 @@ HOST_PIDFILE="$OMNI_HOME/og-host.pid"
 HOST_LOGDIR="$OMNI_HOME/logs/host"
 SERVER_LOGDIR="$OMNI_HOME/logs/server"
 
-# Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_CLAUDE_CONFIG_DIR,
-# OG_AUTO_UPDATE (1 = `og start` pulls + re-applies the install first).
+# Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_TUNNEL_PROVIDER,
+# OG_TUNNL_SSH_KEY, OG_TUNNL_RANDOM, OG_CLAUDE_CONFIG_DIR, OG_AUTO_UPDATE
+# (1 = `og start` pulls + re-applies the install first).
 # Written as an if, not `[[ ]] && source`: under `set -e` a bare failing test as
 # the last statement of an AND-list is an easy way to abort the script.
 # Sourced BEFORE AGENT_NAME is resolved below, or the installer's OG_AGENT
@@ -63,7 +79,14 @@ PORT="${OG_PORT:-6767}"
 # home directory, and an agent told to read "AGENTS.md at the repo root" finds
 # nothing — the exact failure this fixes. Captured before any cd.
 OG_LAUNCH_DIR="${OG_WORKSPACE:-$PWD}"
-NGROK_API="http://127.0.0.1:4040/api/tunnels"
+# ngrok's local API. 4040 is the default, but the free plan allows one agent and
+# a second unrelated agent on the box can hold 4040 — at which point og would
+# read THAT project's tunnel list. So og discovers its OWN agent's web-interface
+# address from that agent's log (ngrok_web_addr) and queries that. A NGROK_API
+# set in the environment or og.env is an override and always wins; when the
+# address cannot be discovered, 4040 remains the fallback.
+NGROK_API_OVERRIDE="${NGROK_API:-}"
+NGROK_API="${NGROK_API_OVERRIDE:-http://127.0.0.1:4040/api/tunnels}"
 # The exact invocation, kept so a self-update can re-exec it unchanged.
 OG_ARGV=("$@")
 
@@ -126,11 +149,332 @@ server_running() {
   esac
 }
 
-ngrok_pid() {
-  [[ -f "$NGROK_PIDFILE" ]] || return 1
-  local p; p="$(cat "$NGROK_PIDFILE" 2>/dev/null || true)"
+# ---- tunnel provider seam -------------------------------------------------
+# A tunnel is one of a few providers, each behind four functions chosen by id:
+#   tunnel_preflight_<p>  checks; die with actionable instructions
+#   tunnel_spawn_<p>      launch + write pidfile; return immediately
+#   tunnel_scrape_<p>     print the https URL or fail (polled by the wait loop)
+#   tunnel_stop_<p>       terminate
+# ngrok is the default and its behaviour is unchanged; tunnl.gg is the second.
+# The URL is published in ONE provider-agnostic file so `og url` / `og status`
+# need no per-provider branch. See docs/TUNNEL-PROVIDERS.md.
+
+# Per-provider pidfile / logfile. Functions, not vars, so the legacy single
+# og-ngrok.pid can be told apart from the new og-tunnel-ngrok.pid.
+tunnel_pidfile() { echo "$OMNI_HOME/og-tunnel-$1.pid"; }
+tunnel_logfile() { echo "$OMNI_HOME/logs/$1.log"; }
+
+tunnel_pid() {
+  local f; f="$(tunnel_pidfile "$1")"
+  [[ -f "$f" ]] || return 1
+  local p; p="$(cat "$f" 2>/dev/null || true)"
   [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
   return 1
+}
+
+# A tunnel started by an og that predates per-provider pidfiles.
+legacy_tunnel_pid() {
+  [[ -f "$LEGACY_NGROK_PIDFILE" ]] || return 1
+  local p; p="$(cat "$LEGACY_NGROK_PIDFILE" 2>/dev/null || true)"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+  return 1
+}
+
+running_tunnel_provider() {
+  local p
+  for p in ngrok tunnl; do
+    tunnel_pid "$p" >/dev/null && { echo "$p"; return 0; }
+  done
+  legacy_tunnel_pid >/dev/null && { echo ngrok; return 0; }
+  return 1
+}
+
+# Canonical ids are ngrok and tunnl; tunnl.gg is accepted as an alias. Anything
+# else is refused by the caller, never silently defaulted.
+normalize_tunnel_provider() {
+  case "$1" in
+    ngrok) echo ngrok ;;
+    tunnl|tunnl.gg) echo tunnl ;;
+    *) return 1 ;;
+  esac
+}
+
+# Strip SGR colour escapes. tunnl wraps its banner and URL in them; they must go
+# before the URL regex runs.
+strip_sgr() { sed -E $'s/\033\\[[0-9;]*[A-Za-z]//g'; }
+
+# Drain a tunnel's log stream, keeping at most $cap bytes on disk. tunnl prints a
+# request-table row for the life of the tunnel, so writing its output straight to
+# a file would grow without bound. This must NEVER exit early: a reader that
+# stops makes the writer (ssh) take SIGPIPE, which kills the tunnel. It exits on
+# its own when ssh closes the pipe, so teardown does not have to track it.
+tunnel_log_sink() {
+  local log="$1" cap="${2:-262144}" n=0 line
+  exec 8>>"$log" || exit 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( n < cap )); then
+      printf '%s\n' "$line" >&8
+      n=$(( n + ${#line} + 1 ))
+    fi
+  done
+  exec 8>&-
+}
+
+# Kill by pid with the same grace then -9 the rest of og uses.
+kill_graceful() {
+  local p="$1"
+  kill "$p" 2>/dev/null || true
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+}
+
+# -- preflight ---------------------------------------------------------------
+tunnel_preflight() {
+  case "$1" in
+    ngrok) tunnel_preflight_ngrok ;;
+    tunnl) tunnel_preflight_tunnl ;;
+    *) die "unknown tunnel provider: $1" ;;
+  esac
+}
+tunnel_preflight_ngrok() {
+  command -v ngrok >/dev/null || die "ngrok is not installed (https://ngrok.com/download)"
+  # ngrok v3 refuses to tunnel without an authtoken, and the failure is buried in
+  # its log — check up front so the message is actionable.
+  ngrok config check >/dev/null 2>&1 || die "ngrok has no authtoken. Get yours at https://dashboard.ngrok.com/get-started/your-authtoken then run:
+    ngrok config add-authtoken <token>"
+}
+# Path to the dedicated ed25519 key tunnl pins its stable URL to. Generated by
+# `og setup`; never generated here.
+tunnl_key_path() { echo "${OG_TUNNL_SSH_KEY:-$OMNI_HOME/tunnl_ed25519}"; }
+tunnel_preflight_tunnl() {
+  command -v ssh >/dev/null || die "ssh is not installed (tunnl.gg runs over ssh)"
+  local key; key="$(tunnl_key_path)"
+  [[ -f "$key" ]] || die "tunnl.gg ssh key not found at $key
+    Run 'og setup' to generate it, or set OG_TUNNL_SSH_KEY in $CONF_FILE."
+}
+
+# -- spawn -------------------------------------------------------------------
+tunnel_spawn() {
+  local p="$1"; shift
+  case "$p" in
+    ngrok) tunnel_spawn_ngrok "$@" ;;
+    tunnl) tunnel_spawn_tunnl "$@" ;;
+    *) die "unknown tunnel provider: $p" ;;
+  esac
+}
+tunnel_spawn_ngrok() {
+  local port="$1" domain="$2" log args
+  log="$(tunnel_logfile ngrok)"
+  # Migration: adopt a tunnel left running by an og that wrote the legacy
+  # og-ngrok.pid, so it is reused rather than duplicated.
+  if ! tunnel_pid ngrok >/dev/null && legacy_tunnel_pid >/dev/null; then
+    legacy_tunnel_pid > "$(tunnel_pidfile ngrok)"
+  fi
+  mkdir -p "$(dirname "$log")"
+  if tunnel_pid ngrok >/dev/null; then
+    info "reusing the ngrok tunnel already running (pid $(tunnel_pid ngrok))"
+  else
+    args=(http "$port" --log=stdout --log-format=logfmt)
+    [[ -n "$domain" ]] && args+=(--domain "${domain#https://}")
+    info "starting ngrok on port $port${domain:+ (domain: ${domain#https://})}"
+    nohup ngrok "${args[@]}" >"$log" 2>&1 &
+    echo $! > "$(tunnel_pidfile ngrok)"
+  fi
+}
+tunnel_spawn_tunnl() {
+  local port="$1" key log user
+  key="$(tunnl_key_path)"
+  log="$(tunnel_logfile tunnl)"
+  mkdir -p "$(dirname "$log")"
+  # stdin MUST stay open or ssh -tt sees EOF and the tunnel dies seconds after
+  # printing its URL. A read-write fd on a FIFO never sees EOF and sends no data.
+  # /dev/null, -n, and `sleep infinity | ssh` are all wrong here (the last adds a
+  # second process og does not track and would orphan on stop).
+  rm -f "$TUNNL_FIFO"
+  mkfifo "$TUNNL_FIFO"
+  exec 9<>"$TUNNL_FIFO"
+  # stable@ ties the URL to the key, so a reconnect keeps the same URL and the
+  # server's baked OMNIGENT_ACCOUNTS_BASE_URL stays valid. Random is opt-in.
+  user="stable@"
+  [[ "${OG_TUNNL_RANDOM:-0}" == "1" ]] && user=""
+  info "starting tunnl.gg tunnel on port $port${user:+ (as ${user%@})}"
+  nohup ssh -tt \
+    -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -i "$key" -o IdentitiesOnly=yes \
+    -R 80:localhost:$port \
+    "${user}proxy.tunnl.gg" \
+    <&9 > >(trap '' HUP; tunnel_log_sink "$log" "$TUNNL_LOG_CAP") 2>&1 &
+  echo $! > "$(tunnel_pidfile tunnl)"
+}
+
+# -- scrape ------------------------------------------------------------------
+tunnel_scrape() {
+  case "$1" in
+    ngrok) tunnel_scrape_ngrok ;;
+    tunnl) tunnel_scrape_tunnl ;;
+    *) return 1 ;;
+  esac
+}
+# How long og waits for its own ngrok to log its web-interface address before it
+# gives up and reads 4040. An ngrok that never emits the record must still work,
+# so the fallback is delayed, not removed — but bounded, so it lands well inside
+# cmd_start's 20s (40 x 0.5s) poll budget with time to spare.
+NGROK_ADDR_GRACE=6
+
+# File mtime as epoch seconds. -c is GNU, -f is BSD/macOS; tried in that order
+# so macOS (which rejects -c with a nonzero exit) falls through to -f. Empty
+# output means "unknown", which the caller reads as "do not wait".
+ngrok_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# True while og's OWN ngrok may still be about to log where its web service
+# listens: the process is alive, its logfile exists, but no valid `addr` record
+# is in it yet. Returning failure in this window is what stops the caller from
+# falling back to 4040 — where a second, unrelated ngrok agent may be holding
+# another project's tunnels — before our own agent has had a chance to speak.
+# Bounded by NGROK_ADDR_GRACE from spawn so a version that never logs the record
+# still reaches the 4040 fallback: waiting past the grace is clearly futile.
+ngrok_addr_pending() {
+  local pidfile log started now
+  tunnel_pid ngrok >/dev/null || return 1
+  log="$(tunnel_logfile ngrok)"
+  [[ -f "$log" ]] || return 1
+  pidfile="$(tunnel_pidfile ngrok)"
+  started="$(ngrok_mtime "$pidfile" || true)"
+  [[ -n "$started" ]] || return 1
+  now="$(date +%s)"
+  (( now - started < NGROK_ADDR_GRACE ))
+}
+
+# The web-interface address of OG'S OWN ngrok, read from the logfile it writes
+# (launched below with --log=stdout --log-format=logfmt). ngrok emits a
+# `starting web service` logfmt record carrying `addr=<host:port>`; taking the
+# address from that record ties the API query to the agent og started rather
+# than to whatever agent grabbed 4040. The MOST RECENT record wins: a log can
+# carry records from more than one run, and only the latest addresses the
+# process being polled. logfmt may quote the value and a CRLF log leaves a
+# trailing CR, so both are stripped, and the result must look like host:port —
+# a non-empty but malformed address would build a URL curl can never reach and
+# fail a start that 4040 would have served. Empty output means "not discovered",
+# so the caller's fallback logic still applies.
+ngrok_web_addr() {
+  local log addr
+  log="$(tunnel_logfile ngrok)"
+  [[ -f "$log" ]] || return 1
+  addr="$(grep 'starting web service' "$log" 2>/dev/null \
+    | grep -oE 'addr=[^[:space:]]+' \
+    | tail -1 \
+    | cut -d= -f2-)"
+  addr="${addr%$'\r'}"
+  addr="${addr%\"}"; addr="${addr#\"}"
+  [[ "$addr" =~ ^[A-Za-z0-9._-]+:[0-9]+$ ]] || return 1
+  printf '%s' "$addr"
+}
+# Read the public https URL out of ngrok's local API. This moved out of the old
+# singleton tunnel_url() so a second unrelated ngrok agent on 4040 can no longer
+# make og adopt another project's URL. Which API to query: an explicit NGROK_API
+# override wins; otherwise og's own agent's address (ngrok_web_addr) once it is
+# discovered; otherwise 4040. 4040 is NOT used while discovery may still
+# succeed — see ngrok_addr_pending — because that fallback is the very race this
+# indirection exists to close. In the single-agent case the discovered address
+# IS 4040, so behaviour is unchanged.
+tunnel_scrape_ngrok() {
+  local api="$NGROK_API" addr=""
+  if [[ -z "$NGROK_API_OVERRIDE" ]]; then
+    addr="$(ngrok_web_addr || true)"
+    if [[ -n "$addr" ]]; then
+      api="http://$addr/api/tunnels"
+    elif ngrok_addr_pending; then
+      # Our own ngrok has not logged its address yet; failing here keeps the
+      # poll loop waiting instead of reading another agent's tunnel list.
+      return 1
+    fi
+  fi
+  curl -fsS --max-time 3 "$api" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for t in d.get("tunnels", []):
+    u = t.get("public_url", "")
+    if u.startswith("https://"):
+        print(u); sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+# tunnl prints CRLF-terminated, SGR-coloured output whose banner wording is not a
+# stable contract: ~20 lines of QR follow. Strip, then regex — never anchor on
+# the "URL" label or a line number.
+tunnel_scrape_tunnl() {
+  local log; log="$(tunnel_logfile tunnl)"
+  [[ -f "$log" ]] || return 1
+  tr -d '\r' < "$log" \
+    | strip_sgr \
+    | grep -m1 -oE 'https://[a-zA-Z0-9.-]+\.tunnl\.gg'
+}
+# tunnl's own expiry line, e.g. "Expires in 24h, or after 2h without traffic".
+# Parsed, not assumed, so a changed cap is reflected rather than hardcoded.
+tunnel_expiry_scrape_tunnl() {
+  local log; log="$(tunnel_logfile tunnl)"
+  [[ -f "$log" ]] || return 1
+  tr -d '\r' < "$log" \
+    | strip_sgr \
+    | grep -m1 -oE 'Expires[[:space:]]+in[[:space:]]+[0-9]+h' \
+    | grep -m1 -oE '[0-9]+h'
+}
+record_tunnl_expiry() {
+  local dur="" i
+  for i in 1 2 3 4 5; do
+    dur="$(tunnel_expiry_scrape_tunnl || true)"
+    [[ -n "$dur" ]] && break
+    sleep 0.2
+  done
+  [[ "$dur" =~ ^([0-9]+)h$ ]] || return 0
+  echo $(( $(date +%s) + BASH_REMATCH[1] * 3600 )) > "$TUNNEL_EXPIRY_FILE"
+}
+tunnel_expiry_left() {
+  [[ -f "$TUNNEL_EXPIRY_FILE" ]] || return 1
+  local exp now; exp="$(cat "$TUNNEL_EXPIRY_FILE" 2>/dev/null || true)"
+  [[ "$exp" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  if [[ "$exp" -le "$now" ]]; then echo "expired"; return 0; fi
+  local s=$(( exp - now ))
+  echo "in $((s/3600))h $(((s%3600)/60))m"
+}
+
+# -- stop --------------------------------------------------------------------
+tunnel_stop_ngrok() {
+  local pid="$1"; [[ -n "$pid" ]] || return 1
+  info "stopping ngrok tunnel (pid $pid)"
+  kill_graceful "$pid"
+}
+tunnel_stop_tunnl() {
+  local pid="$1"; [[ -n "$pid" ]] || return 1
+  info "stopping tunnl.gg tunnel (pid $pid)"
+  kill_graceful "$pid"
+}
+# Stop whichever provider is actually running (they can coexist), plus a tunnel
+# left by an older og under the legacy pidfile. Returns 0 if it stopped anything.
+tunnel_stop() {
+  local stopped=0 p pid
+  for p in ngrok tunnl; do
+    pid="$(tunnel_pid "$p" || true)"
+    if [[ -n "$pid" ]]; then
+      "tunnel_stop_$p" "$pid"
+      stopped=1
+    fi
+  done
+  local lpid; lpid="$(legacy_tunnel_pid || true)"
+  if [[ -n "$lpid" ]]; then
+    info "stopping ngrok tunnel (pid $lpid, legacy pidfile)"
+    kill_graceful "$lpid"
+    stopped=1
+  fi
+  [[ "$stopped" -eq 1 ]]
 }
 
 # Ensure a project exists whose DEFAULT AGENT is the orchestrator, and echo its name.
@@ -533,20 +877,38 @@ same_path() {
   [[ "$a" == "$b" ]]
 }
 
-# Read the public https URL out of ngrok's local API.
+# The provider that wrote the cached URL, or empty when none is recorded.
+cached_tunnel_provider() {
+  [[ -s "$TUNNEL_PROVIDER_FILE" ]] || return 1
+  head -1 "$TUNNEL_PROVIDER_FILE"
+}
+
+# Invalidate the URL cache: the URL, its owning provider, and tunnl's expiry.
+# Called at the start of every `og start` (see cmd_start) and whenever the cached
+# URL's owner is found dead.
+clear_tunnel_cache() {
+  rm -f "$TUNNEL_URL_FILE" "$TUNNEL_PROVIDER_FILE" "$TUNNEL_EXPIRY_FILE"
+}
+
+# Read the public https URL out of the provider-agnostic cache — but only while
+# the tunnel that wrote it is still alive. Unlike the old live-API poll, the
+# cache is not self-validating: a tunnel can die with no `og stop` (tunnl's 2h
+# idle / 24h caps, a network drop, an ngrok crash, a reboot, a SIGKILL), leaving
+# a file that advertises a dead link. Validate against the owning provider's
+# pidfile (the same liveness notion tunnel_pid uses); if the owner is gone, clear
+# the cache so the next caller is not misled, and report no tunnel.
 tunnel_url() {
-  curl -fsS --max-time 3 "$NGROK_API" 2>/dev/null | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-for t in d.get("tunnels", []):
-    u = t.get("public_url", "")
-    if u.startswith("https://"):
-        print(u); sys.exit(0)
-sys.exit(1)
-' 2>/dev/null
+  [[ -s "$TUNNEL_URL_FILE" ]] || return 1
+  local prov; prov="$(cached_tunnel_provider || true)"
+  case "$prov" in
+    ngrok|tunnl) ;;
+    *) clear_tunnel_cache; return 1 ;;
+  esac
+  if ! tunnel_pid "$prov" >/dev/null; then
+    clear_tunnel_cache
+    return 1
+  fi
+  head -1 "$TUNNEL_URL_FILE"
 }
 
 og_host_pid() {
@@ -651,20 +1013,63 @@ export_worker_scoping() {
 cmd_start() {
   # `og start`            -> local  (LAN only; the safe default)
   # `og start local`      -> same, explicit
-  # `og start tunneled`   -> ngrok, domain from og.env
-  # `og start tunneled X` -> ngrok on domain X
+  # `og start tunneled`   -> a public tunnel; provider from --use/og.env (ngrok
+  #                          is the default)
+  # `og start tunneled X` -> ngrok on reserved domain X
   # `og start X`          -> back-compat: a bare argument that is not a mode is
-  #                          a domain, which only ever meant tunneled.
-  local mode="local" domain=""
-  case "${1:-}" in
-    local)    mode="local";    shift ;;
-    tunneled) mode="tunneled"; shift; domain="${1:-${OG_NGROK_DOMAIN:-}}" ;;
-    "")       mode="${OG_DEFAULT_MODE:-local}"
-              [[ "$mode" == "tunneled" ]] && domain="${OG_NGROK_DOMAIN:-}" ;;
-    -*)       die "unknown option: $1  (try: og help)" ;;
-    *)        mode="tunneled"; domain="$1"; shift
+  #                          an ngrok domain, which only ever meant tunneled.
+  # `og start ... --use ngrok|tunnl[.gg]` -> provider for this run only.
+  #
+  # og has no flag parser anywhere else, but --use consumes a value so it cannot
+  # be one more positional case arm (see docs/TUNNEL-PROVIDERS.md): collect
+  # positionals and flags in one pass.
+  local use="" mode="local" domain="" provider
+  local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --use)
+        [[ -n "${2:-}" ]] || die "--use needs a provider: ngrok or tunnl"
+        use="$2"; shift 2 ;;
+      --use=*)
+        use="${1#--use=}"; shift ;;
+      -*) die "unknown option: $1  (try: og help)" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  # Precedence: --use > OG_TUNNEL_PROVIDER (og.env) > ngrok. An override is never
+  # written back to og.env.
+  if [[ -n "$use" ]]; then
+    provider="$(normalize_tunnel_provider "$use")" \
+      || die "unknown tunnel provider: $use  (valid: ngrok, tunnl)"
+  else
+    provider="$(normalize_tunnel_provider "${OG_TUNNEL_PROVIDER:-ngrok}")" \
+      || die "unknown OG_TUNNEL_PROVIDER: ${OG_TUNNEL_PROVIDER:-}  (valid: ngrok, tunnl)"
+  fi
+  case "${pos[0]:-}" in
+    local)    mode="local" ;;
+    tunneled) mode="tunneled"; domain="${pos[1]:-}" ;;
+    "")       mode="${OG_DEFAULT_MODE:-local}" ;;
+    *)        mode="tunneled"; domain="${pos[0]}"
+              if [[ "$provider" != "ngrok" ]]; then
+                die "'og start $domain' means an ngrok reserved domain, which provider '$provider' does not support.
+    Reserved names on tunnl.gg are a Pro feature. Run 'og start tunneled' for a free stable@ URL, or '--use ngrok'."
+              fi
               info "a bare argument is read as an ngrok domain; this is 'og start tunneled $domain'" ;;
   esac
+  # A domain is an ngrok concept: only ngrok takes the positional argument or
+  # OG_NGROK_DOMAIN. Under tunnl a positional domain is refused, never silently
+  # dropped; OG_NGROK_DOMAIN is simply not consulted.
+  if [[ "$mode" == "tunneled" ]]; then
+    if [[ "$provider" == "ngrok" ]]; then
+      domain="${domain:-${OG_NGROK_DOMAIN:-}}"
+    else
+      if [[ -n "$domain" ]]; then
+        die "'og start tunneled $domain' passes an ngrok reserved domain, which provider 'tunnl' does not support.
+    Reserved names on tunnl.gg are a Pro feature. Run 'og start tunneled' for a free stable@ URL, or '--use ngrok'."
+      fi
+      domain=""
+    fi
+  fi
   OG_MODE="$mode"
 
   # Before anything is started: with auto-update on, this re-execs the same
@@ -675,9 +1080,16 @@ cmd_start() {
     omnigent server status 2>&1 | sed 's/^/    /'
     die "Omnigent is already running. Run 'og stop' first (this will end live sessions)."
   fi
+  # A fresh start begins with no cached tunnel URL. The cache is written only in
+  # the tunneled branch below and otherwise persists across runs (surviving a
+  # reboot, or a tunnel that died on its own), so without this a LAN-only start
+  # would inherit and advertise a previous run's public URL. Placed AFTER the
+  # already-running guard so a refused start does not destroy the live tunnel's
+  # published URL; every failure past this point leaves no stale URL behind.
+  clear_tunnel_cache
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
   command -v omnigent >/dev/null || die "omnigent is not on PATH"
-  [[ "$mode" == "tunneled" ]] && { command -v ngrok >/dev/null || die "ngrok is not installed (https://ngrok.com/download)"; }
+  [[ "$mode" == "tunneled" ]] && tunnel_preflight "$provider"
 
   # Fail fast and name the culprit: without this, a busy port surfaces only
   # after ~30s of polling as a raw uvicorn traceback in the server log
@@ -707,38 +1119,43 @@ cmd_start() {
     ok "local mode: $url"
     info "reachable from devices on this network only"
   else
-  # ngrok v3 refuses to tunnel without an authtoken, and the failure is buried
-  # in its log — check up front so the message is actionable.
-  if ! ngrok config check >/dev/null 2>&1; then
-    die "ngrok has no authtoken. Get yours at https://dashboard.ngrok.com/get-started/your-authtoken then run:
-    ngrok config add-authtoken <token>"
-  fi
-
-  mkdir -p "$(dirname "$NGROK_LOG")"
-
-  if ngrok_pid >/dev/null; then
-    info "reusing the ngrok tunnel already running (pid $(ngrok_pid))"
-  else
-    local args=(http "$PORT" --log=stdout --log-format=logfmt)
-    [[ -n "$domain" ]] && args+=(--domain "${domain#https://}")
-    info "starting ngrok on port $PORT${domain:+ (domain: ${domain#https://})}"
-    nohup ngrok "${args[@]}" >"$NGROK_LOG" 2>&1 &
-    echo $! > "$NGROK_PIDFILE"
-  fi
+  tunnel_spawn "$provider" "$PORT" "$domain"
 
   # Poll for the URL rather than sleeping a fixed amount: cold starts vary.
   local i
   for i in $(seq 1 40); do
-    url="$(tunnel_url || true)"
+    url="$(tunnel_scrape "$provider" || true)"
     [[ -n "$url" ]] && break
-    if ! ngrok_pid >/dev/null; then
-      printf '\n--- ngrok log ---\n'; tail -15 "$NGROK_LOG" 2>/dev/null
-      rm -f "$NGROK_PIDFILE"
-      die "ngrok exited during startup (see log above)"
+    if ! tunnel_pid "$provider" >/dev/null; then
+      printf '\n--- %s log ---\n' "$provider"; tail -15 "$(tunnel_logfile "$provider")" 2>/dev/null
+      rm -f "$(tunnel_pidfile "$provider")"
+      die "$provider exited during startup (see log above)"
     fi
     sleep 0.5
   done
-  [[ -n "$url" ]] || { tail -15 "$NGROK_LOG" 2>/dev/null; die "timed out waiting for the ngrok URL"; }
+  if [[ -z "$url" ]]; then
+    if [[ "$provider" == "ngrok" ]]; then
+      tail -15 "$(tunnel_logfile "$provider")" 2>/dev/null
+      die "timed out waiting for the ngrok URL"
+    fi
+    printf '\n--- %s log ---\n' "$provider"; tail -15 "$(tunnel_logfile "$provider")" 2>/dev/null
+    die "could not find a URL in tunnl's output (see log above)"
+  fi
+  # The URL is not proof the tunnel is up: both providers can print the URL and
+  # then die moments later — for tunnl that is the *normal* failure mode (stdin
+  # EOF, or the 2h idle cap). Reporting success here would hand the user a dead
+  # link, so assert the child is still alive before caching the URL.
+  if ! tunnel_pid "$provider" >/dev/null; then
+    printf '\n--- %s log ---\n' "$provider"; tail -15 "$(tunnel_logfile "$provider")" 2>/dev/null
+    die "$provider printed a URL but the tunnel process is gone — the URL would be dead"
+  fi
+  # Written as soon as the URL is known, for both providers, so `og url` and
+  # `og status` are provider-agnostic. The provider is recorded first: a URL with
+  # no owner recorded reads as no tunnel, so the order never exposes a URL that
+  # tunnel_url cannot vouch for.
+  printf '%s\n' "$provider" > "$TUNNEL_PROVIDER_FILE"
+  printf '%s\n' "$url" > "$TUNNEL_URL_FILE"
+  [[ "$provider" == "tunnl" ]] && record_tunnl_expiry
   ok "tunnel up: $url"
   fi
   # From here on the address is known, so guarantee it reaches the user no
@@ -1204,15 +1621,13 @@ cmd_stop() {
     info "omnigent was not running"
   fi
 
-  if ngrok_pid >/dev/null; then
-    local p; p="$(ngrok_pid)"
-    info "stopping ngrok (pid $p)"
-    kill "$p" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
-    kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+  # Stop whichever tunnel provider is actually running, plus a tunnel left by an
+  # older og under the legacy pidfile. Checking both is what makes a stop after a
+  # provider switch safe.
+  if tunnel_stop; then
     stopped=1
   else
-    info "no ngrok tunnel started by og"
+    info "no tunnel started by og"
   fi
   # Destroy the session so nothing survives to go stale. Only the CLI/daemon
   # token is dropped — a browser already signed in keeps its own cookie, so a
@@ -1222,7 +1637,9 @@ cmd_stop() {
     stopped=1
   fi
 
-  rm -f "$NGROK_PIDFILE" "$SERVER_PIDFILE" "$HOST_PIDFILE"
+  rm -f "$(tunnel_pidfile ngrok)" "$(tunnel_pidfile tunnl)" "$LEGACY_NGROK_PIDFILE" \
+        "$TUNNEL_URL_FILE" "$TUNNEL_PROVIDER_FILE" "$TUNNEL_EXPIRY_FILE" "$TUNNL_FIFO" \
+        "$SERVER_PIDFILE" "$HOST_PIDFILE"
 
   # `omnigent stop` stops the host daemons and the background server, and the
   # daemon reaps its own runners on exit. What it does NOT do is tear down the
@@ -1307,10 +1724,20 @@ cmd_status() {
   else
     echo "    omnigent: not running"
   fi
-  if ngrok_pid >/dev/null; then
-    echo "    ngrok:    pid $(ngrok_pid)  $(tunnel_url || echo '(no https tunnel yet)')"
+  # Provider-agnostic: the URL comes from the cache both providers write, and the
+  # provider from whichever pidfile is live. tunnl's parsed expiry is shown so
+  # its 24h cap is visible rather than surprising.
+  local tprov; tprov="$(running_tunnel_provider || true)"
+  if [[ -n "$tprov" ]]; then
+    local tpid; tpid="$(tunnel_pid "$tprov" || true)"
+    [[ -z "$tpid" ]] && tpid="$(legacy_tunnel_pid || true)"
+    echo "    tunnel:   $tprov  pid ${tpid:-?}  $(tunnel_url || echo '(no https URL cached yet)')"
+    if [[ "$tprov" == "tunnl" ]]; then
+      local exp; exp="$(tunnel_expiry_left || true)"
+      [[ -n "$exp" ]] && echo "    expires:  $exp  (tunnl cap; 2h idle)"
+    fi
   else
-    echo "    ngrok:    not running"
+    echo "    tunnel:   not running"
   fi
   local ttl; ttl="$(token_ttl_left || true)"
   local cu; cu="$(cred_user || true)"
@@ -1424,7 +1851,7 @@ cmd_chat() {
 }
 
 cmd_url() {
-  local url; url="$(tunnel_url)" || die "no ngrok tunnel is running"
+  local url; url="$(tunnel_url)" || die "no tunnel is running"
   echo "$url"
   [[ -t 1 ]] && print_qr "$url" >&2
   return 0

@@ -172,6 +172,8 @@ def _base_plan(**overrides):
         "accounts": {},
         "port": 6767,
         "ngrok_domain": "",
+        "tunnel_provider": "ngrok",
+        "tunnl_ssh_key": "",
         "max_dispatches": 4,
         "bin_dir": "/tmp/bin",
         "default_mode": "local",
@@ -1881,7 +1883,8 @@ FOUR_CODER_PLAN = {
                {"id": "opencode", "priority": 2, "model": "opencode/mimo-v2.6-flash-free"},
                {"id": "kilo", "priority": 3, "model": "kilo/kilo-auto/free"},
                {"id": "freebuff", "priority": 4, "model": "z-ai/glm-5.3-flash"}],
-    "reviewer": {"id": "codex"}, "port": 6767, "ngrok_domain": "", "max_dispatches": 4,
+    "reviewer": {"id": "codex"}, "port": 6767, "ngrok_domain": "",
+    "tunnel_provider": "ngrok", "tunnl_ssh_key": "", "max_dispatches": 4,
 }
 
 
@@ -2778,6 +2781,120 @@ def test_registry_comment_documents_the_role_unverified_fields():
     comment = "\n".join(m.REGISTRY["$comment"])
     assert "unverified_roles" in comment
     assert "roles_note" in comment
+
+
+# --------------------------------------------------------------------------
+# tunnel_provider / tunnl_ssh_key -- tunnl.gg alongside ngrok
+# --------------------------------------------------------------------------
+def test_emit_questions_offers_the_tunnel_provider_knob(monkeypatch, capsys):
+    # A choice knob on the default_mode template: ngrok stays the default and
+    # tunnl is offered beside it, so an AI installer can drive the choice.
+    monkeypatch.setattr(m, "scan", lambda: {"codex": "/bin/codex"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    tp = next(x for x in q["questions"] if x["key"] == "tunnel_provider")
+    assert tp["type"] == "choice"
+    assert tp["choices"] == ["ngrok", "tunnl"]
+    assert tp["default"] == "ngrok"
+    # ...and the dedicated tunnl key is a path question defaulting under OMNI.
+    tk = next(x for x in q["questions"] if x["key"] == "tunnl_ssh_key")
+    assert tk["type"] == "path"
+    assert tk["default"] == m.default_tunnl_key()
+
+
+def test_og_env_carries_the_tunnel_provider_and_key(tmp_path, monkeypatch):
+    env = _og_env(tmp_path, monkeypatch, _base_plan(
+        tunnel_provider="tunnl", tunnl_ssh_key="/sandbox/tunnl_ed25519"))
+    assert "OG_TUNNEL_PROVIDER=tunnl\n" in env
+    assert "OG_TUNNL_SSH_KEY=/sandbox/tunnl_ed25519\n" in env
+
+
+def test_og_env_tunnel_knobs_default_to_ngrok(tmp_path, monkeypatch):
+    # Keys absent from a plan (an older hand-written JSON) must behave like a
+    # fresh ngrok install, with the key path resolving under OMNI -- never the
+    # invoking user's real HOME.
+    plan = _base_plan()
+    plan.pop("tunnel_provider", None)
+    plan.pop("tunnl_ssh_key", None)
+    env = _og_env(tmp_path, monkeypatch, plan)
+    assert "OG_TUNNEL_PROVIDER=ngrok\n" in env
+    assert f"OG_TUNNL_SSH_KEY={tmp_path / 'tunnl_ed25519'}\n" in env
+
+
+def test_ensure_tunnl_key_generates_a_missing_key(tmp_path, monkeypatch):
+    key = tmp_path / "keys" / "tunnl_ed25519"
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        key.write_text("PRIVATE")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    m.ensure_tunnl_key({"tunnel_provider": "tunnl", "tunnl_ssh_key": str(key)})
+    assert seen, "ssh-keygen was not invoked for a missing key"
+    cmd = seen[0]
+    assert cmd[:3] == ["ssh-keygen", "-t", "ed25519"]
+    assert cmd[cmd.index("-f") + 1] == str(key)
+    assert (key.stat().st_mode & 0o777) == 0o600
+
+
+def test_ensure_tunnl_key_leaves_an_existing_key_byte_identical(tmp_path, monkeypatch):
+    # Regenerating would silently move the user's stable tunnl.gg URL.
+    key = tmp_path / "tunnl_ed25519"
+    key.write_text("ORIGINAL-KEY-BYTES")
+    before = key.read_bytes()
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: pytest.fail("ssh-keygen must not run for an existing key"))
+    m.ensure_tunnl_key({"tunnel_provider": "tunnl", "tunnl_ssh_key": str(key)})
+    assert key.read_bytes() == before
+
+
+def test_ensure_tunnl_key_uses_the_default_path_under_omni(tmp_path, monkeypatch):
+    # No tunnl_ssh_key in the plan: it lands under OMNI (the sandbox), not HOME.
+    monkeypatch.setattr(m, "OMNI", tmp_path / "omnigent")
+    key = tmp_path / "omnigent" / "tunnl_ed25519"
+
+    def fake_run(cmd, **kw):
+        Path(cmd[cmd.index("-f") + 1]).write_text("PRIVATE")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    m.ensure_tunnl_key({"tunnel_provider": "tunnl"})
+    assert key.exists()
+
+
+def test_ensure_tunnl_key_is_a_noop_for_ngrok(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        lambda *a, **k: pytest.fail("ngrok must not generate a tunnl key"))
+    m.ensure_tunnl_key({"tunnel_provider": "ngrok",
+                        "tunnl_ssh_key": str(tmp_path / "tunnl_ed25519")})
+    assert not (tmp_path / "tunnl_ed25519").exists()
+
+
+def test_validate_rejects_an_unknown_tunnel_provider():
+    # A typo in a hand-written plan must be refused, not written to og.env.
+    issues = m.validate(_base_plan(tunnel_provider="tuunl"))
+    assert any(level == "error" and "tunnel_provider" in msg for level, msg in issues)
+
+
+def test_validate_accepts_both_tunnel_providers():
+    for provider in ("ngrok", "tunnl"):
+        issues = m.validate(_base_plan(tunnel_provider=provider))
+        assert not any(level == "error" for level, _ in issues), provider
+
+
+def test_show_displays_the_tunnel_provider_and_key(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "codex": "/bin/codex"})
+    state = _base_plan(tunnel_provider="tunnl", tunnl_ssh_key="/sandbox/tunnl_ed25519")
+    m.show(state)
+    out = capsys.readouterr().out
+    assert "tunnl" in out
+    assert "/sandbox/tunnl_ed25519" in out
 
 
 # --------------------------------------------------------------------------

@@ -919,19 +919,32 @@ def build_plan_interactive(state: dict) -> dict:
             break
         if ask_yes(f"port {port} looks like it's already in use — use it anyway?", default=False):
             break
-    domain = ask("Reserved ngrok domain (blank = ephemeral URL each start)",
+    domain = ask("Reserved ngrok domain — ngrok only (blank = ephemeral URL each start)",
                  state.get("ngrok_domain", ""))
+    say()
+    say(f"{C['dim']}  ngrok = public URL via ngrok; needs a free ngrok account{C['x']}")
+    say(f"{C['dim']}  tunnl = public URL via tunnl.gg; a dedicated key keeps one URL{C['x']}")
+    tunnel_provider = pick_one(
+        "Which tunnel provider?",
+        [("ngrok", "ngrok — reserved or ephemeral ngrok domain (recommended)", None),
+         ("tunnl", "tunnl.gg — SSH tunnel with a stable key-derived URL", None)],
+        state.get("tunnel_provider", "ngrok"))
+    if tunnel_provider == "tunnl":
+        tunnl_ssh_key = ask("tunnl.gg SSH key path (dedicated — it names your stable URL)",
+                            state.get("tunnl_ssh_key") or default_tunnl_key())
+    else:
+        tunnl_ssh_key = state.get("tunnl_ssh_key") or default_tunnl_key()
     max_dispatch = ask("Max worker dispatches per orchestrator turn",
                        str(state.get("max_dispatches", 4)))
     bin_dir = ask("Install the `og` command where?",
                   state.get("bin_dir") or str(default_bin_dir()))
     say()
     say(f"{C['dim']}  local    = LAN only; the QR points at this machine's network IP{C['x']}")
-    say(f"{C['dim']}  tunneled = ngrok public URL, reachable from anywhere{C['x']}")
+    say(f"{C['dim']}  tunneled = public URL via the chosen tunnel provider{C['x']}")
     default_mode = pick_one(
         "What should a bare `og start` do?",
         [("local", "local — LAN only (recommended)", None),
-         ("tunneled", "tunneled — start ngrok and expose a public URL", None)],
+         ("tunneled", "tunneled — start a tunnel and expose a public URL", None)],
         state.get("default_mode", "local"))
     say()
     say(f"{C['dim']}  `og` is copied out of this checkout; a `git pull` here changes nothing{C['x']}")
@@ -949,6 +962,8 @@ def build_plan_interactive(state: dict) -> dict:
         "accounts": accounts,
         "port": int(port),
         "ngrok_domain": domain,
+        "tunnel_provider": tunnel_provider,
+        "tunnl_ssh_key": tunnl_ssh_key,
         "max_dispatches": int(max_dispatch),
         "bin_dir": bin_dir,
         "default_mode": default_mode,
@@ -1239,6 +1254,18 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            f"orchestrator prompt is {quoted} bytes shell-quoted — within "
                            f"{PROMPT_CEILING - quoted} of the tmux ceiling. Put new guidance in "
                            "skills/, not the prompt."))
+
+    # An unknown provider would reach og.env verbatim, and `og start tunneled`
+    # would have no tunnel to start. Refuse it here rather than write a bogus
+    # value; the sibling knobs are unvalidated, so this is the one guard the
+    # knob needs, not a validation layer for it.
+    provider = plan.get("tunnel_provider", "ngrok")
+    if provider not in TUNNEL_PROVIDERS:
+        issues.append(("error",
+                       f"tunnel_provider must be one of "
+                       f"{', '.join(TUNNEL_PROVIDERS)} — got {provider!r}. "
+                       "`og start tunneled` has no tunnel to start from an "
+                       "unknown provider."))
     return issues
 
 
@@ -2287,6 +2314,11 @@ def write_og_env(plan: dict) -> None:
     else:
         lines += ["# OG_NGROK_DOMAIN=your-name.ngrok.app   # a reserved domain keeps",
                   "#   invite links and session cookies working across restarts."]
+    lines += ["", "# Which tunnel `og start tunneled` uses.",
+              f"OG_TUNNEL_PROVIDER={plan.get('tunnel_provider', 'ngrok')}",
+              "# The dedicated tunnl.gg key. tunnl.gg derives the stable URL from",
+              "# it, so do not point this at your personal key or regenerate it.",
+              f"OG_TUNNL_SSH_KEY={resolve_tunnl_key(plan)}"]
     # Every id with its own account gets an env line, not just the primary
     # reviewer. Interactive now collects `accounts` for every id in every chain,
     # but this only ever emitted the head's -- so a BACKUP reviewer configured
@@ -2342,6 +2374,11 @@ def apply(plan: dict, dry_run: bool = False) -> None:
         ok(f"dry run: {plan['agent_name']} would be written to {bundle}")
         say(json.dumps(plan, indent=2))
         return
+
+    # tunnl.gg names its stable URL from a dedicated key, so it must be created
+    # once and never regenerated. Done before any config is written, so a
+    # failure here refuses the install instead of half-applying one.
+    ensure_tunnl_key(plan)
 
     # 1. agent bundle
     (bundle / "agents").mkdir(parents=True, exist_ok=True)
@@ -2485,6 +2522,54 @@ def resolve_bin_dir(plan: dict) -> Path:
     if raw:
         return Path(os.path.expanduser(os.path.expandvars(raw))).resolve()
     return default_bin_dir()
+
+
+TUNNEL_PROVIDERS = ("ngrok", "tunnl")
+
+
+def default_tunnl_key() -> str:
+    """Where the dedicated tunnl.gg key goes when the user names no path.
+
+    Under OMNI, which is $OMNIGENT_HOME or ~/.omnigent, so the AGENTS.md
+    sandbox recipe (`HOME=$S OMNIGENT_HOME=$S/.omnigent`) writes the key into
+    the sandbox rather than the invoking user's real ~/.omnigent.
+    """
+    return str(OMNI / "tunnl_ed25519")
+
+
+def resolve_tunnl_key(plan: dict) -> str:
+    """Precedence: plan value > default. Expanded, so a `~` in a hand-written
+    plan still lands in the right place."""
+    raw = plan.get("tunnl_ssh_key") or default_tunnl_key()
+    return str(Path(os.path.expanduser(os.path.expandvars(raw))))
+
+
+def ensure_tunnl_key(plan: dict) -> None:
+    """Create the dedicated tunnl.gg key once; never overwrite an existing one.
+
+    tunnl.gg derives the stable URL from this key's public half, so
+    regenerating it silently changes the user's URL on the next reconnect.
+    An existing private key is therefore left byte-identical and only a
+    missing one is generated. No-op unless the resolved provider is tunnl.
+    """
+    if plan.get("tunnel_provider", "ngrok") != "tunnl":
+        return
+    key = Path(resolve_tunnl_key(plan))
+    if key.exists():
+        return
+    key.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        out = subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key),
+             "-C", "og tunnl.gg stable URL"],
+            capture_output=True, text=True)
+    except FileNotFoundError:
+        die("tunnl.gg needs `ssh-keygen` to create its dedicated key, but it "
+            "is not on PATH. Install OpenSSH and re-run.")
+    if out.returncode != 0:
+        die(f"could not generate the tunnl.gg key at {key}:\n"
+            f"    {out.stderr.strip() or out.stdout.strip()}")
+    key.chmod(0o600)
 
 
 POLICY_MODULE = "omnigent_local_policies"
@@ -2689,7 +2774,15 @@ def emit_questions() -> None:
                             if (a.get("multi_account") or {}).get("supported")]},
             {"key": "port", "type": "int", "default": 6767, "ask": "Omnigent server port?"},
             {"key": "ngrok_domain", "type": "string", "default": "",
-             "ask": "Reserved ngrok domain? Blank means a new URL each start."},
+             "ask": "Reserved ngrok domain? Blank means a new URL each start. "
+                    "Applies to ngrok only."},
+            {"key": "tunnel_provider", "type": "choice", "choices": ["ngrok", "tunnl"],
+             "default": "ngrok",
+             "ask": "Which tunnel provider should `og start tunneled` use? ngrok is "
+                    "the default; tunnl.gg needs a dedicated SSH key."},
+            {"key": "tunnl_ssh_key", "type": "path", "default": default_tunnl_key(),
+             "ask": "Path to the dedicated tunnl.gg SSH key. It names the stable URL, "
+                    "so keep it; ngrok installs can leave the default."},
             {"key": "max_dispatches", "type": "int", "default": 4,
              "ask": "Max worker dispatches per orchestrator turn?"},
             {"key": "default_mode", "type": "choice", "choices": ["local", "tunneled"],
@@ -2763,6 +2856,8 @@ def show(state: dict) -> None:
         say(f"{C['b']}account{C['x']}       {reg[aid]['label']} → {path}")
     say(f"{C['b']}port{C['x']}          {state['port']}")
     say(f"{C['b']}ngrok{C['x']}         {state.get('ngrok_domain') or '(ephemeral)'}")
+    say(f"{C['b']}tunnel{C['x']}        {state.get('tunnel_provider', 'ngrok')}")
+    say(f"{C['b']}tunnl key{C['x']}     {resolve_tunnl_key(state)}")
     say(f"{C['b']}og command{C['x']}    {resolve_bin_dir(state) / 'og'}")
     say(f"{C['b']}og start{C['x']}      {state.get('default_mode', 'local')}")
     say(f"{C['b']}auto-update{C['x']}   {'on' if state.get('auto_update', True) else 'off (og start warns; og update applies)'}")
