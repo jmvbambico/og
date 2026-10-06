@@ -15,7 +15,7 @@ judges the batched diff. Policies, not prompts, enforce what may be merged.
 [![Release](https://img.shields.io/github/v/release/jmvbambico/og)](https://github.com/jmvbambico/og/releases)
 [![License: WTFPL](https://img.shields.io/badge/license-WTFPL-blue.svg)](http://www.wtfpl.net/about/)
 
-`og` is the control script (server + ngrok tunnel + agent registration);
+`og` is the control script (server + public tunnel + agent registration);
 `install.sh` is the interactive installer that generates the agent bundle for
 whichever CLIs you actually have.
 
@@ -44,7 +44,7 @@ Omnigent gives you the runtime. This repo is the *opinionated setup on top*:
 ## Architecture
 
 ```
-                 you (terminal, or phone via the ngrok URL)
+                 you (terminal, or phone via the tunnel URL)
                                   │
                           ┌───────▼────────┐
                           │  og  (bash)    │  tunnel → server → register agent
@@ -120,7 +120,7 @@ one.
 | `<omnigent venv>/site-packages/omnigent-local-policies.pth` | puts that directory on **omnigent's** `sys.path` (resolved from the `omnigent` entry point, verified by importing) |
 | `~/.omnigent/config.yaml` | patched: `policy_modules`, `acp.agents`, `default_agent` |
 | `~/.omnigent/opencode/opencode.json` | OpenCode worker overrides: drops the blocking `question` tool; wires a code-intelligence MCP (e.g. CodeGraph) when its CLI is on PATH. Only when OpenCode is a coder, not the orchestrator |
-| `~/.omnigent/og.env` | `OG_AGENT`, `OG_PORT`, ngrok domain, reviewer account, `OG_AUTO_UPDATE` |
+| `~/.omnigent/og.env` | `OG_AGENT`, `OG_PORT`, tunnel provider + ngrok domain, reviewer account, `OG_AUTO_UPDATE` |
 | `~/.omnigent/og-install.json` | **your choices — the source of truth** |
 
 The YAML bundles are *generated artifacts*. Edit `og-install.json` and re-run,
@@ -150,7 +150,8 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | | Why |
 |---|---|
 | `gh` | only for projects hosted on GitHub whose delivery ends in a PR: the orchestrator opens it, and the merge gate reads the review marker from its body. Without it the gate denies protected-branch merges (the safe side); everything else — dispatch, worktrees, review — runs as normal. |
-| `ngrok` | only for `og start tunneled`: a public URL so you can drive a run from outside your network. A *reserved domain* keeps invite links and session cookies working across restarts. |
+| `ngrok` | only for `og start tunneled` on the default provider: a public URL so you can drive a run from outside your network. A *reserved domain* keeps invite links and session cookies working across restarts. |
+| `ssh` | only for `og start tunneled --use tunnl.gg`: that provider *is* an ssh reverse tunnel, so there is nothing to install on macOS, Linux or Windows 10+. No account either. |
 | `qrencode` | prints the tunnel URL as a QR block |
 
 **At least one coding CLI.** Run `./install.sh --check` to see what you have.
@@ -321,7 +322,8 @@ The installer will ask you to:
    (`CLAUDE_CONFIG_DIR`, e.g. `~/.claude-work`) so it is independent of your
    interactive login
 9. port (checked for availability — suggests a free one if the default is
-   taken), ngrok domain, max dispatches per turn
+   taken), **which tunnel provider** `og start tunneled` should use by default
+   (`ngrok` or `tunnl`), the ngrok reserved domain, max dispatches per turn
 10. **where the `og` command is installed** — defaults to a directory already on
     your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
     isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
@@ -368,7 +370,8 @@ what to ask the user, the constraints to respect, and how to verify the result.
 
 ```
 og start            serve on your LAN — QR points at this machine's network IP
-og start tunneled   start ngrok first, then serve behind that public origin
+og start tunneled   start the tunnel first, then serve behind that public origin
+                    --use ngrok|tunnl.gg overrides the configured provider
 og init [path]      scaffold a repo's orchestration contract
 og stop             stop server, host daemons, tunnel
 og restart [mode]   og stop, then og start — same arguments as start
@@ -401,7 +404,7 @@ The file backend is the floor, not a bug: it has the same protection as
 
 ### local vs tunneled
 
-**`og start` is local by default.** No tunnel, no ngrok account, nothing
+**`og start` is local by default.** No tunnel, no third-party account, nothing
 exposed to the internet: the server binds `0.0.0.0` and the QR encodes
 `http://<your-LAN-IP>:<port>`, which any device on the same wifi can open.
 Login is still required — a LAN is still a network.
@@ -417,15 +420,70 @@ straight through to attaching the host daemon. This only happens when `og
 start` is run from an interactive terminal; a non-interactive run (e.g. from a
 script) falls back to printing `og login` as a manual next step.
 
-**`og start tunneled`** brings up ngrok first and serves behind that origin.
-The server needs its public origin *at boot*, which is why the tunnel starts
-first: otherwise the phone gets WebSocket 4403 and HTTP 403 on chat. Use this
-when you need to drive a run from outside your network. A reserved domain
-(`OG_NGROK_DOMAIN`) keeps invite links and cookies working across restarts.
+**`og start tunneled`** brings the tunnel up first and serves behind that
+origin. The server needs its public origin *at boot*, which is why the tunnel
+starts first: otherwise the phone gets WebSocket 4403 and HTTP 403 on chat. Use
+this when you need to drive a run from outside your network.
 
 Flip the default for a bare `og start` with `OG_DEFAULT_MODE` in `og.env`. A
 bare argument is still read as an ngrok domain, so the old
 `og start my.ngrok.app` keeps working.
+
+### Tunnel providers
+
+Two are supported. **ngrok is the default**; `tunnl.gg` exists for when ngrok
+cannot serve you — its free tier has a monthly bandwidth cap and allows one
+agent per machine, so a box already exposing a port through ngrok has no spare
+slot.
+
+| | `ngrok` (default) | `tunnl.gg` |
+|---|---|---|
+| install | the `ngrok` binary | none — it is plain `ssh` |
+| account | authtoken required | none |
+| monthly bandwidth | capped on the free tier | no monthly cap |
+| concurrent tunnels | 1 on the free tier | 3 per IP |
+| stable URL | reserved domain (paid) | free, tied to an ssh key |
+| chosen name | reserved domain (paid) | Pro only — **not supported here** |
+| tunnel lifetime | unlimited | **24 h, or 2 h with no requests** |
+| latency | — | ~500 ms per request |
+
+Pick the default in `og setup` (question 9), or set `OG_TUNNEL_PROVIDER` in
+`og.env`. Override it for a single run:
+
+```
+og start tunneled --use tunnl.gg     # this run only; nothing is written back
+og restart tunneled --use ngrok
+og start tunneled --use tunnl        # `tunnl` and `tunnl.gg` both work
+```
+
+Precedence is `--use` → `OG_TUNNEL_PROVIDER` → `ngrok`. An unknown value is an
+error, never a silent fallback to the default.
+
+**ngrok.** A reserved domain (`OG_NGROK_DOMAIN`, or a positional
+`og start tunneled <domain>`) keeps invite links and cookies working across
+restarts. `og` discovers its *own* agent's local API address from the log it
+writes, rather than assuming `127.0.0.1:4040` — so a second unrelated ngrok
+agent on the box can no longer make `og` adopt that other project's URL.
+
+**tunnl.gg.** `og setup` generates a dedicated ed25519 key at
+`~/.omnigent/tunnl_ed25519` and connects as `stable@`, which derives the
+subdomain from that key so the URL survives reconnects. That matters more than
+it sounds: the server bakes its public origin into its environment at launch, so
+a URL that changed underneath it would strand auth cookies and the WebSocket
+origin allowlist with no way to repair them short of a restart. The key is
+generated once and never regenerated — overwriting it would silently change your
+URL. `OG_TUNNL_RANDOM=1` opts into a throwaway URL instead.
+
+Two consequences of tunnl.gg's caps, worth knowing before you rely on it: a
+tunnel dies at 24 h or after 2 h without traffic, and `og` does not yet
+reconnect for you — `og status` shows the remaining time so the limit is
+visible rather than surprising. Reserved names are a Pro feature, so a domain
+argument under `--use tunnl.gg` is refused rather than quietly ignored.
+
+`og` never switches providers by itself: if ngrok cannot serve, it says so and
+stops rather than silently changing your public URL. See
+[`docs/TUNNEL-PROVIDERS.md`](docs/TUNNEL-PROVIDERS.md) for the design record and
+the measured behaviour behind these choices.
 
 One consequence worth knowing: a non-loopback bind is not the "canonical local
 server" as far as Omnigent is concerned, so `omnigent server status` and
