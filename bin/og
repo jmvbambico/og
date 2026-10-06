@@ -41,6 +41,11 @@ OMNI_HOME="$HOME/.omnigent"
 # (which kills the tunnel seconds after it prints its URL).
 LEGACY_NGROK_PIDFILE="$OMNI_HOME/og-ngrok.pid"
 TUNNEL_URL_FILE="$OMNI_HOME/og-tunnel.url"
+# Which provider wrote $TUNNEL_URL_FILE. A cached URL is only valid while the
+# tunnel that wrote it is alive, and "alive" must be checked against the RIGHT
+# pidfile — so the provider is recorded beside the URL rather than inside it,
+# keeping $TUNNEL_URL_FILE a bare URL (`og url` still prints just the URL).
+TUNNEL_PROVIDER_FILE="$OMNI_HOME/og-tunnel.provider"
 TUNNEL_EXPIRY_FILE="$OMNI_HOME/og-tunnel.expiry"
 TUNNL_FIFO="$OMNI_HOME/og-tunnl.fifo"
 # tunnl prints a request-table row per request for the tunnel's whole life, so a
@@ -793,9 +798,37 @@ same_path() {
   [[ "$a" == "$b" ]]
 }
 
-# Read the public https URL out of the provider-agnostic cache.
+# The provider that wrote the cached URL, or empty when none is recorded.
+cached_tunnel_provider() {
+  [[ -s "$TUNNEL_PROVIDER_FILE" ]] || return 1
+  head -1 "$TUNNEL_PROVIDER_FILE"
+}
+
+# Invalidate the URL cache: the URL, its owning provider, and tunnl's expiry.
+# Called at the start of every `og start` (see cmd_start) and whenever the cached
+# URL's owner is found dead.
+clear_tunnel_cache() {
+  rm -f "$TUNNEL_URL_FILE" "$TUNNEL_PROVIDER_FILE" "$TUNNEL_EXPIRY_FILE"
+}
+
+# Read the public https URL out of the provider-agnostic cache — but only while
+# the tunnel that wrote it is still alive. Unlike the old live-API poll, the
+# cache is not self-validating: a tunnel can die with no `og stop` (tunnl's 2h
+# idle / 24h caps, a network drop, an ngrok crash, a reboot, a SIGKILL), leaving
+# a file that advertises a dead link. Validate against the owning provider's
+# pidfile (the same liveness notion tunnel_pid uses); if the owner is gone, clear
+# the cache so the next caller is not misled, and report no tunnel.
 tunnel_url() {
   [[ -s "$TUNNEL_URL_FILE" ]] || return 1
+  local prov; prov="$(cached_tunnel_provider || true)"
+  case "$prov" in
+    ngrok|tunnl) ;;
+    *) clear_tunnel_cache; return 1 ;;
+  esac
+  if ! tunnel_pid "$prov" >/dev/null; then
+    clear_tunnel_cache
+    return 1
+  fi
   head -1 "$TUNNEL_URL_FILE"
 }
 
@@ -968,6 +1001,13 @@ cmd_start() {
     omnigent server status 2>&1 | sed 's/^/    /'
     die "Omnigent is already running. Run 'og stop' first (this will end live sessions)."
   fi
+  # A fresh start begins with no cached tunnel URL. The cache is written only in
+  # the tunneled branch below and otherwise persists across runs (surviving a
+  # reboot, or a tunnel that died on its own), so without this a LAN-only start
+  # would inherit and advertise a previous run's public URL. Placed AFTER the
+  # already-running guard so a refused start does not destroy the live tunnel's
+  # published URL; every failure past this point leaves no stale URL behind.
+  clear_tunnel_cache
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
   command -v omnigent >/dev/null || die "omnigent is not on PATH"
   [[ "$mode" == "tunneled" ]] && tunnel_preflight "$provider"
@@ -1031,7 +1071,10 @@ cmd_start() {
     die "$provider printed a URL but the tunnel process is gone — the URL would be dead"
   fi
   # Written as soon as the URL is known, for both providers, so `og url` and
-  # `og status` are provider-agnostic.
+  # `og status` are provider-agnostic. The provider is recorded first: a URL with
+  # no owner recorded reads as no tunnel, so the order never exposes a URL that
+  # tunnel_url cannot vouch for.
+  printf '%s\n' "$provider" > "$TUNNEL_PROVIDER_FILE"
   printf '%s\n' "$url" > "$TUNNEL_URL_FILE"
   [[ "$provider" == "tunnl" ]] && record_tunnl_expiry
   ok "tunnel up: $url"
@@ -1516,7 +1559,7 @@ cmd_stop() {
   fi
 
   rm -f "$(tunnel_pidfile ngrok)" "$(tunnel_pidfile tunnl)" "$LEGACY_NGROK_PIDFILE" \
-        "$TUNNEL_URL_FILE" "$TUNNEL_EXPIRY_FILE" "$TUNNL_FIFO" \
+        "$TUNNEL_URL_FILE" "$TUNNEL_PROVIDER_FILE" "$TUNNEL_EXPIRY_FILE" "$TUNNL_FIFO" \
         "$SERVER_PIDFILE" "$HOST_PIDFILE"
 
   # `omnigent stop` stops the host daemons and the background server, and the
