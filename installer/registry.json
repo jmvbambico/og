@@ -72,12 +72,6 @@
       "vendor": "anthropic",
       "relay": true,
       "silent_model_failure": false,
-      "multi_account": {
-        "supported": true,
-        "env": "CLAUDE_CONFIG_DIR",
-        "default_dir": "$HOME/.claude-work",
-        "note": "claude-native honours $CLAUDE_CONFIG_DIR, so a second account can run the reviewer independently of your interactive Claude Code login. The in-process claude-sdk harness ignores it."
-      },
       "model": {
         "required": false,
         "pin_path": "executor.model",

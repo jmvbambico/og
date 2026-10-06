@@ -167,7 +167,7 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 
 | Agent | Harness | Roles | Model pin | Notes |
 |---|---|---|---|---|
-| Claude Code | `claude-native` | orch / coder / reviewer | optional | multi-account via `CLAUDE_CONFIG_DIR` |
+| Claude Code | `claude-native` | orch / coder / reviewer | optional |  |
 | OpenCode (Zen) | `opencode-native` | orch / coder | **required** | lists every provider you've added with `opencode auth login` (Zen, DeepSeek, Anthropic, …); Zen's free `-free` lineup rotates and is day-capped |
 | Codex | `codex-native` | orch / coder / reviewer | optional — 4 static choices | the CLI does not enumerate models, so the picker offers a static list and accepts a hand-typed newer id |
 | Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model**; runs with `--auto-approve true` (see below) |
@@ -318,17 +318,14 @@ The installer will ask you to:
    Skip it and the bundle has no scout spec at all
 7. optionally pick an **integrator** — runs git, worktree and gate plumbing and
    **never decides a merge**. Also skippable
-8. for Claude, whether the reviewer runs on a **second account**
-   (`CLAUDE_CONFIG_DIR`, e.g. `~/.claude-work`) so it is independent of your
-   interactive login
-9. port (checked for availability — suggests a free one if the default is
+8. port (checked for availability — suggests a free one if the default is
    taken), **which tunnel provider** `og start tunneled` should use by default
    (`ngrok` or `tunnl`), the ngrok reserved domain, max dispatches per turn
-10. **where the `og` command is installed** — defaults to a directory already on
-    your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
-    isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
-    or `"bin_dir"` in a plan.
-11. whether `og start` should **auto-update** (default yes) — see
+9. **where the `og` command is installed** — defaults to a directory already on
+   your `PATH` (`~/.local/bin` or `~/bin`), and warns if the one you choose
+   isn't. Override without being asked via `OG_BIN_DIR=/some/bin ./install.sh`,
+   or `"bin_dir"` in a plan.
+10. whether `og start` should **auto-update** (default yes) — see
     [Updating](#updating). Off, it only warns when a newer og exists.
 
 Then:
@@ -375,7 +372,7 @@ og start tunneled   start the tunnel first, then serve behind that public origin
 og init [path]      scaffold a repo's orchestration contract
 og stop             stop server, host daemons, tunnel
 og restart [mode]   og stop, then og start — same arguments as start
-og setup            re-run the installer: agents, models, reviewer, accounts
+og setup            re-run the installer: agents, models, reviewer
 og status           what is running, and the URL
 og chat             open an orchestrator session in this terminal
 og url              print the URL (pipe-friendly)

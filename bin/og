@@ -59,7 +59,7 @@ HOST_LOGDIR="$OMNI_HOME/logs/host"
 SERVER_LOGDIR="$OMNI_HOME/logs/server"
 
 # Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_TUNNEL_PROVIDER,
-# OG_TUNNL_SSH_KEY, OG_TUNNL_RANDOM, OG_CLAUDE_CONFIG_DIR, OG_AUTO_UPDATE
+# OG_TUNNL_SSH_KEY, OG_TUNNL_RANDOM, OG_AUTO_UPDATE
 # (1 = `og start` pulls + re-applies the install first).
 # Written as an if, not `[[ ]] && source`: under `set -e` a bare failing test as
 # the last statement of an AND-list is an easy way to abort the script.
@@ -924,8 +924,8 @@ og_host_pid() {
 # _build_host_daemon_env (cli.py), which in --server mode keeps only process
 # essentials plus DATABRICKS_/OTEL_ prefixes. It does keep
 # OMNIGENT_RUNNER_ENV_PASSTHROUGH -- but not the variables that list NAMES, so
-# the daemon never had CLAUDE_CONFIG_DIR / OPENCODE_* / OPENCODE_CONFIG_DIR to
-# forward, and export_worker_scoping was a no-op one hop earlier than the hop
+# the daemon never had OPENCODE_* / OPENCODE_CONFIG_DIR to forward, and
+# export_worker_scoping was a no-op one hop earlier than the hop
 # it was written for (verified: the daemon's env carried none of them). A
 # foreground `omnigent host` runs the daemon in-process with og's full
 # environment; the daemon->runner hop (_build_runner_env) then honours the
@@ -959,10 +959,8 @@ start_host_daemon() {
 # Two facts decide how this must be done, both verified against omnigent 0.13:
 #
 # 1. The daemon builds the runner's env from an ALLOWLIST (host/connect.py,
-#    _build_runner_env), not from its own environment. CLAUDE_CONFIG_DIR and
-#    OPENCODE_* are not on it. A plain `export` here therefore never reached a
-#    worker: the reviewer ran on ~/.claude (its status files resolved there in
-#    the runner log), not on the second account the install plan named. The
+#    _build_runner_env), not from its own environment. OPENCODE_* is not on
+#    it. A plain `export` here therefore never reached a worker. The
 #    one operator-controlled escape is OMNIGENT_RUNNER_ENV_PASSTHROUGH, a
 #    comma-separated list of extra names to forward -- and that var itself IS
 #    allowlisted, so setting it here is enough.
@@ -970,13 +968,6 @@ start_host_daemon() {
 #    `opencode serve` by prefix (only OPENCODE_CONFIG / _CONFIG_CONTENT are
 #    dropped), and the claude terminal inherits the runner's env. So once the
 #    names cross the daemon->runner hop, they arrive.
-#
-# CLAUDE_CONFIG_DIR: scopes every claude-native sub-agent (orchestrator AND
-# reviewer alike -- there is no per-sub-agent override) to a second account.
-# Unset (no account in the plan) must NOT default to a made-up path like
-# ~/.claude-work: the installer never creates it, so exporting it blind would
-# break every claude-native login. Unset falls through to Claude Code's own
-# default (~/.claude), the account your interactive `claude` uses.
 #
 # OPENCODE_DISABLE_*: omnigent already spawns `opencode serve` with per-session
 # XDG dirs, so the user's global ~/.config/opencode never reaches it -- but the
@@ -991,10 +982,6 @@ start_host_daemon() {
 # through. Use `opencode --pure` by hand for bare interactive testing instead.
 export_worker_scoping() {
   local names="OPENCODE_DISABLE_CLAUDE_CODE,OPENCODE_DISABLE_EXTERNAL_SKILLS"
-  if [[ -n "${OG_CLAUDE_CONFIG_DIR:-}" ]]; then
-    export CLAUDE_CONFIG_DIR="$OG_CLAUDE_CONFIG_DIR"
-    names="CLAUDE_CONFIG_DIR,$names"
-  fi
   export OPENCODE_DISABLE_CLAUDE_CODE=1
   export OPENCODE_DISABLE_EXTERNAL_SKILLS=1
   if [[ -n "${OG_OPENCODE_CONFIG_DIR:-}" && -f "$OG_OPENCODE_CONFIG_DIR/opencode.json" ]]; then
@@ -1204,7 +1191,6 @@ cmd_start() {
   # not this token, but lower it in og.env if you would rather re-login weekly.
   export OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS="${OG_SESSION_TTL_HOURS:-720}"
 
-  info "account: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-(unset — Claude Code default ~/.claude)}"
   [[ -n "${OPENCODE_CONFIG_DIR:-}" ]] && info "opencode workers: $OPENCODE_CONFIG_DIR (question tool off)"
   # NOT `omnigent server --background`. That flag is handled first in cli.py --
   # `if background: _run_background_server(); return` -- and _run_background_server
