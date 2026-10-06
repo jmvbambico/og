@@ -79,7 +79,14 @@ PORT="${OG_PORT:-6767}"
 # home directory, and an agent told to read "AGENTS.md at the repo root" finds
 # nothing — the exact failure this fixes. Captured before any cd.
 OG_LAUNCH_DIR="${OG_WORKSPACE:-$PWD}"
-NGROK_API="http://127.0.0.1:4040/api/tunnels"
+# ngrok's local API. 4040 is the default, but the free plan allows one agent and
+# a second unrelated agent on the box can hold 4040 — at which point og would
+# read THAT project's tunnel list. So og discovers its OWN agent's web-interface
+# address from that agent's log (ngrok_web_addr) and queries that. A NGROK_API
+# set in the environment or og.env is an override and always wins; when the
+# address cannot be discovered, 4040 remains the fallback.
+NGROK_API_OVERRIDE="${NGROK_API:-}"
+NGROK_API="${NGROK_API_OVERRIDE:-http://127.0.0.1:4040/api/tunnels}"
 # The exact invocation, kept so a self-update can re-exec it unchanged.
 OG_ARGV=("$@")
 
@@ -310,11 +317,33 @@ tunnel_scrape() {
     *) return 1 ;;
   esac
 }
+# The web-interface address of OG'S OWN ngrok, read from the logfile it writes
+# (launched below with --log=stdout --log-format=logfmt). ngrok emits a
+# `starting web service` logfmt record carrying `addr=<host:port>`; taking the
+# address from that record ties the API query to the agent og started rather
+# than to whatever agent grabbed 4040. Empty when the record is absent, so the
+# caller falls back to 4040.
+ngrok_web_addr() {
+  local log; log="$(tunnel_logfile ngrok)"
+  [[ -f "$log" ]] || return 1
+  grep -m1 'starting web service' "$log" 2>/dev/null \
+    | grep -oE 'addr=[^[:space:]]+' \
+    | head -1 \
+    | cut -d= -f2-
+}
 # Read the public https URL out of ngrok's local API. This moved out of the old
 # singleton tunnel_url() so a second unrelated ngrok agent on 4040 can no longer
-# make og adopt another project's URL.
+# make og adopt another project's URL. Which API to query: an explicit NGROK_API
+# override wins; otherwise og's own agent's address (ngrok_web_addr) when it can
+# be discovered; otherwise 4040. In the single-agent case the discovered address
+# IS 4040, so behaviour is unchanged.
 tunnel_scrape_ngrok() {
-  curl -fsS --max-time 3 "$NGROK_API" 2>/dev/null | python3 -c '
+  local api="$NGROK_API" addr
+  if [[ -z "$NGROK_API_OVERRIDE" ]]; then
+    addr="$(ngrok_web_addr || true)"
+    [[ -n "$addr" ]] && api="http://$addr/api/tunnels"
+  fi
+  curl -fsS --max-time 3 "$api" 2>/dev/null | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
