@@ -74,6 +74,14 @@ AGENT_NAME="${OG_AGENT:-dev-lead}"
 AGENT_DIR="$OMNI_HOME/agents/$AGENT_NAME"
 
 PORT="${OG_PORT:-6767}"
+# Local policy module directory (omnigent_local_policies.py). Set by the
+# installer in og.env; defaulted here too so an og.env from before this var
+# existed still works. Exported as PYTHONPATH when the host daemon launches
+# below -- a fallback independent of the .pth file install_pth() writes into
+# omnigent's site-packages, which a `brew upgrade omnigent` (or any package
+# manager that replaces the venv's prefix wholesale instead of upgrading it
+# in place) orphans. og.env lives outside that prefix, so this survives it.
+OG_POLICY_PATH="${OG_POLICY_PATH:-$OMNI_HOME/policies}"
 # The directory og was launched from becomes the default WORKSPACE for new
 # sessions in the pinned project. Without this the composer falls back to the
 # home directory, and an agent told to read "AGENTS.md at the repo root" finds
@@ -937,7 +945,12 @@ og_host_pid() {
 start_host_daemon() {
   mkdir -p "$HOST_LOGDIR"
   local log="$HOST_LOGDIR/host-$(date +%Y%m%d-%H%M%S)-og.log"
-  nohup env PYTHONUNBUFFERED=1 omnigent host --server "http://127.0.0.1:$PORT" --non-interactive \
+  # PYTHONPATH carries OG_POLICY_PATH so the daemon can import
+  # omnigent_local_policies even if the installer's .pth went stale (see
+  # OG_POLICY_PATH above). Prepended ahead of any PYTHONPATH already in the
+  # environment, not replacing it.
+  nohup env PYTHONUNBUFFERED=1 PYTHONPATH="$OG_POLICY_PATH${PYTHONPATH:+:$PYTHONPATH}" \
+    omnigent host --server "http://127.0.0.1:$PORT" --non-interactive \
     >"$log" 2>&1 &
   echo $! > "$HOST_PIDFILE"
   local i

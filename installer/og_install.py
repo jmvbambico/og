@@ -2248,6 +2248,12 @@ def write_og_env(plan: dict) -> None:
         lines += ["", "# OpenCode worker overrides (drops the blocking `question` tool). og start",
                   "# exports this as OPENCODE_CONFIG_DIR and forwards it to the workers.",
                   f"OG_OPENCODE_CONFIG_DIR={ocd}"]
+    lines += ["", "# Where omnigent_local_policies.py lives. `og start` exports this as",
+              "# PYTHONPATH for the host daemon -- a fallback independent of the .pth file",
+              "# install_pth() writes into omnigent's site-packages, which a package-manager",
+              "# upgrade (e.g. `brew upgrade omnigent`) can orphan by replacing the venv's",
+              "# prefix wholesale. og.env lives outside that prefix, so this survives it.",
+              f"OG_POLICY_PATH={OMNI / 'policies'}"]
     (OMNI / "og.env").write_text("\n".join(lines) + "\n")
 
 
