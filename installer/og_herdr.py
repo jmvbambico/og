@@ -94,12 +94,15 @@ class Bridge:
     """
 
     def __init__(self, watcher, client, workspace=None, dry_run=False,
-                 source=DEFAULT_SOURCE):
+                 source=DEFAULT_SOURCE, cwd=None):
         self.watcher = watcher
         self.client = client
         self.workspace = workspace
         self.dry_run = dry_run
         self.source = source
+        # The directory new panes open in. It comes from THIS process (see
+        # `_added`), so with no explicit --cwd it is the bridge's own cwd.
+        self.cwd = os.getcwd() if cwd is None else cwd
         self._tabs: dict[str, dict] = {}
 
     # -- public surface -----------------------------------------------------
@@ -155,7 +158,16 @@ class Bridge:
             return [f"resume add {sid} → pane {rec['pane_id']} "
                     f"'omnigent attach {sid}' [{state}]"]
         title = session.get("title")
-        cwd = session.get("workspace") or str(Path.home())
+        # The pane's directory comes from THIS process, never the session row:
+        # the HTTP session object carries no directory at all. Verified against
+        # a live server — its keys are agent_id, agent_name, archived,
+        # comments_count, created_at, external_session_id, id, labels, owner,
+        # parent_session_id, pending_elicitations_count, permission_level,
+        # runner_id, status, title, updated_at, viewer_unread, and there is no
+        # `workspace`. A lookup for that absent key always read None, so every
+        # pane silently opened in $HOME. `og herdr` is run from the repo whose
+        # sessions it projects, so the bridge's own cwd is the directory to use.
+        cwd = self.cwd
         label = "og:" + (title or sid[:8])
         state = _state(session)
         if self.dry_run:
@@ -316,6 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="herdr socket path (default: the client's own)")
     ap.add_argument("--workspace", default=None, metavar="ID",
                     help="herdr workspace to open tabs in")
+    ap.add_argument("--cwd", default=os.getcwd(), metavar="PATH",
+                    help="directory new panes open in (default: the bridge's "
+                         "current working directory)")
     ap.add_argument("--source", default=DEFAULT_SOURCE, metavar="NAME",
                     help=f"reporting source name (default: {DEFAULT_SOURCE})")
     return ap
@@ -353,7 +368,7 @@ def main(argv=None) -> int:
         client = HerdrClient(socket_path=args.socket)
 
     bridge = Bridge(watcher, client, workspace=args.workspace,
-                    dry_run=args.dry_run, source=args.source)
+                    dry_run=args.dry_run, source=args.source, cwd=args.cwd)
 
     if args.once:
         for line in bridge.run_once():
