@@ -61,17 +61,23 @@ def _error_line(sid: str, exc) -> str:
     return f"error {sid}: {code}: {message}"
 
 
-def _id_of(entry) -> str | None:
-    """The id out of a tab_create result's `tab` / `root_pane` sub-object.
+def _id_of(entry, key: str) -> str | None:
+    """The id `key` out of a tab_create result's `tab` / `root_pane` sub-object.
 
-    herdr 0.9.3 names these `tab_id` and `pane_id` respectively; there is no
-    generic `id` key, so checking one would only ever match a shape the server
-    never sends.
+    herdr 0.9.3 names these `tab_id` and `pane_id`; there is no generic `id`
+    key, so checking one would only ever match a shape the server never sends.
+
+    The caller STATES which id it wants rather than this function trying keys in
+    a fixed order, because the live `root_pane` object carries BOTH keys — so an
+    order-sensitive lookup is only accidentally correct, and reversing it would
+    hand the TAB id to `pane_run` and type the attach command at a tab handle.
+    The real shape, quoted from a live server:
+
+        "root_pane":{"pane_id":"w1:pQ","terminal_id":"...",
+                     "workspace_id":"w1","tab_id":"w1:tG",...}
     """
     if isinstance(entry, dict):
-        for key in ("pane_id", "tab_id"):
-            if entry.get(key):
-                return entry[key]
+        return entry.get(key) or None
     return None
 
 
@@ -158,8 +164,8 @@ class Bridge:
             return [f"dry-run: add {label} ({cwd}) → omnigent attach {sid} "
                     f"[{state}]"]
         result = self.client.tab_create(self.workspace, cwd=cwd, label=label)
-        tab_id = _id_of(result.get("tab"))
-        pane_id = _id_of(result.get("root_pane"))
+        tab_id = _id_of(result.get("tab"), "tab_id")
+        pane_id = _id_of(result.get("root_pane"), "pane_id")
         if tab_id is None or pane_id is None:
             return self._reject_partial_create(sid, tab_id, pane_id)
         # Record the mapping the moment the ids are known, BEFORE the rest of
@@ -200,10 +206,14 @@ class Bridge:
         """Reject a tab_create reply that carried no usable ids.
 
         Stores nothing: a `pane_id` of None in the mapping would make every
-        later `changed` report against a pane that does not exist. When a tab id
-        WAS obtained but its pane id was not, close it best-effort so the user's
-        workspace does not keep an orphan tab; a failure of that cleanup is
-        recorded, not raised, so the rest of the batch still runs.
+        later `changed` report against a pane that does not exist. Two
+        asymmetric halves are cleaned up best-effort, since a partial create may
+        still have left something in the user's workspace:
+          - a tab id but no pane id: close the orphan tab;
+          - a pane id but no tab id: there is no tab handle to close, so close
+            the orphan pane directly.
+        A failure of either cleanup is recorded, not raised, so the rest of the
+        batch still runs.
         """
         if tab_id is None and pane_id is None:
             detail = "no tab or pane id"
@@ -215,6 +225,11 @@ class Bridge:
         if tab_id is not None:
             try:
                 self.client.tab_close(tab_id)
+            except _error_cls() as exc:
+                lines.append(_error_line(sid, exc))
+        elif pane_id is not None:
+            try:
+                self.client.pane_close(pane_id)
             except _error_cls() as exc:
                 lines.append(_error_line(sid, exc))
         return lines
@@ -247,21 +262,37 @@ class Bridge:
             self._tabs.pop(sid, None)
             return [f"dry-run: remove {sid} (release pane, close tab)"]
         pane_id, tab_id = rec["pane_id"], rec["tab_id"]
+        # release_agent and tab_close are handled SEPARATELY because a
+        # `not_found` from the two means different things. From release_agent it
+        # means only that no agent marker was registered for the pane — which
+        # happens when setup failed part-way (see `step`), with the pane and tab
+        # still very much open. It does NOT prove the tab is gone, so it is
+        # "nothing to release" and we PROCEED to close the tab. Only a
+        # `not_found` from tab_close proves the tab itself is gone: closing a
+        # tab's only pane removes the tab, so a later tab.close answers
+        # tab_not_found. Folding the two into one try also let a release_agent
+        # `not_found` skip tab_close entirely and then drop the mapping —
+        # orphaning an open tab that nothing tracked any more.
         try:
             self.client.release_agent(pane_id, self.source, agent="omnigent")
+        except _error_cls() as exc:
+            if getattr(exc, "code", None) != "not_found":
+                # Any other error keeps the mapping: popping it here would leave
+                # the pane and tab untracked with no way to retry, leaking them
+                # for good. The error is recorded by `reconcile` and a later
+                # `removed` retries this cleanup.
+                raise
+        try:
             self.client.tab_close(tab_id)
         except _error_cls() as exc:
             if getattr(exc, "code", None) == "not_found":
-                # herdr says the pane or tab is already gone: the outcome we
-                # wanted has happened, so drop the mapping instead of retrying a
-                # removal that can never succeed.
+                # The tab is already gone: the outcome we wanted has happened,
+                # so drop the mapping instead of retrying a removal that can
+                # never succeed.
                 self._tabs.pop(sid, None)
                 return [f"remove {sid} (pane {pane_id}, tab {tab_id}; "
                         f"already gone)"]
-            # Any other error keeps the mapping: popping it here would leave the
-            # pane and tab untracked with no way to retry, leaking them for
-            # good. The error is recorded by `reconcile` and a later `removed`
-            # retries this cleanup.
+            # As above: any other error keeps the mapping for a later retry.
             raise
         self._tabs.pop(sid, None)
         return [f"remove {sid} (pane {pane_id}, tab {tab_id})"]
