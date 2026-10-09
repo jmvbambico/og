@@ -300,6 +300,30 @@ def test_failed_orphan_tab_close_is_recorded_not_raised(seams):
     assert "s1" not in bridge._tabs
 
 
+def test_added_with_pane_id_but_no_tab_id_closes_the_orphan_pane(seams):
+    # No tab id means there is no tab handle to close, but the pane was created;
+    # close it directly so it is not left behind.
+    client = RecordingClient(create_results=[
+        {"tab": {}, "root_pane": {"pane_id": "paneZ"}}])
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    assert any("error s1" in ln for ln in lines)
+    assert _names(client) == ["tab_create", "pane_close"]
+    assert _call(client, "pane_close")[1] == ("paneZ",)
+    assert "s1" not in bridge._tabs
+
+
+def test_failed_orphan_pane_close_is_recorded_not_raised(seams):
+    client = RecordingClient(
+        create_results=[{"tab": {}, "root_pane": {"pane_id": "paneZ"}}],
+        fail={"pane_close": FakeHerdrError("boom", "cannot close")})
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    assert sum("error s1" in ln for ln in lines) == 2
+    assert _names(client) == ["tab_create", "pane_close"]
+    assert "s1" not in bridge._tabs
+
+
 def test_failed_removal_keeps_the_mapping_for_a_retry(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
@@ -334,6 +358,80 @@ def test_removal_where_herdr_says_not_found_is_treated_as_done(seams):
 
     assert bridge.reconcile([Ev("removed", "s1", {})]) == []
     assert client.calls == []
+
+
+def test_release_agent_not_found_still_attempts_tab_close(seams):
+    # A `not_found` from release_agent means only "there was no marker to
+    # release" — it does NOT mean the tab is gone (setup may have failed before
+    # reporting the marker, leaving the tab open). So tab_close must still run.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    client.calls.clear()
+
+    client.fail = {"release_agent": FakeHerdrError("not_found", "no marker")}
+    lines = bridge.reconcile([Ev("removed", "s1", {})])
+
+    assert _names(client) == ["release_agent", "tab_close"]
+    assert _call(client, "tab_close")[1] == ("tab1",)
+    # tab_close succeeded, so only now is the mapping dropped.
+    assert "s1" not in bridge._tabs
+    assert any("remove s1" in ln for ln in lines)
+
+
+def test_release_agent_not_found_then_tab_close_failure_keeps_the_mapping(seams):
+    # release_agent says "no marker" (swallowed), but tab_close then fails with a
+    # real error: the tab's fate is unknown, so the mapping must survive and a
+    # later `removed` must retry the whole cleanup.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    client.calls.clear()
+
+    client.fail = {"release_agent": FakeHerdrError("not_found", "no marker"),
+                   "tab_close": FakeHerdrError("boom", "cannot close")}
+    lines = bridge.reconcile([Ev("removed", "s1", {})])
+    assert _names(client) == ["release_agent", "tab_close"]
+    assert any("error s1" in ln for ln in lines)
+    assert "s1" in bridge._tabs
+    client.calls.clear()
+
+    again = bridge.reconcile([Ev("removed", "s1", {})])
+    assert _names(client) == ["release_agent", "tab_close"]
+    assert "remove s1" in again[0]
+    assert "s1" not in bridge._tabs
+
+
+def test_tab_close_not_found_is_treated_as_already_gone(seams):
+    # Only a `not_found` from tab_close proves the tab is gone (closing a tab's
+    # only pane removes the tab, so a later tab.close answers tab_not_found):
+    # drop the mapping and never retry.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    client.calls.clear()
+
+    client.fail = {"tab_close": FakeHerdrError("not_found", "tab_not_found")}
+    lines = bridge.reconcile([Ev("removed", "s1", {})])
+    assert _names(client) == ["release_agent", "tab_close"]
+    assert "already gone" in lines[0]
+    assert "s1" not in bridge._tabs
+    client.calls.clear()
+
+    assert bridge.reconcile([Ev("removed", "s1", {})]) == []
+    assert client.calls == []
+
+
+def test_underlying_id_lookup_is_key_explicit_not_order_dependent():
+    # The live `root_pane` object carries BOTH keys, so an order-sensitive lookup
+    # would silently return the wrong one; the caller must name the key.
+    root_pane = {"pane_id": "w1:pQ", "terminal_id": "term",
+                 "workspace_id": "w1", "tab_id": "w1:tG"}
+    tab = {"tab_id": "w1:tG"}
+    assert m._id_of(root_pane, "pane_id") == "w1:pQ"
+    assert m._id_of(root_pane, "tab_id") == "w1:tG"
+    assert m._id_of(tab, "tab_id") == "w1:tG"
+    assert m._id_of(tab, "pane_id") is None
 
 
 def test_fake_client_returns_the_real_api_key_names():
