@@ -120,11 +120,11 @@
           "anthropic": "opencode-anthropic-auth",
           "google": "opencode-antigravity-auth"
         },
-        "prefer": "opencode/mimo-v2.5-free",
-        "note": "`opencode models` lists every provider you have added with `opencode auth login` (e.g. deepseek/..., anthropic/...), not just Zen; those bill at the provider's rates. Zen's free `opencode/*-free` lineup rotates, and a paid Zen id on a workspace with no payment method is a FAILED dispatch, not a slower one."
+        "prefer": "opencode/mimo-v2.6-flash-free",
+        "note": "`opencode models` lists every provider you have added with `opencode auth login` (e.g. deepseek/..., anthropic/...), not just Zen; those bill at the provider's rates. Zen's free `opencode/*-free` lineup rotates, and a paid Zen id on a workspace with no payment method is a FAILED dispatch, not a slower one. Install from `anomalyco/tap/opencode`, NOT plain `brew install opencode`: homebrew-core keeps ONE opencode formula and it is on the 2.x line, which Omnigent's opencode-native harness refuses (it pins 1.17.7 <= v < 1.19.0) — and reports that refusal as `version-too-low` in configured_harnesses, so the user is told to UPGRADE when they need to DOWNGRADE. That mismatch is how coder_zen sat silently dead for days. The tap splits the lines (opencode = 1.18.x, opencode-v2 = 2.x), so upgrading from it stays in range."
       },
       "install": {
-        "brew": "brew install sst/tap/opencode",
+        "brew": "brew install anomalyco/tap/opencode",
         "npm": "npm i -g opencode-ai"
       },
       "login": "opencode auth login",
