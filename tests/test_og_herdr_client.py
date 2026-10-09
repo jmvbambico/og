@@ -841,8 +841,16 @@ def test_events_subscribe_defaults_to_an_empty_subscriptions_list(fake):
     assert server.requests[0]["params"] == {"subscriptions": []}
 
 
-def test_events_subscribe_accepts_the_types_alias(fake):
-    """`types=` still works — the old parameter name, mapped onto the new key."""
+def test_events_subscribe_sends_entries_verbatim_and_has_no_types_alias(fake):
+    """`subscriptions` is the only spelling, and entries go out untouched.
+
+    Measured against a live herdr, a list of type *names* is refused:
+      {"subscriptions": ["pane.agent_status_changed"]} -> "invalid type:
+      string ..., expected internally tagged enum Subscription"
+    so there is no `types=` alias to map onto it — it could only build a request
+    guaranteed to be rejected on the wire, at stream time rather than at the
+    call site. The supported form passes its entries through unmodelled.
+    """
     def subscribe_handler(request, send):
         send({"id": request["id"], "result": {"type": "subscription_started"}})
         send({"id": "evt_1", "event": "agent.state", "params": {"state": "idle"}})
@@ -850,12 +858,20 @@ def test_events_subscribe_accepts_the_types_alias(fake):
 
     server = fake(subscribe_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
-    stream = client.events_subscribe(types=["pane.exit", "agent.state"])
+    # Argument binding fails before the generator body runs, so nothing reaches
+    # the socket — the point of dropping the alias instead of keeping it.
+    with pytest.raises(TypeError):
+        client.events_subscribe(types=["pane.exit", "agent.state"])
+    assert server.requests == []
+
+    entries = [{"type": "pane.agent_status_changed", "pane_id": "w1:pQ"},
+               {"type": "pane.exited", "pane_id": "w1:pR"}]
+    stream = client.events_subscribe(subscriptions=entries)
     assert next(stream)["event"] == "agent.state"
     stream.close()
     client.close()
     assert server.requests[0]["method"] == "events.subscribe"
-    assert server.requests[0]["params"] == {"subscriptions": ["pane.exit", "agent.state"]}
+    assert server.requests[0]["params"] == {"subscriptions": entries}
 
 
 def test_events_subscribe_raises_on_error_ack(fake):

@@ -457,30 +457,31 @@ class HerdrClient:
     # subscriptions
     # ------------------------------------------------------------------
 
-    def events_subscribe(self, subscriptions: Optional[List[Any]] = None,
-                         types: Optional[List[str]] = None) -> Iterator[dict]:
+    def events_subscribe(self, subscriptions: Optional[List[Any]] = None) -> Iterator[dict]:
         """Subscribe to pushed events; yields each event frame as it arrives.
 
-        `subscriptions` is passed through verbatim — this client does not
-        model the entry schema, because the wire format was measured and is
-        not a list of type names:
+        `subscriptions` is the only accepted parameter and is passed through
+        verbatim — this client does not model the entry schema, because the
+        wire format was measured and is not a list of type names:
 
-            {"subscriptions": []}                              -> starts (ack)
-            {"subscriptions": ["pane.agent_status_changed"]}      -> "invalid
+            {"subscriptions": []}                           -> starts (ack)
+            {"subscriptions": ["pane.agent_status_changed"]}  -> "invalid
                 type: string ..., expected internally tagged enum Subscription"
             {"subscriptions": [{"type": "pane.agent_status_changed"}]}
-                                                                -> "missing
+                                                              -> "missing
                 field `pane_id`"
+            {"params": {}}                                   -> "invalid
+                request: missing field `subscriptions`"
 
         So each entry is an internally-tagged object, a per-type entry also
-        needs `pane_id`, and the **empty list is the accepted catch-all**. The
-        key itself is not optional: omitting `subscriptions` (or sending a
-        `types` list, which is what this client used to do) is rejected with
-        "invalid request: missing field `subscriptions`".
+        needs `pane_id`, the key itself is not optional, and the **empty list
+        is the accepted catch-all**.
 
-        `types` is a source-compatible alias that maps onto `subscriptions`,
-        because the old parameter name suggested the entry schema and callers
-        written against it would otherwise break on a signature change alone.
+        There is deliberately no `types=` spelling of this parameter. The second
+        measured result above is why: a list of names is exactly what herdr
+        refuses, so such an alias could only ever build a request guaranteed to
+        be rejected — and it would be rejected at stream time as a server error
+        rather than at the call site, which is worse than a signature change.
 
         The frames yielded are herdr's raw event objects (they carry `event`,
         not `result`).
@@ -493,8 +494,6 @@ class HerdrClient:
         for a blocking stream.
         """
         entries: List[Any] = list(subscriptions) if subscriptions is not None else []
-        if not entries and types:
-            entries = list(types)
         req_id = self._send("events.subscribe", {"subscriptions": entries})
         try:
             while True:
