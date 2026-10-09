@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import io
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "installer"))
-import og_herdr_watch as w  # noqa: E402
+import og_herdr_watch as w
 
 
 # --------------------------------------------------------------------------
@@ -280,14 +278,53 @@ def test_sessions_without_id_are_skipped():
     assert [e.session_id for e in events] == ["s1"]
 
 
-def test_events_do_not_alias_server_objects():
-    # Mutating what we stored must not corrupt the caller's previous snapshot.
+def test_events_do_not_alias_the_watchers_retained_objects():
+    # SessionEvent promises "both are copies, safe to keep" — so neither may be
+    # the very dict the watcher is still holding on to. Mutating the test's own
+    # listing proves nothing here: StubOpener JSON-encodes it, so poll_once
+    # works on a fresh decode and the fixture dict is not the same object at all.
+    # The object that matters is the one under _seen, which is what a real
+    # watcher would go on to read, diff and mutate.
     watcher, _ = first_poll([session("s1")])
-    live = session("s1", status="idle")
-    watcher.opener = StubOpener([live])
+    stored = watcher._seen["s1"]            # what poll #1 retained
+    watcher.opener = StubOpener([session("s1", status="idle")])
     event = watcher.poll_once()[0]
-    live["status"] = "running"
+    retained = watcher._seen["s1"]          # what poll #2 retained
+
+    assert event.kind == "changed"
+
+    # The copy is a value, not a view: rewrite both retained objects and the
+    # event must still report what was true when it was polled.
+    stored["status"] = "tampered"
+    retained["status"] = "tampered"
     assert event.previous["status"] == "running"
+    assert event.session["status"] == "idle"
+    assert event.state == "idle"
+
+    # Same thing stated directly — neither may be the very dict `_seen` holds.
+    assert event.previous is not stored, \
+        "event.previous aliases the object retained from the last poll"
+    assert event.session is not retained, \
+        "event.session aliases the object the watcher is still holding"
+
+
+def test_mutating_an_event_does_not_fabricate_the_next_changed_event():
+    # The same invariant from the other side, and the reason the copy exists.
+    # `_seen` intentionally holds the object the server returned; if the event
+    # shared that object, a consumer scribbling on an event would be editing
+    # the watcher's memory and the next poll would report a change that never
+    # happened — or swallow one that did.
+    watcher, _ = first_poll([session("s1")])
+    watcher.opener = StubOpener([session("s1", status="idle")])
+    event = watcher.poll_once()[0]
+    assert event.kind == "changed"
+
+    event.session["status"] = "running"
+    event.session["title"] = "scribbled-over"
+
+    watcher.opener = StubOpener([session("s1", status="idle")])
+    assert watcher.poll_once() == [], \
+        "the caller's edit leaked into the watcher's retained state"
 
 
 # --------------------------------------------------------------------------
