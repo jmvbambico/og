@@ -3072,3 +3072,132 @@ def test_per_role_sites_are_pinned():
         "generalize it, or add its function to PER_ROLE_SITES. Or a pinned site "
         "was renamed or removed: update PER_ROLE_SITES to match."
     )
+
+
+# --------------------------------------------------------------------------
+# bin/og re-writes a stranded local-policy .pth before the server boots
+# --------------------------------------------------------------------------
+@pytest.fixture
+def brewed_omnigent(tmp_path):
+    """An `omnigent` entry point whose shebang names a venv python, plus a HOME
+    holding a policies dir -- the shape `og start` finds on disk. Returns
+    (home, venv_python, env) where env is ready for a bash subprocess.
+
+    This stands in for the Homebrew case the guard exists for: the venv is NOT
+    at either path og_install knows by convention, so only shebang resolution
+    finds it."""
+    import venv
+    home = tmp_path / "home"
+    (home / ".omnigent").mkdir(parents=True)
+    pol_dir = home / ".omnigent" / "policies"
+    pol_dir.mkdir()
+    (pol_dir / "omnigent_local_policies.py").write_text("merge_gate = lambda **kw: None\n")
+
+    cellar = tmp_path / "Cellar" / "omnigent" / "9.9.9" / "libexec"
+    venv.create(cellar, with_pip=False, symlinks=True)
+    py = cellar / "bin" / "python"
+    binroot = tmp_path / "brewbin"
+    binroot.mkdir()
+    entry = binroot / "omnigent"
+    entry.write_text(f"#!{py}\nimport sys\nprint('fake omnigent')\n")
+    entry.chmod(0o755)
+    env = {
+        "HOME": str(home),
+        # The guard shells out to python3 for realpath, so a python3 must be here.
+        "PATH": f"{binroot}:{Path(sys.executable).parent}:/usr/bin:/bin",
+    }
+    return home, py, env
+
+
+def _og_func(call, env):
+    """Source bin/og (its no-argument dispatch prints help and exits 0) to get at
+    one internal function, then call it."""
+    # $0 must be the script itself: the no-argument branch renders help with
+    # `sed -n '2,19p' "$0"`, which would otherwise read a file named "bash".
+    return subprocess.run(
+        ["bash", "-c", f'source "{OG}" >/dev/null; {call}', str(OG)],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+
+
+def _purelib(py):
+    return Path(subprocess.run(
+        [str(py), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        capture_output=True, text=True, check=True).stdout.strip())
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_resolves_the_omnigent_interpreter_through_the_shebang(brewed_omnigent):
+    _home, py, env = brewed_omnigent
+    r = _og_func("omnigent_python", env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == str(py)
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_start_guard_restores_a_pth_stranded_by_an_upgrade(brewed_omnigent):
+    """`brew upgrade omnigent` builds a fresh version-scoped venv, leaving the
+    installer's .pth behind in the old one. Without this the server boots and
+    denies every action with 'policy evaluation error'."""
+    home, py, env = brewed_omnigent
+    pth = _purelib(py) / "omnigent-local-policies.pth"
+    assert not pth.exists()  # the fresh venv: nothing on sys.path yet
+    r = _og_func("ensure_policies_importable", env)
+    assert r.returncode == 0, r.stderr
+    assert pth.read_text() == str(home / ".omnigent" / "policies") + "\n"
+    assert "restored the local-policy path" in r.stdout
+    # Proven in a fresh process, which is what the server will be.
+    out = subprocess.run([str(py), "-c", "import omnigent_local_policies as x; print(x.__file__)"],
+                         capture_output=True, text=True, check=True).stdout
+    assert str(home / ".omnigent" / "policies") in out
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_start_guard_is_silent_when_the_policies_already_import(brewed_omnigent):
+    """A healthy install must not be narrated on every `og start`, and the .pth
+    it already has must be left byte-identical."""
+    home, py, env = brewed_omnigent
+    pth = _purelib(py) / "omnigent-local-policies.pth"
+    pth.write_text(str(home / ".omnigent" / "policies") + "\n")
+    before = pth.read_bytes()
+    r = _og_func("ensure_policies_importable", env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+    assert pth.read_bytes() == before
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_start_guard_skips_when_there_are_no_local_policies(brewed_omnigent):
+    """No policies dir means nothing was installed to strand -- and a sandboxed
+    HOME looks exactly like this, where writing would repoint the LIVE path at a
+    temp dir. Skip, write nothing, do not fail the start."""
+    home, py, env = brewed_omnigent
+    import shutil as _sh
+    _sh.rmtree(home / ".omnigent" / "policies")
+    r = _og_func("ensure_policies_importable", env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+    assert not (_purelib(py) / "omnigent-local-policies.pth").exists()
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_start_guard_dies_when_the_policy_module_is_missing(brewed_omnigent):
+    """The policies dir exists but holds no module: writing the .pth cannot make
+    the import work, so the start must stop here rather than boot a deny-all
+    server."""
+    home, py, env = brewed_omnigent
+    (home / ".omnigent" / "policies" / "omnigent_local_policies.py").unlink()
+    r = _og_func("ensure_policies_importable", env)
+    assert r.returncode != 0
+    assert "deny every action" in r.stderr
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="bash script")
+def test_og_start_calls_the_policy_guard_before_booting(brewed_omnigent):
+    """The wiring, not the function: the guard must run in cmd_start, and ahead
+    of the port check and server spawn."""
+    src = OG.read_text()
+    assert "\n  ensure_policies_importable\n" in src
+    start = src.index("cmd_start()")
+    guard = src.index("\n  ensure_policies_importable\n", start)
+    assert guard < src.index("port $PORT is already in use", start)

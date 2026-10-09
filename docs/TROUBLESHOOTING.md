@@ -170,6 +170,23 @@ echo "$HOME/.omnigent/policies" > "$SITE/omnigent-local-policies.pth"
 og stop && og start
 ```
 
+**This no longer strands you on an omnigent upgrade.** The `.pth` lives in
+omnigent's own venv, so it moves with omnigent. `uv tool` and pipx keep that
+venv at one path and an upgrade in place keeps the `.pth`; Homebrew's is
+version-scoped (`Cellar/omnigent/<version>/libexec`), so `brew upgrade
+omnigent` builds a *fresh* venv and leaves the `.pth` behind in the old one —
+the same deny-everything state as above, from a command that looks routine.
+`og start` now checks the import before it boots the server and re-writes the
+`.pth` if it is missing, printing:
+
+```
+→ omnigent moved to a new venv; restored the local-policy path (.../omnigent-local-policies.pth)
+```
+
+A healthy install prints nothing. If the re-write cannot fix it (the policies
+dir has no `omnigent_local_policies.py`, or site-packages is not writable),
+`og start` **stops** rather than boot a deny-all server, and names what to do.
+
 ---
 
 ## A policy is configured but never fires
