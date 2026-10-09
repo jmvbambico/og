@@ -94,6 +94,63 @@ user's own browser or phone. So it reports `blocked` and stops there.
 
 ---
 
+## The socket's real contract (measured, not assumed)
+
+Three facts about the herdr socket were discovered only by talking to a running
+server. Every one of them had already passed a full test suite against a fake
+built on the opposite assumption, and the first would have broken the feature
+outright — so they are recorded here rather than left in a commit message.
+
+### A connection serves exactly ONE request
+
+The server answers one request, then closes. Measured across three trials, one
+connection each:
+
+```
+workspace.list, workspace.list, workspace.list  ->  reply, EOF, BrokenPipeError
+ping, agent.list                                ->  pong, BrokenPipeError
+```
+
+The method does not matter. Since the bridge issues four calls per session
+(`tab.create`, `pane.run`, `pane.report_agent`, `pane.report_metadata`), a
+reused connection fails on every *second* call — alternating failure on every
+event. `og_herdr_client.py` therefore connects, sends, reads and closes per
+request. `events.subscribe` is the sole exception: there the subscription *is*
+the connection.
+
+### `events.subscribe` takes `subscriptions`, not a list of type names
+
+```
+{}                                              -> missing field `subscriptions`
+{"types": [...]}                                -> missing field `subscriptions`
+{"subscriptions": ["pane.agent_status_changed"]} -> invalid type: string …,
+                                                    expected internally tagged
+                                                    enum Subscription
+{"subscriptions": [{"type": "…"}]}              -> missing field `pane_id`
+{"subscriptions": []}                           -> {"type":"subscription_started"}
+```
+
+So each entry is an internally-tagged object, a per-type entry also needs a
+`pane_id`, and the empty list is the accepted catch-all.
+
+### An unparseable request comes back with `"id": ""`
+
+herdr cannot echo an id it failed to read, so a malformed request answers with
+an empty id. A reply loop that skips frames on id mismatch therefore discards
+the server's real message, reads EOF, and reports a dropped connection instead
+of `missing field 'subscriptions'`. The client carves out empty-id error frames
+for exactly this reason.
+
+### One consequence worth generalising
+
+A fake server encodes the beliefs of whoever wrote it. All three defects above
+sat behind green tests, and the suite even contained a test
+(`test_peer_close_is_reported_not_retried`) that modelled the *real* hangup
+behaviour while the comment beside it asserted the opposite. When a component
+talks to something external, probe the real thing before trusting the fake.
+
+---
+
 ## Agent state: pushed, not detected
 
 herdr classifies agents into `working` / `blocked` / `done` / `idle` /
@@ -211,3 +268,39 @@ Those specific approvals always need the browser. This is the one place where
   tunnel.
 - **Persistence.** The bridge keeps its session→pane mapping in memory, so a
   restart re-reconciles from scratch rather than re-adopting existing panes.
+- **Duplicate session ids** in one listing: the last entry wins. The server
+  does not emit duplicates, so this is theoretical.
+- **A buffered partial SSE frame is lost** if `resp.read()` raises, because
+  `flush()` only runs on a clean end-of-stream.
+- **`pane.read` tolerates five payload spellings** (a bare string, or
+  `text`/`output`/`content`/`data`, or a `lines` list). Only one is in use;
+  the tolerance is unverified guesswork and could be narrowed once the real
+  shape is confirmed against a live pane.
+
+---
+
+## Operational notes
+
+Things the bridge has to do because of how long it runs:
+
+- **`watch()` survives a failed poll.** A transient HTTP error, a server
+  restart or a malformed listing would otherwise end the generator, and
+  `Bridge.run_forever` does not wrap it — so one blip would silently stop
+  projecting anything. It retries with bounded backoff (`poll_interval` up to
+  `MAX_POLL_BACKOFF`, reset on recovery) and reports to stderr. `poll_once`
+  stays strict and still raises; only the loop is forgiving. Because
+  `self._seen` is assigned last in `poll_once`, a failed poll cannot corrupt
+  it, so recovery diffs against the last state actually observed instead of
+  emitting a storm of `removed` + `added`.
+- **The SSE buffers are capped** (`MAX_SSE_LINE_BYTES`, `MAX_SSE_FRAME_BYTES`).
+  A stream that never sends a newline, or a `data:` run never closed by a blank
+  line, would otherwise grow memory without limit in a process meant to run for
+  days. Over the cap the junk is discarded and the stream continues.
+- **Tokens are matched to the server.** `discover_token(base_url, …)` returns a
+  token only when the store key names that server. It used to prefer a loopback
+  key and then fall through to the first usable token, which would have sent a
+  remote server's bearer token to `127.0.0.1`.
+- **A partially set-up pane is resumable.** The session→pane record is written
+  the moment `tab.create` returns ids, with a step counter, so a herdr call
+  that fails mid-setup leaves exactly one tab that a redelivered `added`
+  finishes — rather than a second tab, or an untracked orphan.
