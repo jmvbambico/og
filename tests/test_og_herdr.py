@@ -355,8 +355,42 @@ def test_build_parser_overrides():
     assert args.source == "me"
 
 
-def test_module_imports_without_sibling_modules():
-    """The siblings are absent in this worktree; that this import succeeded is
-    the proof the bridge does not import them at module load."""
-    assert not (Path(m.__file__).parent / "og_herdr_client.py").exists()
-    assert not (Path(m.__file__).parent / "og_herdr_watch.py").exists()
+def test_siblings_are_imported_lazily_not_at_module_load():
+    """og_herdr.py must import cleanly even when a sibling module is missing.
+
+    The siblings live on other branches, so at any moment one or both may be
+    absent from the tree — the bridge therefore must not import them at module
+    load, only inside the functions that use them. Asserting the files are
+    ABSENT on disk is not evidence of that (and inverts the moment the branches
+    batch together), and checking sys.modules is order-dependent because other
+    test files import the siblings. So parse og_herdr.py and split its imports
+    by where they execute: an import reachable only through a function/lambda
+    body runs lazily, a module-level one runs on first import.
+    """
+    def imports(node, inside_function):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            inside_function = True
+        found = []
+        if isinstance(node, ast.Import):
+            found += [(a.name, inside_function) for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            found.append((node.module or "", inside_function))
+        for child in ast.iter_child_nodes(node):
+            found += imports(child, inside_function)
+        return found
+
+    def is_sibling(name):
+        return name in ("og_herdr_client", "og_herdr_watch") or \
+            name.startswith(("og_herdr_client.", "og_herdr_watch."))
+
+    tree = ast.parse(Path(m.__file__).read_text())
+    found = imports(tree, False)
+    eager = {name for name, inside in found if not inside}
+    lazy = {name for name, inside in found if inside}
+
+    assert not [name for name in eager if is_sibling(name)], \
+        "module load must not pull in the siblings"
+    # Positive control: the lazy imports are actually there, so a refactor that
+    # simply deleted them cannot make this test pass vacuously.
+    assert "og_herdr_watch" in lazy
+    assert "og_herdr_client" in lazy
