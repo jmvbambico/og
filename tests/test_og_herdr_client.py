@@ -53,12 +53,15 @@ class FakeHerdr:
     for framing/id assertions.
 
     Each instance owns a private socket directory, removed by `close()`.
+    `connections` counts accepted connections, so a test can assert that
+    requests went out on separate sockets rather than one reused one.
     """
 
     def __init__(self, handler):
         self.directory = tempfile.mkdtemp(prefix="hfd-", dir=SOCKET_BASE)
         self.path = str(Path(self.directory) / SOCKET_NAME)
         self.requests = []
+        self.connections = 0
         self._handler = handler
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -76,6 +79,8 @@ class FakeHerdr:
                 continue
             except OSError:
                 return
+            # Counted here, on the single accept thread, so no locking needed.
+            self.connections += 1
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn):
@@ -121,8 +126,18 @@ class FakeHerdr:
 RESULTS = {
     "ping": {"type": "pong"},
     "workspace.list": {"workspaces": [{"name": "dev", "active_tab": "tab_9"}]},
-    "tab.create": {"tab": {"id": "tab_9", "label": "coder"},
-                   "root_pane": {"id": "pane_1"}},
+    # The real tab.create reply, measured against a live herdr 0.9.1 server.
+    # Note there is no generic `id` key: the tab is `tab.tab_id` and the root
+    # pane is `root_pane.pane_id`, and root_pane carries its `tab_id` too.
+    "tab.create": {"type": "tab_created",
+                   "tab": {"tab_id": "w1:tG", "workspace_id": "w1", "number": 16,
+                           "label": "og-null-ws", "focused": False,
+                           "pane_count": 1, "agent_status": "unknown"},
+                   "root_pane": {"pane_id": "w1:pQ",
+                                 "terminal_id": "term_65d6ae6b5871712",
+                                 "workspace_id": "w1", "tab_id": "w1:tG",
+                                 "cwd": "/private/tmp", "agent_status": "unknown",
+                                 "revision": 0}},
     "tab.close": {"closed": True},
     "pane.run": {"started": True},
     "pane.close": {"closed": True},
@@ -137,13 +152,20 @@ RESULTS = {
 
 
 def echo_handler(request, send):
-    """Reply with the canned result for the request's method.
+    """Reply with the canned result, then hang up — which is what herdr does.
 
-    Returns False (keep the connection open) because that is herdr: one
-    connection serves many requests, it does not hang up after each one.
+    Returns True (close after the reply) because a real herdr connection
+    serves exactly ONE request: measured against a live 0.9.1 server,
+    `workspace.list` three times on one connection gave a reply, then EOF, then
+    BrokenPipeError, and `ping` followed by `agent.list` gave a pong then
+    BrokenPipeError. Method did not matter.
+
+    This handler used to keep the connection open on the belief that herdr
+    multiplexes; that belief was wrong, and it hid a client bug — see
+    test_four_calls_in_a_row_each_get_their_own_connection.
     """
     send({"id": request["id"], "result": RESULTS.get(request["method"], {})})
-    return False
+    return True
 
 
 @pytest.fixture(autouse=True)
@@ -192,7 +214,7 @@ def client(fake):
 # request framing / id sequencing
 # --------------------------------------------------------------------------
 
-def test_call_frames_request_as_ndjson_with_id_and_method(client, fake):
+def test_call_frames_request_as_ndjson_with_id_and_method(fake):
     server = fake()
     framed = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     assert framed.ping() == {"type": "pong"}
@@ -210,7 +232,7 @@ def test_call_sends_an_empty_params_object_when_none_given(fake):
     empty.close()
 
 
-def test_request_ids_sequence_across_calls_on_one_connection(fake):
+def test_request_ids_sequence_across_calls_on_one_client(fake):
     server = fake()
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     client.ping()
@@ -233,10 +255,61 @@ def test_request_ids_do_not_restart_after_reconnect(fake):
 
 
 # --------------------------------------------------------------------------
+# one connection per request
+# --------------------------------------------------------------------------
+
+def test_four_calls_in_a_row_each_get_their_own_connection(fake):
+    """Regression: herdr serves ONE request per connection, then hangs up.
+
+    Measured against a live 0.9.1 server: workspace.list three times on one
+    connection gave a reply, then EOF, then BrokenPipeError; ping followed by
+    agent.list gave a pong then BrokenPipeError. With the old reuse design
+    every second call therefore failed, which for the bridge's four-call
+    session (tab_create, pane_run, report_agent, report_metadata) meant
+    alternating failure on every event. echo_handler now closes after each
+    reply so this is the shape a real server has.
+    """
+    server = fake()  # echo_handler: reply, then hang up
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    client.tab_create("w1", "/private/tmp", "og-null-ws")
+    client.pane_run("w1:pQ", "pytest -q")
+    client.report_agent("w1:pQ", "og", "coder", "working")
+    client.report_metadata("w1:pQ", "og", title="coder")
+    # Four requests, four separate sockets, every one of them answered.
+    assert [r["method"] for r in server.requests] == [
+        "tab.create", "pane.run", "pane.report_agent", "pane.report_metadata"]
+    assert server.connections == 4
+    client.close()
+
+
+def test_a_call_does_not_borrow_or_close_a_live_subscription(fake):
+    """A subscription owns its connection; an ordinary call must not take it."""
+    def subscribe_handler(request, send):
+        if request["method"] != "events.subscribe":
+            send({"id": request["id"], "result": RESULTS["ping"]})
+            return True  # one request per connection, like herdr
+        send({"id": request["id"], "result": {"type": "subscription_started"}})
+        send({"id": "evt_1", "event": "pane.exit", "params": {}})
+        send({"id": "evt_2", "event": "pane.exit", "params": {}})
+        return False  # the stream stays open
+
+    server = fake(subscribe_handler)
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    stream = client.events_subscribe()
+    assert next(stream)["id"] == "evt_1"
+    # An ordinary call in the middle of the stream gets its own socket...
+    assert client.ping() == {"type": "pong"}
+    # ...and the stream is still readable afterwards.
+    assert next(stream)["id"] == "evt_2"
+    stream.close()
+    client.close()
+
+
+# --------------------------------------------------------------------------
 # result unwrapping / error frames
 # --------------------------------------------------------------------------
 
-def test_call_returns_the_result_object_not_the_envelope(client, fake):
+def test_call_returns_the_result_object_not_the_envelope(fake):
     server = fake()
     unwrap = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     result = unwrap.call("agent.get", {"target": "coder"})
@@ -285,6 +358,32 @@ def test_error_frame_without_code_or_message_still_raises(fake):
         client.ping()
     assert excinfo.value.code == "unknown"
     client.close()
+
+
+def test_error_frame_with_an_empty_id_raises_the_servers_message(fake):
+    """An unparseable request is answered with "id": "" — that is our answer.
+
+    Measured against a live herdr: a request it cannot parse comes back with
+    an empty id, e.g. `params {}` -> "missing field `subscriptions`". Skipping
+    such a frame on the id mismatch threw the server's message away, read EOF
+    and reported `disconnected`, so a malformed request looked like a dropped
+    connection.
+    """
+    def empty_id_error_handler(request, send):
+        send({"id": "", "error": {"code": "invalid_request",
+                                  "message": "invalid request: missing field "
+                                             "`subscriptions` at line 1 column 51"}})
+        return True
+
+    server = fake(empty_id_error_handler)
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    with pytest.raises(herdr.HerdrError) as excinfo:
+        # The request herdr actually rejected when probed live.
+        client.call("events.subscribe", {})
+    client.close()
+    assert excinfo.value.code == "invalid_request"
+    assert "missing field `subscriptions`" in excinfo.value.message
+    assert excinfo.value.code != "disconnected"
 
 
 def test_frame_with_our_id_but_neither_result_nor_error_raises(fake):
@@ -376,6 +475,24 @@ def test_reply_loop_skips_event_frames_sent_between_the_request_and_reply(fake):
     client.close()
 
 
+def test_reply_loop_skips_an_event_frame_carrying_the_awaited_id(fake):
+    """Defensive: an event is never an answer, whatever its id says.
+
+    Ids are client-generated and monotonic, so this was never observed — the
+    server would have to echo a live one. Skipping on the `event` key costs one
+    condition and removes the class instead of relying on that.
+    """
+    def shadowing_event_handler(request, send):
+        send({"id": request["id"], "event": "pane.exit", "params": {"pane_id": "pane_1"}})
+        send({"id": request["id"], "result": {"type": "pong"}})
+        return True
+
+    server = fake(shadowing_event_handler)
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    assert client.ping() == {"type": "pong"}
+    client.close()
+
+
 # --------------------------------------------------------------------------
 # socket path resolution
 # --------------------------------------------------------------------------
@@ -456,7 +573,7 @@ def test_resolve_socket_path_matches_priority_order(tmp_path):
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("state", ["idle", "working", "blocked", "unknown"])
-def test_report_agent_accepts_valid_states(client, fake, state):
+def test_report_agent_accepts_valid_states(fake, state):
     server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stateful.report_agent("pane_1", "og", "coder", state)
@@ -465,7 +582,7 @@ def test_report_agent_accepts_valid_states(client, fake, state):
 
 
 @pytest.mark.parametrize("state", ["busy", "", "IDLE", "done", None])
-def test_report_agent_rejects_invalid_state_before_socket(client, fake, state):
+def test_report_agent_rejects_invalid_state_before_socket(fake, state):
     server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     with pytest.raises(ValueError):
@@ -475,7 +592,7 @@ def test_report_agent_rejects_invalid_state_before_socket(client, fake, state):
     stateful.close()
 
 
-def test_report_agent_drops_unset_optional_params(client, fake):
+def test_report_agent_drops_unset_optional_params(fake):
     server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stateful.report_agent("pane_1", "og", "coder", "working")
@@ -484,7 +601,7 @@ def test_report_agent_drops_unset_optional_params(client, fake):
     stateful.close()
 
 
-def test_report_agent_passes_optional_params_when_given(client, fake):
+def test_report_agent_passes_optional_params_when_given(fake):
     server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stateful.report_agent("pane_1", "og", "coder", "blocked",
@@ -508,12 +625,16 @@ def test_workspace_list(client):
     assert client.workspace_list() == [{"name": "dev", "active_tab": "tab_9"}]
 
 
-def test_tab_create(client, fake):
+def test_tab_create(fake):
     server = fake()
     tab = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     result = tab.tab_create("dev", "/repo", "coder", focus=True)
-    assert result["tab"]["id"] == "tab_9"
-    assert result["root_pane"]["id"] == "pane_1"
+    # Real key names: herdr has no generic `id`, and root_pane carries both its
+    # own pane_id and the tab_id it belongs to.
+    assert result["type"] == "tab_created"
+    assert result["tab"]["tab_id"] == "w1:tG"
+    assert result["root_pane"]["pane_id"] == "w1:pQ"
+    assert result["root_pane"]["tab_id"] == "w1:tG"
     assert server.requests[0]["params"] == {
         "workspace": "dev", "cwd": "/repo", "label": "coder", "focus": True}
     tab.close()
@@ -572,26 +693,29 @@ def test_connect_to_missing_socket_raises_herdr_error(tmp_path):
     client.close()
 
 
-def test_peer_close_is_reported_not_retried(fake):
-    """A connection the server hung up on fails loudly instead of re-sending.
+def test_hangup_before_the_reply_is_reported_not_retried(fake):
+    """A peer that dies mid-request fails loudly instead of being re-sent.
 
-    Re-sending would risk running a non-idempotent method twice, so the client
-    surfaces `disconnected` and only reconnects on the *next* call.
+    The failure is not retried on a fresh connection: a request that may have
+    been half-processed must not be replayed, since methods like tab.create are
+    not idempotent. The *next* call is a clean new connection.
     """
     def hangup_handler(request, send):
-        send({"id": request["id"], "result": {"type": "pong"}})
-        return True  # close after every reply
+        return True  # read the request, answer nothing, hang up
 
     server = fake(hangup_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
-    assert client.ping() == {"type": "pong"}
     with pytest.raises(herdr.HerdrError) as excinfo:
         client.ping()
     assert excinfo.value.code == "disconnected"
-    # The dead socket was dropped, so the next call is a clean reconnect.
-    assert client.ping() == {"type": "pong"}
-    # req_2 never reached the server: the failed write was not replayed.
-    assert [r["id"] for r in server.requests] == ["req_1", "req_3"]
+    # The failed request was not replayed: one request, one connection.
+    assert [r["id"] for r in server.requests] == ["req_1"]
+    assert server.connections == 1
+    # The next call opens its own connection rather than reusing the dead one.
+    with pytest.raises(herdr.HerdrError):
+        client.ping()
+    assert server.connections == 2
+    assert [r["id"] for r in server.requests] == ["req_1", "req_2"]
     client.close()
 
 
@@ -664,9 +788,63 @@ def test_events_subscribe_handles_event_before_ack(fake):
     client.close()
 
 
-def test_events_subscribe_forwards_types_filter(fake):
+def test_events_subscribe_sends_a_subscriptions_list(fake):
+    """The wire key is `subscriptions`, and entries pass through verbatim.
+
+    Measured against a live herdr:
+      {"subscriptions": []}                                  -> starts
+      {"subscriptions": ["pane.agent_status_changed"]}        -> "invalid
+          type: string ..., expected internally tagged enum Subscription"
+      {"subscriptions": [{"type": "pane.agent_status_changed"}]}
+                                                            -> "missing
+          field `pane_id`"
+    Each entry is an internally-tagged object, a per-type entry also needs
+    `pane_id`, and the empty list is the accepted catch-all.
+    """
     def subscribe_handler(request, send):
-        send({"id": request["id"], "result": {"subscribed": True}})
+        send({"id": request["id"], "result": {"type": "subscription_started"}})
+        send({"id": "evt_1", "event": "agent.state", "params": {"state": "idle"}})
+        return False
+
+    server = fake(subscribe_handler)
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    stream = client.events_subscribe(
+        subscriptions=[{"type": "pane.agent_status_changed", "pane_id": "w1:pQ"}])
+    assert next(stream)["event"] == "agent.state"
+    stream.close()
+    client.close()
+    assert server.requests[0] == {
+        "id": "req_1",
+        "method": "events.subscribe",
+        "params": {"subscriptions": [{"type": "pane.agent_status_changed",
+                                      "pane_id": "w1:pQ"}]},
+    }
+
+
+def test_events_subscribe_defaults_to_an_empty_subscriptions_list(fake):
+    """`[]` is what the server accepts, so it is the default — not omitted.
+
+    Omitting `params` (what this client used to send) is rejected outright:
+    "invalid request: missing field `subscriptions` at line 1 column 51".
+    """
+    def subscribe_handler(request, send):
+        send({"id": request["id"], "result": {"type": "subscription_started"}})
+        send({"id": "evt_1", "event": "pane.exit", "params": {}})
+        return False
+
+    server = fake(subscribe_handler)
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    stream = client.events_subscribe()
+    assert next(stream)["event"] == "pane.exit"
+    stream.close()
+    client.close()
+    assert server.requests[0]["params"] == {"subscriptions": []}
+
+
+def test_events_subscribe_accepts_the_types_alias(fake):
+    """`types=` still works — the old parameter name, mapped onto the new key."""
+    def subscribe_handler(request, send):
+        send({"id": request["id"], "result": {"type": "subscription_started"}})
         send({"id": "evt_1", "event": "agent.state", "params": {"state": "idle"}})
         return False
 
@@ -677,7 +855,7 @@ def test_events_subscribe_forwards_types_filter(fake):
     stream.close()
     client.close()
     assert server.requests[0]["method"] == "events.subscribe"
-    assert server.requests[0]["params"] == {"types": ["pane.exit", "agent.state"]}
+    assert server.requests[0]["params"] == {"subscriptions": ["pane.exit", "agent.state"]}
 
 
 def test_events_subscribe_raises_on_error_ack(fake):
@@ -692,3 +870,27 @@ def test_events_subscribe_raises_on_error_ack(fake):
         next(stream)
     assert excinfo.value.code == "unsupported"
     client.close()
+
+
+def test_events_subscribe_raises_on_an_error_ack_with_an_empty_id(fake):
+    """The refusal herdr sends for the very `subscriptions` frame we build.
+
+    It cannot echo an id from a request it failed to parse, so the ack arrives
+    with "id": "" — dropping it on the id match would hang until EOF and report
+    `disconnected` instead of naming the bad parameter.
+    """
+    def empty_id_error_subscribe(request, send):
+        send({"id": "", "error": {
+            "code": "invalid_request",
+            "message": "invalid request: missing field `subscriptions` "
+                       "at line 1 column 51"}})
+        return True
+
+    server = fake(empty_id_error_subscribe)
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    stream = client.events_subscribe()
+    with pytest.raises(herdr.HerdrError) as excinfo:
+        next(stream)
+    client.close()
+    assert excinfo.value.code == "invalid_request"
+    assert "missing field `subscriptions`" in excinfo.value.message
