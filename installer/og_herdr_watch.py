@@ -456,8 +456,11 @@ class SessionWatcher:
         self.token = token
         self.poll_interval = poll_interval
         self.opener = opener or urllib.request.urlopen
-        # session_id -> last seen session object. Populated by poll_once.
+        # session id -> last seen session object. Populated by poll_once.
         self._seen: dict[str, dict] = {}
+        # Whether the last listing was truncated, so the notice written about
+        # it is written once per transition rather than once per poll.
+        self._listing_truncated = False
 
     # -- auth ---------------------------------------------------------------
 
@@ -518,6 +521,55 @@ class SessionWatcher:
             body = resp.read()
         return json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
 
+    def _fetch_listing(self, kind: str = "any") -> tuple[list, bool]:
+        """Walk the listing to its end -> (rows, truncated).
+
+        `truncated` means the walk stopped with rows left unfetched — the page
+        cap ran out, the row cap cut the tail off, the envelope promised more
+        but gave no cursor to ask for, or the server handed back a cursor it had
+        already given. A complete listing is `truncated is False`.
+
+        The caller cannot invent the difference from the rows themselves: the
+        rows of a truncated listing are indistinguishable from the rows of a
+        smaller server, and that indistinguishability is exactly what makes a
+        truncated listing dangerous — see poll_once.
+        """
+        rows: list = []
+        truncated = False
+        params = {"kind": kind, "limit": SESSION_PAGE_LIMIT}
+        seen_cursors: set = set()
+        cursor: Optional[str] = None
+
+        for _ in range(MAX_SESSION_PAGES):
+            if cursor:
+                params["after"] = cursor
+            payload = self._get_json(
+                f"{self.base_url}/v1/sessions?{urllib.parse.urlencode(params)}"
+            )
+            page, has_more, next_cursor = _read_page(payload)
+            rows.extend(page)
+            if not has_more:
+                break
+            if not next_cursor or next_cursor in seen_cursors:
+                # The server says there is more and will not say where to get
+                # it. Stopping is the only thing that terminates the walk, and
+                # whatever is past that point counts as unfetched.
+                truncated = True
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            # The page cap ran out on a page that still claimed there was more.
+            truncated = True
+
+        if len(rows) > MAX_LISTED_SESSIONS:
+            # A server ignoring `limit` and sending a huge page: the cap still
+            # holds, and the rows it cuts are rows we did not finish reading.
+            rows = rows[:MAX_LISTED_SESSIONS]
+            truncated = True
+
+        return rows, truncated
+
     def list_sessions(self, kind: str = "any") -> list:
         """Every listed session, walked across pages. Unfiltered — narrowing is
         `should_project`'s job, so this stays a faithful read of the API.
@@ -536,30 +588,12 @@ class SessionWatcher:
         The walk is capped (MAX_SESSION_PAGES, MAX_LISTED_SESSIONS) so a poll
         stays bounded in requests and memory whatever the server holds. The cap
         drops the OLDEST rows, which are the ones this most needs — hence the
-        order-of-magnitude headroom rather than a tight bound, and hence that
-        hitting it means the session count grew past anything anticipated.
+        order-of-magnitude headroom rather than a tight bound. Those rows also
+        stop being evidence of deletion: `_fetch_listing` reports when the walk
+        stopped short, and poll_once acts on it.
         """
-        rows: list = []
-        params = {"kind": kind, "limit": SESSION_PAGE_LIMIT}
-        seen_cursors: set = set()
-        cursor: Optional[str] = None
-
-        for _ in range(MAX_SESSION_PAGES):
-            if cursor:
-                params["after"] = cursor
-            payload = self._get_json(
-                f"{self.base_url}/v1/sessions?{urllib.parse.urlencode(params)}"
-            )
-            page, has_more, next_cursor = _read_page(payload)
-            rows.extend(page)
-            if not has_more or not next_cursor or next_cursor in seen_cursors:
-                # No next page, no cursor to ask with, or a server repeating a
-                # cursor — any of these ends the walk instead of looping on it.
-                break
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-
-        return rows[:MAX_LISTED_SESSIONS]
+        rows, _truncated = self._fetch_listing(kind)
+        return rows
 
     def poll_once(self) -> list:
         """One listing, diffed against the last, as a list of SessionEvent.
@@ -571,12 +605,31 @@ class SessionWatcher:
         is handed the live set and nothing else; a sub-agent finishing reads as
         "removed" because that is what it is.
 
-        Strict: a transport or decode error propagates. `_seen` is replaced as
+        A TRUNCATED listing cannot mean anything by an absence. Rows past the
+        cap were never fetched, and since the listing is newest-first those are
+        the oldest sessions — the roots, the panes the user is typing into — so
+        reporting them as removed would close exactly the panes that must not
+        close, manufactured by our own ceiling rather than by the server. So a
+        truncated poll emits no removals at all, and keeps the sessions it did
+        not see in `_seen`: dropping them would only move the damage, turning
+        this poll's phantom removals into the next complete poll's phantom
+        `added`, and the consumer would open a second tab for a session whose
+        pane is already on screen. What the poll *did* see is still diffed
+        normally, so `added` and `changed` keep flowing while truncated.
+
+        The cost, stated plainly: a session that quietly finished during a
+        truncated window keeps its pane until a complete listing arrives — a
+        stale pane instead of a wrongly closed one — and if the listing never
+        completes, removals never resume at all. One line to stderr, on the
+        transition into that state and out of it, is what makes it findable.
+
+        Strict: a transport or decode error propagates. `_seen` is updated as
         the very last statement, so a failure leaves the previously observed
         state untouched rather than half-updated.
         """
+        rows, truncated = self._fetch_listing(kind="any")
         fresh = {}
-        for session in self.list_sessions(kind="any"):
+        for session in rows:
             sid = _session_id(session)
             if sid is not None and should_project(session):
                 fresh[sid] = session
@@ -588,12 +641,49 @@ class SessionWatcher:
             elif self._material_change(self._seen[sid], session):
                 events.append(SessionEvent("changed", sid, dict(session),
                                            dict(self._seen[sid])))
+
+        if truncated:
+            self._announce_listing(len(rows), truncated)
+            # Merge over what we already knew rather than replacing it: the
+            # sessions missing from this poll are missing from the FETCH, not
+            # from the server, and the only honest record of them is the one we
+            # took when we could still see them.
+            self._seen.update(fresh)
+            return events
+
         for sid, session in self._seen.items():
             if sid not in fresh:
                 events.append(SessionEvent("removed", sid, {}, dict(session)))
 
+        self._announce_listing(len(rows), truncated)
         self._seen = fresh
         return events
+
+    def _announce_listing(self, rows: int, truncated: bool) -> None:
+        """Report a change in what this watcher knows, not the state itself.
+
+        Being on partial knowledge is something an operator has to be able to
+        discover — it changes what the events above mean — but a watcher
+        polling every few seconds in a permanently truncated state would
+        otherwise say the same thing forever and bury everything else. So the
+        line is written when the state changes and not in between: entering the
+        truncated state, and coming back out of it.
+        """
+        if truncated == self._listing_truncated:
+            return
+        self._listing_truncated = truncated
+        if truncated:
+            sys.stderr.write(
+                f"og herdr watch: session listing truncated at {rows} rows; "
+                "reporting only what was fetched, removals suppressed until a "
+                "complete listing arrives\n"
+            )
+        else:
+            sys.stderr.write(
+                f"og herdr watch: session listing complete again ({rows} rows); "
+                "removals resume\n"
+            )
+        sys.stderr.flush()
 
     @staticmethod
     def _material_change(previous: dict, current: dict) -> bool:
@@ -616,7 +706,7 @@ class SessionWatcher:
         resume on their own when the server comes back.
 
         `_seen` is deliberately not touched on the failure path: poll_once()
-        replaces it as its last statement, so a poll that raises leaves the last
+        updates it as its last statement, so a poll that raises leaves the last
         state actually observed in place and recovery diffs against that.
         Otherwise every live session would be reported removed and re-added on
         each outage, and the consumer would thrash rebuilding tabs it already

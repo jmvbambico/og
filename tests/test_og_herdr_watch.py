@@ -385,6 +385,150 @@ def test_list_sessions_caps_the_rows_it_returns(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# a listing that stopped short is not evidence of deletion
+# --------------------------------------------------------------------------
+
+def cap_pages(monkeypatch, pages=1):
+    """Force the walk to stop after `pages` fetches — the page cap."""
+    monkeypatch.setattr(w, "MAX_SESSION_PAGES", pages)
+
+
+def test_a_complete_listing_is_not_truncated():
+    rows, truncated = w.SessionWatcher(
+        opener=StubOpener(envelope([session("s1")]))
+    )._fetch_listing()
+    assert ([r["id"] for r in rows], truncated) == (["s1"], False)
+
+
+def test_the_page_cap_is_reported_as_truncated(monkeypatch):
+    cap_pages(monkeypatch)
+    opener = StubOpener(envelope([session("s1")], has_more=True, last_id="s1"))
+    rows, truncated = w.SessionWatcher(opener=opener)._fetch_listing()
+    assert ([r["id"] for r in rows], truncated) == (["s1"], True)
+
+
+def test_a_server_that_will_not_say_where_to_continue_is_truncated():
+    # has_more with no cursor to use: more exists and none of it was fetched.
+    payload = {"object": "list", "data": [{"status": "running"}], "has_more": True}
+    _rows, truncated = w.SessionWatcher(opener=StubOpener(payload))._fetch_listing()
+    assert truncated is True
+
+
+def test_a_repeated_cursor_is_reported_as_truncated():
+    page = envelope([session("s1")], has_more=True, last_id="same")
+    opener = StubOpener(page)
+    rows, truncated = w.SessionWatcher(opener=opener)._fetch_listing()
+    assert truncated is True
+    assert len(rows) == 2, "both fetches landed before the walk gave up"
+
+
+def test_the_row_cap_is_reported_as_truncated(monkeypatch):
+    monkeypatch.setattr(w, "MAX_LISTED_SESSIONS", 1)
+    opener = StubOpener(envelope([session("s1"), session("s2")]))
+    rows, truncated = w.SessionWatcher(opener=opener)._fetch_listing()
+    assert ([r["id"] for r in rows], truncated) == (["s1"], True)
+
+
+def test_a_truncated_listing_does_not_manufacture_removals(monkeypatch):
+    watcher = w.SessionWatcher(
+        opener=StubOpener(envelope([session("s1"), session("s2")]))
+    )
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [
+        ("added", "s1"), ("added", "s2"),
+    ]
+
+    # Now past what one capped walk can fetch. s2 is beyond the page — the
+    # oldest rows are the roots — and not gone.
+    cap_pages(monkeypatch)
+    watcher.opener = StubOpener(envelope([session("s1")], has_more=True, last_id="s1"))
+    assert watcher.poll_once() == []
+    assert set(watcher._seen) == {"s1", "s2"}, "the unseen session was forgotten"
+
+
+def test_the_next_complete_listing_emits_the_removal_it_suppressed(monkeypatch):
+    watcher = w.SessionWatcher(
+        opener=StubOpener(envelope([session("s1"), session("s2")]))
+    )
+    watcher.poll_once()
+
+    cap_pages(monkeypatch)
+    watcher.opener = StubOpener(envelope([session("s1")], has_more=True, last_id="s1"))
+    assert watcher.poll_once() == []
+
+    # This listing really does lack s2, and having kept the record of it from
+    # the truncated poll the watcher can say so — exactly once.
+    watcher.opener = StubOpener(envelope([session("s1")]))
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("removed", "s2")]
+    assert events[0].previous["id"] == "s2"
+
+    watcher.opener = StubOpener(envelope([session("s1")]))
+    assert watcher.poll_once() == []
+
+
+def test_a_truncated_listing_still_reports_added_and_changed(monkeypatch):
+    cap_pages(monkeypatch)
+    watcher = w.SessionWatcher(opener=StubOpener(
+        envelope([session("s1"), session("s3")], has_more=True, last_id="s3")
+    ))
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [
+        ("added", "s1"), ("added", "s3"),
+    ]
+
+    watcher.opener = StubOpener(envelope(
+        [session("s1", status="idle"), session("s3")], has_more=True, last_id="s3"
+    ))
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [("changed", "s1")]
+
+
+def test_a_session_beyond_the_cap_is_not_re_added_when_it_returns(monkeypatch):
+    watcher = w.SessionWatcher(
+        opener=StubOpener(envelope([session("s1"), session("s2")]))
+    )
+    watcher.poll_once()
+
+    cap_pages(monkeypatch)
+    watcher.opener = StubOpener(envelope([session("s1")], has_more=True, last_id="s1"))
+    assert watcher.poll_once() == []
+    assert "s2" in watcher._seen
+
+    # s2 is back in the window and unchanged. Suppressing the removal is only
+    # half the fix: if the retained state had been replaced, this would be an
+    # "added" and the consumer would open a second tab for a session whose pane
+    # is already on screen.
+    watcher.opener = StubOpener(envelope(
+        [session("s1"), session("s2")], has_more=True, last_id="s2"
+    ))
+    assert watcher.poll_once() == []
+
+
+def test_the_truncation_notice_is_written_once_per_transition(monkeypatch, capsys):
+    cap_pages(monkeypatch)
+    page = envelope([session("s1")], has_more=True, last_id="s1")
+    watcher = w.SessionWatcher(opener=StubOpener(page, page, page))
+    for _ in range(3):
+        watcher.poll_once()
+    err = capsys.readouterr().err
+    assert err.count("truncated") == 1, err
+    assert "removals suppressed" in err, err
+
+    # Coming back out of it is worth a line too — the watcher is whole again
+    # and removals resume — and it is a line, not a flood.
+    complete = envelope([session("s1")])
+    for _ in range(3):
+        watcher.opener = StubOpener(complete)
+        watcher.poll_once()
+    err = capsys.readouterr().err
+    assert err.count("complete again") == 1, err
+    assert "truncated" not in err
+
+
+def test_an_untruncated_watcher_writes_nothing(capsys):
+    w.SessionWatcher(opener=StubOpener(envelope([session("s1")]))).poll_once()
+    assert capsys.readouterr().err == ""
+
+
+# --------------------------------------------------------------------------
 # the measured envelope and row, parsed verbatim
 # --------------------------------------------------------------------------
 
