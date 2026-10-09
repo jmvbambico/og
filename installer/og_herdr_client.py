@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """og herdr — a stdlib-only client for the herdr control socket.
 
-Transport (verified against herdr 0.9.3)
-----------------------------------------
+Transport (verified against a live herdr 0.9.1 server / 0.9.3 client)
+------------------------------------------------------------------
 herdr speaks **newline-delimited JSON over a Unix domain socket**: one JSON
 object per line, in both directions, UTF-8, no framing header.
 
@@ -10,10 +10,34 @@ object per line, in both directions, UTF-8, no framing header.
     success  {"id":"req_1","result":{"type":"pong"}}
     error    {"id":"req_1","error":{"code":"not_found","message":"pane not found"}}
 
-A reply always echoes the request's ``id``. ``result`` is the payload (empty
-object for void methods); ``error`` replaces it entirely on failure and carries
-a machine-readable ``code`` plus a human ``message``. Both are surfaced as
-:class:`HerdrError`.
+``result`` is the payload (empty object for void methods); ``error`` replaces it
+entirely on failure and carries a machine-readable ``code`` plus a human
+``message``. Both are surfaced as :class:`HerdrError`.
+
+A connection serves exactly ONE request
+---------------------------------------
+The server answers one request and then closes, whatever the method. Measured,
+three separate trials, one connection each:
+
+    workspace.list, workspace.list, workspace.list
+      -> reply, then EOF, then BrokenPipeError
+    ping, agent.list
+      -> pong, then BrokenPipeError
+
+So this client connects, sends, reads and closes for every request. Reusing a
+connection made every *second* call fail on a peer that had already hung up —
+for a four-call session (tab.create, pane.run, report_agent, report_metadata)
+that is alternating failure on every event. ``events.subscribe`` is the one
+exception: there the subscription genuinely *is* the connection, so it keeps
+its socket open for as long as the stream runs.
+
+A reply echoes the request's id — unless herdr could not read the request
+-----------------------------------------------------------------------------
+A request herdr cannot parse comes back with ``"id": ""``, not the id that was
+sent. Such a frame is the answer to the in-flight request and is raised as-is;
+skipping it would read EOF and report a useless ``disconnected`` in place of
+the server's real "missing field ``subscriptions``". See
+:meth:`HerdrClient._await_reply`.
 
 Socket path resolution (highest priority first)
 -----------------------------------------------
@@ -24,12 +48,14 @@ Socket path resolution (highest priority first)
 
 A quirk that shapes this file
 ----------------------------
-``events.subscribe`` turns the connection into a **push channel**: from then on
+``events.subscribe`` turns its connection into a **push channel**: from then on
 the server interleaves unsolicited event frames with anything else it sends, and
 those event frames may arrive *before* the subscribe ack. A reply read loop
 therefore cannot assume "the next frame I read is my answer" — it must skip
-every frame whose ``id`` is not the request it is waiting for. See
-:meth:`HerdrClient._await_reply` and :meth:`HerdrClient.events_subscribe`.
+every frame whose ``id`` is not the request it is waiting for, which is also
+what lets an event that somehow carries the awaited id be stepped over instead
+of mistaken for a result. See :meth:`HerdrClient._await_reply` and
+:meth:`HerdrClient.events_subscribe`.
 
 Everything here is stdlib (json + socket) and every socket error — refused,
 timed out, closed mid-reply, malformed frame — is funnelled into
@@ -91,9 +117,11 @@ def _drop_none(params: Dict[str, Any]) -> Dict[str, Any]:
 class HerdrClient:
     """Synchronous client for the herdr control socket.
 
-    One connection is opened lazily on the first request and reused for
-    subsequent ones; :meth:`close` releases it, and a later call reconnects.
-    Use it as a context manager to tie the socket to a block.
+    Every request gets its own connection: herdr answers one request per
+    connection and then hangs up (measured — see the module docstring), so
+    each call connects, sends, reads its reply and closes. :meth:`close` and
+    the context manager still work — they matter for :meth:`events_subscribe`,
+    whose connection is long-lived.
     """
 
     def __init__(self, socket_path: Optional[str] = None,
@@ -142,7 +170,12 @@ class HerdrClient:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the connection. Safe to call when never connected, or twice."""
+        """Close any open connection. Safe to call when never connected, or twice.
+
+        Ordinary requests are one-per-connection and have already closed
+        themselves; this is what releases a live :meth:`events_subscribe`
+        stream, and what a context manager block calls on the way out.
+        """
         rfile, sock = self._rfile, self._sock
         self._rfile, self._sock = None, None
         for closeable in (rfile, sock):
@@ -191,11 +224,12 @@ class HerdrClient:
         try:
             self._sock.sendall(data)
         except OSError as exc:
-            # No silent reconnect-and-retry: a peer that has gone away may have
-            # taken a *previous* request with it, and re-sending on a fresh
-            # connection would run a non-idempotent method (tab.create) twice.
-            # The socket is closed so the next call reconnects cleanly, and the
-            # failure is reported instead of papered over.
+            # The connection was opened for this request alone, so a write
+            # failure cannot have swallowed an *earlier* one, and there is
+            # nothing worth retrying: re-sending would risk running a
+            # non-idempotent method (tab.create) twice. Report the failure
+            # rather than paper over it, after dropping the dead socket — which
+            # for events_subscribe also tears down the stream.
             self.close()
             raise HerdrError("disconnected", "write failed: {0}".format(exc)) from exc
 
@@ -209,8 +243,8 @@ class HerdrClient:
         except socket.timeout as exc:
             # Must be caught before the OSError arm below; socket.timeout is a
             # subclass. The buffered reader's state after a mid-line timeout is
-            # not trustworthy, so the connection is left unusable — callers that
-            # want to recover call close() and reconnect.
+            # not trustworthy, so the connection is left unusable; call() drops
+            # it in its finally, and a caller streaming events calls close().
             raise HerdrError(
                 "timeout",
                 "no reply from herdr within {0}s".format(self.timeout),
@@ -254,13 +288,29 @@ class HerdrClient:
     def _await_reply(self, req_id: str) -> Any:
         """Read frames until the reply carrying `req_id` arrives.
 
-        The skip is the whole point of this method: once a subscription is
-        active the connection carries unsolicited event frames, and an event
-        can even overtake the ack for the subscribe request itself. Anything
-        whose `id` is not `req_id` is not our answer, whatever it is.
+        The skip is the point of this method: on a subscribed connection the
+        server interleaves unsolicited event frames, and an event can even
+        overtake the ack for the subscribe request itself. Anything that is not
+        our answer is stepped over.
         """
         while True:
             frame = self._read_frame()
+            # Defensive, not observed: ids are client-generated and monotonic,
+            # so the server would have to echo a live one for an event frame to
+            # land here. Skipping event frames on their own merit costs one
+            # condition and removes the class instead of arguing about it.
+            if "event" in frame:
+                continue
+            # WHY the empty-id carve-out: when herdr cannot parse a request it
+            # cannot echo the id, and answers with "id": "" — measured:
+            #   params {} -> {"id":"","error":{"code":"invalid_request",
+            #                       "message":"invalid request: missing field
+            #                       `subscriptions` at line 1 column 51"}}
+            # Skipping that frame on the id mismatch threw the real message
+            # away, read EOF and reported `disconnected`, so a malformed
+            # request looked like a dropped connection.
+            if not frame.get("id") and "error" in frame:
+                self._raise_error_frame(frame)
             if frame.get("id") != req_id:
                 continue
             if "error" in frame:
@@ -273,9 +323,22 @@ class HerdrClient:
     def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> dict:
         """Send one request and return its unwrapped `result` object.
 
+        One connection per call: connect, send, read the reply, close. herdr
+        answers a single request per connection and hangs up (measured), so a
+        shared connection would break every second call.
+
         Raises :class:`HerdrError` on an error frame or any transport failure.
         """
-        return self._await_reply(self._send(method, params))
+        # Any connection already on the client belongs to a live
+        # events_subscribe stream; set it aside so this call cannot borrow (and
+        # then close) the subscription's socket. Restored at the end either way.
+        stream_sock, stream_rfile = self._sock, self._rfile
+        self._sock = self._rfile = None
+        try:
+            return self._await_reply(self._send(method, params))
+        finally:
+            self.close()
+            self._sock, self._rfile = stream_sock, stream_rfile
 
     @staticmethod
     def _field(result: Any, key: str, method: str) -> Any:
@@ -394,36 +457,64 @@ class HerdrClient:
     # subscriptions
     # ------------------------------------------------------------------
 
-    def events_subscribe(self, types: Optional[List[str]] = None) -> Iterator[dict]:
+    def events_subscribe(self, subscriptions: Optional[List[Any]] = None,
+                         types: Optional[List[str]] = None) -> Iterator[dict]:
         """Subscribe to pushed events; yields each event frame as it arrives.
 
-        `types` optionally narrows the stream. The frames yielded are herdr's
-        raw event objects (they carry `event`, not `result`).
+        `subscriptions` is passed through verbatim — this client does not
+        model the entry schema, because the wire format was measured and is
+        not a list of type names:
 
-        Two lifetime facts. The generator owns the connection — the
-        subscription *is* the connection — so closing it (or leaving a `for`
-        loop early) closes the socket. And the client's timeout applies per
-        read, so an idle stream raises :class:`HerdrError` with code `timeout`
-        rather than blocking forever; pass `timeout=None` for a blocking stream.
+            {"subscriptions": []}                              -> starts (ack)
+            {"subscriptions": ["pane.agent_status_changed"]}      -> "invalid
+                type: string ..., expected internally tagged enum Subscription"
+            {"subscriptions": [{"type": "pane.agent_status_changed"}]}
+                                                                -> "missing
+                field `pane_id`"
+
+        So each entry is an internally-tagged object, a per-type entry also
+        needs `pane_id`, and the **empty list is the accepted catch-all**. The
+        key itself is not optional: omitting `subscriptions` (or sending a
+        `types` list, which is what this client used to do) is rejected with
+        "invalid request: missing field `subscriptions`".
+
+        `types` is a source-compatible alias that maps onto `subscriptions`,
+        because the old parameter name suggested the entry schema and callers
+        written against it would otherwise break on a signature change alone.
+
+        The frames yielded are herdr's raw event objects (they carry `event`,
+        not `result`).
+
+        Lifetime. This is the one connection that is *not* one-per-request: the
+        generator owns it — the subscription *is* the connection — so closing
+        it (or leaving a `for` loop early) closes the socket. And the client's
+        timeout applies per read, so an idle stream raises :class:`HerdrError`
+        with code `timeout` rather than blocking forever; pass `timeout=None`
+        for a blocking stream.
         """
-        params = {"types": list(types)} if types else {}
-        req_id = self._send("events.subscribe", params)
+        entries: List[Any] = list(subscriptions) if subscriptions is not None else []
+        if not entries and types:
+            entries = list(types)
+        req_id = self._send("events.subscribe", {"subscriptions": entries})
         try:
             while True:
                 frame = self._read_frame()
-                # The subscribe ack is identified by our request id and carries
-                # no event name — consume it and keep streaming. An event frame
-                # can beat the ack to the wire, which is why this cannot simply
-                # read until it sees a matching id.
-                if "event" not in frame and frame.get("id") == req_id:
-                    if "error" in frame:
-                        self._raise_error_frame(frame)
-                    continue
+                # Two ways herdr can refuse this request. A well-formed refusal
+                # echoes our id; a request it could not parse cannot, and comes
+                # back with "id": "" — which is what a bad `subscriptions` frame
+                # produces, the very case this key exists for. Both are raised;
+                # see _await_reply for why skipping the empty-id one is wrong.
+                if not frame.get("id") and "error" in frame:
+                    self._raise_error_frame(frame)
+                if frame.get("id") == req_id and "error" in frame:
+                    self._raise_error_frame(frame)
                 if "event" in frame:
                     yield frame
-                # Anything else on a subscribed connection carries neither our
-                # id nor an event name: drop it rather than hand the caller a
-                # frame it cannot interpret.
+                # The ack itself (our id, no event name) is consumed here, and so
+                # is anything else this connection carries that is neither our id
+                # nor an event name — dropped rather than handed to the caller as
+                # a frame it cannot interpret. An event frame can beat the ack to
+                # the wire, so this cannot simply read until it sees a match.
         finally:
             self.close()
 
