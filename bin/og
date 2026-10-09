@@ -157,6 +157,75 @@ server_running() {
   esac
 }
 
+# ---- local-policy path self-heal ------------------------------------------
+# config.yaml names `omnigent_local_policies` in policy_modules, so an omnigent
+# that cannot import it does not degrade: every policy evaluation raises and the
+# server denies every action, with nothing in the chat error pointing back at the
+# cause. The import works through a .pth the installer writes into omnigent's OWN
+# site-packages — so it is tied to whichever venv omnigent lives in, and that
+# venv can move out from under us. `uv tool` and pipx keep a stable path and
+# survive an upgrade; Homebrew's is version-scoped
+# (Cellar/omnigent/<version>/libexec), so `brew upgrade omnigent` builds a fresh
+# venv and the .pth is left behind in the old one. Re-write it here instead of
+# making the user remember to re-run install.sh. Silent when it already imports.
+
+# The interpreter omnigent runs under -- NOT the one running og. The entry point
+# is a console script whose shebang names its venv's python; that venv's
+# site-packages is where the .pth has to land. Mirrors omnigent_python() in
+# installer/og_install.py.
+omnigent_python() {
+  local exe real dir first py
+  exe="$(command -v omnigent 2>/dev/null || true)"
+  [[ -n "$exe" ]] || return 1
+  # realpath via python3: ~/.local/bin/omnigent is a symlink into the venv, and
+  # BSD readlink has no -f to resolve a chain.
+  real="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$exe" 2>/dev/null || true)"
+  [[ -n "$real" && -f "$real" ]] || return 1
+  dir="$(dirname "$real")"
+  first="$(head -1 "$real" 2>/dev/null || true)"
+  if [[ "$first" == '#!'* ]]; then
+    py="$(printf '%s' "${first#\#!}" | awk '{print $1}')"
+    # `#!/usr/bin/env python3` names the interpreter in the second field.
+    if [[ "$(basename "$py")" == "env" ]]; then
+      py="$(command -v "$(printf '%s' "${first#\#!}" | awk '{print $2}')" 2>/dev/null || true)"
+    fi
+    [[ -n "$py" && -x "$py" ]] && { echo "$py"; return 0; }
+  fi
+  # A launcher with no usable shebang: the venv's python sits beside it.
+  local n
+  for n in python3 python; do
+    [[ -x "$dir/$n" ]] && { echo "$dir/$n"; return 0; }
+  done
+  return 1
+}
+
+ensure_policies_importable() {
+  local pol_dir="$OMNI_HOME/policies"
+  # No local policies installed (or a sandboxed HOME, where OMNI_HOME points at
+  # a temp dir): nothing to heal, and nothing that would deny-all.
+  [[ -d "$pol_dir" ]] || return 0
+  local py
+  py="$(omnigent_python)" || die "could not find the interpreter omnigent runs under.
+    Its site-packages is where the local-policy path lives. Re-run the installer: og setup"
+  "$py" -c 'import omnigent_local_policies' >/dev/null 2>&1 && return 0
+
+  local site
+  site="$("$py" -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
+  [[ -n "$site" && -d "$site" ]] || die "omnigent cannot import its local policies, and \
+site-packages for $py could not be resolved.
+    Re-run the installer: og setup"
+  local pth="$site/omnigent-local-policies.pth"
+  printf '%s\n' "$pol_dir" > "$pth" 2>/dev/null \
+    || die "omnigent cannot import its local policies and $pth is not writable.
+    Write it yourself:  echo '$pol_dir' > '$pth'"
+  # Prove it in a fresh process: the .pth is read at interpreter startup, so this
+  # is exactly what the server will see.
+  "$py" -c 'import omnigent_local_policies' >/dev/null 2>&1 \
+    || die "wrote $pth but omnigent still cannot import its local policies under $py.
+    The server would deny every action with 'policy evaluation error'. Re-run: og setup"
+  info "omnigent moved to a new venv; restored the local-policy path ($pth)"
+}
+
 # ---- tunnel provider seam -------------------------------------------------
 # A tunnel is one of a few providers, each behind four functions chosen by id:
 #   tunnel_preflight_<p>  checks; die with actionable instructions
@@ -1114,6 +1183,9 @@ cmd_start() {
   clear_tunnel_cache
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
   command -v omnigent >/dev/null || die "omnigent is not on PATH"
+  # Before the server boots, not after: a .pth stranded by an omnigent upgrade
+  # turns every policy evaluation into a deny, which surfaces only in chat.
+  ensure_policies_importable
   [[ "$mode" == "tunneled" ]] && tunnel_preflight "$provider"
 
   # Fail fast and name the culprit: without this, a busy port surfaces only
