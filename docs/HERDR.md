@@ -141,13 +141,81 @@ the server's real message, reads EOF, and reports a dropped connection instead
 of `missing field 'subscriptions'`. The client carves out empty-id error frames
 for exactly this reason.
 
+## The HTTP API's real shape (measured)
+
+The session listing was originally documented here from `sys_session_get_info`'s
+MCP output. That was wrong, and the wrong version reached the implementation.
+What `GET /v1/sessions` actually returns, measured against 0.17.0:
+
+```json
+{"object":"list","data":[ … ],"has_more":true,"first_id":"<id>","last_id":"<id>"}
+```
+
+One row carries exactly these keys:
+
+```
+agent_id  agent_name  archived  comments_count  created_at  external_session_id
+id  labels  owner  parent_session_id  pending_elicitations_count
+permission_level  runner_id  status  title  updated_at  viewer_unread
+```
+
+Four traps, each of which had already shipped into the code:
+
+- **`pending_elicitations_count` is PLURAL.** The MCP tool spells it singular.
+  Reading the singular key against a REST row silently never matches, so
+  `blocked` — the state a human most needs to see — never fires.
+- **The id is `id`, not `session_id`**, and the array is `data`, not
+  `sessions`. There is no `kind` field on a row at all; root versus sub-agent
+  is `parent_session_id` being null or not.
+- **There is no `workspace` field**, so a session does not tell you its
+  directory. `og herdr` takes `--cwd`, defaulting to its own working directory.
+- **The listing is paginated**: default page 20, newest-first, cursor via
+  `after=<last_id>`, with `has_more` saying whether more remain. There is **no
+  server-side status filter** — `status=`, `statuses=` and `state=` are all
+  ignored — so filtering is the client's job.
+
+### Why pagination is a correctness problem, not a performance one
+
+Sessions are never retired from the listing: this machine held 100+ with 91
+idle and 8 failed. Reading only the first page means the root session — the
+conversation the human is actually driving — is pushed off by newer sub-agents
+and never seen. Worse, a session that falls off the page boundary between polls
+is indistinguishable from one that ended, so a naive diff reports `removed` and
+the bridge closes a live pane.
+
+The watcher therefore walks the cursor to the end, bounded by
+`SESSION_PAGE_LIMIT` / `MAX_SESSION_PAGES` / `MAX_LISTED_SESSIONS`; and when a
+walk stops short for any reason it suppresses `removed` events for that poll and
+merges rather than replaces its retained state. Suppression alone would be a
+trap: without the merge, the next complete poll re-reports every suppressed
+session as `added` and the bridge opens a second tab for a pane already on
+screen.
+
+That suppression is only sound **because the listing is newest-first**, so the
+rows that go unseen are old ones already known. If the ordering ever flips, a
+genuinely new session could land beyond the cap and never be announced.
+
+### What gets a pane
+
+Projecting every live session would mean ~100 tabs, nearly all dead. So:
+
+- a **root** session is projected while it is listed and not archived — it
+  reads `idle` the whole time it waits for the human to type, so retiring it on
+  idle would close the pane they are typing into;
+- a **sub-agent** is projected only while `running` or holding a pending
+  elicitation, and its pane retires when it goes idle or fails.
+
 ### One consequence worth generalising
 
-A fake server encodes the beliefs of whoever wrote it. All three defects above
-sat behind green tests, and the suite even contained a test
-(`test_peer_close_is_reported_not_retried`) that modelled the *real* hangup
-behaviour while the comment beside it asserted the opposite. When a component
-talks to something external, probe the real thing before trusting the fake.
+A fake server encodes the beliefs of whoever wrote it, and a contract document
+encodes the beliefs of whoever wrote *that*. Eight of the fourteen blocking
+defects in this feature were wrong beliefs about herdr or Omnigent, not wrong
+code — they passed review, 223 tests, and a different-vendor reviewer, because
+every one of those checks was reasoning from the same wrong premise. The suite
+even contained a test (`test_peer_close_is_reported_not_retried`) that modelled
+the *real* hangup behaviour while the comment beside it asserted the opposite.
+
+Probe the real thing before writing the contract, not after the tests pass.
 
 ---
 
@@ -276,6 +344,13 @@ Those specific approvals always need the browser. This is the one place where
   `text`/`output`/`content`/`data`, or a `lines` list). Only one is in use;
   the tolerance is unverified guesswork and could be narrowed once the real
   shape is confirmed against a live pane.
+- **A permanently truncated listing** (session count above the caps forever)
+  degrades the watcher to add-and-change only: removals never resume, so a
+  finished worker beyond the cap keeps a stale pane. The stderr notice on
+  entering that state is the operator's signal.
+- **`_seen` does not evict.** During a long truncated period it grows to the
+  server's session count. Bounded and small per row, but there is no eviction
+  policy, because "which session do we forget" is a consumer decision.
 
 ---
 
