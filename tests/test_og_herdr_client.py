@@ -1,15 +1,19 @@
 """Tests for installer/og_herdr_client.py — the herdr socket API client.
 
 Safety: nothing here may touch the live herdr session. Every test that speaks
-the protocol drives a threaded fake AF_UNIX server bound to a path inside
-tmp_path, and an autouse fixture scrubs $HERDR_SOCKET_PATH / $HERDR_SESSION so
-even an accidental un-injected resolve cannot reach ~/.config/herdr/herdr.sock.
-No `herdr` CLI is invoked either.
+the protocol drives a threaded fake AF_UNIX server whose socket lives in its own
+short-lived temp directory (see SOCKET_BASE for why not tmp_path), and an
+autouse fixture scrubs $HERDR_SOCKET_PATH / $HERDR_SESSION so even an
+accidental un-injected resolve cannot reach ~/.config/herdr/herdr.sock. Every
+client is still constructed with an explicit socket path. No `herdr` CLI is
+invoked either.
 """
 from __future__ import annotations
 
 import json
+import shutil
 import socket
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -23,6 +27,21 @@ import og_herdr_client as herdr
 # fake herdr server
 # --------------------------------------------------------------------------
 
+# Where the fake's socket directory is created. NOT tmp_path.
+#
+# sun_path in an AF_UNIX sockaddr is capped at 104 bytes on macOS and 108 on
+# Linux, and pytest's tmp_path is long before the socket name starts: on macOS
+# TMPDIR is already /private/var/folders/<..>/T/ and pytest appends
+# pytest-of-<user>/pytest-N/<test-name><n>/. Parametrised names like
+# test_report_agent_rejects_invalid_state_before_socket[IDLE] pushed the bind
+# past the cap and every test errored with "AF_UNIX path too long" before its
+# body ran — on the author's short-TMPDIR machine and on CI alike. A fresh
+# mkdtemp under /tmp with a 6-char name keeps the path at ~25 bytes whatever
+# the test is called.
+SOCKET_BASE = "/tmp"
+SOCKET_NAME = "h.sock"
+
+
 class FakeHerdr:
     """Threaded AF_UNIX server speaking herdr's newline-delimited JSON.
 
@@ -32,10 +51,13 @@ class FakeHerdr:
     can push event frames at its own pace; it also accepts raw bytes for the
     malformed-payload tests. Every decoded request is recorded in `requests`
     for framing/id assertions.
+
+    Each instance owns a private socket directory, removed by `close()`.
     """
 
-    def __init__(self, handler, directory, name="herdr.sock"):
-        self.path = str(Path(directory) / name)
+    def __init__(self, handler):
+        self.directory = tempfile.mkdtemp(prefix="hfd-", dir=SOCKET_BASE)
+        self.path = str(Path(self.directory) / SOCKET_NAME)
         self.requests = []
         self._handler = handler
         self._stop = threading.Event()
@@ -89,6 +111,9 @@ class FakeHerdr:
         except OSError:
             pass
         self._thread.join(timeout=2)
+        # The socket file outlives the socket itself, so the directory has to go
+        # too or /tmp accumulates one hfd-* per fake.
+        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 # Canned results per wire method, matching the payload shape each wrapper
@@ -128,13 +153,24 @@ def scrub_herdr_env(monkeypatch):
     monkeypatch.delenv("HERDR_SESSION", raising=False)
 
 
+def test_fake_socket_path_fits_the_af_unix_sun_path_cap(fake):
+    """The reason the fake ignores tmp_path, asserted so it stays true.
+
+    104 is macOS's cap on sun_path (108 on Linux); a path that crosses it fails
+    the bind and every assertion in the test with it.
+    """
+    server = fake()
+    assert len(server.path.encode("utf-8")) <= 104
+    assert server.path.startswith(SOCKET_BASE)
+
+
 @pytest.fixture
-def fake(tmp_path):
-    """Factory for fake servers; every one is closed at test teardown."""
+def fake():
+    """Factory for fake servers; every one is closed (and unlinked) at teardown."""
     servers = []
 
-    def make(handler=echo_handler, name="herdr.sock"):
-        server = FakeHerdr(handler, tmp_path, name=name)
+    def make(handler=echo_handler):
+        server = FakeHerdr(handler)
         servers.append(server)
         return server
 
@@ -157,7 +193,7 @@ def client(fake):
 # --------------------------------------------------------------------------
 
 def test_call_frames_request_as_ndjson_with_id_and_method(client, fake):
-    server = fake(name="framing.sock")
+    server = fake()
     framed = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     assert framed.ping() == {"type": "pong"}
     assert server.requests == [{"id": "req_1", "method": "ping", "params": {}}]
@@ -167,7 +203,7 @@ def test_call_frames_request_as_ndjson_with_id_and_method(client, fake):
 def test_call_sends_an_empty_params_object_when_none_given(fake):
     # `params` is always present, empty object included: herdr reads it
     # unconditionally, so omitting the key would change the frame shape.
-    server = fake(name="emptyparams.sock")
+    server = fake()
     empty = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     empty.call("tab.close")
     assert server.requests[0] == {"id": "req_1", "method": "tab.close", "params": {}}
@@ -175,7 +211,7 @@ def test_call_sends_an_empty_params_object_when_none_given(fake):
 
 
 def test_request_ids_sequence_across_calls_on_one_connection(fake):
-    server = fake(name="seq.sock")
+    server = fake()
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     client.ping()
     client.pane_close("pane_1")
@@ -185,7 +221,7 @@ def test_request_ids_sequence_across_calls_on_one_connection(fake):
 
 
 def test_request_ids_do_not_restart_after_reconnect(fake):
-    server = fake(name="reconnect.sock")
+    server = fake()
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     client.ping()
     client.close()
@@ -201,7 +237,7 @@ def test_request_ids_do_not_restart_after_reconnect(fake):
 # --------------------------------------------------------------------------
 
 def test_call_returns_the_result_object_not_the_envelope(client, fake):
-    server = fake(name="unwrap.sock")
+    server = fake()
     unwrap = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     result = unwrap.call("agent.get", {"target": "coder"})
     assert result == {"name": "coder", "state": "working"}
@@ -214,7 +250,7 @@ def test_call_returns_empty_dict_when_result_is_null(fake):
         send({"id": request["id"], "result": None})
         return True
 
-    server = fake(null_handler, name="null.sock")
+    server = fake(null_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     assert client.call("tab.close", {"tab_id": "tab_9"}) == {}
     client.close()
@@ -226,7 +262,7 @@ def test_error_frame_raises_herdr_error_with_code_and_message(fake):
               "error": {"code": "not_found", "message": "pane not found"}})
         return True
 
-    server = fake(error_handler, name="error.sock")
+    server = fake(error_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     with pytest.raises(herdr.HerdrError) as excinfo:
         client.pane_close("pane_does_not_exist")
@@ -243,7 +279,7 @@ def test_error_frame_without_code_or_message_still_raises(fake):
         send({"id": request["id"], "error": {}})
         return True
 
-    server = fake(bare_error_handler, name="bare-error.sock")
+    server = fake(bare_error_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     with pytest.raises(herdr.HerdrError) as excinfo:
         client.ping()
@@ -256,7 +292,7 @@ def test_frame_with_our_id_but_neither_result_nor_error_raises(fake):
         send({"id": request["id"]})
         return True
 
-    server = fake(envelope_only_handler, name="envelope.sock")
+    server = fake(envelope_only_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     with pytest.raises(herdr.HerdrError) as excinfo:
         client.ping()
@@ -269,7 +305,7 @@ def test_non_json_reply_raises_bad_response(fake):
         send(b"this is not json\n")
         return True
 
-    server = fake(non_json_handler, name="nonjson.sock")
+    server = fake(non_json_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     with pytest.raises(herdr.HerdrError) as excinfo:
         client.ping()
@@ -282,7 +318,7 @@ def test_non_object_reply_raises_bad_response(fake):
         send({"id": request["id"], "result": [1, 2, 3]})
         return True
 
-    server = fake(list_handler, name="listpayload.sock")
+    server = fake(list_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     # The result is passed through as-is; it is the wrapper, not call(), that
     # decides what the payload must look like.
@@ -295,7 +331,7 @@ def test_wrapper_raises_bad_response_when_expected_field_missing(fake):
         send({"id": request["id"], "result": {"unexpected": []}})
         return True
 
-    server = fake(shapeless_handler, name="shapeless.sock")
+    server = fake(shapeless_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     with pytest.raises(herdr.HerdrError) as excinfo:
         client.workspace_list()
@@ -319,7 +355,7 @@ def test_reply_loop_skips_event_frame_with_a_different_id(fake):
         send({"id": request["id"], "result": {"type": "pong"}})
         return True
 
-    server = fake(interleave_handler, name="interleave.sock")
+    server = fake(interleave_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     assert client.ping() == {"type": "pong"}
     client.close()
@@ -332,7 +368,7 @@ def test_reply_loop_skips_event_frames_sent_between_the_request_and_reply(fake):
         send({"id": request["id"], "result": {"type": "pong"}})
         return True
 
-    server = fake(late_event_handler, name="late-event.sock")
+    server = fake(late_event_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     # The first matching-id frame is the answer; the trailing event is left on
     # the wire for whoever reads next.
@@ -421,7 +457,7 @@ def test_resolve_socket_path_matches_priority_order(tmp_path):
 
 @pytest.mark.parametrize("state", ["idle", "working", "blocked", "unknown"])
 def test_report_agent_accepts_valid_states(client, fake, state):
-    server = fake(name="state-{0}.sock".format(state))
+    server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stateful.report_agent("pane_1", "og", "coder", state)
     assert server.requests[0]["params"]["state"] == state
@@ -430,7 +466,7 @@ def test_report_agent_accepts_valid_states(client, fake, state):
 
 @pytest.mark.parametrize("state", ["busy", "", "IDLE", "done", None])
 def test_report_agent_rejects_invalid_state_before_socket(client, fake, state):
-    server = fake(name="badstate.sock")
+    server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     with pytest.raises(ValueError):
         stateful.report_agent("pane_1", "og", "coder", state)
@@ -440,7 +476,7 @@ def test_report_agent_rejects_invalid_state_before_socket(client, fake, state):
 
 
 def test_report_agent_drops_unset_optional_params(client, fake):
-    server = fake(name="opts.sock")
+    server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stateful.report_agent("pane_1", "og", "coder", "working")
     params = server.requests[0]["params"]
@@ -449,7 +485,7 @@ def test_report_agent_drops_unset_optional_params(client, fake):
 
 
 def test_report_agent_passes_optional_params_when_given(client, fake):
-    server = fake(name="opts2.sock")
+    server = fake()
     stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stateful.report_agent("pane_1", "og", "coder", "blocked",
                           message="waiting on input", seq=7, agent_session_id="sess_1")
@@ -473,7 +509,7 @@ def test_workspace_list(client):
 
 
 def test_tab_create(client, fake):
-    server = fake(name="tabcreate.sock")
+    server = fake()
     tab = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     result = tab.tab_create("dev", "/repo", "coder", focus=True)
     assert result["tab"]["id"] == "tab_9"
@@ -546,7 +582,7 @@ def test_peer_close_is_reported_not_retried(fake):
         send({"id": request["id"], "result": {"type": "pong"}})
         return True  # close after every reply
 
-    server = fake(hangup_handler, name="hangup.sock")
+    server = fake(hangup_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     assert client.ping() == {"type": "pong"}
     with pytest.raises(herdr.HerdrError) as excinfo:
@@ -559,20 +595,17 @@ def test_peer_close_is_reported_not_retried(fake):
     client.close()
 
 
-def test_timeout_raises_herdr_error(tmp_path):
+def test_timeout_raises_herdr_error(fake):
     def stall_handler(request, send):
         time.sleep(0.3)  # accept, read, but never reply within the client's timeout
         return True
 
-    server = FakeHerdr(stall_handler, tmp_path, name="stall.sock")
-    try:
-        client = herdr.HerdrClient(socket_path=server.path, timeout=0.1)
-        with pytest.raises(herdr.HerdrError) as excinfo:
-            client.ping()
-        assert excinfo.value.code == "timeout"
-        client.close()
-    finally:
-        server.close()
+    server = fake(stall_handler)
+    client = herdr.HerdrClient(socket_path=server.path, timeout=0.1)
+    with pytest.raises(herdr.HerdrError) as excinfo:
+        client.ping()
+    assert excinfo.value.code == "timeout"
+    client.close()
 
 
 # --------------------------------------------------------------------------
@@ -586,7 +619,7 @@ def test_events_subscribe_yields_pushed_frames(fake):
         send({"id": "evt_2", "event": "agent.state", "params": {"state": "idle"}})
         return False  # keep the connection open
 
-    server = fake(subscribe_handler, name="events.sock")
+    server = fake(subscribe_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stream = client.events_subscribe()
     first = next(stream)
@@ -605,7 +638,7 @@ def test_events_subscribe_skips_ack_before_events(fake):
         send({"event": "pane.exit", "params": {"pane_id": "pane_1"}})
         return False
 
-    server = fake(subscribe_handler, name="events-ack.sock")
+    server = fake(subscribe_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stream = client.events_subscribe()
     frame = next(stream)
@@ -622,7 +655,7 @@ def test_events_subscribe_handles_event_before_ack(fake):
         send({"id": "evt_after", "event": "pane.exit", "params": {}})
         return False
 
-    server = fake(subscribe_handler, name="events-race.sock")
+    server = fake(subscribe_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stream = client.events_subscribe()
     assert next(stream)["event"] == "workspace.changed"
@@ -637,7 +670,7 @@ def test_events_subscribe_forwards_types_filter(fake):
         send({"id": "evt_1", "event": "agent.state", "params": {"state": "idle"}})
         return False
 
-    server = fake(subscribe_handler, name="events-types.sock")
+    server = fake(subscribe_handler)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stream = client.events_subscribe(types=["pane.exit", "agent.state"])
     assert next(stream)["event"] == "agent.state"
@@ -652,7 +685,7 @@ def test_events_subscribe_raises_on_error_ack(fake):
         send({"id": request["id"], "error": {"code": "unsupported", "message": "no"}})
         return True
 
-    server = fake(error_subscribe, name="events-error.sock")
+    server = fake(error_subscribe)
     client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
     stream = client.events_subscribe()
     with pytest.raises(herdr.HerdrError) as excinfo:
