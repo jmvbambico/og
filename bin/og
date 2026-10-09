@@ -531,9 +531,31 @@ try:
         print(f"{agent_name} is not registered on the server", file=sys.stderr); sys.exit(1)
 
     projects = call("/v1/projects").get("data", [])
-    proj = next((p for p in projects if p.get("name") == name), None)
-    if proj is None:
+
+    # Match the project case-insensitively. A project named "Hivemind" and an
+    # agent named "hivemind" are the same thing to a human but not to `==`, so
+    # an exact-name lookup missed it and POSTed a SECOND project — two
+    # identical-looking folders in the sidebar until someone deleted one by hand.
+    matches = [p for p in projects if (p.get("name") or "").casefold() == name.casefold()]
+    if matches:
+        # Prefer the exact-case project; else the lowest id, so a rerun adopts
+        # the same one regardless of the order the server happens to return.
+        proj = next((p for p in matches if p.get("name") == name), None) \
+            or min(matches, key=lambda p: str(p.get("id", "")))
+        used = proj.get("name") or name
+        if used != name:
+            # Adopt it under the canonical name. The PATCH 409s when another of
+            # our projects already holds `name`; keep this one's own name then,
+            # since the URL must point at a project that really exists.
+            try:
+                call(f"/v1/projects/{proj['id']}", "PATCH", {"name": name})
+                used = name
+            except urllib.error.HTTPError as e:
+                if e.code != 409:
+                    raise
+    else:
         proj = call("/v1/projects", "POST", {"name": name})
+        used = name
 
     # Pin the workspace to og's launch directory and the local host, so a new
     # session starts IN the repo you ran `og start` from rather than $HOME.
@@ -554,7 +576,10 @@ try:
     cur = proj.get("config") or {}
     if any(cur.get(k) != v for k, v in want.items()):
         call(f"/v1/projects/{proj['id']}", "PATCH", {"config": {**cur, **want}})
-    print(name)
+    # `used` is the canonical name, except when a rename hit 409 and we had to
+    # stay on the adopted project's own name — the URL must point at whichever
+    # name the project actually has.
+    print(used)
 except urllib.error.HTTPError as e:
     print(f"project setup failed (HTTP {e.code})", file=sys.stderr); sys.exit(1)
 except Exception as e:
