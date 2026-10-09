@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from urllib.error import URLError
 
 import pytest
 
@@ -35,9 +36,11 @@ class FakeResponse(io.BytesIO):
 class StubOpener:
     """Records every request and replies from a queue of bodies.
 
-    `bodies` entries may be bytes (one chunk per read) or a dict (JSON-encoded
-    and readable in any chunk size). The last body repeats if the watcher reads
-    more than once, which keeps a `watch()`-style loop from running dry.
+    `bodies` entries may be bytes (one chunk per read), a dict (JSON-encoded
+    and readable in any chunk size), or an Exception instance, which is raised
+    instead of replied with — that is how a dead server is simulated. The last
+    body repeats if the watcher reads more than once, which keeps a `watch()`-
+    style loop from running dry.
     """
 
     def __init__(self, *bodies):
@@ -47,6 +50,8 @@ class StubOpener:
     def __call__(self, request):
         self.requests.append(request)
         body = self.bodies.pop(0) if len(self.bodies) > 1 else self.bodies[0]
+        if isinstance(body, BaseException):
+            raise body
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
         return FakeResponse(body)
@@ -377,6 +382,67 @@ def test_sse_frame_split_mid_crlf():
     assert parse([b'data: {"a": 1}\r', b'\n\r\n']) == [{"a": 1}]
 
 
+def test_sse_bare_cr_line_endings():
+    # SSE permits CR, CRLF and bare LF. CR-only is not what Omnigent emits, but
+    # the parser claims to speak the format, so it has to: read as one enormous
+    # line otherwise, losing every frame on the stream.
+    assert parse([b'data: {"a": 1}\r\r']) == [{"a": 1}]
+
+
+def test_sse_bare_cr_stream_of_several_frames():
+    body = b': beat\r\rdata: {"n": 1}\r\rdata: {"n": 2}\r\r'
+    assert parse([body]) == [{"n": 1}, {"n": 2}]
+
+
+def test_sse_bare_cr_frame_split_across_reads():
+    assert parse([b'data: {"a": 1', b'}\r', b'\r']) == [{"a": 1}]
+
+
+def test_sse_trailing_bare_cr_dispatches_at_flush():
+    # A lone CR at the end of a buffer is held back — the next byte decides
+    # whether it was a bare CR or half a CRLF — so this frame can only arrive
+    # when the stream ends.
+    assert parse([b'data: {"a": 1}\r\rdata: {"b": 2}\r']) == [{"a": 1}, {"b": 2}]
+
+
+def test_sse_mixed_line_endings():
+    body = b'data: {"n": 1}\r\n\r\ndata: {"n": 2}\n\ndata: {"n": 3}\r\r'
+    assert parse([body]) == [{"n": 1}, {"n": 2}, {"n": 3}]
+
+
+def test_sse_caps_a_line_that_never_terminates():
+    # A peer that never sends a newline must not be able to grow the parser in a
+    # process meant to run for days.
+    parser = w._SSEParser()
+    chunk = b"x" * 65536
+    for _ in range(64):                       # 4 MiB of one unterminated line
+        assert list(parser.feed(chunk)) == []
+        assert len(parser._buf) <= w.MAX_SSE_LINE_BYTES + len(chunk)
+
+    # ...and the stream is still usable once the peer starts speaking SSE again.
+    assert list(parser.feed(b"\n")) == []     # ends the discarded line
+    assert list(parser.feed(b'data: {"ok": 1}\n\n')) == [{"ok": 1}]
+
+
+def test_sse_drops_the_frame_a_discarded_line_belongs_to():
+    parser = w._SSEParser()
+    parser.feed(b'data: {"partial": ')      # start of a real frame ...
+    parser.feed(b"z" * (w.MAX_SSE_LINE_BYTES + 1))   # ... then a runaway line
+    assert parser._data_bytes == 0
+    assert list(parser.feed(b'\ndata: {"ok": 1}\n\n')) == [{"ok": 1}]
+
+
+def test_sse_caps_data_lines_that_never_dispatch():
+    parser = w._SSEParser()
+    chunk = b'data: {"x": "' + b"y" * 4096 + b'"}\n'
+    for _ in range(2048):                     # 8 MiB of undispatched data
+        assert list(parser.feed(chunk)) == []
+        assert parser._data_bytes <= w.MAX_SSE_FRAME_BYTES
+
+    assert list(parser.feed(b'\ndata: {"ok": 1}\n\n')) == [{"ok": 1}]
+    assert parser._data_bytes == 0
+
+
 def test_sse_multiple_frames_in_one_read():
     assert parse([b'data: {"n": 1}\n\ndata: {"n": 2}\n\n']) == [{"n": 1}, {"n": 2}]
 
@@ -418,42 +484,70 @@ def write_tokens(home: Path, payload) -> None:
     (home / "auth_tokens.json").write_text(json.dumps(payload))
 
 
+LOCAL = "http://127.0.0.1:6767"
+
+
 def test_discover_token_reads_nested_entry(tmp_path):
-    write_tokens(tmp_path, {"http://127.0.0.1:6767": {
+    write_tokens(tmp_path, {LOCAL: {
         "token": "tok-nested", "user_id": "u1", "expires_at": "2030-01-01",
     }})
-    assert w.SessionWatcher.discover_token(home=tmp_path) == "tok-nested"
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) == "tok-nested"
 
 
 def test_discover_token_reads_bare_string_entry(tmp_path):
-    write_tokens(tmp_path, {"http://127.0.0.1:6767": "tok-bare"})
-    assert w.SessionWatcher.discover_token(home=tmp_path) == "tok-bare"
+    write_tokens(tmp_path, {LOCAL: "tok-bare"})
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) == "tok-bare"
 
 
-def test_discover_token_prefers_loopback_entry(tmp_path):
+def test_discover_token_uses_the_entry_for_this_server(tmp_path):
     write_tokens(tmp_path, {
         "https://remote.example": {"token": "tok-remote"},
-        "http://127.0.0.1:6767": {"token": "tok-local"},
+        LOCAL: {"token": "tok-local"},
     })
-    assert w.SessionWatcher.discover_token(home=tmp_path) == "tok-local"
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) == "tok-local"
+
+
+def test_discover_token_ignores_a_token_issued_for_another_server(tmp_path):
+    # The whole point: no entry for this server means run unauthenticated, not
+    # "borrow the remote one" — a bearer presented to a host it was not issued
+    # for is a leak, and it is invisible because the request still succeeds.
+    write_tokens(tmp_path, {"https://remote.example": {"token": "tok-remote"}})
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
+
+
+def test_discover_token_ignores_a_token_for_another_server_via_alias(tmp_path):
+    # Same trap through a spelling that *contains* the loopback host: a
+    # substring preference would have picked this up, a key match does not.
+    write_tokens(tmp_path, {"https://127.0.0.1.example.com": "tok-remote"})
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
+
+
+def test_discover_token_ignores_an_unusable_token_value(tmp_path):
+    write_tokens(tmp_path, {LOCAL: {"token": 17}})
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
+
+
+def test_discover_token_matches_ignoring_a_trailing_slash(tmp_path):
+    write_tokens(tmp_path, {"http://127.0.0.1:6767/": {"token": "tok-slash"}})
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) == "tok-slash"
 
 
 def test_discover_token_missing_file_returns_none(tmp_path):
-    assert w.SessionWatcher.discover_token(home=tmp_path) is None
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
 
 
 def test_discover_token_corrupt_file_returns_none(tmp_path):
     (tmp_path / "auth_tokens.json").write_text("{not json")
-    assert w.SessionWatcher.discover_token(home=tmp_path) is None
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
 
 
 def test_discover_token_empty_or_bogus_returns_none(tmp_path):
     write_tokens(tmp_path, {})
-    assert w.SessionWatcher.discover_token(home=tmp_path) is None
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
     write_tokens(tmp_path, {"http://x": {"token": ""}})
-    assert w.SessionWatcher.discover_token(home=tmp_path) is None
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
     write_tokens(tmp_path, ["nope"])
-    assert w.SessionWatcher.discover_token(home=tmp_path) is None
+    assert w.SessionWatcher.discover_token(LOCAL, home=tmp_path) is None
 
 
 # --------------------------------------------------------------------------
@@ -496,3 +590,124 @@ def test_watch_generator_sleeps_between_polls(monkeypatch):
             events.append(event)
     assert [e.kind for e in events] == ["added"]
     assert sleeps == [0.25]
+
+
+# --------------------------------------------------------------------------
+# watch() resilience: the only production caller (og_herdr.py's run_forever)
+# wraps nothing, so a transient error must not stop the daemon
+# --------------------------------------------------------------------------
+
+class Stop(Exception):
+    """Raised by the fake sleep to end a watch() loop after N sleeps."""
+
+
+def drive_watch(monkeypatch, watcher, stop_after_sleeps):
+    """Run watcher.watch() to the Nth sleep. Returns (events, sleeps).
+
+    Sleeping is stubbed, so the backoff can be asserted exactly and no test
+    ever waits on a real clock.
+    """
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= stop_after_sleeps:
+            raise Stop
+
+    monkeypatch.setattr(w.time, "sleep", fake_sleep)
+    events = []
+    with pytest.raises(Stop):
+        for event in watcher.watch():
+            events.append(event)
+    return events, sleeps
+
+
+def test_watch_survives_a_failed_poll_and_keeps_yielding(monkeypatch, capsys):
+    down = URLError(ConnectionRefusedError(111, "Connection refused"))
+    opener = StubOpener(
+        [session("s1")],   # poll 1: s1 live
+        down,              # poll 2: server restarting
+        down,              # poll 3: still down
+        [session("s1")],   # poll 4: back, unchanged
+    )
+    watcher = w.SessionWatcher(poll_interval=0.5, token="super-secret",
+                               opener=opener)
+    events, sleeps = drive_watch(monkeypatch, watcher, stop_after_sleeps=4)
+
+    # s1 is announced once and never churned. If the failed polls had touched
+    # _seen, recovery would diff against an empty state and emit removed+added
+    # for a session that never went anywhere.
+    assert [(e.kind, e.session_id) for e in events] == [("added", "s1")]
+    assert watcher._seen == {"s1": session("s1")}
+
+    # It waited rather than spun, the wait grew while the server stayed down,
+    # and it went back to poll_interval once a poll succeeded.
+    assert sleeps == [0.5, 0.5, 1.0, 0.5]
+    assert len(opener.requests) == 4
+
+    # The failure is visible to whoever is watching the daemon's stderr, and
+    # the bearer token is not in it.
+    err = capsys.readouterr().err
+    assert "poll failed" in err
+    assert "Connection refused" in err
+    assert "super-secret" not in err
+
+
+def test_watch_keeps_going_through_a_long_outage(monkeypatch):
+    # Server gone for two polls, then a real change: the diff must be against
+    # the last state actually seen, so only the status move is reported.
+    opener = StubOpener(
+        [session("s1", status="running")],
+        URLError("boom"), URLError("boom"),
+        [session("s1", status="idle")],
+    )
+    watcher = w.SessionWatcher(poll_interval=0.5, opener=opener)
+    events, sleeps = drive_watch(monkeypatch, watcher, stop_after_sleeps=4)
+    assert [(e.kind, e.session_id, e.state) for e in events] == [
+        ("added", "s1", "working"),
+        ("changed", "s1", "idle"),
+    ]
+    assert sleeps == [0.5, 0.5, 1.0, 0.5]
+
+
+def test_watch_backoff_is_bounded(monkeypatch):
+    watcher = w.SessionWatcher(poll_interval=1.0,
+                               opener=StubOpener(URLError("down")))
+    events, sleeps = drive_watch(monkeypatch, watcher, stop_after_sleeps=8)
+    assert events == []
+    # Doubles up to the cap and then stays there — unbounded backoff would be
+    # its own outage, leaving the watcher asleep long after the server is back.
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 16.0,
+                      w.MAX_POLL_BACKOFF, w.MAX_POLL_BACKOFF, w.MAX_POLL_BACKOFF]
+
+
+def test_watch_failure_message_scrubs_url_credentials(monkeypatch, capsys):
+    # urllib puts the request URL in its error message, and a base URL written
+    # with userinfo would otherwise print that password into the daemon's log.
+    opener = StubOpener(
+        URLError("<urlopen error http://user:hunter2@127.0.0.1:6767/v1/sessions>")
+    )
+    watcher = w.SessionWatcher(poll_interval=0.1, opener=opener)
+    drive_watch(monkeypatch, watcher, stop_after_sleeps=1)
+    err = capsys.readouterr().err
+    assert "hunter2" not in err
+    assert "***@" in err
+
+
+def test_poll_once_still_raises():
+    # The resilience belongs to the loop. poll_once() is the primitive and stays
+    # strict, so a caller that wants the exception still gets it.
+    watcher = w.SessionWatcher(opener=StubOpener(URLError("boom")))
+    with pytest.raises(URLError):
+        watcher.poll_once()
+
+
+def test_watch_does_not_swallow_keyboard_interrupt(monkeypatch):
+    # A daemon still has to be stoppable: Ctrl-C must not be retried forever.
+    sleeps = []
+    monkeypatch.setattr(w.time, "sleep", lambda s: sleeps.append(s))
+    watcher = w.SessionWatcher(poll_interval=0.5,
+                               opener=StubOpener(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        list(watcher.watch())
+    assert sleeps == [], "Ctrl-C was treated as a poll failure and retried"

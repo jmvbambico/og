@@ -20,7 +20,9 @@ API facts this encodes, verified against a running server:
   parent_session_id, pending_elicitation_count, workspace.
 * Auth may be required. `~/.omnigent/auth_tokens.json` maps base URL to
   `{token, user_id, expires_at}`. Tokens are read, never logged, never printed,
-  never hardcoded; if none is found we proceed unauthenticated.
+  never hardcoded; if none is found we proceed unauthenticated. A token is only
+  ever used for the server it was issued for: a store holding nothing but a
+  remote server's token leaves us unauthenticated rather than borrowing it.
 
 stdlib only; Python 3.10+.
 """
@@ -28,6 +30,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -48,6 +52,57 @@ IDLE_STATUSES = frozenset({"idle", "completed", "done", "closed"})
 # thrash. Session identity/state, title and status are the only things anyone
 # acts on.
 MATERIAL_FIELDS = ("title", "status")
+
+# Ceiling on how long watch() waits between retries after a failed poll. Long
+# enough that a server restart does not become a request storm, short enough
+# that events start flowing again promptly once it is back.
+MAX_POLL_BACKOFF = 30.0
+
+# Ceilings for the SSE parser. A session event is kilobytes; a megabyte is
+# already several orders of magnitude past anything real. Past these the peer is
+# either broken or hostile, and in a process meant to run for days the only
+# acceptable response is to drop what we cannot hold and keep the tail alive —
+# a live stream that dies on one malformed frame is worse than one that skips
+# it, and one that buffers forever until it is OOM-killed is worse still.
+MAX_SSE_LINE_BYTES = 1 << 20    # 1 MiB for a single line with no terminator
+MAX_SSE_FRAME_BYTES = 4 << 20   # 4 MiB of accumulated `data:` lines
+
+# A watcher is a background process: its stderr goes wherever the user pointed
+# it, so anything it prints must be safe to show.
+_URL_USERINFO = re.compile(r"(?<=://)[^/\s:@]+(:[^/\s@]*)?@")
+
+
+def _scrub(text: str) -> str:
+    """Strip `user:pass@` out of anything about to be written to stderr.
+
+    urllib puts the request URL into its error messages, so a base URL written
+    as http://user:pass@host would otherwise land in a log line. The bearer
+    token travels in a header and never appears in an exception, but the URL is
+    cheap to scrub and this is the one function whose output nobody reads before
+    it is printed.
+    """
+    return _URL_USERINFO.sub("***@", text)
+
+
+def _server_key(url: str) -> str:
+    """Canonical form of a base URL, for matching a token to its server.
+
+    Keeps scheme/host/port and path (so `...:6767` and `...:6767/` are the same
+    server), lowercases the host because hosts are case-insensitive, and drops
+    any userinfo so a secret in the URL cannot reach a log line or a
+    comparison. Anything unparseable falls back to the stripped string, which
+    simply will not match.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        netloc = (parts.hostname or "").lower()
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        return urllib.parse.urlunsplit(
+            (parts.scheme.lower(), netloc, parts.path.rstrip("/"), "", "")
+        )
+    except ValueError:  # e.g. a port that is not a number
+        return url.strip().rstrip("/")
 
 
 def herdr_state(session: dict) -> str:
@@ -125,23 +180,41 @@ class _SSEParser:
     retry:) are ignored, and a payload that is not valid JSON is skipped rather
     than raising — one bad frame must not kill a live tail. Chunk boundaries
     are irrelevant; a frame split across reads still dispatches once.
+
+    Lines end at CR, LF or CRLF, all three of which the spec allows. A lone CR
+    at the very end of the buffer is held back until the next read, because the
+    byte after it decides whether it was a bare CR or half of a CRLF.
+
+    Both buffers are capped (MAX_SSE_LINE_BYTES, MAX_SSE_FRAME_BYTES). A stream
+    that never terminates a line, or a run of `data:` lines that never dispatches,
+    is dropped rather than buffered: this object lives inside a process meant to
+    run for days, and a malformed peer must not be able to grow it without
+    limit or kill the tail.
     """
 
     def __init__(self) -> None:
         self._buf = b""
         self._data: list[bytes] = []
+        self._data_bytes = 0
+        # True while we are discarding the tail of a line we already threw away,
+        # so its remainder is not mistaken for a fresh frame.
+        self._resync = False
 
     def feed(self, chunk: bytes) -> Iterator[dict]:
         self._buf += chunk
         while True:
-            idx = self._buf.find(b"\n")
+            idx = self._next_break()
             if idx < 0:
+                if len(self._buf) > MAX_SSE_LINE_BYTES:
+                    self._drop_line()
                 break
             raw = self._buf[:idx]
-            self._buf = self._buf[idx + 1:]
-            # SSE allows CR, CRLF or bare LF line endings.
-            if raw.endswith(b"\r"):
-                raw = raw[:-1]
+            # A CRLF is one terminator, not an empty line between two.
+            width = 2 if self._buf[idx:idx + 2] == b"\r\n" else 1
+            self._buf = self._buf[idx + width:]
+            if self._resync:
+                self._resync = False
+                continue
             frame = self._line(raw)
             if frame is not None:
                 yield frame
@@ -149,16 +222,46 @@ class _SSEParser:
     def flush(self) -> Iterator[dict]:
         """Dispatch anything still buffered when the stream ends without a
         trailing blank line (some servers close right after a frame)."""
-        if self._buf:
-            raw, self._buf = self._buf, b""
-            if raw.endswith(b"\r"):
-                raw = raw[:-1]
-            frame = self._line(raw)
-            if frame is not None:
-                yield frame
+        rest, self._buf = self._buf, b""
+        if self._resync:
+            # Whatever is left belongs to a line we already discarded.
+            self._resync = False
+        else:
+            # Normalise to LF so a trailing lone CR — which feed() held back
+            # because it might have been a CRLF — terminates its line here.
+            for raw in rest.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n"):
+                frame = self._line(raw)
+                if frame is not None:
+                    yield frame
         frame = self._dispatch()
         if frame is not None:
             yield frame
+
+    def _next_break(self) -> int:
+        """Index of the next line terminator in `_buf`, or -1 if there is none
+        (yet — a lone CR on the very end counts as "yet", see the class docstring).
+        """
+        lf = self._buf.find(b"\n")
+        cr = self._buf.find(b"\r")
+        if cr == len(self._buf) - 1 and lf < 0:
+            # Could be half of a CRLF whose LF is still in flight. Splitting now
+            # would turn one terminator into two, i.e. invent a blank line and
+            # dispatch a frame the peer has not finished writing.
+            return -1
+        if lf < 0:
+            return cr
+        if cr < 0 or lf < cr:
+            return lf
+        return cr
+
+    def _drop_line(self) -> None:
+        """Throw away a line too big to hold, and resynchronise on its end."""
+        self._buf = b""
+        # The frame this line belonged to is already over budget; keeping any of
+        # it would mean dispatching half a frame once the terminator arrives.
+        self._data = []
+        self._data_bytes = 0
+        self._resync = True
 
     def _line(self, raw: bytes) -> Optional[dict]:
         if raw == b"":
@@ -171,6 +274,10 @@ class _SSEParser:
         if value.startswith(b" "):
             value = value[1:]
         self._data.append(value)
+        self._data_bytes += len(value) + 1
+        if self._data_bytes > MAX_SSE_FRAME_BYTES:
+            self._data = []
+            self._data_bytes = 0
         return None
 
     def _dispatch(self) -> Optional[dict]:
@@ -178,6 +285,7 @@ class _SSEParser:
             return None
         payload = b"\n".join(self._data)
         self._data = []
+        self._data_bytes = 0
         try:
             decoded = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -210,15 +318,20 @@ class SessionWatcher:
     # -- auth ---------------------------------------------------------------
 
     @staticmethod
-    def discover_token(home=None) -> Optional[str]:
-        """Best-effort read of the machine-local API token.
+    def discover_token(base_url: str, home=None) -> Optional[str]:
+        """Read the API token issued for `base_url`, if there is one.
 
         Looks in `home` (default $OMNIGENT_HOME, else ~/.omnigent) for
         auth_tokens.json, whose shape is {base_url: {token, user_id,
-        expires_at}} (older files stored a bare string per base URL). Entries
-        for a loopback server win, since that is the server og talks to.
-        Returns None when the file is missing or unreadable — the caller then
-        runs unauthenticated. The token value is never logged.
+        expires_at}} (older files stored a bare string per base URL).
+
+        Only an entry whose key names this server is considered. A store that
+        holds a token for `https://remote.example` and nothing for localhost
+        must leave us unauthenticated, not send that remote bearer to the
+        loopback server — a credential presented to a host it was not issued for
+        is a credential leak, and it is easy to miss because it still "works".
+        Returns None when the file, the entry or a usable token is missing; the
+        caller then runs unauthenticated. The token value is never logged.
         """
         if home is None:
             home = os.environ.get("OMNIGENT_HOME") or str(Path.home() / ".omnigent")
@@ -230,12 +343,13 @@ class SessionWatcher:
         if not isinstance(data, dict):
             return None
 
-        def order(item):
-            key = str(item[0])
-            local = ("127.0.0.1" in key) or ("localhost" in key)
-            return (0 if local else 1, key)
-
-        for _, entry in sorted(data.items(), key=order):
+        target = _server_key(base_url)
+        for key, entry in data.items():
+            # Two spellings of the same URL can both be present; the tie-break
+            # that matters is which one holds a usable token, so scan them all
+            # rather than picking a winner on the key alone.
+            if _server_key(str(key)) != target:
+                continue
             if isinstance(entry, str) and entry:
                 return entry
             if isinstance(entry, dict):
@@ -278,6 +392,10 @@ class SessionWatcher:
 
         "added" for new ids, "removed" for vanished ids, and "changed" only
         when herdr_state, title or status moved — see MATERIAL_FIELDS.
+
+        Strict: a transport or decode error propagates. `_seen` is replaced as
+        the very last statement, so a failure leaves the previously observed
+        state untouched rather than half-updated.
         """
         fresh = {}
         for session in self.list_sessions(kind="any"):
@@ -308,14 +426,43 @@ class SessionWatcher:
     def watch(self):
         """Yield events forever, sleeping poll_interval between polls.
 
-        Deliberately a plain generator with no exception handling: a caller
-        that wants to survive a server restart can wrap it, and one that does
-        not should see the failure instead of an infinite silent loop.
+        poll_once() is strict — a refused connection, a 500, or a listing that
+        is not JSON raises out of it — and it stays that way: a caller that
+        wants the exception should get it. The *loop* is what has to be
+        resilient, because the only production caller (og_herdr.py's
+        `run_forever`) wraps nothing and a daemon that dies of one server
+        restart has silently stopped doing its job.
+
+        So a failed poll is reported on stderr and retried after a backoff that
+        doubles up to MAX_POLL_BACKOFF and resets on the first success. Events
+        resume on their own when the server comes back.
+
+        `_seen` is deliberately not touched on the failure path: poll_once()
+        replaces it as its last statement, so a poll that raises leaves the last
+        state actually observed in place and recovery diffs against that.
+        Otherwise every live session would be reported removed and re-added on
+        each outage, and the consumer would thrash rebuilding tabs it already
+        has.
         """
+        backoff = self.poll_interval
         while True:
-            for event in self.poll_once():
+            try:
+                events = self.poll_once()
+            except Exception as exc:  # noqa: BLE001 — surviving this IS the job
+                # KeyboardInterrupt and SystemExit are BaseException and
+                # GeneratorExit closes the generator, so Ctrl-C still stops it.
+                sys.stderr.write(
+                    f"og herdr watch: poll failed ({_scrub(repr(exc))}); "
+                    f"retrying in {backoff:g}s\n"
+                )
+                sys.stderr.flush()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_POLL_BACKOFF)
+                continue
+            for event in events:
                 yield event
             time.sleep(self.poll_interval)
+            backoff = self.poll_interval
 
     # -- live tail ----------------------------------------------------------
 
@@ -353,7 +500,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     watcher = SessionWatcher(
         base_url=args.base_url,
-        token=SessionWatcher.discover_token(),
+        token=SessionWatcher.discover_token(args.base_url),
         poll_interval=args.interval,
     )
     for event in watcher.poll_once():
