@@ -57,18 +57,84 @@ class StubOpener:
         return FakeResponse(body)
 
 
-def session(sid="s1", status="running", **extra):
+def session(sid="s1", status="running", parent=None, **extra):
+    """A session row shaped like the real API's.
+
+    Every key here is a key the listing actually returns (the captured row
+    below is the reference); only identity, status and parentage vary per test.
+    Building fixtures from the measured shape rather than a guessed one is the
+    point: a wrong contract in a fixture hides the same bug it would hide in the
+    module.
+    """
     base = {
-        "session_id": sid,
+        "id": sid,
+        "agent_id": "05724a49a7ad4e52a8698a8dc98a864e",
+        "agent_name": "hivemind",
+        "archived": False,
+        "comments_count": 0,
+        "created_at": 1791566251,
+        "external_session_id": f"ses_{sid}",
+        "labels": {},
+        "owner": "cryogenix",
+        "parent_session_id": parent,
+        "pending_elicitations_count": 0,
+        "permission_level": 4,
+        "runner_id": "runner_token_b6d20a38844b57baad37dc4e61e36846",
         "status": status,
         "title": f"title-{sid}",
-        "agent_name": "dev-lead",
-        "parent_session_id": None,
-        "pending_elicitation_count": 0,
-        "workspace": "/tmp/ws",
+        "updated_at": 1791566384,
+        "viewer_unread": False,
     }
     base.update(extra)
     return base
+
+
+def envelope(rows, has_more=False, last_id=None):
+    """A list envelope of the shape the server answers with."""
+    env = {"object": "list", "data": list(rows), "has_more": has_more}
+    if last_id is None and rows:
+        last_id = rows[-1].get("id")
+    if last_id is not None:
+        env["last_id"] = last_id
+        env["first_id"] = rows[0].get("id")
+    return env
+
+
+def urls(opener):
+    return [r.full_url for r in opener.requests]
+
+
+# One row exactly as it came off a live 0.17.0 server. Kept as text so it is
+# parsed the same way the module parses it, and kept verbatim so a test cannot
+# quietly "fix" a fixture to match the code.
+VERBATIM_ROW_JSON = """
+{"agent_id":"05724a49a7ad4e52a8698a8dc98a864e",
+ "agent_name":"hivemind",
+ "archived":false,
+ "comments_count":0,
+ "created_at":1791566251,
+ "external_session_id":"ses_ede5462ebffe8PRK3LyKCkOka3",
+ "id":"6583350e2adc4fbf8b9f8b323de0f513",
+ "labels":{},
+ "owner":"cryogenix",
+ "parent_session_id":"e29bf406bd6d480cbc61fa6125e8d5fd",
+ "pending_elicitations_count":0,
+ "permission_level":4,
+ "runner_id":"runner_token_b6d20a38844b57baad37dc4e61e36846",
+ "status":"idle",
+ "title":"coder_zen:fix-drop-types-alias",
+ "updated_at":1791566384,
+ "viewer_unread":false}
+"""
+
+VERBATIM_ROW = json.loads(VERBATIM_ROW_JSON)
+
+VERBATIM_ENVELOPE_JSON = (
+    '{"object":"list","data":[' + VERBATIM_ROW_JSON.strip() + '],'
+    '"has_more":true,'
+    '"first_id":"6583350e2adc4fbf8b9f8b323de0f513",'
+    '"last_id":"6583350e2adc4fbf8b9f8b323de0f513"}'
+)
 
 
 # --------------------------------------------------------------------------
@@ -98,33 +164,33 @@ def test_state_case_and_whitespace_insensitive():
 
 
 def test_state_elicitation_overrides_running():
-    assert w.herdr_state({"status": "running", "pending_elicitation_count": 1}) == "blocked"
+    assert w.herdr_state({"status": "running", "pending_elicitations_count": 1}) == "blocked"
 
 
 def test_state_elicitation_overrides_idle():
-    assert w.herdr_state({"status": "idle", "pending_elicitation_count": 3}) == "blocked"
+    assert w.herdr_state({"status": "idle", "pending_elicitations_count": 3}) == "blocked"
 
 
 def test_state_elicitation_string_count_still_blocks():
     # A string count has shown up in client payloads; erring toward "blocked"
     # is the safe direction.
-    assert w.herdr_state({"status": "running", "pending_elicitation_count": "2"}) == "blocked"
+    assert w.herdr_state({"status": "running", "pending_elicitations_count": "2"}) == "blocked"
 
 
 def test_state_zero_elicitation_does_not_block():
-    assert w.herdr_state({"status": "running", "pending_elicitation_count": 0}) == "working"
+    assert w.herdr_state({"status": "running", "pending_elicitations_count": 0}) == "working"
 
 
 def test_state_bool_elicitation_does_not_block():
-    assert w.herdr_state({"status": "running", "pending_elicitation_count": True}) == "working"
+    assert w.herdr_state({"status": "running", "pending_elicitations_count": True}) == "working"
 
 
 @pytest.mark.parametrize("bad", [
     {},
     {"status": None},
     {"status": 7},
-    {"pending_elicitation_count": "many"},
-    {"status": "running", "pending_elicitation_count": None},
+    {"pending_elicitations_count": "many"},
+    {"status": "running", "pending_elicitations_count": None},
     None,
     [],
     "not a dict",
@@ -136,6 +202,55 @@ def test_state_malformed_never_raises(bad):
 def test_state_malformed_non_dict_is_unknown():
     assert w.herdr_state(None) == "unknown"
     assert w.herdr_state(["running"]) == "unknown"
+
+
+# -- the measured field name ------------------------------------------------
+#
+# The row spells the count PLURAL. Reading the singular spelling meant the key
+# never matched any real row, so "blocked" never fired — the one state a human
+# most needs to see, silently dead.
+
+def test_state_verbatim_row_with_one_elicitation_is_blocked():
+    row = dict(VERBATIM_ROW, pending_elicitations_count=1)
+    assert w.herdr_state(row) == "blocked"
+
+
+def test_state_verbatim_row_as_captured_is_idle():
+    # Unchanged, and read exactly as the server sends it: every other key here is
+    # the server's, so an idle verdict means those keys were read and found
+    # quiet rather than never looked at.
+    assert w.herdr_state(VERBATIM_ROW) == "idle"
+
+
+def test_state_plural_spelling_alone_is_enough_to_block():
+    # The regression test for the slip: this row carries no singular key at all,
+    # so a module reading only the singular spelling reports "idle" here.
+    assert w.herdr_state({"status": "idle", "pending_elicitations_count": 1}) == "blocked"
+
+
+def test_state_plural_zero_alone_does_not_block():
+    assert w.herdr_state({"status": "running", "pending_elicitations_count": 0}) == "working"
+
+
+def test_state_singular_mcp_spelling_still_blocks():
+    # Kept as a fallback on purpose: `session_get_info` in the MCP tool set
+    # reports `pending_elicitation_count`, so a caller who got its session dict
+    # from there rather than from HTTP still gets a blocked pane.
+    assert w.herdr_state({"status": "idle", "pending_elicitation_count": 1}) == "blocked"
+
+
+def test_state_plural_decides_when_a_row_carries_both_spellings():
+    # Plural is the contract; the singular only fills in for a row that has no
+    # usable plural count, so it cannot overrule one that does.
+    both = {"status": "running", "pending_elicitations_count": 0,
+            "pending_elicitation_count": 1}
+    assert w.herdr_state(both) == "working"
+
+
+def test_state_singular_fills_in_when_the_plural_count_is_unusable():
+    row = {"status": "running", "pending_elicitations_count": "many",
+           "pending_elicitation_count": 1}
+    assert w.herdr_state(row) == "blocked"
 
 
 # --------------------------------------------------------------------------
@@ -150,6 +265,9 @@ def test_list_sessions_requests_kind_any_by_default():
     url = opener.requests[0].full_url
     assert "/v1/sessions" in url
     assert "kind=any" in url, f"watcher must ask for sub-agents: {url}"
+    # An explicit page size, not the server's default of 20 — a default-sized
+    # page is what loses the root session.
+    assert f"limit={w.SESSION_PAGE_LIMIT}" in url
 
 
 def test_list_sessions_kind_is_overridable():
@@ -188,6 +306,210 @@ def test_poll_once_asks_for_kind_any():
     opener = StubOpener([session()])
     w.SessionWatcher(opener=opener).poll_once()
     assert "kind=any" in opener.requests[0].full_url
+
+
+# --------------------------------------------------------------------------
+# pagination: the listing is newest-first and paged, so one page is not the
+# listing
+# --------------------------------------------------------------------------
+
+def test_list_sessions_walks_every_page_and_passes_the_cursor():
+    pages = [
+        envelope([session("s1"), session("s2")], has_more=True, last_id="s2"),
+        envelope([session("s3"), session("s4")], has_more=True, last_id="s4"),
+        envelope([session("s5")], has_more=False, last_id="s5"),
+    ]
+    opener = StubOpener(*pages)
+    rows = w.SessionWatcher(opener=opener).list_sessions()
+
+    assert [r["id"] for r in rows] == ["s1", "s2", "s3", "s4", "s5"]
+
+    seen = urls(opener)
+    assert len(seen) == 3, seen
+    assert "after=" not in seen[0]
+    assert "after=s2" in seen[1], seen[1]
+    assert "after=s4" in seen[2], seen[2]
+    assert all("kind=any" in u for u in seen)
+
+
+def test_list_sessions_cursor_falls_back_to_the_last_row_id():
+    # An envelope that omits last_id still has to make progress, or the walk
+    # would stop after one page and lose the oldest rows.
+    first = {"object": "list", "data": [session("s1"), session("s2")], "has_more": True}
+    opener = StubOpener(first, envelope([session("s3")]))
+    rows = w.SessionWatcher(opener=opener).list_sessions()
+    assert [r["id"] for r in rows] == ["s1", "s2", "s3"]
+    assert "after=s2" in urls(opener)[1]
+
+
+def test_list_sessions_stops_when_the_server_gives_no_cursor():
+    # has_more with nowhere to continue is not a reason to ask again: repeating
+    # the first request would return the same page and walk in circles.
+    page = {"object": "list", "data": [{"status": "running"}], "has_more": True}
+    opener = StubOpener(page)
+    rows = w.SessionWatcher(opener=opener).list_sessions()
+    assert rows == [{"status": "running"}]
+    assert len(opener.requests) == 1
+
+
+def test_list_sessions_stops_a_server_that_repeats_a_cursor():
+    # A server that ignores `after` and keeps claiming has_more must not be able
+    # to spin the walk forever.
+    opener = StubOpener(envelope([session("s1")], has_more=True, last_id="same"))
+    w.SessionWatcher(opener=opener).list_sessions()
+    assert len(opener.requests) == 2, urls(opener)
+
+
+def test_list_sessions_caps_a_runaway_at_the_page_limit():
+    # has_more true forever, page after page: the walk stops at the ceiling.
+    opener = StubOpener(
+        *[envelope([session(f"s{i}")], has_more=True, last_id=f"s{i}")
+          for i in range(w.MAX_SESSION_PAGES * 2)]
+    )
+    rows = w.SessionWatcher(opener=opener).list_sessions()
+    assert len(opener.requests) == w.MAX_SESSION_PAGES
+    assert len(rows) == w.MAX_SESSION_PAGES
+
+
+def test_list_sessions_caps_the_rows_it_returns(monkeypatch):
+    # A server that ignores `limit` and sends a huge page still cannot make one
+    # poll hold an unbounded number of rows.
+    monkeypatch.setattr(w, "MAX_LISTED_SESSIONS", 3)
+    opener = StubOpener(
+        envelope([session("s1"), session("s2")], has_more=True, last_id="s2"),
+        envelope([session("s3"), session("s4")], has_more=True, last_id="s4"),
+        envelope([session("s5"), session("s6")], has_more=False),
+    )
+    rows = w.SessionWatcher(opener=opener).list_sessions()
+    assert [r["id"] for r in rows] == ["s1", "s2", "s3"]
+
+
+# --------------------------------------------------------------------------
+# the measured envelope and row, parsed verbatim
+# --------------------------------------------------------------------------
+
+def test_verbatim_envelope_is_parsed_into_rows():
+    # The captured envelope says has_more true, so a correct walker follows the
+    # cursor; the second (empty) body is the end of the walk.
+    opener = StubOpener(json.loads(VERBATIM_ENVELOPE_JSON), envelope([]))
+    rows = w.SessionWatcher(opener=opener).list_sessions()
+    assert rows == [VERBATIM_ROW]
+    assert "after=6583350e2adc4fbf8b9f8b323de0f513" in urls(opener)[1]
+
+
+def test_verbatim_envelope_without_more_pages_is_one_request():
+    payload = json.loads(VERBATIM_ENVELOPE_JSON)
+    payload["has_more"] = False
+    opener = StubOpener(payload)
+    assert w.SessionWatcher(opener=opener).list_sessions() == [VERBATIM_ROW]
+    assert len(opener.requests) == 1
+
+
+def test_poll_once_keys_a_verbatim_row_on_its_id():
+    # The event identity comes from `id`. The captured row carries no
+    # `session_id`, no `kind` and no `workspace` — the three keys the old
+    # contract claimed — so anything still reaching for them reads nothing.
+    live = dict(VERBATIM_ROW, status="running")
+    watcher = w.SessionWatcher(opener=StubOpener(envelope([live])))
+    event = watcher.poll_once()[0]
+    assert event.session_id == "6583350e2adc4fbf8b9f8b323de0f513"
+    assert event.session == live
+    assert event.state == "working"
+
+
+# --------------------------------------------------------------------------
+# should_project: what is worth a pane at all
+# --------------------------------------------------------------------------
+
+def test_should_project_a_root_that_is_idle():
+    # A root is the conversation the human is typing into. It reads "idle" the
+    # whole time it waits for them, so retiring it on idle would close the pane
+    # they are typing into.
+    row = dict(VERBATIM_ROW, parent_session_id=None, status="idle")
+    assert w.should_project(row) is True
+
+
+def test_should_project_a_root_that_is_archived_is_not():
+    row = dict(VERBATIM_ROW, parent_session_id=None, archived=True)
+    assert w.should_project(row) is False
+
+
+def test_should_project_an_idle_sub_agent_is_not():
+    # The verbatim row as captured: a sub-agent, idle, done. Projecting every
+    # finished session is what made the workspace unusable.
+    assert w.should_project(VERBATIM_ROW) is False
+
+
+def test_should_project_a_running_sub_agent_is():
+    row = dict(VERBATIM_ROW, status="running")
+    assert w.should_project(row) is True
+
+
+def test_should_project_a_blocked_sub_agent_is_even_when_idle():
+    row = dict(VERBATIM_ROW, status="idle", pending_elicitations_count=2)
+    assert w.should_project(row) is True
+    assert w.herdr_state(row) == "blocked"
+
+
+def test_should_project_never_projects_an_archived_sub_agent():
+    for status in ("running", "idle"):
+        row = dict(VERBATIM_ROW, status=status, archived=True,
+                   pending_elicitations_count=1)
+        assert w.should_project(row) is False, status
+
+
+@pytest.mark.parametrize("bad", [None, [], "not a dict", {}, {"id": "s1"}])
+def test_should_project_malformed_never_raises(bad):
+    assert w.should_project(bad) in (True, False)
+
+
+def test_poll_once_only_reports_projected_sessions():
+    # The consumer sees the live set and nothing else: an idle sub-agent is
+    # absent from the very first poll rather than being added and removed.
+    opener = StubOpener(envelope([
+        session("root", status="idle"),
+        session("worker-running", status="running", parent="root"),
+        session("worker-idle", status="idle", parent="root"),
+        session("worker-failed", status="failed", parent="root"),
+        session("archived", status="running", parent="root", archived=True),
+    ]))
+    watcher = w.SessionWatcher(opener=opener)
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [
+        ("added", "root"), ("added", "worker-running"),
+    ]
+
+
+def test_a_sub_agent_going_idle_produces_exactly_one_removed_event():
+    watcher = w.SessionWatcher(
+        opener=StubOpener(envelope([session("s1", status="running", parent="root")]))
+    )
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [("added", "s1")]
+
+    watcher.opener = StubOpener(
+        envelope([session("s1", status="idle", parent="root")])
+    )
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("removed", "s1")]
+    assert events[0].session == {}
+    assert events[0].previous["status"] == "running"
+    assert events[0].state == "unknown"
+
+    # ...and once. It is gone from the set now, so nothing re-reports it.
+    watcher.opener = StubOpener(
+        envelope([session("s1", status="idle", parent="root")])
+    )
+    assert watcher.poll_once() == []
+
+
+def test_a_root_that_goes_idle_is_never_removed():
+    # Same status move, opposite outcome: the pane the user is typing into
+    # stays.
+    watcher = w.SessionWatcher(
+        opener=StubOpener(envelope([session("root", status="running")]))
+    )
+    assert [e.kind for e in watcher.poll_once()] == ["added"]
+    watcher.opener = StubOpener(envelope([session("root", status="idle")]))
+    assert [e.kind for e in watcher.poll_once()] == ["changed"]
 
 
 # --------------------------------------------------------------------------
@@ -232,7 +554,7 @@ def test_vanished_id_is_removed_with_no_current_session():
     events = watcher.poll_once()
     assert [(e.kind, e.session_id) for e in events] == [("removed", "s2")]
     assert events[0].session == {}
-    assert events[0].previous["session_id"] == "s2"
+    assert events[0].previous["id"] == "s2"
     assert events[0].state == "unknown"
 
 
@@ -248,7 +570,7 @@ def test_status_change_emits_changed():
 def test_elicitation_arriving_emits_changed_and_flips_state():
     watcher, _ = first_poll([session("s1", status="running")])
     watcher.opener = StubOpener([session("s1", status="running",
-                                          pending_elicitation_count=1)])
+                                          pending_elicitations_count=1)])
     events = watcher.poll_once()
     assert [e.kind for e in events] == ["changed"]
     assert events[0].state == "blocked"
@@ -281,6 +603,15 @@ def test_added_and_removed_in_one_poll():
 def test_sessions_without_id_are_skipped():
     _, events = first_poll([{"status": "running"}, session("s1")])
     assert [e.session_id for e in events] == ["s1"]
+
+
+def test_a_row_whose_only_id_is_external_session_id_is_skipped():
+    # `external_session_id` is a different handle from the row identity, so
+    # keying on it would let one session be counted twice under two names.
+    row = dict(session("s1"))
+    del row["id"]
+    _, events = first_poll([row, session("s2")])
+    assert [e.session_id for e in events] == ["s2"]
 
 
 def test_events_do_not_alias_the_watchers_retained_objects():
