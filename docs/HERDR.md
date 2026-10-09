@@ -351,6 +351,24 @@ Those specific approvals always need the browser. This is the one place where
 - **`_seen` does not evict.** During a long truncated period it grows to the
   server's session count. Bounded and small per row, but there is no eviction
   policy, because "which session do we forget" is a consumer decision.
+- **A never-fetched session retires only when it comes back into view.** A
+  session that finishes while sitting past the cap keeps its pane until a
+  listing fits in one walk. Inherent: without the row there is no evidence to
+  retire on, and inventing one is the original defect. A session that *was*
+  fetched and stopped qualifying retires immediately, truncated or not.
+- **A retired session that later reappears arrives as `added`, not `changed`**,
+  so the bridge opens a fresh tab rather than reviving the old one.
+- **Duplicate rows for one id are last-wins, verdict included.** A server
+  sending `[projectable, archived]` for the same id would close a live
+  session's pane. First-wins has the mirror failure; the choice is pinned in
+  tests in both directions so it is deliberate.
+- **`_announce_listing` sets its flag before writing to stderr**, so a failed
+  write loses the truncation notice permanently. Observability only.
+- **`watch()` retries every `Exception`**, so a programming error (`TypeError`,
+  `AssertionError`) becomes a log-and-retry loop rather than surfacing.
+  Narrowing the catch risks reintroducing "the daemon dies on one unexpected
+  error", which is the defect the broad catch exists to prevent — a judgement
+  call, left to the owner.
 
 ---
 
