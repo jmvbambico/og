@@ -54,10 +54,22 @@ def _error_cls():
     return HerdrError
 
 
+def _error_line(sid: str, exc) -> str:
+    """One `reconcile`-style error line for a failed herdr call."""
+    code = getattr(exc, "code", "herdr-error")
+    message = getattr(exc, "message", str(exc))
+    return f"error {sid}: {code}: {message}"
+
+
 def _id_of(entry) -> str | None:
-    """The id out of a tab_create result's `tab` / `root_pane` sub-object."""
+    """The id out of a tab_create result's `tab` / `root_pane` sub-object.
+
+    herdr 0.9.3 names these `tab_id` and `pane_id` respectively; there is no
+    generic `id` key, so checking one would only ever match a shape the server
+    never sends.
+    """
     if isinstance(entry, dict):
-        for key in ("id", "pane_id", "tab_id"):
+        for key in ("pane_id", "tab_id"):
             if entry.get(key):
                 return entry[key]
     return None
@@ -96,9 +108,7 @@ class Bridge:
             try:
                 lines.extend(self._apply(event))
             except _error_cls() as exc:
-                code = getattr(exc, "code", "herdr-error")
-                message = getattr(exc, "message", str(exc))
-                lines.append(f"error {event.session_id}: {code}: {message}")
+                lines.append(_error_line(event.session_id, exc))
         return lines
 
     def run_once(self) -> list:
@@ -125,30 +135,89 @@ class Bridge:
         return []
 
     def _added(self, sid: str, session: dict) -> list:
-        # Idempotent: a session already mapped must not get a second tab, so a
-        # re-delivered `added` is a no-op.
-        if sid in self._tabs:
-            return []
+        rec = self._tabs.get(sid)
+        if rec is not None:
+            # One tab per session: a redelivered `added` either finds setup
+            # already complete (no-op) or a previous attempt that died part-way
+            # — in which case the pane already exists and the remaining steps
+            # resume on it instead of a second `tab_create` opening a duplicate
+            # tab for the one session.
+            if rec["ready"]:
+                return []
+            state = _state(session)
+            self._setup_pane(sid, rec, state)
+            return [f"resume add {sid} → pane {rec['pane_id']} "
+                    f"'omnigent attach {sid}' [{state}]"]
         title = session.get("title")
         cwd = session.get("workspace") or str(Path.home())
         label = "og:" + (title or sid[:8])
         state = _state(session)
         if self.dry_run:
-            self._tabs[sid] = {"tab_id": None, "pane_id": None, "title": title}
+            self._tabs[sid] = {"tab_id": None, "pane_id": None, "title": title,
+                               "step": 3, "ready": True}
             return [f"dry-run: add {label} ({cwd}) → omnigent attach {sid} "
                     f"[{state}]"]
         result = self.client.tab_create(self.workspace, cwd=cwd, label=label)
         tab_id = _id_of(result.get("tab"))
         pane_id = _id_of(result.get("root_pane"))
-        self.client.pane_run(pane_id, "omnigent attach " + sid)
-        self.client.report_agent(pane_id, self.source, agent="omnigent",
-                                 state=state)
-        self.client.report_metadata(pane_id, self.source, title=title)
-        # Remember the mapping only once the pane exists: a failure above leaves
-        # the session unmapped so a later `added` can retry it.
-        self._tabs[sid] = {"tab_id": tab_id, "pane_id": pane_id, "title": title}
+        if tab_id is None or pane_id is None:
+            return self._reject_partial_create(sid, tab_id, pane_id)
+        # Record the mapping the moment the ids are known, BEFORE the rest of
+        # the setup. If a setup call then raises, this record keeps the pane
+        # tracked so a redelivered `added` resumes on it; recording only on
+        # full success would leave the session looking unmapped and the retry
+        # would open a second tab.
+        rec = {"tab_id": tab_id, "pane_id": pane_id, "title": title,
+               "step": 0, "ready": False}
+        self._tabs[sid] = rec
+        self._setup_pane(sid, rec, state)
         return [f"add {sid} → tab {tab_id} pane {pane_id} "
                 f"'omnigent attach {sid}' [{state}]"]
+
+    def _setup_pane(self, sid: str, rec: dict, state: str) -> None:
+        """Run the post-`tab_create` setup steps for a session's pane.
+
+        `rec["step"]` counts the steps that have already succeeded, so a failure
+        mid-setup leaves the record pointing at the failed step. A redelivered
+        `added` then resumes from there on the SAME pane rather than creating a
+        second tab, and a step that already succeeded is not repeated —
+        re-running pane.run would submit the attach command into the pane again.
+        """
+        pane_id = rec["pane_id"]
+        if rec["step"] <= 0:
+            self.client.pane_run(pane_id, "omnigent attach " + sid)
+            rec["step"] = 1
+        if rec["step"] <= 1:
+            self.client.report_agent(pane_id, self.source, agent="omnigent",
+                                     state=state)
+            rec["step"] = 2
+        if rec["step"] <= 2:
+            self.client.report_metadata(pane_id, self.source, title=rec["title"])
+            rec["step"] = 3
+            rec["ready"] = True
+
+    def _reject_partial_create(self, sid: str, tab_id, pane_id) -> list:
+        """Reject a tab_create reply that carried no usable ids.
+
+        Stores nothing: a `pane_id` of None in the mapping would make every
+        later `changed` report against a pane that does not exist. When a tab id
+        WAS obtained but its pane id was not, close it best-effort so the user's
+        workspace does not keep an orphan tab; a failure of that cleanup is
+        recorded, not raised, so the rest of the batch still runs.
+        """
+        if tab_id is None and pane_id is None:
+            detail = "no tab or pane id"
+        elif tab_id is None:
+            detail = "no tab id"
+        else:
+            detail = "no pane id"
+        lines = [f"error {sid}: bad_response: tab.create reply had {detail}"]
+        if tab_id is not None:
+            try:
+                self.client.tab_close(tab_id)
+            except _error_cls() as exc:
+                lines.append(_error_line(sid, exc))
+        return lines
 
     def _changed(self, sid: str, session: dict, previous: dict) -> list:
         rec = self._tabs.get(sid)
@@ -171,14 +240,31 @@ class Bridge:
                                                    else "")]
 
     def _removed(self, sid: str) -> list:
-        rec = self._tabs.pop(sid, None)
+        rec = self._tabs.get(sid)
         if rec is None:
             return []
         if self.dry_run:
+            self._tabs.pop(sid, None)
             return [f"dry-run: remove {sid} (release pane, close tab)"]
-        self.client.release_agent(rec["pane_id"], self.source, agent="omnigent")
-        self.client.tab_close(rec["tab_id"])
-        return [f"remove {sid} (pane {rec['pane_id']}, tab {rec['tab_id']})"]
+        pane_id, tab_id = rec["pane_id"], rec["tab_id"]
+        try:
+            self.client.release_agent(pane_id, self.source, agent="omnigent")
+            self.client.tab_close(tab_id)
+        except _error_cls() as exc:
+            if getattr(exc, "code", None) == "not_found":
+                # herdr says the pane or tab is already gone: the outcome we
+                # wanted has happened, so drop the mapping instead of retrying a
+                # removal that can never succeed.
+                self._tabs.pop(sid, None)
+                return [f"remove {sid} (pane {pane_id}, tab {tab_id}; "
+                        f"already gone)"]
+            # Any other error keeps the mapping: popping it here would leave the
+            # pane and tab untracked with no way to retry, leaking them for
+            # good. The error is recorded by `reconcile` and a later `removed`
+            # retries this cleanup.
+            raise
+        self._tabs.pop(sid, None)
+        return [f"remove {sid} (pane {pane_id}, tab {tab_id})"]
 
 
 # ---------------------------------------------------------------------------
