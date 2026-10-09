@@ -502,6 +502,110 @@ def test_a_session_beyond_the_cap_is_not_re_added_when_it_returns(monkeypatch):
     assert watcher.poll_once() == []
 
 
+# -- a truncated poll is only uncertain about what it never fetched ---------
+
+def test_a_truncated_listing_retires_a_sub_agent_it_fetched_and_found_idle(monkeypatch):
+    # Suppressing removals wholesale is what left a finished worker holding a
+    # stale pane. The row came back; it says the session is done; truncation
+    # says nothing about that.
+    cap_pages(monkeypatch)
+    watcher = w.SessionWatcher(opener=StubOpener(envelope([
+        session("root", parent=None),
+        session("worker", status="running", parent="root"),
+    ])))
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [
+        ("added", "root"), ("added", "worker"),
+    ]
+
+    watcher.opener = StubOpener(envelope([
+        session("root", parent=None),
+        session("worker", status="idle", parent="root"),
+    ], has_more=True, last_id="root"))
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("removed", "worker")]
+    assert events[0].previous["status"] == "running"
+    assert "worker" not in watcher._seen, "a retired session stayed in _seen"
+    assert "root" in watcher._seen
+
+
+def test_a_truncated_listing_retires_a_session_that_came_back_archived(monkeypatch):
+    cap_pages(monkeypatch)
+    watcher = w.SessionWatcher(opener=StubOpener(envelope(
+        [session("s1", status="running", parent="root")]
+    )))
+    assert [e.kind for e in watcher.poll_once()] == ["added"]
+
+    watcher.opener = StubOpener(envelope(
+        [session("s1", status="running", parent="root", archived=True)],
+        has_more=True, last_id="s1",
+    ))
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [("removed", "s1")]
+    assert "s1" not in watcher._seen
+
+
+def test_a_truncated_listing_separates_fetched_and_rejected_from_unfetched(monkeypatch):
+    # Both cases in one poll: only the one the watcher actually saw retires.
+    cap_pages(monkeypatch)
+    watcher = w.SessionWatcher(opener=StubOpener(envelope([
+        session("gone", status="running", parent="root"),
+        session("beyond", status="running", parent="root"),
+    ])))
+    watcher.poll_once()
+
+    watcher.opener = StubOpener(envelope([
+        session("gone", status="idle", parent="root"),
+        # "beyond" is simply not in this page: unfetched, so still believed in.
+    ], has_more=True, last_id="gone"))
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("removed", "gone")]
+    assert set(watcher._seen) == {"beyond"}
+
+
+def test_a_retired_session_does_not_come_back_on_the_next_truncated_poll(monkeypatch):
+    # ...and it actually leaves the retained state, or the poll after this one
+    # removes it all over again.
+    cap_pages(monkeypatch)
+    watcher = w.SessionWatcher(opener=StubOpener(envelope(
+        [session("s1", status="running", parent="root")]
+    )))
+    watcher.poll_once()
+
+    idle = envelope([session("s1", status="idle", parent="root")],
+                    has_more=True, last_id="s1")
+    watcher.opener = StubOpener(idle)
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [("removed", "s1")]
+
+    watcher.opener = StubOpener(idle)
+    assert watcher.poll_once() == []
+
+
+def test_a_duplicated_id_ends_on_the_last_row_that_arrived(monkeypatch):
+    # Documented policy: last row wins, for the object and for the verdict.
+    # This is the one case where a truncated poll and a complete one can
+    # disagree about what a row means, so it is pinned rather than left to
+    # whichever copy the dict happened to keep.
+    cap_pages(monkeypatch)
+    live = session("s1", status="running", parent="root")
+    dead = session("s1", status="idle", parent="root")
+    watcher = w.SessionWatcher(opener=StubOpener(envelope([live, dead])))
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == []
+
+    # ...and the reverse order keeps it, so the rule is the last row's and not
+    # a preference for one verdict.
+    watcher = w.SessionWatcher(opener=StubOpener(envelope([dead, live])))
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [("added", "s1")]
+
+
+def test_a_duplicated_row_is_reported_once(monkeypatch):
+    cap_pages(monkeypatch)
+    watcher = w.SessionWatcher(opener=StubOpener(envelope(
+        [session("s1"), session("s1", title="renamed")]
+    )))
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("added", "s1")]
+    assert events[0].session["title"] == "renamed", "last row did not win"
+
+
 def test_the_truncation_notice_is_written_once_per_transition(monkeypatch, capsys):
     cap_pages(monkeypatch)
     page = envelope([session("s1")], has_more=True, last_id="s1")
@@ -916,6 +1020,44 @@ def test_sse_caps_data_lines_that_never_dispatch():
 
     assert list(parser.feed(b'\ndata: {"ok": 1}\n\n')) == [{"ok": 1}]
     assert parser._data_bytes == 0
+
+
+def test_sse_drops_the_tail_of_an_oversized_frame():
+    # The cap used to clear the buffer and stop there, so the rest of the frame
+    # accumulated as though it were fresh and the blank line dispatched it: the
+    # consumer got a fragment it cannot tell from a whole frame, and the
+    # consumer is a UI that acts on what it is handed.
+    parser = w._SSEParser()
+    oversize = b'x' * (w.MAX_SSE_FRAME_BYTES + 1)
+    assert list(parser.feed(b'data: "' + oversize + b'"\n')) == []
+    assert list(parser.feed(b'data: {"ok": true}\n')) == [], "tail of the same frame"
+    assert list(parser.feed(b"\n")) == [], "frame boundary"
+    assert parser._data == [] and parser._data_bytes == 0
+
+    # The frame after it is a normal frame again — including a multi-line one,
+    # which a stale fragment would have corrupted.
+    assert list(parser.feed(b'data: {"n":\ndata: 1}\n\n')) == [{"n": 1}]
+
+
+def test_flush_cannot_dispatch_the_tail_of_an_oversized_frame():
+    # The stream ends with the poisoned frame still open, part of it sitting
+    # unterminated in the buffer. flush() is the last chance to hand the
+    # consumer something it would take for a frame; it must not.
+    # feed() is a generator: every call below is drained, or it runs nothing at
+    # all and the test passes without having fed the parser.
+    parser = w._SSEParser()
+    oversize = b'x' * (w.MAX_SSE_FRAME_BYTES + 1)
+    assert list(parser.feed(b'data: "' + oversize + b'"\n')) == []
+    assert list(parser.feed(b'data: {"ok": true}')) == []   # unterminated: buffered
+    assert list(parser.flush()) == []
+
+
+def test_flush_after_an_oversized_frame_still_parses_the_next_one():
+    parser = w._SSEParser()
+    oversize = b'x' * (w.MAX_SSE_FRAME_BYTES + 1)
+    assert list(parser.feed(b'data: "' + oversize + b'"\n')) == []
+    assert list(parser.flush()) == []
+    assert list(parser.feed(b'data: {"ok": 1}\n\n')) == [{"ok": 1}]
 
 
 def test_sse_multiple_frames_in_one_read():

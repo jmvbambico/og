@@ -281,6 +281,14 @@ class _SSEParser:
     is dropped rather than buffered: this object lives inside a process meant to
     run for days, and a malformed peer must not be able to grow it without
     limit or kill the tail.
+
+    Hitting the frame cap discards the frame through to its blank-line
+    boundary, not just up to the line that broke the cap. Clearing the buffer at
+    the cap would leave the rest of the frame accumulating as though it were
+    fresh, and the blank line would then dispatch that tail as a whole frame:
+    the consumer cannot tell a fragment from data, and the consumer here is a
+    UI that acts on what it is handed. A dropped frame is a gap; a fabricated
+    one is worse.
     """
 
     def __init__(self) -> None:
@@ -290,6 +298,10 @@ class _SSEParser:
         # True while we are discarding the tail of a line we already threw away,
         # so its remainder is not mistaken for a fresh frame.
         self._resync = False
+        # True once the frame cap has tripped: swallow every line until the
+        # blank line that ends this frame, so no part of an oversized frame is
+        # ever dispatched as if it were a whole one.
+        self._discard_frame = False
 
     def feed(self, chunk: bytes) -> Iterator[dict]:
         self._buf += chunk
@@ -324,6 +336,12 @@ class _SSEParser:
                 frame = self._line(raw)
                 if frame is not None:
                     yield frame
+        if self._discard_frame:
+            # The stream ended inside a frame that had already been poisoned.
+            # The lines above went through _line and were swallowed; refusing to
+            # dispatch here as well means ending the stream mid-discard cannot
+            # turn the remainder into a frame, whatever _line is doing later.
+            return
         frame = self._dispatch()
         if frame is not None:
             yield frame
@@ -356,7 +374,16 @@ class _SSEParser:
 
     def _line(self, raw: bytes) -> Optional[dict]:
         if raw == b"":
+            # The blank line that ends the frame. Arriving mid-discard it also
+            # ends the discard, so the next frame parses normally; _data is
+            # empty by then, so this dispatches nothing.
+            self._discard_frame = False
             return self._dispatch()
+        if self._discard_frame:
+            # Past the frame cap and still inside the frame: swallow this line
+            # too, whatever it is. Dispatching the tail would hand the consumer
+            # a fragment it has no way to distinguish from a whole frame.
+            return None
         if raw.startswith(b":"):
             return None  # keepalive comment
         field_name, _, value = raw.partition(b":")
@@ -367,8 +394,13 @@ class _SSEParser:
         self._data.append(value)
         self._data_bytes += len(value) + 1
         if self._data_bytes > MAX_SSE_FRAME_BYTES:
+            # Over budget: drop what we have and mark the frame as poisoned.
+            # The frame has not ended — more `data:` lines of it may still be
+            # coming — so the discard has to run to the blank line rather than
+            # stop here.
             self._data = []
             self._data_bytes = 0
+            self._discard_frame = True
         return None
 
     def _dispatch(self) -> Optional[dict]:
@@ -605,34 +637,58 @@ class SessionWatcher:
         is handed the live set and nothing else; a sub-agent finishing reads as
         "removed" because that is what it is.
 
-        A TRUNCATED listing cannot mean anything by an absence. Rows past the
-        cap were never fetched, and since the listing is newest-first those are
-        the oldest sessions — the roots, the panes the user is typing into — so
-        reporting them as removed would close exactly the panes that must not
-        close, manufactured by our own ceiling rather than by the server. So a
-        truncated poll emits no removals at all, and keeps the sessions it did
-        not see in `_seen`: dropping them would only move the damage, turning
-        this poll's phantom removals into the next complete poll's phantom
-        `added`, and the consumer would open a second tab for a session whose
-        pane is already on screen. What the poll *did* see is still diffed
-        normally, so `added` and `changed` keep flowing while truncated.
+A TRUNCATED listing cannot mean anything by an absence — but only for the
+        rows it never fetched. Those are past the cap, and since the listing is
+        newest-first they are the oldest sessions: the roots, the panes the user
+        is typing into. Reporting them as removed would close exactly the panes
+        that must not close, manufactured by our own ceiling rather than by the
+        server.
 
-        The cost, stated plainly: a session that quietly finished during a
-        truncated window keeps its pane until a complete listing arrives — a
-        stale pane instead of a wrongly closed one — and if the listing never
-        completes, removals never resume at all. One line to stderr, on the
-        transition into that state and out of it, is what makes it findable.
+        So absence has to be read in three states, not two, and they are not
+        equally uncertain:
+
+        * FETCHED and no longer projectable — a sub-agent went idle, a row came
+          back archived. The row is in hand and says the session is done, and a
+          truncated poll is irrelevant to that: it gets its `removed` event
+          like any other, or the pane for a finished worker would sit there
+          until the listing fit in one walk.
+        * NEVER FETCHED — beyond the cap. Absence proves nothing, so the
+          removal is suppressed and the session stays in `_seen`. Dropping it
+          would only move the damage: this poll's phantom removals become the
+          next complete poll's phantom `added`, and the consumer opens a second
+          tab for a session whose pane is already on screen.
+        * PRESENT, unchanged. `added` and `changed` flow from the fetched rows
+          exactly as before, truncated or not.
+
+        The cost that remains, stated plainly: a session that finished while it
+        sat past the cap keeps a stale pane until a complete listing brings it
+        back into view, and if no listing is ever complete again, the never-
+        fetched ones never retire at all. A stale pane instead of a wrongly
+        closed one; one stderr line, on the transition into that state and out
+        of it, is what makes it findable.
 
         Strict: a transport or decode error propagates. `_seen` is updated as
         the very last statement, so a failure leaves the previously observed
         state untouched rather than half-updated.
         """
         rows, truncated = self._fetch_listing(kind="any")
-        fresh = {}
+
+        # Every id that came back in this poll, whether or not it qualifies,
+        # because "did not qualify" and "was never asked" are different facts
+        # and only the second one licenses an absence. On a duplicated id the
+        # last row wins — it decides both the retained object and whether the
+        # id still projects, so a later archived or idle copy retires an id an
+        # earlier qualifying copy had kept alive. The server should not send
+        # two rows for one id; when it does, honouring the last is the same
+        # rule `fresh` has always applied to the object itself, and keeping the
+        # first appearance's position keeps event order equal to listing order.
+        fetched: dict[str, tuple[dict, bool]] = {}
         for session in rows:
             sid = _session_id(session)
-            if sid is not None and should_project(session):
-                fresh[sid] = session
+            if sid is not None:
+                fetched[sid] = (session, should_project(session))
+
+        fresh = {sid: row for sid, (row, qualifies) in fetched.items() if qualifies}
 
         events = []
         for sid, session in fresh.items():
@@ -642,18 +698,29 @@ class SessionWatcher:
                 events.append(SessionEvent("changed", sid, dict(session),
                                            dict(self._seen[sid])))
 
+        retired = []
+        for sid, session in self._seen.items():
+            if sid in fresh:
+                continue
+            if truncated and sid not in fetched:
+                # Never fetched. Kept, not removed: the next complete listing
+                # will decide, and by then the diff is against this record
+                # rather than against a gap.
+                continue
+            retired.append(sid)
+            events.append(SessionEvent("removed", sid, {}, dict(session)))
+
         if truncated:
             self._announce_listing(len(rows), truncated)
-            # Merge over what we already knew rather than replacing it: the
-            # sessions missing from this poll are missing from the FETCH, not
-            # from the server, and the only honest record of them is the one we
-            # took when we could still see them.
+            # Merge over what we already knew rather than replacing it: what is
+            # missing from this poll is missing from the FETCH, and the only
+            # honest record of those sessions is the one taken when we could
+            # still see them. The ones this poll did retire have to actually
+            # leave, or the next poll retires them again.
             self._seen.update(fresh)
+            for sid in retired:
+                self._seen.pop(sid, None)
             return events
-
-        for sid, session in self._seen.items():
-            if sid not in fresh:
-                events.append(SessionEvent("removed", sid, {}, dict(session)))
 
         self._announce_listing(len(rows), truncated)
         self._seen = fresh
