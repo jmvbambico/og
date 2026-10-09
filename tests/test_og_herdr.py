@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import os
 from pathlib import Path
 
 import pytest
@@ -121,8 +122,8 @@ def _call(client, name):
 def test_added_sequence(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, workspace="ws",
-                      source="og-bridge")
-    session = {"title": "Fix bug", "workspace": "/tmp/ws", "state": "working"}
+                      source="og-bridge", cwd="/tmp/ws")
+    session = {"title": "Fix bug", "state": "working"}
     lines = bridge.reconcile([Ev("added", "s1", session)])
 
     assert _names(client) == ["tab_create", "pane_run", "report_agent",
@@ -139,13 +140,41 @@ def test_added_sequence(seams):
     assert len(lines) == 1 and "add s1" in lines[0]
 
 
-def test_added_defaults_cwd_to_home_and_label_to_session_id(seams):
+def test_cwd_flag_is_honoured_for_new_panes(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/srv/repo")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    assert _call(client, "tab_create")[2]["cwd"] == "/srv/repo"
+
+
+def test_added_defaults_cwd_to_process_cwd_and_label_to_session_id(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
     lines = bridge.reconcile([Ev("added", "abcdef123456", {})])
-    assert _call(client, "tab_create")[2]["cwd"] == str(Path.home())
+    # No --cwd: the pane opens in the bridge's own cwd, not a hardcoded path.
+    assert _call(client, "tab_create")[2]["cwd"] == os.getcwd()
     assert _call(client, "tab_create")[2]["label"] == "og:abcdef12"
     assert len(lines) == 1
+
+
+def test_realistic_session_row_without_workspace_key_uses_bridge_cwd(seams):
+    # A complete live session row: the HTTP object has NO directory key at all
+    # (this is the exact key set a live server returned), so the cwd must come
+    # from the bridge's invocation rather than from the row.
+    session = {
+        "agent_id": "a1", "agent_name": "opencode", "archived": False,
+        "comments_count": 0, "created_at": "2026-01-01T00:00:00Z",
+        "external_session_id": "ext-1", "id": "s1", "labels": [],
+        "owner": "me", "parent_session_id": None,
+        "pending_elicitations_count": 0, "permission_level": "default",
+        "runner_id": "r1", "status": "running", "title": "Fix bug",
+        "updated_at": "2026-01-01T00:00:01Z", "viewer_unread": False,
+    }
+    assert "workspace" not in session
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/under/test")
+    bridge.reconcile([Ev("added", "s1", session)])
+    assert _call(client, "tab_create")[2]["cwd"] == "/repo/under/test"
 
 
 def test_changed_sequence_reports_state_and_title(seams):
@@ -575,6 +604,15 @@ def test_build_parser_overrides():
     assert args.socket == "/tmp/s.sock"
     assert args.workspace == "w1"
     assert args.source == "me"
+
+
+def test_build_parser_exposes_cwd_with_process_cwd_default():
+    args = m.build_parser().parse_args([])
+    # The documented default IS the bridge's own cwd, so assert against the same
+    # source rather than a hardcoded path.
+    assert args.cwd == os.getcwd()
+    overridden = m.build_parser().parse_args(["--cwd", "/srv/repo"])
+    assert overridden.cwd == "/srv/repo"
 
 
 def test_siblings_are_imported_lazily_not_at_module_load():
