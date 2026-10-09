@@ -34,9 +34,12 @@ class Ev:
 
 
 class RecordingClient:
-    def __init__(self, fail=None):
+    def __init__(self, fail=None, create_results=None):
         self.calls = []
         self.fail = fail or {}
+        # Queued tab_create returns, so a test can hand back a malformed reply
+        # (missing ids) that the default well-formed shape never produces.
+        self.create_results = list(create_results) if create_results else []
         self._seq = 0
 
     def _call(self, name, *args, **kwargs):
@@ -50,9 +53,12 @@ class RecordingClient:
 
     def tab_create(self, workspace, cwd, label, focus=False):
         self._call("tab_create", workspace, cwd=cwd, label=label)
+        if self.create_results:
+            return self.create_results.pop(0)
         self._seq += 1
-        return {"tab": {"id": f"tab{self._seq}"},
-                "root_pane": {"id": f"pane{self._seq}"}}
+        # The REAL herdr 0.9.3 shape: `tab_id` / `pane_id`, never a generic `id`.
+        return {"tab": {"tab_id": f"tab{self._seq}"},
+                "root_pane": {"pane_id": f"pane{self._seq}"}}
 
     def tab_close(self, tab_id):
         self._call("tab_close", tab_id)
@@ -218,6 +224,124 @@ def test_unmapped_removed_is_ignored(seams):
     lines = bridge.reconcile([Ev("removed", "ghost", {})])
     assert lines == []
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# recovery from a herdr call that fails part-way through one event
+# ---------------------------------------------------------------------------
+
+def test_partial_setup_failure_retries_on_the_same_pane_without_a_second_tab(
+        seams):
+    # pane_run fails once. The tab and pane already exist, so the redelivered
+    # `added` must resume setup on them rather than create a second tab.
+    client = RecordingClient(fail={"pane_run": FakeHerdrError("boom", "pane gone")})
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    session = {"title": "T", "state": "idle"}
+
+    first = bridge.reconcile([Ev("added", "s1", session)])
+    assert any("error s1" in ln for ln in first)
+    # The mapping was recorded after tab_create, so the pane stays tracked.
+    assert bridge._tabs["s1"]["tab_id"] == "tab1"
+    assert bridge._tabs["s1"]["pane_id"] == "pane1"
+    assert _names(client).count("tab_create") == 1
+    client.calls.clear()
+
+    second = bridge.reconcile([Ev("added", "s1", session)])
+    assert _names(client).count("tab_create") == 0
+    assert _names(client) == ["pane_run", "report_agent", "report_metadata"]
+    assert _call(client, "pane_run")[1] == ("pane1", "omnigent attach s1")
+    assert "resume add s1" in second[0]
+    assert bridge._tabs["s1"]["ready"] is True
+
+
+def test_added_with_no_usable_ids_records_error_and_never_reports_on_none(
+        seams):
+    client = RecordingClient(create_results=[{"tab": {}, "root_pane": {}}])
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    lines = bridge.reconcile([
+        Ev("added", "bad", {"title": "bad", "state": "idle"}),
+        Ev("added", "good", {"title": "good", "state": "idle"}),
+    ])
+    assert any("error bad" in ln for ln in lines)
+    assert any("add good" in ln for ln in lines)
+    # Nothing usable was stored for the malformed create, and none of the
+    # follow-up calls were made with a None pane.
+    assert "bad" not in bridge._tabs
+    assert _names(client).count("pane_run") == 1
+    assert _call(client, "report_agent")[1][0] == "pane1"
+
+    # A later `changed` for the rejected session must not report against a None
+    # pane: there is no mapping, so it is ignored.
+    client.calls.clear()
+    assert bridge.reconcile([Ev("changed", "bad", {"state": "working"})]) == []
+    assert client.calls == []
+
+
+def test_added_with_tab_id_but_no_pane_id_closes_the_orphan_tab(seams):
+    client = RecordingClient(create_results=[{"tab": {"tab_id": "tabZ"},
+                                              "root_pane": {}}])
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    assert any("error s1" in ln for ln in lines)
+    assert _names(client) == ["tab_create", "tab_close"]
+    assert _call(client, "tab_close")[1] == ("tabZ",)
+    assert "s1" not in bridge._tabs
+
+
+def test_failed_orphan_tab_close_is_recorded_not_raised(seams):
+    client = RecordingClient(
+        create_results=[{"tab": {"tab_id": "tabZ"}, "root_pane": {}}],
+        fail={"tab_close": FakeHerdrError("boom", "cannot close")})
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    # Both the malformed-reply line and the failed cleanup line are recorded.
+    assert sum("error s1" in ln for ln in lines) == 2
+    assert _names(client) == ["tab_create", "tab_close"]
+    assert "s1" not in bridge._tabs
+
+
+def test_failed_removal_keeps_the_mapping_for_a_retry(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    client.calls.clear()
+
+    client.fail = {"release_agent": FakeHerdrError("boom", "cannot release")}
+    lines = bridge.reconcile([Ev("removed", "s1", {})])
+    assert any("error s1" in ln for ln in lines)
+    # Cleanup failed, so the mapping survives and a later `removed` can retry.
+    assert "s1" in bridge._tabs
+    client.calls.clear()
+
+    again = bridge.reconcile([Ev("removed", "s1", {})])
+    assert _names(client) == ["release_agent", "tab_close"]
+    assert "remove s1" in again[0]
+    assert "s1" not in bridge._tabs
+
+
+def test_removal_where_herdr_says_not_found_is_treated_as_done(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    client.calls.clear()
+
+    client.fail = {"release_agent": FakeHerdrError("not_found", "pane not found")}
+    lines = bridge.reconcile([Ev("removed", "s1", {})])
+    # Already-gone is success for us: drop the mapping and do not retry.
+    assert "s1" not in bridge._tabs
+    assert any("remove s1" in ln for ln in lines)
+    client.calls.clear()
+
+    assert bridge.reconcile([Ev("removed", "s1", {})]) == []
+    assert client.calls == []
+
+
+def test_fake_client_returns_the_real_api_key_names():
+    client = RecordingClient()
+    result = client.tab_create("ws", cwd="/tmp", label="x")
+    assert set(result) == {"tab", "root_pane"}
+    assert "tab_id" in result["tab"] and "id" not in result["tab"]
+    assert "pane_id" in result["root_pane"] and "id" not in result["root_pane"]
 
 
 # ---------------------------------------------------------------------------
