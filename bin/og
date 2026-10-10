@@ -4,6 +4,10 @@
 #   og start [local]    start on the LAN: server on 0.0.0.0, QR of your LAN IP
 #   og start tunneled [domain] [--use ngrok|tunnl]
 #                       start the tunnel first, then the server behind that origin
+#   og start [<mux>] …  the same start, inside a terminal multiplexer: `herdr` opens
+#                       the session as a herdr space. The word may appear anywhere;
+#                       an ngrok domain NAMED after a multiplexer is unreachable
+#                       positionally — say OG_NGROK_DOMAIN=<domain> og start tunneled.
 #   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
 #   og restart [mode]   og stop, then og start with the same arguments
@@ -16,6 +20,7 @@
 #   og logs [-f]        tail the server log
 #   og audit [id]       what happened in the latest run: per-worker tools, stalls, reports
 #   og stats            per-agent quota/capacity: remaining, reset, tier, source
+#   og agents [options] the live session tree in this terminal (not herdr-specific)
 #   og herdr [options]  project live omnigent sessions into herdr panes
 #   og update           pull the checkout and re-apply the install
 #   og version          print the installed version
@@ -1105,21 +1110,16 @@ export_worker_scoping() {
   fi
 }
 
-cmd_start() {
-  # `og start`            -> local  (LAN only; the safe default)
-  # `og start local`      -> same, explicit
-  # `og start tunneled`   -> a public tunnel; provider from --use/og.env (ngrok
-  #                          is the default)
-  # `og start tunneled X` -> ngrok on reserved domain X
-  # `og start X`          -> back-compat: a bare argument that is not a mode is
-  #                          an ngrok domain, which only ever meant tunneled.
-  # `og start ... --use ngrok|tunnl[.gg]` -> provider for this run only.
-  #
+# Turn `og start`'s arguments into OG_START_MODE / _DOMAIN / _PROVIDER / _MUX.
+# Split out of cmd_start so the parsing — which is where the multiplexer keyword
+# has to be intercepted BEFORE the bare-argument case arm — is one function a
+# test can call without starting a server.
+parse_start_args() {
   # og has no flag parser anywhere else, but --use consumes a value so it cannot
   # be one more positional case arm (see docs/TUNNEL-PROVIDERS.md): collect
   # positionals and flags in one pass.
-  local use="" mode="local" domain="" provider
-  local -a pos=()
+  local use="" provider mux="" mode="" domain="" ids a
+  local -a pos=() rest=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --use)
@@ -1140,17 +1140,133 @@ cmd_start() {
     provider="$(normalize_tunnel_provider "${OG_TUNNEL_PROVIDER:-ngrok}")" \
       || die "unknown OG_TUNNEL_PROVIDER: ${OG_TUNNEL_PROVIDER:-}  (valid: ngrok, tunnl)"
   fi
-  case "${pos[0]:-}" in
+
+  # THE PARSING COLLISION. A bare argument has always meant an ngrok reserved
+  # domain, so `og start herdr` already works — as a tunnel to a domain called
+  # "herdr", which prints a line saying exactly that. A multiplexer keyword
+  # therefore has to be recognised and REMOVED here, before the bare-argument arm
+  # below can see it, or the new command would quietly do something else.
+  #
+  # Every positional is scanned, not only the first: `og start tunneled herdr` is
+  # a natural thing to type and a first-position-only rule would turn it into
+  # an ngrok domain — the exact footgun this exists to close. Only the FIRST
+  # match is stripped; a second one is left for the domain arm, which will say so.
+  ids="$(mux_ids)"
+  for a in ${pos[@]+"${pos[@]}"}; do
+    if [[ -z "$mux" ]] && [[ -n "$a" ]] && printf '%s\n' "$ids" | grep -Fxq -- "$a"; then
+      mux="$a"
+      continue
+    fi
+    rest+=("$a")
+  done
+  case "${rest[0]:-}" in
     local)    mode="local" ;;
-    tunneled) mode="tunneled"; domain="${pos[1]:-}" ;;
+    tunneled) mode="tunneled"; domain="${rest[1]:-}" ;;
     "")       mode="${OG_DEFAULT_MODE:-local}" ;;
-    *)        mode="tunneled"; domain="${pos[0]}"
+    *)        mode="tunneled"; domain="${rest[0]}"
               if [[ "$provider" != "ngrok" ]]; then
                 die "'og start $domain' means an ngrok reserved domain, which provider '$provider' does not support.
     Reserved names on tunnl.gg are a Pro feature. Run 'og start tunneled' for a free stable@ URL, or '--use ngrok'."
               fi
               info "a bare argument is read as an ngrok domain; this is 'og start tunneled $domain'" ;;
   esac
+  OG_START_MODE="$mode" OG_START_DOMAIN="$domain"
+  OG_START_PROVIDER="$provider" OG_START_MUX="$mux"
+  return 0
+}
+
+# --- multiplexer seam -------------------------------------------------------
+#
+# A multiplexer is a VIEW on a session, never the runtime: `og start herdr` on a
+# machine without herdr warns and starts normally, so nothing here may be fatal.
+#
+# The ids come from installer/registry.json's `multiplexers` array, the same way
+# supported agents come from `agents`: adding a multiplexer is a registry row,
+# not an edit here (AGENTS.md, "add a vendor HERE, not in code"). That array
+# lands in its own change, so og copied out of a checkout that predates it has to
+# keep working — hence the fallback row below. It names exactly the one
+# multiplexer that has a backend, so the degradation is "no multiplexer" rather
+# than "a keyword that silently does nothing".
+#
+#   id <TAB> binary <TAB> homepage
+OG_MUX_FALLBACK=$'herdr\therdr\thttps://herdr.dev/'
+
+# Every supported multiplexer as `id<TAB>binary<TAB>homepage`, one per line.
+# Ids that could not be matched as a single shell word are dropped rather than
+# quoted: one of them would match a half-word of the operator's own argument
+# list, and the registry is ours to keep well-formed.
+mux_rows() {
+  local repo rows=""
+  if repo="$(og_repo_dir 2>/dev/null)"; then
+    rows="$(OG_MUX_REGISTRY="$repo/installer/registry.json" python3 - <<'PYEOF' 2>/dev/null || true
+import json, os, re
+
+WORD = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+try:
+    with open(os.environ["OG_MUX_REGISTRY"]) as handle:
+        catalog = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+rows = catalog.get("multiplexers") if isinstance(catalog, dict) else None
+for row in rows or []:
+    if not isinstance(row, dict):
+        continue
+    mid = row.get("id")
+    binary = row.get("binary") or mid
+    home = row.get("homepage") or row.get("url") or ""
+    if (isinstance(mid, str) and WORD.match(mid)
+            and isinstance(binary, str) and WORD.match(binary)):
+        print("\t".join((mid, binary, home if isinstance(home, str) else "")))
+PYEOF
+)"
+  fi
+  printf '%s\n' "${rows:-$OG_MUX_FALLBACK}"
+}
+
+mux_ids() { mux_rows | cut -f1; }
+
+# The binary that runs multiplexer $1, or nothing. Also the id's own name when
+# the row does not override it: the id IS the command an operator types.
+mux_binary() {
+  mux_rows | awk -F'\t' -v want="$1" '$1 == want { print $2; found = 1 }
+    END { exit(found ? 0 : 1) }'
+}
+
+mux_homepage() {
+  mux_rows | awk -F'\t' -v want="$1" '$1 == want { print $3; found = 1 }
+    END { exit(found ? 0 : 1) }'
+}
+
+cmd_start() {
+  # `og start`            -> local  (LAN only; the safe default)
+  # `og start local`      -> same, explicit
+  # `og start tunneled`   -> a public tunnel; provider from --use/og.env (ngrok
+  #                          is the default)
+  # `og start tunneled X` -> ngrok on reserved domain X
+  # `og start <mux> ...`  -> the same start, then the session inside a terminal
+  #                          multiplexer (today: herdr). Orthogonal to the mode.
+  # `og start X`          -> back-compat: a bare argument that is not a mode is
+  #                          an ngrok domain, which only ever meant tunneled.
+  # `og start ... --use ngrok|tunnl[.gg]` -> provider for this run only.
+  parse_start_args "$@"
+  local mode="$OG_START_MODE" domain="$OG_START_DOMAIN" provider="$OG_START_PROVIDER"
+  local mux="$OG_START_MUX"
+
+  # A missing multiplexer is never an error: og is fully usable without one.
+  # Checked HERE, before anything is started, rather than at the launcher call
+  # twenty seconds later — the warning is about the command the operator just
+  # typed, and `og start herdr` on a machine with no herdr must still be a plain
+  # `og start`, which is only true if the keyword is dropped before the first
+  # side effect.
+  if [[ -n "$mux" ]]; then
+    local mux_bin; mux_bin="$(mux_binary "$mux" || true)"
+    if [[ -z "$mux_bin" ]] || ! command -v "$mux_bin" >/dev/null 2>&1; then
+      printf '\033[0;33m!\033[0m %s not found on PATH — starting without it.\n' "$mux"
+      echo "  Install it from $(mux_homepage "$mux" 2>/dev/null || echo "$mux") and re-run to use spaces."
+      mux=""
+    fi
+  fi
+
   # A domain is an ngrok concept: only ngrok takes the positional argument or
   # OG_NGROK_DOMAIN. Under tunnl a positional domain is refused, never silently
   # dropped; OG_NGROK_DOMAIN is simply not consulted.
@@ -1476,6 +1592,26 @@ cmd_start() {
   show_access
   echo "    log:    $server_log"
   echo "    stop:   og stop"
+
+  # Last, and only ever reached by an `og start <mux>`: everything above is the
+  # ordinary `og start`, which is exactly the point — `og chat` runs INSIDE a
+  # pane and needs the live server this just brought up, so the launcher cannot
+  # move before it, and og is fully usable if it never runs at all.
+  #
+  # Loopback, not OG_PUBLIC_URL: the panes run here, on this machine, and the
+  # tunnel is for a browser elsewhere.
+  if [[ -n "$mux" ]]; then
+    local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_herdr_launch.py directly."
+    command -v python3 >/dev/null || die "python3 is required"
+    local launcher="$repo/installer/og_herdr_launch.py"
+    [[ -f "$launcher" ]] || {
+      printf '\033[0;31merror:\033[0m og start %s is not installed (missing %s); re-run og setup\n' \
+        "$mux" "$launcher" >&2
+      exit 2
+    }
+    exec python3 "$launcher" --mux "$mux" --server "http://127.0.0.1:$PORT"
+  fi
 }
 
 # Where og's own helpers live. The installer copies `og` to a bin dir that is
@@ -1689,6 +1825,22 @@ cmd_stats() {
     Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_stats.py directly."
   command -v python3 >/dev/null || die "python3 is required"
   exec python3 "$repo/installer/og_stats.py" "$@"
+}
+
+# The session tree in this terminal. Same shape as cmd_herdr, including the
+# missing-script check, and for the same reason: og_agents imports og_herdr and
+# og_herdr_watch at module load, so a checkout predating the bridge fails with a
+# bare ImportError — "re-run og setup" is the answer, not a traceback.
+cmd_agents() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_agents.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  local viewer="$repo/installer/og_agents.py"
+  [[ -f "$viewer" ]] || {
+    printf '\033[0;31merror:\033[0m og agents is not installed (missing %s); re-run og setup\n' "$viewer" >&2
+    exit 2
+  }
+  exec python3 "$viewer" "$@"
 }
 
 # The herdr bridge ships on its own branch, so an install that predates it has
@@ -2001,11 +2153,18 @@ case "${1:-}" in
   logs)   shift; cmd_logs "$@" ;;
   audit)  shift; cmd_audit "$@" ;;
   stats)  shift; cmd_stats "$@" ;;
+  agents) shift; cmd_agents "$@" ;;
   herdr)  shift; cmd_herdr "$@" ;;
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    # The usage block is the comment header, so the RANGE has to track it: every
+    # command added above without widening this quietly drops off the end of
+    # `og help`, which is how `og version` went missing once already. 2,26 is the
+    # last line of the command list (the prose below it is not help).
+    # tests/test_og_start_mux.py::test_help_block_lists_every_dispatched_command
+    # is the guard that cannot rot the way a number does.
+    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac
