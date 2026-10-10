@@ -104,6 +104,39 @@ def urls(opener):
     return [r.full_url for r in opener.requests]
 
 
+class RecordingStderr:
+    """A stderr that keeps what it was handed, and can be told to fail.
+
+    The watcher's own diagnostics go to sys.stderr, so the only way to test
+    what happens when that write fails is to hand the module a stderr that
+    fails. `fail_times` failures, then it behaves; `attempts` counts every
+    write the module tried, failed or not, which is how a test can tell "the
+    notice was never even attempted again" from "it was attempted and nothing
+    was written".
+    """
+
+    def __init__(self, fail_times=0, error=None):
+        self.lines = []
+        self.attempts = 0
+        self.flushes = 0
+        self.fail_times = fail_times
+        self.error = error if error is not None else OSError(32, "Broken pipe")
+
+    def write(self, text):
+        self.attempts += 1
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise self.error
+        self.lines.append(text)
+
+    def flush(self):
+        self.flushes += 1
+
+    @property
+    def text(self):
+        return "".join(self.lines)
+
+
 # One row exactly as it came off a live 0.17.0 server. Kept as text so it is
 # parsed the same way the module parses it, and kept verbatim so a test cannot
 # quietly "fix" a fixture to match the code.
@@ -1328,3 +1361,172 @@ def test_watch_does_not_swallow_keyboard_interrupt(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         list(watcher.watch())
     assert sleeps == [], "Ctrl-C was treated as a poll failure and retried"
+
+
+def test_watch_does_not_retry_system_exit(monkeypatch):
+    # Same for SystemExit: a BaseException, so it was never in scope for the
+    # broad catch, and excluding _BUG_EXCEPTIONS must not have moved it there.
+    sleeps = []
+    monkeypatch.setattr(w.time, "sleep", lambda s: sleeps.append(s))
+    watcher = w.SessionWatcher(poll_interval=0.5, opener=StubOpener(SystemExit(2)))
+    with pytest.raises(SystemExit):
+        list(watcher.watch())
+    assert sleeps == []
+
+
+# --------------------------------------------------------------------------
+# a stderr that refuses the truncation notice: the notice is the only record
+# that the watcher is running on partial knowledge, so losing it silently
+# leaves removals suppressed with nothing in the log to explain it
+# --------------------------------------------------------------------------
+
+def test_a_notice_that_could_not_be_written_is_not_recorded_as_announced(monkeypatch):
+    cap_pages(monkeypatch)
+    page = envelope([session("s1")], has_more=True, last_id="s1")
+    err = RecordingStderr(fail_times=1)
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(opener=StubOpener(page))
+
+    watcher.poll_once()
+    assert err.text == "", "a notice reached a stderr that refused it"
+    assert watcher._listing_truncated is False, (
+        "the state was recorded as announced even though nothing was written, "
+        "so the next poll would find no transition and never retry the notice"
+    )
+
+    # The state is unchanged, so the next poll still sees a transition — and
+    # this time the write lands. A transient stderr failure costs one line, not
+    # the notice.
+    watcher.poll_once()
+    assert "truncated" in err.text, err.text
+    assert "removals suppressed" in err.text, err.text
+    assert err.flushes == 1
+
+
+def test_a_persistently_broken_stderr_raises_nothing_and_writes_nothing(monkeypatch):
+    # The other half of the same decision: a stderr that is gone for good. The
+    # write is attempted every poll and fails every time, so the cost is one
+    # failed syscall per poll. No exception may reach poll_once's caller (a
+    # broken stderr would otherwise turn a logging problem into a poll-failure
+    # retry loop) and no state may be recorded (see the test above).
+    cap_pages(monkeypatch)
+    page = envelope([session("s1")], has_more=True, last_id="s1")
+    err = RecordingStderr(fail_times=10_000)
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(opener=StubOpener(page))
+
+    events = watcher.poll_once()
+    for _ in range(2):
+        assert watcher.poll_once() == []
+
+    assert [(e.kind, e.session_id) for e in events] == [("added", "s1")], (
+        "the watcher stopped producing events because it could not log"
+    )
+    assert err.text == "", "something was written to a stderr that refuses it"
+    assert err.attempts == 3, "the notice was not retried, so a recovering stderr would never get it"
+    assert watcher._listing_truncated is False
+
+
+def test_a_written_notice_is_recorded_so_the_state_is_not_re_announced(monkeypatch):
+    # The regression guard for the fix above: recording the state on success is
+    # still what stops a permanently truncated watcher from saying so forever.
+    cap_pages(monkeypatch)
+    page = envelope([session("s1")], has_more=True, last_id="s1")
+    err = RecordingStderr()
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(opener=StubOpener(page))
+
+    for _ in range(3):
+        watcher.poll_once()
+    assert err.text.count("truncated") == 1, err.text
+    assert watcher._listing_truncated is True
+    assert err.flushes == 1
+
+
+def test_a_broken_stderr_is_not_mistaken_for_a_bug_by_poll_once(monkeypatch):
+    # The ValueError half: "I/O operation on closed file". Only OSError+ValueError
+    # are swallowed, and a stderr failure must never be escalated into the
+    # stopping-for-a-bug path added below.
+    cap_pages(monkeypatch)
+    page = envelope([session("s1")], has_more=True, last_id="s1")
+    closed = ValueError("I/O operation on closed file")
+    err = RecordingStderr(fail_times=10_000, error=closed)
+    monkeypatch.setattr(w.sys, "stderr", err)
+    w.SessionWatcher(opener=StubOpener(page)).poll_once()
+    assert err.text == ""
+
+
+# --------------------------------------------------------------------------
+# watch() stops on what can only be a bug, and keeps retrying everything else
+# --------------------------------------------------------------------------
+
+def test_the_bug_tuple_is_exactly_the_four_definitional_cases():
+    # Pinned so that growing it is a deliberate act. Adding a class is right
+    # when it cannot come from I/O; replacing this with a list of known-good
+    # errors is the failure that stops the daemon on an outage.
+    assert w._BUG_EXCEPTIONS == (TypeError, AttributeError, NameError, AssertionError)
+
+
+@pytest.mark.parametrize("exc_type", [TypeError, AttributeError, NameError,
+                                      AssertionError])
+def test_watch_stops_instead_of_retrying_a_bug(monkeypatch, capsys, exc_type):
+    # A broken module cannot be fixed by asking again. What it must not do is
+    # look like a network blip while it burns a process at the 30s ceiling.
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        # A loop that got here is retrying the bug, which is the thing under
+        # test. Ending it here makes that a failure instead of a hang.
+        raise Stop
+
+    monkeypatch.setattr(w.time, "sleep", fake_sleep)
+    watcher = w.SessionWatcher(poll_interval=0.5,
+                               opener=StubOpener(exc_type("boom")))
+
+    with pytest.raises(exc_type):
+        list(watcher.watch())
+    assert sleeps == [], "a bug was retried instead of raised"
+
+    err = capsys.readouterr().err
+    assert "bug" in err, err
+    assert exc_type.__name__ in err, "the log does not say which exception stopped it"
+    assert "poll failed" not in err, (
+        "the stop was reported as a transport failure, which is the reading "
+        f"that hides the bug: {err}"
+    )
+
+
+@pytest.mark.parametrize(
+    "exc", [OSError("down"), URLError("down"),
+            json.JSONDecodeError("Expecting value", "{", 0)],
+    ids=["OSError", "URLError", "JSONDecodeError"],
+)
+def test_watch_still_retries_the_errors_that_look_like_transport(
+        monkeypatch, capsys, exc):
+    # The exclusion is small on purpose: everything the network and the decoder
+    # can plausibly raise keeps its existing backoff, unchanged.
+    watcher = w.SessionWatcher(poll_interval=0.5, opener=StubOpener(exc))
+    events, sleeps = drive_watch(monkeypatch, watcher, stop_after_sleeps=3)
+
+    assert events == []
+    assert sleeps == [0.5, 1.0, 2.0], "the retry backoff changed for a retried error"
+    err = capsys.readouterr().err
+    assert "poll failed" in err, err
+    assert "retrying" in err, err
+
+
+def test_watch_retries_an_exception_nobody_enumerated(monkeypatch, capsys):
+    # This is the defect the broad catch exists for. A class the module has never
+    # heard of — a future SSL error, whatever a caller's injected opener raises —
+    # must still be retried; treating "unrecognised" as "fatal" is what silently
+    # ended the daemon on a server restart.
+    class Weird(Exception):
+        """An exception no allow-list would have been able to enumerate."""
+
+    watcher = w.SessionWatcher(poll_interval=0.5, opener=StubOpener(Weird("odd")))
+    events, sleeps = drive_watch(monkeypatch, watcher, stop_after_sleeps=3)
+
+    assert events == []
+    assert sleeps == [0.5, 1.0, 2.0]
+    assert "poll failed" in capsys.readouterr().err

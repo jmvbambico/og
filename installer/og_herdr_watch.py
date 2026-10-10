@@ -103,6 +103,25 @@ MAX_SSE_FRAME_BYTES = 4 << 20   # 4 MiB of accumulated `data:` lines
 # it, so anything it prints must be safe to show.
 _URL_USERINFO = re.compile(r"(?<=://)[^/\s:@]+(:[^/\s@]*)?@")
 
+# The exceptions that can only mean this module is wrong, so watch() re-raises
+# them instead of retrying. The test is where they come from, not how common
+# they are: nothing on the transport path raises any of them. urllib raises
+# URLError/HTTPError (OSError subclasses) and socket.timeout (also an OSError);
+# json raises JSONDecodeError and a bad decode raises UnicodeDecodeError (both
+# ValueErrors). A TypeError out of the poll path is a mistake in this code, and
+# retrying broken code can never succeed — it only wastes the process, and it
+# buries the bug under "poll failed (...); retrying in 30s", a line that reads
+# like a network blip and will be believed.
+#
+# This is an EXCLUSION list on purpose, never an allow-list of expected
+# failures. An allow-list would stop the daemon dead on any transport error
+# nobody enumerated — an SSL class, whatever an injected opener raises — which
+# is precisely the outage the retry loop exists to survive (a server restart
+# silently ending the watcher is a shipped defect). Retrying the unknown is the
+# safe default; only the provably unretryable is excluded. Grow it when a new
+# class of bug shows up; do not shrink it to a list of known-good errors.
+_BUG_EXCEPTIONS = (TypeError, AttributeError, NameError, AssertionError)
+
 
 def _scrub(text: str) -> str:
     """Strip `user:pass@` out of anything about to be written to stderr.
@@ -735,22 +754,52 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         otherwise say the same thing forever and bury everything else. So the
         line is written when the state changes and not in between: entering the
         truncated state, and coming back out of it.
+
+        The state is recorded as announced only if the write actually landed —
+        see the except clause, which is the whole reason this method exists in
+        its present shape.
         """
         if truncated == self._listing_truncated:
             return
-        self._listing_truncated = truncated
         if truncated:
-            sys.stderr.write(
+            line = (
                 f"og herdr watch: session listing truncated at {rows} rows; "
                 "reporting only what was fetched, removals suppressed until a "
                 "complete listing arrives\n"
             )
         else:
-            sys.stderr.write(
+            line = (
                 f"og herdr watch: session listing complete again ({rows} rows); "
                 "removals resume\n"
             )
-        sys.stderr.flush()
+        try:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            # stderr is a pipe to whatever the user launched us into, and it can
+            # be gone (broken pipe, closed descriptor, full disk on a redirect).
+            # OSError covers broken pipe and ENOSPC, ValueError covers writing
+            # to a closed file — the whole failure surface of a two-line
+            # best-effort write, which is why this is not a bare except.
+            #
+            # The failure is swallowed AND the state is deliberately left
+            # unrecorded, which is the part that matters. Recording it first (or
+            # moving the assignment after the write without the try) loses the
+            # notice for good on the first failure: every later poll sees no
+            # transition, returns early, and the watcher then runs with removals
+            # suppressed and nothing anywhere saying so. Leaving it unrecorded
+            # means a transient failure is simply retried on the next poll and
+            # the notice still lands; a permanently broken stderr means every
+            # poll tries, every try fails, and so nothing is written, nothing
+            # is raised and nothing is recorded — no spam, no poll-failure retry
+            # loop, cost one failed syscall per poll.
+            #
+            # Accepted wart: if write() succeeded and flush() then raised, the
+            # text can still reach the stream later and the retry prints a second
+            # copy. A duplicated notice is strictly better than a lost one, and
+            # this is the tradeoff to make deliberately rather than discover.
+            return
+        self._listing_truncated = truncated
 
     @staticmethod
     def _material_change(previous: dict, current: dict) -> bool:
@@ -772,6 +821,16 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         doubles up to MAX_POLL_BACKOFF and resets on the first success. Events
         resume on their own when the server comes back.
 
+        What is deliberately NOT retried is `_BUG_EXCEPTIONS` — see the tuple for
+        why those four and only those four. They are re-raised immediately, not
+        retried once first: a first attempt cannot make a TypeError go away, and
+        paying one backoff to learn that only delays the crash an operator needs
+        to see. One stderr line says why the watcher stopped and names the
+        exception, because a daemon that exits silently is exactly what this
+        loop exists not to be. KeyboardInterrupt and SystemExit are
+        BaseException and GeneratorExit closes the generator, so Ctrl-C still
+        stops it and none of the three are affected by any of this.
+
         `_seen` is deliberately not touched on the failure path: poll_once()
         updates it as its last statement, so a poll that raises leaves the last
         state actually observed in place and recovery diffs against that.
@@ -783,9 +842,23 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         while True:
             try:
                 events = self.poll_once()
+            except _BUG_EXCEPTIONS as exc:
+                # Raised, not logged and retried: see _BUG_EXCEPTIONS. The line
+                # is written first because "poll failed; retrying" would be a
+                # lie about why this stopped, and stopping quietly is worse.
+                try:
+                    sys.stderr.write(
+                        f"og herdr watch: poll raised {_scrub(repr(exc))}, which "
+                        "does not come from the transport; this looks like a bug "
+                        "in the watcher, so it is stopping rather than retrying\n"
+                    )
+                    sys.stderr.flush()
+                except (OSError, ValueError):
+                    # A broken stderr must not replace the bug it is reporting:
+                    # the TypeError leaving this generator is the useful thing.
+                    pass
+                raise
             except Exception as exc:  # noqa: BLE001 — surviving this IS the job
-                # KeyboardInterrupt and SystemExit are BaseException and
-                # GeneratorExit closes the generator, so Ctrl-C still stops it.
                 sys.stderr.write(
                     f"og herdr watch: poll failed ({_scrub(repr(exc))}); "
                     f"retrying in {backoff:g}s\n"
