@@ -67,6 +67,12 @@ DEFAULT_SERVER = "http://127.0.0.1:6767"
 CHAT_COMMAND = "og chat"
 AGENTS_COMMAND = "og agents"
 
+# The agents pane's share of the split — `pane.split`'s `ratio` is the fraction
+# RETAINED by the pane being split (measured: 0.8 left the original at 172
+# columns and the new pane at 43, so 0.8 is the 80/20 the operator asked for).
+# The chat is the session; the agents pane is a sidebar, hence 80/20 not 50/50.
+AGENTS_PANE_RATIO = 0.8
+
 # Statuses that mean "this session is the one to come back to". `idle`
 # deliberately counts: a root reads idle for the whole time it waits for the
 # human to type, which is precisely the session they want returned to. A failed
@@ -340,7 +346,7 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
     try:
         reply = ctx.client.call("pane.split", {
             "target_pane_id": root_pane, "direction": "right",
-            "focus": False, "cwd": ctx.cwd,
+            "focus": False, "cwd": ctx.cwd, "ratio": AGENTS_PANE_RATIO,
         })
     except Exception as exc:
         warn("could not open the og agents pane ({0}); the chat is up "

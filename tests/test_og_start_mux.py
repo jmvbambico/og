@@ -15,8 +15,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -233,3 +235,174 @@ def test_og_start_herdr_warns_and_degrades_without_herdr(tmp_path):
     assert result.returncode != 0
     assert not (home / ".omnigent" / "og-server.pid").exists()
     assert not (home / ".omnigent" / "logs" / "server").exists()
+
+
+# --------------------------------------------------------------------------
+# the herdr bridge is started for a mux launch, and stopped by `og stop`
+# --------------------------------------------------------------------------
+# The daemon helpers are driven by SOURCING bin/og (functions only; the
+# top-level help arm prints usage and is discarded) and calling them directly,
+# the same seam parse_start_args uses. Driving `og start` to the bridge would
+# start a real server, and the real `og stop` body would reap the operator's
+# live tmux terminals — so the helpers run in isolation against a STUB bridge.
+# OG_REPO is pointed at the stub's fake checkout, so start_herdr_bridge spawns a
+# sleeper and never the real bridge, which would connect to a herdr socket.
+
+def _run_sourced(home, body, *, env=None, timeout=30):
+    """Source bin/og in a throwaway HOME and run the bash snippet `body`."""
+    environment = {
+        "HOME": str(home),
+        "OG_REPO": str(REPO),
+        # The real PATH (plus the POSIX dirs) so the stub's python3 resolves;
+        # OG_REPO is what keeps the REAL bridge — and the herdr socket — out.
+        "PATH": os.environ.get("PATH", "") + os.pathsep + "/usr/bin:/bin",
+    }
+    if env:
+        environment.update(env)
+    return subprocess.run(
+        ["bash", "-c",
+         'src="$0"; set --; source "$src" >/dev/null 2>&1; ' + body, str(OG)],
+        capture_output=True, text=True, timeout=timeout, env=environment)
+
+
+def _stub_checkout(tmp_path):
+    """A fake og checkout whose installer/og_herdr.py just sleeps."""
+    repo = tmp_path / "stub-repo"
+    (repo / "installer").mkdir(parents=True)
+    (repo / "installer" / "og_herdr.py").write_text(
+        "import time\ntime.sleep(300)\n")
+    return repo
+
+
+def _kill(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def test_a_mux_launch_starts_the_bridge_and_starts_it_only_once(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    stub = _stub_checkout(tmp_path)
+    body = "\n".join([
+        "start_herdr_bridge",
+        'printf "first=%s\\n" "$(cat "$OG_HERDR_PIDFILE")"',
+        "start_herdr_bridge",
+        'printf "second=%s\\n" "$(cat "$OG_HERDR_PIDFILE")"',
+    ])
+    result = _run_sourced(home, body, env={"OG_REPO": str(stub)})
+    assert result.returncode == 0, result.stderr
+
+    first = re.search(r"^first=(\d+)$", result.stdout, re.M)
+    second = re.search(r"^second=(\d+)$", result.stdout, re.M)
+    assert first and second, result.stdout
+    # The second call saw a live pid and did NOT start a second bridge.
+    assert "already running" in result.stdout
+    assert first.group(1) == second.group(1)
+
+    pid = int(first.group(1))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pytest.fail("the stub bridge is not running")
+    finally:
+        _kill(pid)
+    # The pidfile lives beside the server/host pidfiles, and the log where the
+    # other daemons log, so `og stop` and `og logs` can both find the bridge.
+    assert (home / ".omnigent" / "og-herdr.pid").exists()
+    assert list((home / ".omnigent" / "logs" / "herdr").glob("herdr-*.log"))
+
+
+def test_og_stop_stops_the_bridge(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    stub = _stub_checkout(tmp_path)
+    started = _run_sourced(
+        home, 'start_herdr_bridge\ncat "$OG_HERDR_PIDFILE"\n',
+        env={"OG_REPO": str(stub)})
+    assert started.returncode == 0, started.stderr
+    pid = int(started.stdout.strip().splitlines()[-1])
+    os.kill(pid, 0)  # alive before the stop
+    try:
+        # A stop sandbox that CANNOT reach the operator's live server or live
+        # tmux terminals: a fake omnigent reports "not running" (so `omnigent
+        # stop` is never invoked), and TMPDIR points at an empty dir so
+        # orphan_terminal_dirs sweeps nothing.
+        fakebin = tmp_path / "bin"
+        fakebin.mkdir()
+        omni = fakebin / "omnigent"
+        omni.write_text('#!/bin/sh\n[ "$*" = "server status" ] && echo "not running"\nexit 1\n')
+        omni.chmod(0o755)
+        (fakebin / "python3").symlink_to(sys.executable)
+        stop_home = tmp_path / "stop-home"
+        (stop_home / ".omnigent").mkdir(parents=True)
+        (stop_home / ".omnigent" / "og-herdr.pid").write_text(str(pid))
+        empty_tmp = tmp_path / "empty-tmp"
+        empty_tmp.mkdir()
+
+        result = subprocess.run(
+            ["bash", str(OG), "stop"], capture_output=True, text=True,
+            timeout=30,
+            env={"HOME": str(stop_home), "TMPDIR": str(empty_tmp),
+                 "PATH": str(fakebin) + ":/usr/bin:/bin"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "stopping the herdr bridge" in result.stdout
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        assert not (stop_home / ".omnigent" / "og-herdr.pid").exists()
+    finally:
+        _kill(pid)
+
+
+# --------------------------------------------------------------------------
+# a mux launch must not auto-open a browser
+# --------------------------------------------------------------------------
+# The suppression must be observable, but cmd_start cannot be driven to the
+# export without starting a server — so it lives in its own function (the same
+# reason parse_start_args was split out) and cmd_start calls it.
+
+def _autopen_after_call(home, *, mux, preset=None):
+    env = {} if preset is None else {"OMNIGENT_ACCOUNTS_AUTO_OPEN": preset}
+    body = "\n".join([
+        'suppress_accounts_autopen "%s"' % mux,
+        'printf "autopen=%s\\n" "${OMNIGENT_ACCOUNTS_AUTO_OPEN-unset}"',
+    ])
+    result = _run_sourced(home, body, env=env)
+    assert result.returncode == 0, result.stderr
+    match = re.search(r"^autopen=(.*)$", result.stdout, re.M)
+    assert match, result.stdout
+    return match.group(1)
+
+
+def test_a_mux_launch_suppresses_the_browser_autopen(tmp_path):
+    assert _autopen_after_call(tmp_path / "home", mux="herdr") == "0"
+
+
+def test_an_explicit_autopen_setting_is_not_overridden(tmp_path):
+    # The operator said what they want — either value — so leave it alone.
+    home = tmp_path / "home"
+    assert _autopen_after_call(home, mux="herdr", preset="1") == "1"
+    assert _autopen_after_call(home, mux="herdr", preset="0") == "0"
+
+
+def test_a_plain_start_is_not_suppressed(tmp_path):
+    # No multiplexer: existing `og start` behaviour, unchanged.
+    assert _autopen_after_call(tmp_path / "home", mux="") == "unset"
+
+
+def test_cmd_start_calls_the_helpers_it_is_meant_to():
+    """The helpers above are inert unless cmd_start calls them. Pin both call
+    sites so a refactor that drops one fails here rather than at the operator."""
+    text = OG.read_text()
+    assert re.search(r'^\s*suppress_accounts_autopen "\$mux"$', text, re.M)
+    assert re.search(r'^\s*start_herdr_bridge$', text, re.M)

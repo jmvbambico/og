@@ -61,8 +61,13 @@ SECRET_FILE="$OMNI_HOME/.cookie-secret"
 CONF_FILE="$OMNI_HOME/og.env"
 SERVER_PIDFILE="$OMNI_HOME/og-server.pid"
 HOST_PIDFILE="$OMNI_HOME/og-host.pid"
+# The herdr bridge is og's OWN daemon (it projects omnigent sessions into herdr),
+# so it gets a pidfile and log directory beside the server's and the host's —
+# which is exactly what lets `og stop` find and end it.
+OG_HERDR_PIDFILE="$OMNI_HOME/og-herdr.pid"
 HOST_LOGDIR="$OMNI_HOME/logs/host"
 SERVER_LOGDIR="$OMNI_HOME/logs/server"
+HERDR_LOGDIR="$OMNI_HOME/logs/herdr"
 
 # Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_TUNNEL_PROVIDER,
 # OG_TUNNL_SSH_KEY, OG_TUNNL_RANDOM, OG_AUTO_UPDATE
@@ -1065,6 +1070,71 @@ start_host_daemon() {
   return 0
 }
 
+og_herdr_pid() {
+  [[ -f "$OG_HERDR_PIDFILE" ]] || return 1
+  local p; p="$(cat "$OG_HERDR_PIDFILE" 2>/dev/null || true)"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+  return 1
+}
+
+# Start the herdr BRIDGE — the daemon that projects live omnigent sessions into
+# herdr spaces/tabs and pushes the working/blocked/idle badges. Without it
+# `og start herdr` opens one space and stops there: the agents never appear as
+# tabs because nothing is watching the server for new sessions.
+#
+# Idempotent on purpose. Two bridges polling the same server would both try to
+# create a tab for the same session — the state file makes the second one adopt
+# rather than duplicate, but two daemons writing one file is not a shape to
+# design for, so a live pid in the pidfile means there is nothing to do.
+#
+# Same shape as start_host_daemon: nohup + our own pidfile, so `og stop` can end
+# it. The bridge is og's process, not omnigent's, so omnigent's own stop never
+# sees it.
+#
+# Uses the live og server (the caller starts it only once that is up). The herdr
+# socket need not be up yet: a failed herdr call is caught and reported by the
+# bridge's reconcile (og_herdr.py), so it retries instead of dying.
+start_herdr_bridge() {
+  if og_herdr_pid >/dev/null; then
+    ok "herdr bridge already running (pid $(og_herdr_pid))"
+    return 0
+  fi
+  local repo; repo="$(og_repo_dir)" || {
+    printf '\033[0;33m!\033[0m cannot find the og checkout; not starting the herdr bridge\n' >&2
+    return 0
+  }
+  local bridge="$repo/installer/og_herdr.py"
+  [[ -f "$bridge" ]] || {
+    printf '\033[0;33m!\033[0m the herdr bridge is not installed (missing %s); this space will not be projected\n' "$bridge" >&2
+    return 0
+  }
+  mkdir -p "$HERDR_LOGDIR"
+  local log="$HERDR_LOGDIR/herdr-$(date +%Y%m%d-%H%M%S)-og.log"
+  # --cwd names the directory new spaces open in. OG_LAUNCH_DIR is captured from
+  # the launch directory before any cd, which is the directory the launcher is
+  # about to open a space on.
+  nohup env PYTHONUNBUFFERED=1 python3 "$bridge" \
+    --server "http://127.0.0.1:$PORT" --cwd "$OG_LAUNCH_DIR" \
+    >"$log" 2>&1 &
+  echo $! > "$OG_HERDR_PIDFILE"
+  ok "herdr bridge started (pid $(cat "$OG_HERDR_PIDFILE"))"
+  echo "    log:    $log"
+  return 0
+}
+
+# Stop the herdr bridge. Mirrors the host daemon's teardown in cmd_stop: SIGTERM,
+# a short grace, then SIGKILL. Returns 0 when it stopped something.
+stop_herdr_bridge() {
+  og_herdr_pid >/dev/null || return 1
+  local p; p="$(og_herdr_pid)"
+  info "stopping the herdr bridge (pid $p)"
+  kill "$p" 2>/dev/null || true
+  local _i
+  for _i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+  return 0
+}
+
 # Scope the WORKERS, which the host daemon spawns via a runner:
 #
 #   og start/attach -> omnigent host -> runner -> claude / opencode serve / ...
@@ -1237,6 +1307,24 @@ mux_homepage() {
     END { exit(found ? 0 : 1) }'
 }
 
+# A mux launch asked for a TERMINAL interface, so do not let the server steal
+# focus with a browser. omnigent's server opens `_bootstrap_result.open_url` at
+# boot when OMNIGENT_ACCOUNTS_AUTO_OPEN is truthy — default TRUE
+# (omnigent/server/app.py:1674-1682). The OMNIGENT_ACCOUNTS_BASE_URL mitigation
+# the server-start comment names does not cover this path.
+#
+# Scoped to the mux path: a plain `og start` auto-opening the UI on a first run
+# is existing behaviour nobody asked to change. An explicit setting from the
+# environment or og.env always wins, so an operator who WANTS the browser keeps
+# it. Split out from cmd_start so a test can call it directly (cmd_start cannot
+# be driven to this point without starting a server), the same reason
+# parse_start_args exists.
+suppress_accounts_autopen() {
+  [[ -n "${1:-}" ]] || return 0
+  [[ -z "${OMNIGENT_ACCOUNTS_AUTO_OPEN+x}" ]] || return 0
+  export OMNIGENT_ACCOUNTS_AUTO_OPEN=0
+}
+
 cmd_start() {
   # `og start`            -> local  (LAN only; the safe default)
   # `og start local`      -> same, explicit
@@ -1266,6 +1354,10 @@ cmd_start() {
       mux=""
     fi
   fi
+
+  # Only for a launch that is actually going into a multiplexer (see
+  # suppress_accounts_autopen for why). Must happen BEFORE the server boots below.
+  suppress_accounts_autopen "$mux"
 
   # A domain is an ngrok concept: only ngrok takes the positional argument or
   # OG_NGROK_DOMAIN. Under tunnl a positional domain is refused, never silently
@@ -1610,6 +1702,11 @@ cmd_start() {
         "$mux" "$launcher" >&2
       exit 2
     }
+    # Start the bridge BEFORE the launcher opens the space. The bridge only needs
+    # the live og server (already up above); the launcher writes its `pending`
+    # record for the directory before `og chat` can have minted a session, so the
+    # bridge CLAIMS the launcher's space rather than racing to make a second one.
+    start_herdr_bridge
     exec python3 "$launcher" --mux "$mux" --server "http://127.0.0.1:$PORT"
   fi
 }
@@ -1886,6 +1983,16 @@ cmd_stop() {
     info "omnigent was not running"
   fi
 
+  # The bridge is og's own daemon and survives the server's stop as a process, so
+  # without this it would keep polling a dead server (and hold its pidfile)
+  # forever. Stopped outside the server branch: a crashed server with a live
+  # bridge is exactly when the operator most wants `og stop` to work.
+  if stop_herdr_bridge; then
+    stopped=1
+  else
+    info "no herdr bridge started by og"
+  fi
+
   # Stop whichever tunnel provider is actually running, plus a tunnel left by an
   # older og under the legacy pidfile. Checking both is what makes a stop after a
   # provider switch safe.
@@ -1904,7 +2011,7 @@ cmd_stop() {
 
   rm -f "$(tunnel_pidfile ngrok)" "$(tunnel_pidfile tunnl)" "$LEGACY_NGROK_PIDFILE" \
         "$TUNNEL_URL_FILE" "$TUNNEL_PROVIDER_FILE" "$TUNNEL_EXPIRY_FILE" "$TUNNL_FIFO" \
-        "$SERVER_PIDFILE" "$HOST_PIDFILE"
+        "$SERVER_PIDFILE" "$HOST_PIDFILE" "$OG_HERDR_PIDFILE"
 
   # `omnigent stop` stops the host daemons and the background server, and the
   # daemon reaps its own runners on exit. What it does NOT do is tear down the

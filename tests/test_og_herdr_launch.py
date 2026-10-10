@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "installer"))
 
 from og_herdr import load_state  # noqa: E402  (the bridge's own reader)
 from og_herdr_launch import (  # noqa: E402
+    AGENTS_PANE_RATIO,
     DEFAULT_AGENT_NAME,
     Launch,
     LaunchError,
@@ -446,6 +447,22 @@ def test_agents_pane_off_means_no_split(tmp_path):
     assert client.methods == ["ping", "workspace.create", "tab.rename",
                               "pane.send_text"]
     assert client.text_typed() == ["og chat"]
+
+
+def test_the_split_gives_the_chat_80_percent(tmp_path):
+    """`pane.split`'s `ratio` is the share RETAINED by the pane being split
+    (measured: 0.8 left the original at 172 columns, the new pane at 43), so 0.8
+    is chat-left 80 / agents-right 20. Asserted as the EXACT params dict, so a
+    dropped or renamed key — which silently restores herdr's 50/50 — fails here.
+    """
+    client = FakeClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher()))
+
+    assert client.split_params == {
+        "target_pane_id": "w1:p1", "direction": "right",
+        "focus": False, "cwd": CWD, "ratio": 0.8,
+    }
+    assert AGENTS_PANE_RATIO == 0.8
 
 
 def test_agents_pane_defaults_on_when_the_install_never_answered():
