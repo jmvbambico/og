@@ -209,7 +209,7 @@ class Bridge:
         mid-setup leaves the record pointing at the failed step. A redelivered
         `added` then resumes from there on the SAME pane rather than creating a
         second tab, and a step that already succeeded is not repeated —
-        re-running pane.run would submit the attach command into the pane again.
+        re-running pane_run would submit the attach command into the pane again.
         """
         pane_id = rec["pane_id"]
         if rec["step"] <= 0:
