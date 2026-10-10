@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import os
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -552,7 +553,9 @@ def test_access_panel_survives_a_missing_qrencode(tmp_path, monkeypatch):
 
 
 def test_access_info_prefers_the_tunnel_cache(tmp_path, monkeypatch):
-    (tmp_path / "og-tunnel.url").write_text("https://abc.ngrok-free.app\n")
+    # A cache is trusted only while its owning tunnel is alive, so the live pid
+    # (this test process's own) is part of the fixture, not decoration.
+    _write_tunnel_cache(tmp_path, pid=os.getpid())
     monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
     monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
     monkeypatch.setattr(a, "qr_lines", lambda url: [f"QR {url}"])
@@ -654,3 +657,145 @@ def test_main_once_with_access_renders_the_panel(
     assert rc == 0
     assert "QRROW" in out
     assert "open: http://192.168.100.176:6767" in out
+
+
+# ---------------------------------------------------------------------------
+# 10. the tunnel cache is validated, never trusted, and never cleaned up
+# ---------------------------------------------------------------------------
+#
+# A dead tunnel URL is the worst address to show: it looks authoritative and a
+# phone that scans it gets nothing. `access_info` therefore mirrors bin/og's
+# `tunnel_url` — provider recognised AND its process alive — before it prefers
+# the cache. The difference from bin/og is that a viewer must NOT clear the
+# stale file; see `test_access_info_never_modifies_or_deletes_the_tunnel_cache`.
+
+def _write_tunnel_cache(home, url="https://abc.ngrok-free.app",
+                        provider="ngrok", pid=None):
+    """Write the three cached files bin/og's cmd_start writes, in its order.
+
+    `pid=None` uses this test process's own pid, so a "live" cache needs no
+    subprocess. Returns the paths written.
+    """
+    url_file = home / "og-tunnel.url"
+    provider_file = home / "og-tunnel.provider"
+    pid_file = home / f"og-tunnel-{provider}.pid"
+    url_file.write_text(url + "\n")
+    provider_file.write_text(provider + "\n")
+    pid_file.write_text(f"{os.getpid() if pid is None else pid}\n")
+    return url_file, provider_file, pid_file
+
+
+def _a_dead_pid() -> int:
+    """A pid the kernel reports as dead, probed rather than assumed.
+
+    A pid above the platform's maximum resolves to ESRCH (verified on this
+    machine), so the probe returns on its first candidate; scanning instead of
+    hardcoding keeps the fixture honest if that ever changes.
+    """
+    for pid in range(2**31 - 1, 2**31 - 200, -1):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return pid
+    pytest.fail("could not find a dead pid")
+
+
+def test_access_info_ignores_a_cache_whose_tunnel_pid_is_dead(
+        tmp_path, monkeypatch):
+    _write_tunnel_cache(tmp_path, pid=_a_dead_pid())
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [])
+
+    acc = a.access_info("http://127.0.0.1:6767")
+
+    assert acc.url == "http://192.168.100.176:6767", acc.url
+    assert acc.note == a.LAN_NOTE
+
+
+def test_access_info_ignores_a_cache_with_an_unrecognised_provider(
+        tmp_path, monkeypatch):
+    # A provider og does not know is gate two; a missing provider record (a
+    # tunnel written by an og older than the provider file) is the same result.
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [])
+
+    _write_tunnel_cache(tmp_path, provider="wireguard")
+    assert a.access_info("http://127.0.0.1:6767").url == \
+        "http://192.168.100.176:6767"
+
+    (tmp_path / "og-tunnel.provider").unlink()
+    assert a.access_info("http://127.0.0.1:6767").url == \
+        "http://192.168.100.176:6767"
+
+
+def test_access_info_ignores_a_cache_with_a_missing_pidfile(
+        tmp_path, monkeypatch):
+    _write_tunnel_cache(tmp_path)
+    (tmp_path / "og-tunnel-ngrok.pid").unlink()
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [])
+
+    assert a.access_info("http://127.0.0.1:6767").url == \
+        "http://192.168.100.176:6767"
+
+
+def test_access_info_accepts_a_cache_whose_tunnel_is_alive(
+        tmp_path, monkeypatch):
+    # The live pid is this process's own: nothing is spawned.
+    _write_tunnel_cache(tmp_path, pid=os.getpid())
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [f"QR {url}"])
+
+    acc = a.access_info("http://127.0.0.1:6767")
+
+    assert acc.url == "https://abc.ngrok-free.app"
+    assert acc.qr == ["QR https://abc.ngrok-free.app"]
+    assert acc.note == a.TUNNEL_NOTE
+
+
+def test_access_info_ignores_an_empty_or_missing_url_file(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [])
+
+    # Nothing at all.
+    assert a.access_info("http://127.0.0.1:6767").url == \
+        "http://192.168.100.176:6767"
+
+    # A URL file that exists but holds no address, beside an otherwise valid
+    # live cache: the first gate still fails.
+    _write_tunnel_cache(tmp_path, url="")
+    assert a.access_info("http://127.0.0.1:6767").url == \
+        "http://192.168.100.176:6767"
+
+
+def test_access_info_never_modifies_or_deletes_the_tunnel_cache(
+        tmp_path, monkeypatch):
+    """The read-only property: a stale cache is ignored, not cleaned up.
+
+    Clearing is `og`'s job — it owns the tunnel lifecycle and clears the cache
+    on the next start or `tunnel_url` call. A viewer deleting the operator's
+    state file is the wrong behaviour the AST guard exists to prevent, so this
+    pins the bytes and the existence of every cache file after each access.
+    """
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [])
+
+    for provider, pid in (
+        ("ngrok", _a_dead_pid()),      # recognised, dead  -> ignored
+        ("tunnl", _a_dead_pid()),      # the other provider, dead
+        ("wireguard", os.getpid()),    # unrecognised       -> ignored
+        ("ngrok", os.getpid()),        # live               -> used
+    ):
+        _write_tunnel_cache(tmp_path, provider=provider, pid=pid)
+        before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+        a.access_info("http://127.0.0.1:6767")
+        after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+        assert after == before, f"the cache was touched for {provider!r}"
+        assert (tmp_path / "og-tunnel.url").exists()
