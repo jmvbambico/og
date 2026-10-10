@@ -28,9 +28,14 @@ tested with `--once`, with no tty in sight.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
@@ -61,6 +66,34 @@ DEFAULT_INTERVAL = 3.0
 # "handful" the design budgets for), and MAX_SNIPPETS is a window of reports.
 MAX_ROOT_DETAILS = 32
 MAX_SNIPPETS = 256
+
+# The access panel (the `a` toggle). It is pinned to the bottom of the pane and
+# sized to its content — the QR block, one URL line and one caveat — never to a
+# fraction of the terminal. The list above it shrinks to make room but keeps at
+# least ACCESS_LIST_FLOOR rows, so the toggle can never squeeze the tree out of
+# view entirely. Three is the smallest number that still shows a root and a
+# worker or two, which is enough to stay oriented on a short pane.
+ACCESS_LIST_FLOOR = 3
+
+# The width `render` assumes when it is not told one: the classic terminal. The
+# live view always passes the real width from curses; `--once` falls back here.
+DEFAULT_WIDTH = 80
+
+# The footer. Its own constant so the tests can assert the binding is listed
+# without driving a tty.
+FOOTER = "q quit   r refresh   ↑/↓ move   enter expand   a access"
+
+# The caveats shown under the address, mirroring bin/og's `show_access`: the
+# operator must know whether the address is scannable only on the same wifi or
+# from anywhere. Which one it is is the difference between "hand this to the
+# person next to you" and "this link is public".
+LAN_NOTE = "same wifi only — not reachable from outside your network"
+TUNNEL_NOTE = "public — anyone with this link can open the session"
+NO_ADDRESS_NOTE = "access: no address resolved (no tunnel URL cached, no LAN IP)"
+
+# The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
+# is `http://127.0.0.1:6767`.
+DEFAULT_PORT = urllib.parse.urlsplit(DEFAULT_BASE_URL).port or 6767
 
 
 # ---------------------------------------------------------------------------
@@ -228,12 +261,28 @@ class Row:
 
 
 @dataclass
+class Access:
+    """What the bottom panel shows: an address, a QR to scan, and a caveat.
+
+    `url` is None when nothing resolved, and then `note` is the one honest line
+    the panel shows instead of a fabricated address. `qr` holds the candidate
+    ANSIUTF8 block, already generated; whether it is actually drawn is decided
+    at render time against the pane's width, where the width is known.
+    """
+
+    url: Optional[str] = None
+    qr: list[str] = field(default_factory=list)
+    note: Optional[str] = None
+
+
+@dataclass
 class Frame:
     """The whole view at one instant: the rows, plus anything to say about it."""
 
     rows: list[Row] = field(default_factory=list)
     truncated: bool = False
     notice: Optional[str] = None
+    access: Optional[Access] = None
 
 
 def harness_label(harness: Any) -> str:
@@ -319,11 +368,62 @@ def snippet_line(row: Row) -> str:
     return f"{indent}{_oneline(row.snippet or '')}"
 
 
-def render(frame: Frame) -> list[str]:
+# SGR colour escapes: `\x1b[` … `m`. qrencode -t ANSIUTF8 wraps every line in
+# one of these, and counting them as glyphs is the bug this strips away.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_width(line: str) -> int:
+    """The display columns of one rendered line, ignoring ANSI SGR escapes.
+
+    `len(line)` counts the escapes as visible characters, so a `qrencode -t
+    ANSIUTF8` block measures two to three times too wide that way — a code that
+    fits is judged not to, and the panel silently degrades to URL-only forever.
+    Stripping the escapes measures what the terminal actually paints. (The
+    equivalent for measurement only is bin/og's `print_qr`, which reads the
+    ASCII render — two single-byte characters per module, so bytes/2 is the
+    column count — but this view already has the displayed block in hand, so it
+    measures that instead of spending a second `qrencode` call.)
+    """
+    return len(_ANSI_SGR.sub("", line))
+
+
+def access_lines(access: Access, width: int) -> list[str]:
+    """The bottom panel's lines: the QR when it fits, then the URL and caveat.
+
+    The panel is content-sized, never a fraction of the pane: exactly the QR
+    rows plus two info lines (the URL and its caveat), or one honest line when
+    no address resolved. The TUI reserves exactly these rows at the bottom.
+
+    The QR is drawn only when its WIDTH fits. A code wrapped to the next line
+    is unreadable noise — worse than none, because someone will still try to
+    scan it — so it is dropped and the URL alone carries the address.
+    """
+    if access.url is None:
+        return [access.note or NO_ADDRESS_NOTE]
+    lines: list[str] = []
+    if access.qr and max(_visible_width(line) for line in access.qr) <= width:
+        lines.extend(access.qr)
+    lines.append(f"open: {access.url}")
+    if access.note:
+        lines.append(access.note)
+    return lines
+
+
+def render(frame: Frame, width: int = DEFAULT_WIDTH,
+           height: Optional[int] = None) -> list[str]:
     """A frame as a list of plain-text lines. Pure; no terminal involved.
 
     This is the whole renderer. curses paints exactly these lines, and `--once`
-    prints them, so the shape of the view is tested here without a tty.
+    prints them, so the shape of the view is tested here without a tty — the
+    access panel included, since it is part of the lines and not something
+    drawn onto the window.
+
+    `width` is the pane's column count, used only to decide whether the QR
+    fits. `height`, when given, is the content height: the panel is reserved at
+    the bottom and the list is trimmed above it, but the list never drops below
+    `ACCESS_LIST_FLOOR` rows. `--once` and the tests pass height=None, meaning
+    "show everything".
     """
     lines: list[str] = []
     if frame.notice:
@@ -337,7 +437,13 @@ def render(frame: Frame) -> list[str]:
         lines.append(row_line(row))
         if row.expanded:
             lines.append(snippet_line(row))
-    return lines
+    if frame.access is None:
+        return lines
+    panel = access_lines(frame.access, width)
+    if height is None:
+        return lines + panel
+    room = max(ACCESS_LIST_FLOOR, height - len(panel))
+    return lines[:room] + panel
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +624,138 @@ class AgentModel:
 
 
 # ---------------------------------------------------------------------------
+# the access address: recovery from the tunnel cache or the LAN
+# ---------------------------------------------------------------------------
+
+def qr_lines(url: str) -> list[str]:
+    """A scannable QR for `url` as ANSIUTF8 lines, or [] when qrencode is absent.
+
+    Optional by design: a missing qrencode must cost the QR and nothing else —
+    the URL line below it still carries the address. Mirrors bin/og's
+    `print_qr` flags: `-m 1` is a one-module quiet zone (the default 4 makes
+    the code too tall for a terminal) and `-s 1` the smallest module.
+    """
+    if shutil.which("qrencode") is None:
+        return []
+    try:
+        done = subprocess.run(
+            ["qrencode", "-t", "ANSIUTF8", "-m", "1", "-s", "1", url],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    return [line for line in done.stdout.splitlines() if line]
+
+
+def _probe(argv: list[str]) -> str:
+    """stdout of a read-only probe command, or "" when it cannot run."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout if done.returncode == 0 else ""
+
+
+def _is_ipv4(value: str) -> bool:
+    try:
+        ipaddress.IPv4Address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _lan_ip() -> Optional[str]:
+    """This machine's LAN address, or None.
+
+    The Python counterpart of bin/og's `lan_ip`: macOS exposes it through
+    `ipconfig getifaddr <default-route interface>`, Linux through `ip route`,
+    and `hostname -I` is the last-ditch fallback. Every probe is best-effort; a
+    machine with no route (offline, a container) yields None and the panel says
+    so rather than naming an address that will not answer.
+    """
+    iface = ""
+    for line in _probe(["route", "-n", "get", "default"]).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("interface:"):
+            iface = stripped.split(":", 1)[1].strip()
+            break
+    if iface:
+        candidate = _probe(["ipconfig", "getifaddr", iface]).strip()
+        if _is_ipv4(candidate):
+            return candidate
+    tokens = _probe(["ip", "-4", "route", "get", "1.1.1.1"]).split()
+    if "src" in tokens:
+        candidate = tokens[tokens.index("src") + 1]
+        if _is_ipv4(candidate):
+            return candidate
+    for token in _probe(["hostname", "-I"]).split():
+        if _is_ipv4(token):
+            return token
+    return None
+
+
+def _first_line(path: str) -> Optional[str]:
+    """The first non-empty line of a small text file, or None."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    return line
+    except OSError:
+        pass
+    return None
+
+
+def _server_port(server: str) -> int:
+    """The port in the `--server` URL, or the default.
+
+    Only the port is borrowed: the LAN address takes its host from this
+    machine, not from `--server`, which is usually the loopback URL the panes
+    attach to.
+    """
+    try:
+        port = urllib.parse.urlsplit(server).port
+    except ValueError:
+        port = None
+    return port or DEFAULT_PORT
+
+
+def access_info(server: str, environ: Optional[dict] = None) -> Access:
+    """Recover the address a phone can use, for the `a` panel.
+
+    The ONE place this view does that recovery. It is deliberately a second
+    implementation of bin/og and not a call into it: `og agents` is standalone
+    and runs in any terminal with no dependency on `og` being on PATH, so
+    shelling out to the shell script would be the wrong coupling. bin/og's
+    counterparts are `access_url` (the dispatcher), `tunnel_url` (the cache
+    read, which also validates the tunnel's pid — this view trusts the cache,
+    which `og start` writes and `og stop` clears), `lan_ip`, and `show_access`
+    (whose caveat wording the notes above mirror). Consolidating the two is one
+    edit here.
+
+    Order, and why: a cached tunnel URL is a public address that works from
+    anywhere, so it wins when present; otherwise the host's LAN address at the
+    server's port is the same-wifi fallback. When neither resolves the panel
+    names no address at all — a banner pointing somewhere dead is worse than
+    none, because someone will scan it and get nothing.
+    """
+    env = os.environ if environ is None else environ
+    home = env.get("OMNIGENT_HOME") or os.path.join(
+        os.path.expanduser("~"), ".omnigent")
+    cached = _first_line(os.path.join(home, "og-tunnel.url"))
+    if cached:
+        return Access(url=cached, qr=qr_lines(cached), note=TUNNEL_NOTE)
+    ip = _lan_ip()
+    if ip:
+        url = f"http://{ip}:{_server_port(server)}"
+        return Access(url=url, qr=qr_lines(url), note=LAN_NOTE)
+    return Access(url=None, qr=[], note=NO_ADDRESS_NOTE)
+
+
+# ---------------------------------------------------------------------------
 # the terminal
 # ---------------------------------------------------------------------------
 
@@ -532,12 +770,14 @@ def _tty_available() -> bool:
     return True
 
 
-def _run_tui(model: AgentModel, interval: float) -> int:
+def _run_tui(model: AgentModel, interval: float, server: str,
+             start_access: bool = False) -> int:
     """The live view. curses paints `render`'s lines; keys drive the model.
 
     Keys: `q` quits, `r` forces a refresh, the arrows (or `j`/`k`) move the
-    selection, and Enter expands or collapses the selected row's snippet. It is
-    a viewer: it never sends anything to a session.
+    selection, Enter expands or collapses the selected row's snippet, and `a`
+    toggles the access panel. It is a viewer: it never sends anything to a
+    session.
     """
     import curses
 
@@ -551,6 +791,10 @@ def _run_tui(model: AgentModel, interval: float) -> int:
         force = True
         last = 0.0
         frame = Frame()
+        show_access = start_access
+        # Resolved once, on the toggle: the address does not change while the
+        # view runs, and probing for it every poll would shell out on a timer.
+        access: Optional[Access] = access_info(server) if show_access else None
         while True:
             height, width = stdscr.getmaxyx()
             selected_ids = [r.session_id for r in frame.rows]
@@ -563,6 +807,12 @@ def _run_tui(model: AgentModel, interval: float) -> int:
                 force = False
                 selected_ids = [r.session_id for r in frame.rows]
                 selected = min(selected, max(0, len(frame.rows) - 1))
+
+            # The panel is part of the frame, so `render` is the source of what
+            # is painted; here it only decides how many list rows fit above it.
+            frame.access = access if show_access else None
+            panel = access_lines(frame.access, width) if frame.access else []
+            list_view = max(ACCESS_LIST_FLOOR, height - 1 - len(panel))
 
             # Each row is one display line, plus one when its snippet is shown.
             display: list[tuple[str, Optional[int]]] = []
@@ -580,11 +830,11 @@ def _run_tui(model: AgentModel, interval: float) -> int:
             )
             if sel_line < offset:
                 offset = sel_line
-            elif sel_line >= offset + height - 1:
-                offset = max(0, sel_line - (height - 2))
+            elif sel_line >= offset + list_view:
+                offset = max(0, sel_line - (list_view - 1))
 
             stdscr.erase()
-            for screen_row, (text, index) in enumerate(display[offset:offset + height - 1]):
+            for screen_row, (text, index) in enumerate(display[offset:offset + list_view]):
                 attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
                 try:
                     stdscr.addnstr(screen_row, 0, text, width - 1, attr)
@@ -592,9 +842,19 @@ def _run_tui(model: AgentModel, interval: float) -> int:
                     # Writing the very last cell raises; the line is already
                     # drawn, so this is a no-op rather than a lost frame.
                     pass
-            footer = "q quit   r refresh   ↑/↓ move   enter expand"
+            # The panel sits under the list and above the footer. On a pane too
+            # short to hold both its content-sized height and the list floor it
+            # clips at the footer rather than pushing the tree away.
+            for i, text in enumerate(panel):
+                row = list_view + i
+                if row >= height - 1:
+                    break
+                try:
+                    stdscr.addnstr(row, 0, text, width - 1, curses.A_DIM)
+                except curses.error:
+                    pass
             try:
-                stdscr.addnstr(height - 1, 0, footer, width - 1, curses.A_DIM)
+                stdscr.addnstr(height - 1, 0, FOOTER, width - 1, curses.A_DIM)
             except curses.error:
                 pass
             stdscr.refresh()
@@ -607,6 +867,10 @@ def _run_tui(model: AgentModel, interval: float) -> int:
             if key == ord("r"):
                 force = True
                 continue
+            if key == ord("a"):
+                show_access = not show_access
+                if show_access:
+                    access = access_info(server)
             if key in (curses.KEY_UP, ord("k")):
                 selected = max(0, selected - 1)
             elif key in (curses.KEY_DOWN, ord("j")):
@@ -638,6 +902,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="show every live root, not just this directory's")
     parser.add_argument("--once", action="store_true",
                         help="render one frame as plain text and exit")
+    parser.add_argument("--access", action="store_true",
+                        help="show the access panel (QR + URL); toggled live "
+                             "with 'a'")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                         help="seconds between refreshes in the live view")
     return parser
@@ -669,12 +936,18 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
             # tty and curses, and one plain frame is the honest fallback.
             sys.stderr.write(
                 "og agents: no tty or no curses; rendering one frame instead\n")
-        for line in render(model.refresh()):
+        frame = model.refresh()
+        if args.access:
+            frame.access = access_info(args.server)
+        # The real pane width drives the QR fit; off a tty there is none, so
+        # fall back to the classic 80 columns.
+        width = shutil.get_terminal_size((DEFAULT_WIDTH, 24)).columns
+        for line in render(frame, width=width):
             print(line)
         return 0
 
     try:
-        return _run_tui(model, args.interval)
+        return _run_tui(model, args.interval, args.server, args.access)
     except KeyboardInterrupt:
         return 0
 

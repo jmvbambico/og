@@ -486,3 +486,171 @@ def test_main_once_renders_plain_text_without_a_tty(
     assert rc == 0
     assert "Claude Code" in out
     assert any("• " in line for line in out.splitlines())
+
+
+# ---------------------------------------------------------------------------
+# 9. the access panel (the `a` show-access toggle)
+# ---------------------------------------------------------------------------
+#
+# The panel is part of `render`'s lines, so everything below is asserted through
+# the pure renderer and `--once` — no tty, no curses. `qr_lines` is the only
+# impure piece (it shells out to qrencode, a pure text filter) and every test
+# that would reach it patches it, so no test spawns anything or touches a
+# server.
+
+def _access(qr=(), url="http://192.168.100.176:6767",
+            note="same wifi only"):
+    return a.Access(url=url, qr=list(qr), note=note)
+
+
+def test_access_panel_is_off_by_default_and_the_footer_lists_the_binding():
+    rows = a.build_rows(
+        [listed("root", title="conversation", status="running")], ["root"])
+
+    lines = a.render(a.Frame(rows=rows))
+
+    assert lines == ["conversation"]
+    assert not any(line.startswith("open:") for line in lines)
+    assert a.Frame().access is None, "the toggle starts off"
+    assert "a access" in a.FOOTER, "the footer must advertise the binding"
+
+
+def test_access_panel_shows_the_qr_and_url_when_wide_enough():
+    qr = ["\x1b[40;37;1m" + "█" * 27 + "\x1b[0m"]
+    acc = _access(qr=qr, url="http://192.168.100.176:6767")
+
+    lines = a.render(a.Frame(access=acc), width=80)
+
+    assert qr[0] in lines
+    assert "open: http://192.168.100.176:6767" in lines
+    assert lines[-1] == acc.note
+
+
+def test_access_panel_drops_the_qr_when_the_pane_is_too_narrow():
+    qr = ["\x1b[40;37;1m" + "█" * 27 + "\x1b[0m"]
+    acc = _access(qr=qr, url="http://192.168.100.176:6767")
+
+    lines = a.render(a.Frame(access=acc), width=26)
+
+    assert qr[0] not in lines, "a wrapped QR is unreadable noise, not a code"
+    assert "open: http://192.168.100.176:6767" in lines
+    # Nothing is wrapped: exactly the URL line and its caveat.
+    assert len(lines) == 2
+
+
+def test_access_panel_survives_a_missing_qrencode(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a.shutil, "which", lambda name: None)
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+
+    assert a.qr_lines("http://192.168.100.176:6767") == []
+    acc = a.access_info("http://127.0.0.1:6767")
+    assert acc.url == "http://192.168.100.176:6767"
+    assert acc.qr == []
+    lines = a.render(a.Frame(access=acc), width=80)
+    assert "open: http://192.168.100.176:6767" in lines
+
+
+def test_access_info_prefers_the_tunnel_cache(tmp_path, monkeypatch):
+    (tmp_path / "og-tunnel.url").write_text("https://abc.ngrok-free.app\n")
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [f"QR {url}"])
+
+    acc = a.access_info("http://127.0.0.1:6767")
+
+    assert acc.url == "https://abc.ngrok-free.app"
+    assert acc.qr == ["QR https://abc.ngrok-free.app"]
+    assert acc.note == a.TUNNEL_NOTE
+    assert "public" in acc.note
+
+
+def test_access_info_uses_the_server_port_for_the_lan_address(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: "192.168.100.176")
+    monkeypatch.setattr(a, "qr_lines", lambda url: [])
+
+    acc = a.access_info("http://127.0.0.1:9999")
+
+    assert acc.url == "http://192.168.100.176:9999"
+    assert acc.note == a.LAN_NOTE
+
+
+def test_access_info_names_no_address_when_nothing_resolves(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "_lan_ip", lambda: None)
+
+    acc = a.access_info("http://127.0.0.1:6767")
+
+    assert acc.url is None
+    lines = a.render(a.Frame(access=acc), width=80)
+    assert len(lines) == 1, "one honest line, not a fabricated address"
+    assert "http" not in lines[0]
+    assert "no address" in lines[0]
+
+
+def test_access_panel_height_is_content_sized():
+    qr = [f"qr-row-{i}" for i in range(13)]
+    acc = _access(qr=qr)
+    rows = [a.Row("root", "conversation", "working", 0, is_root=True)]
+
+    lines = a.render(a.Frame(rows=rows, access=acc), width=80)
+
+    # Exactly the list rows, then QR rows, then the two info lines. Not a
+    # fraction of the pane, not a padded block.
+    assert lines[0] == "conversation"
+    assert lines[1:14] == qr
+    assert lines[14] == "open: http://192.168.100.176:6767"
+    assert lines[15] == acc.note
+    assert len(lines) == 1 + 13 + 2
+
+
+def test_agent_list_keeps_a_floor_of_rows_when_the_panel_is_open():
+    qr = [f"qr-row-{i}" for i in range(13)]   # a 15-row panel: 13 QR + 2 info
+    acc = _access(qr=qr)
+    rows = [a.Row(f"s{i}", f"row{i}", "working", 0, is_root=True)
+            for i in range(40)]
+
+    short = a.render(a.Frame(rows=rows, access=acc), width=80, height=8)
+    assert sum(1 for line in short if line.startswith("row")) == a.ACCESS_LIST_FLOOR
+    assert qr[0] in short, "the panel is still shown on a short pane"
+
+    tall = a.render(a.Frame(rows=rows, access=acc), width=80, height=40)
+    assert sum(1 for line in tall if line.startswith("row")) == 40 - 15
+
+
+def test_qr_fit_measures_visible_columns_not_raw_length():
+    # The exact bug: ANSIUTF8 escapes made len() read 41 columns for a 27-column
+    # code, so a code that fits was judged not to and the panel silently
+    # degraded to URL-only forever.
+    escaped = "\x1b[40;37;1m" + "█" * 27 + "\x1b[0m"
+    assert a._visible_width(escaped) == 27
+    assert len(escaped) > 27
+
+    acc = _access(qr=[escaped])
+
+    assert escaped in a.render(a.Frame(access=acc), width=27)
+    assert escaped not in a.render(a.Frame(access=acc), width=26)
+
+
+def test_build_parser_has_the_access_flag():
+    assert a.build_parser().parse_args([]).access is False
+    assert a.build_parser().parse_args(["--access"]).access is True
+
+
+def test_main_once_with_access_renders_the_panel(
+        monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        a, "access_info",
+        lambda server: a.Access(url="http://192.168.100.176:6767",
+                                qr=["QRROW"], note=a.LAN_NOTE))
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+
+    rc = a.main(["--once", "--all", "--access", "--server", "http://x"],
+                opener=opener)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "QRROW" in out
+    assert "open: http://192.168.100.176:6767" in out
