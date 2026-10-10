@@ -4,6 +4,10 @@
 #   og start [local]    start on the LAN: server on 0.0.0.0, QR of your LAN IP
 #   og start tunneled [domain] [--use ngrok|tunnl]
 #                       start the tunnel first, then the server behind that origin
+#   og start [<mux>] …  the same start, inside a terminal multiplexer: `herdr` opens
+#                       the session as a herdr space. The word may appear anywhere;
+#                       an ngrok domain NAMED after a multiplexer is unreachable
+#                       positionally — say OG_NGROK_DOMAIN=<domain> og start tunneled.
 #   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
 #   og restart [mode]   og stop, then og start with the same arguments
@@ -16,6 +20,8 @@
 #   og logs [-f]        tail the server log
 #   og audit [id]       what happened in the latest run: per-worker tools, stalls, reports
 #   og stats            per-agent quota/capacity: remaining, reset, tier, source
+#   og agents [options] the live session tree in this terminal (not herdr-specific)
+#   og herdr [options]  project live omnigent sessions into herdr panes
 #   og update           pull the checkout and re-apply the install
 #   og version          print the installed version
 #
@@ -55,8 +61,13 @@ SECRET_FILE="$OMNI_HOME/.cookie-secret"
 CONF_FILE="$OMNI_HOME/og.env"
 SERVER_PIDFILE="$OMNI_HOME/og-server.pid"
 HOST_PIDFILE="$OMNI_HOME/og-host.pid"
+# The herdr bridge is og's OWN daemon (it projects omnigent sessions into herdr),
+# so it gets a pidfile and log directory beside the server's and the host's —
+# which is exactly what lets `og stop` find and end it.
+OG_HERDR_PIDFILE="$OMNI_HOME/og-herdr.pid"
 HOST_LOGDIR="$OMNI_HOME/logs/host"
 SERVER_LOGDIR="$OMNI_HOME/logs/server"
+HERDR_LOGDIR="$OMNI_HOME/logs/herdr"
 
 # Optional overrides: OG_AGENT, OG_PORT, OG_NGROK_DOMAIN, OG_TUNNEL_PROVIDER,
 # OG_TUNNL_SSH_KEY, OG_TUNNL_RANDOM, OG_AUTO_UPDATE
@@ -103,14 +114,32 @@ info() { printf '\033[0;36m→\033[0m %s\n' "$*"; }
 ok() { printf '\033[0;32m✓\033[0m %s\n' "$*"; }
 
 # Render the public URL as a scannable QR block. Optional by design: a missing
-# qrencode must never fail a start, so this degrades to printing nothing and
-# the URL line below it still carries the address.
+# qrencode must never fail a start, and neither may a code too wide to fit — in
+# both cases this degrades to printing nothing, and the URL line below it still
+# carries the address.
 #   -m 1  one-module quiet zone; the default 4 makes it too tall for a terminal
 #   -s 1  smallest module size
 #   ANSIUTF8 packs two rows per line with half-blocks, so a v3 QR fits ~13 rows
 print_qr() {
   local url="$1"
   command -v qrencode >/dev/null 2>&1 || return 0
+  # Skip a code the pane cannot hold: wrapped to the next line, a QR is
+  # unreadable noise. The width is measured from the ASCII render because it is
+  # two SINGLE-BYTE characters per module, so bytes/2 is the column count under
+  # any locale — the ANSIUTF8 blocks are three bytes each under LC_ALL=C and
+  # would read three times too wide. The codes a human scans here measure 27-31
+  # columns (a LAN address, an ngrok/tunnl host). `tput cols` with an 80-column
+  # fallback when terminfo is absent (a pipe, cron, TERM unset).
+  local cols; cols="$(tput cols 2>/dev/null || true)"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols="${COLUMNS:-80}"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  local half
+  half="$(qrencode -t ASCII -m 1 -s 1 "$url" 2>/dev/null \
+          | awk '{ if (length > m) m = length } END { print m+0 }')"
+  [[ "$half" =~ ^[0-9]+$ ]] || half=0
+  if (( half > 0 )) && (( half / 2 > cols )); then
+    return 0
+  fi
   echo
   qrencode -t ANSIUTF8 -m 1 -s 1 "$url" 2>/dev/null || return 0
 }
@@ -692,6 +721,37 @@ show_access() {
   fi
 }
 
+# Recover the address a human should scan or open RIGHT NOW, from a process that
+# did NOT start the server — today the chat pane of a multiplexer launch, where
+# `og start`'s terminal was replaced by `exec <mux>` and its banner never seen.
+# Prefers a live tunnel URL (tunnel_url validates the cache against its owner's
+# pid), else this machine's LAN address. On success it sets OG_PUBLIC_URL — the
+# exact variable show_access() already prints — and OG_MODE, so the banner shows
+# the right caveat, and returns 0. Returns 1 when neither resolves and touches
+# nothing, so a caller shows no banner rather than a wrong address. It cannot
+# print the URL and let the caller capture it: the mode would be set inside a
+# command-substitution subshell and lost.
+#
+# cmd_start deliberately does NOT call this: its branches ESTABLISH the address,
+# and each owes a failure this read-only recovery cannot give — the tunneled
+# branch scrapes the provider and dumps its log when that fails, the local
+# branch dies naming the missing LAN IP. It also must not prefer a tunnel in
+# local mode. So this is recovery-only, for a process that inherits a running
+# setup.
+access_url() {
+  local url; url="$(tunnel_url || true)"
+  if [[ -n "$url" ]]; then
+    OG_PUBLIC_URL="$url"; OG_MODE=tunneled
+    return 0
+  fi
+  local ip; ip="$(lan_ip || true)"
+  if [[ -n "$ip" ]]; then
+    OG_PUBLIC_URL="http://$ip:$PORT"; OG_MODE=local
+    return 0
+  fi
+  return 1
+}
+
 # --- session lifecycle -------------------------------------------------------
 #
 # Policy: the login session is scoped to the SERVER's lifetime, not to a clock.
@@ -1059,6 +1119,71 @@ start_host_daemon() {
   return 0
 }
 
+og_herdr_pid() {
+  [[ -f "$OG_HERDR_PIDFILE" ]] || return 1
+  local p; p="$(cat "$OG_HERDR_PIDFILE" 2>/dev/null || true)"
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+  return 1
+}
+
+# Start the herdr BRIDGE — the daemon that projects live omnigent sessions into
+# herdr spaces/tabs and pushes the working/blocked/idle badges. Without it
+# `og start herdr` opens one space and stops there: the agents never appear as
+# tabs because nothing is watching the server for new sessions.
+#
+# Idempotent on purpose. Two bridges polling the same server would both try to
+# create a tab for the same session — the state file makes the second one adopt
+# rather than duplicate, but two daemons writing one file is not a shape to
+# design for, so a live pid in the pidfile means there is nothing to do.
+#
+# Same shape as start_host_daemon: nohup + our own pidfile, so `og stop` can end
+# it. The bridge is og's process, not omnigent's, so omnigent's own stop never
+# sees it.
+#
+# Uses the live og server (the caller starts it only once that is up). The herdr
+# socket need not be up yet: a failed herdr call is caught and reported by the
+# bridge's reconcile (og_herdr.py), so it retries instead of dying.
+start_herdr_bridge() {
+  if og_herdr_pid >/dev/null; then
+    ok "herdr bridge already running (pid $(og_herdr_pid))"
+    return 0
+  fi
+  local repo; repo="$(og_repo_dir)" || {
+    printf '\033[0;33m!\033[0m cannot find the og checkout; not starting the herdr bridge\n' >&2
+    return 0
+  }
+  local bridge="$repo/installer/og_herdr.py"
+  [[ -f "$bridge" ]] || {
+    printf '\033[0;33m!\033[0m the herdr bridge is not installed (missing %s); this space will not be projected\n' "$bridge" >&2
+    return 0
+  }
+  mkdir -p "$HERDR_LOGDIR"
+  local log="$HERDR_LOGDIR/herdr-$(date +%Y%m%d-%H%M%S)-og.log"
+  # --cwd names the directory new spaces open in. OG_LAUNCH_DIR is captured from
+  # the launch directory before any cd, which is the directory the launcher is
+  # about to open a space on.
+  nohup env PYTHONUNBUFFERED=1 python3 "$bridge" \
+    --server "http://127.0.0.1:$PORT" --cwd "$OG_LAUNCH_DIR" \
+    >"$log" 2>&1 &
+  echo $! > "$OG_HERDR_PIDFILE"
+  ok "herdr bridge started (pid $(cat "$OG_HERDR_PIDFILE"))"
+  echo "    log:    $log"
+  return 0
+}
+
+# Stop the herdr bridge. Mirrors the host daemon's teardown in cmd_stop: SIGTERM,
+# a short grace, then SIGKILL. Returns 0 when it stopped something.
+stop_herdr_bridge() {
+  og_herdr_pid >/dev/null || return 1
+  local p; p="$(og_herdr_pid)"
+  info "stopping the herdr bridge (pid $p)"
+  kill "$p" 2>/dev/null || true
+  local _i
+  for _i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+  return 0
+}
+
 # Scope the WORKERS, which the host daemon spawns via a runner:
 #
 #   og start/attach -> omnigent host -> runner -> claude / opencode serve / ...
@@ -1104,21 +1229,16 @@ export_worker_scoping() {
   fi
 }
 
-cmd_start() {
-  # `og start`            -> local  (LAN only; the safe default)
-  # `og start local`      -> same, explicit
-  # `og start tunneled`   -> a public tunnel; provider from --use/og.env (ngrok
-  #                          is the default)
-  # `og start tunneled X` -> ngrok on reserved domain X
-  # `og start X`          -> back-compat: a bare argument that is not a mode is
-  #                          an ngrok domain, which only ever meant tunneled.
-  # `og start ... --use ngrok|tunnl[.gg]` -> provider for this run only.
-  #
+# Turn `og start`'s arguments into OG_START_MODE / _DOMAIN / _PROVIDER / _MUX.
+# Split out of cmd_start so the parsing — which is where the multiplexer keyword
+# has to be intercepted BEFORE the bare-argument case arm — is one function a
+# test can call without starting a server.
+parse_start_args() {
   # og has no flag parser anywhere else, but --use consumes a value so it cannot
   # be one more positional case arm (see docs/TUNNEL-PROVIDERS.md): collect
   # positionals and flags in one pass.
-  local use="" mode="local" domain="" provider
-  local -a pos=()
+  local use="" provider mux="" mode="" domain="" ids a
+  local -a pos=() rest=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --use)
@@ -1139,17 +1259,155 @@ cmd_start() {
     provider="$(normalize_tunnel_provider "${OG_TUNNEL_PROVIDER:-ngrok}")" \
       || die "unknown OG_TUNNEL_PROVIDER: ${OG_TUNNEL_PROVIDER:-}  (valid: ngrok, tunnl)"
   fi
-  case "${pos[0]:-}" in
+
+  # THE PARSING COLLISION. A bare argument has always meant an ngrok reserved
+  # domain, so `og start herdr` already works — as a tunnel to a domain called
+  # "herdr", which prints a line saying exactly that. A multiplexer keyword
+  # therefore has to be recognised and REMOVED here, before the bare-argument arm
+  # below can see it, or the new command would quietly do something else.
+  #
+  # Every positional is scanned, not only the first: `og start tunneled herdr` is
+  # a natural thing to type and a first-position-only rule would turn it into
+  # an ngrok domain — the exact footgun this exists to close. Only the FIRST
+  # match is stripped; a second one is left for the domain arm, which will say so.
+  ids="$(mux_ids)"
+  for a in ${pos[@]+"${pos[@]}"}; do
+    if [[ -z "$mux" ]] && [[ -n "$a" ]] && printf '%s\n' "$ids" | grep -Fxq -- "$a"; then
+      mux="$a"
+      continue
+    fi
+    rest+=("$a")
+  done
+  case "${rest[0]:-}" in
     local)    mode="local" ;;
-    tunneled) mode="tunneled"; domain="${pos[1]:-}" ;;
+    tunneled) mode="tunneled"; domain="${rest[1]:-}" ;;
     "")       mode="${OG_DEFAULT_MODE:-local}" ;;
-    *)        mode="tunneled"; domain="${pos[0]}"
+    *)        mode="tunneled"; domain="${rest[0]}"
               if [[ "$provider" != "ngrok" ]]; then
                 die "'og start $domain' means an ngrok reserved domain, which provider '$provider' does not support.
     Reserved names on tunnl.gg are a Pro feature. Run 'og start tunneled' for a free stable@ URL, or '--use ngrok'."
               fi
               info "a bare argument is read as an ngrok domain; this is 'og start tunneled $domain'" ;;
   esac
+  OG_START_MODE="$mode" OG_START_DOMAIN="$domain"
+  OG_START_PROVIDER="$provider" OG_START_MUX="$mux"
+  return 0
+}
+
+# --- multiplexer seam -------------------------------------------------------
+#
+# A multiplexer is a VIEW on a session, never the runtime: `og start herdr` on a
+# machine without herdr warns and starts normally, so nothing here may be fatal.
+#
+# The ids come from installer/registry.json's `multiplexers` array, the same way
+# supported agents come from `agents`: adding a multiplexer is a registry row,
+# not an edit here (AGENTS.md, "add a vendor HERE, not in code"). That array
+# lands in its own change, so og copied out of a checkout that predates it has to
+# keep working — hence the fallback row below. It names exactly the one
+# multiplexer that has a backend, so the degradation is "no multiplexer" rather
+# than "a keyword that silently does nothing".
+#
+#   id <TAB> binary <TAB> homepage
+OG_MUX_FALLBACK=$'herdr\therdr\thttps://herdr.dev/'
+
+# Every supported multiplexer as `id<TAB>binary<TAB>homepage`, one per line.
+# Ids that could not be matched as a single shell word are dropped rather than
+# quoted: one of them would match a half-word of the operator's own argument
+# list, and the registry is ours to keep well-formed.
+mux_rows() {
+  local repo rows=""
+  if repo="$(og_repo_dir 2>/dev/null)"; then
+    rows="$(OG_MUX_REGISTRY="$repo/installer/registry.json" python3 - <<'PYEOF' 2>/dev/null || true
+import json, os, re
+
+WORD = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+try:
+    with open(os.environ["OG_MUX_REGISTRY"]) as handle:
+        catalog = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+rows = catalog.get("multiplexers") if isinstance(catalog, dict) else None
+for row in rows or []:
+    if not isinstance(row, dict):
+        continue
+    mid = row.get("id")
+    binary = row.get("binary") or mid
+    home = row.get("homepage") or row.get("url") or ""
+    if (isinstance(mid, str) and WORD.match(mid)
+            and isinstance(binary, str) and WORD.match(binary)):
+        print("\t".join((mid, binary, home if isinstance(home, str) else "")))
+PYEOF
+)"
+  fi
+  printf '%s\n' "${rows:-$OG_MUX_FALLBACK}"
+}
+
+mux_ids() { mux_rows | cut -f1; }
+
+# The binary that runs multiplexer $1, or nothing. Also the id's own name when
+# the row does not override it: the id IS the command an operator types.
+mux_binary() {
+  mux_rows | awk -F'\t' -v want="$1" '$1 == want { print $2; found = 1 }
+    END { exit(found ? 0 : 1) }'
+}
+
+mux_homepage() {
+  mux_rows | awk -F'\t' -v want="$1" '$1 == want { print $3; found = 1 }
+    END { exit(found ? 0 : 1) }'
+}
+
+# A mux launch asked for a TERMINAL interface, so do not let the server steal
+# focus with a browser. omnigent's server opens `_bootstrap_result.open_url` at
+# boot when OMNIGENT_ACCOUNTS_AUTO_OPEN is truthy — default TRUE
+# (omnigent/server/app.py:1674-1682). The OMNIGENT_ACCOUNTS_BASE_URL mitigation
+# the server-start comment names does not cover this path.
+#
+# Scoped to the mux path: a plain `og start` auto-opening the UI on a first run
+# is existing behaviour nobody asked to change. An explicit setting from the
+# environment or og.env always wins, so an operator who WANTS the browser keeps
+# it. Split out from cmd_start so a test can call it directly (cmd_start cannot
+# be driven to this point without starting a server), the same reason
+# parse_start_args exists.
+suppress_accounts_autopen() {
+  [[ -n "${1:-}" ]] || return 0
+  [[ -z "${OMNIGENT_ACCOUNTS_AUTO_OPEN+x}" ]] || return 0
+  export OMNIGENT_ACCOUNTS_AUTO_OPEN=0
+}
+
+cmd_start() {
+  # `og start`            -> local  (LAN only; the safe default)
+  # `og start local`      -> same, explicit
+  # `og start tunneled`   -> a public tunnel; provider from --use/og.env (ngrok
+  #                          is the default)
+  # `og start tunneled X` -> ngrok on reserved domain X
+  # `og start <mux> ...`  -> the same start, then the session inside a terminal
+  #                          multiplexer (today: herdr). Orthogonal to the mode.
+  # `og start X`          -> back-compat: a bare argument that is not a mode is
+  #                          an ngrok domain, which only ever meant tunneled.
+  # `og start ... --use ngrok|tunnl[.gg]` -> provider for this run only.
+  parse_start_args "$@"
+  local mode="$OG_START_MODE" domain="$OG_START_DOMAIN" provider="$OG_START_PROVIDER"
+  local mux="$OG_START_MUX"
+
+  # A missing multiplexer is never an error: og is fully usable without one.
+  # Checked HERE, before anything is started, rather than at the launcher call
+  # twenty seconds later — the warning is about the command the operator just
+  # typed, and `og start herdr` on a machine with no herdr must still be a plain
+  # `og start`, which is only true if the keyword is dropped before the first
+  # side effect.
+  if [[ -n "$mux" ]]; then
+    local mux_bin; mux_bin="$(mux_binary "$mux" || true)"
+    if [[ -z "$mux_bin" ]] || ! command -v "$mux_bin" >/dev/null 2>&1; then
+      printf '\033[0;33m!\033[0m %s not found on PATH — starting without it.\n' "$mux"
+      echo "  Install it from $(mux_homepage "$mux" 2>/dev/null || echo "$mux") and re-run to use spaces."
+      mux=""
+    fi
+  fi
+
+  # Only for a launch that is actually going into a multiplexer (see
+  # suppress_accounts_autopen for why). Must happen BEFORE the server boots below.
+  suppress_accounts_autopen "$mux"
+
   # A domain is an ngrok concept: only ngrok takes the positional argument or
   # OG_NGROK_DOMAIN. Under tunnl a positional domain is refused, never silently
   # dropped; OG_NGROK_DOMAIN is simply not consulted.
@@ -1475,6 +1733,31 @@ cmd_start() {
   show_access
   echo "    log:    $server_log"
   echo "    stop:   og stop"
+
+  # Last, and only ever reached by an `og start <mux>`: everything above is the
+  # ordinary `og start`, which is exactly the point — `og chat` runs INSIDE a
+  # pane and needs the live server this just brought up, so the launcher cannot
+  # move before it, and og is fully usable if it never runs at all.
+  #
+  # Loopback, not OG_PUBLIC_URL: the panes run here, on this machine, and the
+  # tunnel is for a browser elsewhere.
+  if [[ -n "$mux" ]]; then
+    local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_herdr_launch.py directly."
+    command -v python3 >/dev/null || die "python3 is required"
+    local launcher="$repo/installer/og_herdr_launch.py"
+    [[ -f "$launcher" ]] || {
+      printf '\033[0;31merror:\033[0m og start %s is not installed (missing %s); re-run og setup\n' \
+        "$mux" "$launcher" >&2
+      exit 2
+    }
+    # Start the bridge BEFORE the launcher opens the space. The bridge only needs
+    # the live og server (already up above); the launcher writes its `pending`
+    # record for the directory before `og chat` can have minted a session, so the
+    # bridge CLAIMS the launcher's space rather than racing to make a second one.
+    start_herdr_bridge
+    exec python3 "$launcher" --mux "$mux" --server "http://127.0.0.1:$PORT"
+  fi
 }
 
 # Where og's own helpers live. The installer copies `og` to a bin dir that is
@@ -1690,6 +1973,38 @@ cmd_stats() {
   exec python3 "$repo/installer/og_stats.py" "$@"
 }
 
+# The session tree in this terminal. Same shape as cmd_herdr, including the
+# missing-script check, and for the same reason: og_agents imports og_herdr and
+# og_herdr_watch at module load, so a checkout predating the bridge fails with a
+# bare ImportError — "re-run og setup" is the answer, not a traceback.
+cmd_agents() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_agents.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  local viewer="$repo/installer/og_agents.py"
+  [[ -f "$viewer" ]] || {
+    printf '\033[0;31merror:\033[0m og agents is not installed (missing %s); re-run og setup\n' "$viewer" >&2
+    exit 2
+  }
+  exec python3 "$viewer" "$@"
+}
+
+# The herdr bridge ships on its own branch, so an install that predates it has
+# the checkout but not the script. A missing file must read as "reinstall", not
+# as python's cryptic "can't open file ... [Errno 2]" traceback — hence the
+# explicit check and exit 2 rather than letting exec fail.
+cmd_herdr() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_herdr.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  local bridge="$repo/installer/og_herdr.py"
+  [[ -f "$bridge" ]] || {
+    printf '\033[0;31merror:\033[0m og herdr is not installed (missing %s); re-run og setup\n' "$bridge" >&2
+    exit 2
+  }
+  exec python3 "$bridge" "$@"
+}
+
 cmd_stop() {
   local stopped=0
   if server_running; then
@@ -1717,6 +2032,16 @@ cmd_stop() {
     info "omnigent was not running"
   fi
 
+  # The bridge is og's own daemon and survives the server's stop as a process, so
+  # without this it would keep polling a dead server (and hold its pidfile)
+  # forever. Stopped outside the server branch: a crashed server with a live
+  # bridge is exactly when the operator most wants `og stop` to work.
+  if stop_herdr_bridge; then
+    stopped=1
+  else
+    info "no herdr bridge started by og"
+  fi
+
   # Stop whichever tunnel provider is actually running, plus a tunnel left by an
   # older og under the legacy pidfile. Checking both is what makes a stop after a
   # provider switch safe.
@@ -1735,7 +2060,7 @@ cmd_stop() {
 
   rm -f "$(tunnel_pidfile ngrok)" "$(tunnel_pidfile tunnl)" "$LEGACY_NGROK_PIDFILE" \
         "$TUNNEL_URL_FILE" "$TUNNEL_PROVIDER_FILE" "$TUNNEL_EXPIRY_FILE" "$TUNNL_FIFO" \
-        "$SERVER_PIDFILE" "$HOST_PIDFILE"
+        "$SERVER_PIDFILE" "$HOST_PIDFILE" "$OG_HERDR_PIDFILE"
 
   # `omnigent stop` stops the host daemons and the background server, and the
   # daemon reaps its own runners on exit. What it does NOT do is tear down the
@@ -1943,6 +2268,21 @@ cmd_chat() {
   # Same scoping the host daemon gets (see export_worker_scoping).
   export_worker_scoping
   info "starting a $AGENT_NAME session on http://127.0.0.1:$PORT"
+  # A multiplexer launch REPLACES `og start`'s terminal with `exec <mux>`, so the
+  # access banner show_access prints there is never seen — this pane only ever
+  # ran `og chat`. Recover the address and print the SAME banner before the REPL
+  # takes over; it is expected to scroll above the session. Only on a tty, so
+  # `og chat | …` and captured output stay clean, exactly as `og url` gates its
+  # QR. When access_url finds no address it returns 1 and there is no banner.
+  if [[ -t 1 ]]; then
+    # show_access's once-only guard is not a hazard here: the top of this script
+    # inits OG_ACCESS_SHOWN to 0, and the exec below means the 1 show_access
+    # sets can never suppress a later print. access_url has set OG_PUBLIC_URL
+    # and OG_MODE for it to read.
+    if access_url; then
+      show_access
+    fi
+  fi
   exec omnigent run "$AGENT_DIR" --server "http://127.0.0.1:$PORT" "$@"
 }
 
@@ -1984,10 +2324,18 @@ case "${1:-}" in
   logs)   shift; cmd_logs "$@" ;;
   audit)  shift; cmd_audit "$@" ;;
   stats)  shift; cmd_stats "$@" ;;
+  agents) shift; cmd_agents "$@" ;;
+  herdr)  shift; cmd_herdr "$@" ;;
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    # The usage block is the comment header, so the RANGE has to track it: every
+    # command added above without widening this quietly drops off the end of
+    # `og help`, which is how `og version` went missing once already. 2,26 is the
+    # last line of the command list (the prose below it is not help).
+    # tests/test_og_start_mux.py::test_help_block_lists_every_dispatched_command
+    # is the guard that cannot rot the way a number does.
+    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

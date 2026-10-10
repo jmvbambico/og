@@ -90,6 +90,29 @@ def scan() -> dict:
     return found
 
 
+def multiplexers_by_id() -> dict:
+    return {x["id"]: x for x in REGISTRY.get("multiplexers", [])}
+
+
+def scan_multiplexers(which=shutil.which) -> dict:
+    """Which registry multiplexers have their CLI on PATH.
+
+    Kept separate from the required-prereq scan because a missing multiplexer is
+    NEVER a failure -- og is fully usable without one -- so nothing calls this to
+    decide an exit code.
+
+    `which` is a SEAM, not a decoration. This machine has herdr, so a test that
+    used the real PATH would pass here and fail in CI (or silently stop testing
+    anything on a machine that lacks it). Inject a fake to pin present/absent.
+    """
+    found = {}
+    for x in REGISTRY.get("multiplexers", []):
+        path = which(x["binary"])
+        if path:
+            found[x["id"]] = path
+    return found
+
+
 def host_os() -> str:
     """'macos', 'wsl', 'linux', or 'windows' -- for install hints only.
 
@@ -914,6 +937,13 @@ def build_plan_interactive(state: dict) -> dict:
     # silently kept auto-update off. The prompt always reads (Y/n); only an
     # explicit `n` turns it off.
     auto_update = ask_yes("Auto-update og on `og start`?", True)
+    # Asked always even when herdr is absent, like tunnl_ssh_key: the answer is
+    # saved for whenever it is installed, and the prompt says it does not apply
+    # yet. Unlike auto_update above, the default comes from saved state so an
+    # explicit `n` survives a re-run instead of being silently reset on Enter.
+    herdr_agents_pane = ask_yes(
+        "In a herdr session, open `og agents` beside `og chat` as a split pane? "
+        "(ignored if herdr is not installed)", state.get("herdr_agents_pane", True))
 
     return {
         "version": 1,
@@ -930,6 +960,7 @@ def build_plan_interactive(state: dict) -> dict:
         "bin_dir": bin_dir,
         "default_mode": default_mode,
         "auto_update": auto_update,
+        "herdr_agents_pane": herdr_agents_pane,
     }
 
 
@@ -2646,6 +2677,11 @@ def install_pth(pol_dir: Path) -> None:
 def emit_questions() -> None:
     reg = agents_by_id()
     found = scan()
+    # Multiplexer detection rides along exactly as agent detection does: the
+    # AI installer sees what is present and the catalog it came from, so it can
+    # ask about the herdr pane without shelling out itself.
+    muxes = multiplexers_by_id()
+    mux_found = scan_multiplexers()
     # The static per-agent model list, offered under every role that can pin one.
     model_choices = {a["id"]: (a.get("model") or {}).get("choices")
                      for a in REGISTRY["agents"]
@@ -2679,6 +2715,7 @@ def emit_questions() -> None:
         role_questions.append(q)
     say(json.dumps({
         "detected": {k: reg[k]["label"] for k in found},
+        "detected_multiplexers": {k: muxes[k]["label"] for k in mux_found},
         "state_file": str(STATE),
         "current": load_state() or None,
         "prompt_ceiling_bytes": PROMPT_CEILING,
@@ -2710,9 +2747,19 @@ def emit_questions() -> None:
              "ask": "Should `og start` auto-update (git pull the checkout and re-apply "
                     "the install) before starting? If not, it only warns when a newer "
                     "og exists and `og update` applies it."},
+            # Asked always, like tunnl_ssh_key, with the ask text noting it does
+            # not apply on a herdr-less machine -- so the answer is already saved
+            # for whenever herdr is installed rather than asked at an awkward time.
+            {"key": "herdr_agents_pane", "type": "bool", "default": True,
+             "ask": "In a herdr session, should `og agents` open beside `og chat` as a "
+                    "split pane? No means the session starts with `og chat` alone. "
+                    "Ignored if herdr is not installed."},
         ],
         "apply_with": "og-install --plan plan.json",
         "registry": REGISTRY["agents"],
+        # The multiplexer catalog, surfaced the same way the agent catalog is:
+        # a row here buys detection only, not a backend (see $multiplexers).
+        "multiplexers": REGISTRY.get("multiplexers", []),
     }, indent=2))
 
 
@@ -2820,6 +2867,18 @@ def main() -> None:
             ok(f"{reg[aid]['label']:22} {C['dim']}{path}{C['x']}")
         if not found:
             err("none found — install at least one (see README.md)")
+        # Optional, reported like the per-workflow prereqs above: a multiplexer
+        # is a convenience, so a missing one is a warn, never an err, and it
+        # must NOT reach the exit code on the next line. og runs without one.
+        say()
+        say(f"{C['b']}Terminal multiplexers{C['x']} {C['dim']}(optional){C['x']}")
+        muxes, mux_found = multiplexers_by_id(), scan_multiplexers()
+        for mid, path in sorted(mux_found.items()):
+            ok(f"{muxes[mid]['label']:22} {C['dim']}{path}{C['x']}")
+        for mid, x in sorted(muxes.items()):
+            if mid not in mux_found:
+                warn(f"{x['label']:22} not found — og works without one; "
+                     f"get it at {x['url']}")
         raise SystemExit(1 if missing_required or not found else 0)
 
     if args.show:
@@ -2829,6 +2888,10 @@ def main() -> None:
         plan = json.loads(Path(args.plan).read_text())
         plan.setdefault("version", 1)
         plan.setdefault("auto_update", True)
+        # A live og-install.json written before this key existed must still load
+        # and re-apply, getting the default rather than failing validation. This
+        # is the seam `og update` re-applies the saved plan through.
+        plan.setdefault("herdr_agents_pane", True)
         # Every role to the ordered-chain shape, so an old singleton plan and a
         # new one take the identical path from here on. `priority` still comes
         # from array order, exactly as the coder loop here always set it.

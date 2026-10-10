@@ -590,6 +590,52 @@
       }
     }
   ],
+  "$multiplexers": [
+    "Catalog of terminal multiplexers og can drive. Same rule as `agents`:",
+    "adding one is a ROW here, not a working backend. A row buys DETECTION and",
+    "LISTING only -- the PATH scan, --check and --questions pick it up from the",
+    "row. Driving a multiplexer still needs BACKEND CODE behind it, exactly as",
+    "an agent row needs a harness plugin; do not read a row as evidence that a",
+    "backend exists.",
+    "",
+    "Fields:",
+    "  id            stable key",
+    "  label         what --check and the picker show",
+    "  binary        what the PATH scan looks for",
+    "  url           where to get it (shown when it is missing)",
+    "  session_unit  what a run's top-level session is called in this",
+    "                multiplexer (herdr: a workspace)",
+    "  worker_unit   what a dispatched worker's pane is called (herdr: a tab)",
+    "  capabilities  the contract a backend for this multiplexer must meet. A",
+    "                consumer may rely on ONLY what is listed. `agent_status`",
+    "                (report whether a pane's agent is working or idle) is listed",
+    "                because herdr has it and a future tmux backend would not,",
+    "                which is exactly why it is enumerated rather than assumed.",
+    "  verified      the version this row was last checked against, or false.",
+    "",
+    "tmux is deliberately NOT listed: there is no tmux backend and `og start",
+    "tmux` does not exist, so a row would claim a capability that is not there.",
+    "The README names tmux as not-built, which is the honest place for it."
+  ],
+  "multiplexers": [
+    {
+      "id": "herdr",
+      "label": "herdr",
+      "binary": "herdr",
+      "url": "https://herdr.dev/",
+      "session_unit": "workspace",
+      "worker_unit": "tab",
+      "capabilities": [
+        "create",
+        "close",
+        "run",
+        "focus",
+        "rename",
+        "agent_status"
+      ],
+      "verified": "0.9.3"
+    }
+  ],
   "$prompt_delivery": {
     "argv": "Prompt is appended to the CLI argv at startup. Subject to the tmux command-string ceiling (PROMPT_CEILING).",
     "per_turn": "Prompt is composed and sent per turn over the harness's own transport. No command-line ceiling.",
