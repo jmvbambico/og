@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -406,3 +407,97 @@ def test_cmd_start_calls_the_helpers_it_is_meant_to():
     text = OG.read_text()
     assert re.search(r'^\s*suppress_accounts_autopen "\$mux"$', text, re.M)
     assert re.search(r'^\s*start_herdr_bridge$', text, re.M)
+
+
+# --------------------------------------------------------------------------
+# the other two openers in the same run
+# --------------------------------------------------------------------------
+# Silencing the server is not enough (see suppress_accounts_autopen): the browser
+# the operator kept getting came from og's own openers. These pin the two that
+# do fire on `og start herdr`:
+#   * `og chat` -> `omnigent run` opens the conversation for a REPL, and has no
+#     --no-open / env var — only the `auto_open_conversation` config key;
+#   * cmd_start's needs_setup path calls open_in_browser itself.
+# The `omnigent` CLI is STUBBED so the config write is observed, never executed.
+
+def _stub_omnigent(tmp_path, *, list_output=""):
+    """A fake `omnigent` that records its argv and answers `config list`.
+
+    PATH is prepended with its dir so bin/og resolves THIS one. `list_output`
+    stands in for `omnigent config list`'s stdout — the effective config.
+    """
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir(exist_ok=True)
+    calls = tmp_path / "omnigent-calls"
+    script = fakebin / "omnigent"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls))}\n"
+        "if [ \"$1\" = config ] && [ \"$2\" = list ]; then\n"
+        f"  printf '%s' {shlex.quote(list_output)}\n"
+        "fi\n"
+        "exit 0\n")
+    script.chmod(0o755)
+    return fakebin, calls
+
+
+def _path_with(fakebin):
+    return str(fakebin) + os.pathsep + os.environ.get("PATH", "")
+
+
+def test_suppress_accounts_autopen_sets_og_own_no_browser_flag(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    fakebin, _calls = _stub_omnigent(tmp_path)
+    body = "\n".join([
+        'suppress_accounts_autopen "herdr"',
+        'og_browser_suppressed && echo "browser=suppressed" || echo "browser=allowed"',
+    ])
+    result = _run_sourced(home, body, env={"PATH": _path_with(fakebin)})
+    assert result.returncode == 0, result.stderr
+    assert "browser=suppressed" in result.stdout
+
+
+def test_a_plain_start_leaves_og_own_browser_alone(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    fakebin, _calls = _stub_omnigent(tmp_path)
+    body = ('suppress_accounts_autopen ""\n'
+            'og_browser_suppressed && echo "browser=suppressed" '
+            '|| echo "browser=allowed"')
+    result = _run_sourced(home, body, env={"PATH": _path_with(fakebin)})
+    assert result.returncode == 0, result.stderr
+    assert "browser=allowed" in result.stdout
+
+
+def test_a_mux_launch_turns_off_the_chat_conversation_autopen(tmp_path):
+    """`og chat` (the pane) runs `omnigent run`, which opens the conversation in
+    the browser for an interactive launch. No flag, no env var — the config key
+    is the only lever, so og must set it (here, when the operator has not)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    fakebin, calls = _stub_omnigent(tmp_path)
+    body = 'suppress_accounts_autopen "herdr"'
+    result = _run_sourced(home, body, env={"PATH": _path_with(fakebin)})
+    assert result.returncode == 0, result.stderr
+    assert "config set --global auto_open_conversation=false" in calls.read_text()
+
+
+def test_an_explicit_conversation_autopen_is_not_overridden(tmp_path):
+    """An operator who chose a value — either one — keeps it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    fakebin, calls = _stub_omnigent(
+        tmp_path, list_output="  auto_open_conversation=true\n")
+    body = 'suppress_accounts_autopen "herdr"'
+    result = _run_sourced(home, body, env={"PATH": _path_with(fakebin)})
+    assert result.returncode == 0, result.stderr
+    assert "config set" not in calls.read_text()
+
+
+def test_the_needs_setup_open_browser_is_gated_by_the_suppression():
+    """The one opener og owns itself (the create-admin path) must ask the flag
+    rather than call `open_in_browser` unconditionally."""
+    text = OG.read_text()
+    assert re.search(r'^\s*if og_browser_suppressed; then$', text, re.M)
+    assert re.search(r'^\s*open_in_browser "\$OG_PUBLIC_URL"$', text, re.M)

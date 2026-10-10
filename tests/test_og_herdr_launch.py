@@ -62,7 +62,7 @@ class FakeClient:
     """
 
     def __init__(self, workspaces=(), create=None, split=None, panes=None,
-                 pings_before_up=0):
+                 pings_before_up=0, state_path=None):
         self.calls = []
         self.socket_path = "/tmp/fake-herdr/herdr.sock"
         self.closed = False
@@ -75,6 +75,11 @@ class FakeClient:
         ]
         self._pings = pings_before_up
         self.split_params = None
+        # When set, every `pane.send_text` snapshots the pending records at the
+        # moment the line is sent. This is how the ORDERING defect is caught: a
+        # record written AFTER the send is absent from the snapshot.
+        self.state_path = state_path
+        self.pending_at_send = []
 
     # -- the recording seam -------------------------------------------------
 
@@ -113,8 +118,13 @@ class FakeClient:
         self.call("workspace.close", {"workspace_id": workspace_id})
 
     def pane_run(self, pane_id, command):
-        # The real wrapper appends the newline that submits the line; mirrored
-        # here so an assertion on the text sees what herdr receives.
+        # Snapshot the pending records BEFORE recording this send, so an
+        # assertion can prove the record was already on disk when the line
+        # went out. The real wrapper appends the newline that submits the line;
+        # mirrored here so an assertion on the text sees what herdr receives.
+        if self.state_path is not None:
+            self.pending_at_send.append(
+                dict(load_state(self.state_path).get("pending") or {}))
         self.call("pane.send_text", {"pane_id": pane_id,
                                      "text": command + "\n"})
 
@@ -308,6 +318,51 @@ def ctx_path(tmp_path):
     return tmp_path / "og-herdr.json"
 
 
+def test_case_a_writes_the_pending_record_before_it_types_chat(tmp_path):
+    """THE RACE THIS GUARDS: the bridge is already polling when the launcher
+    runs, and `og chat` mints the session the instant it is typed — so the
+    pending record must be on disk BEFORE that line goes out, or the poll can
+    see a root session with no record and open a second space.
+
+    This asserts the ORDER, not just that both happened: the snapshot is taken
+    at the instant the chat line is sent. A test that only checked the record
+    existed afterwards would pass on the broken tree (where it was written
+    last)."""
+    client = FakeClient(state_path=ctx_path(tmp_path))
+    launch(make_ctx(tmp_path, client, FakeWatcher()))
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert len(client.pending_at_send) == 2
+    # When `og chat` went out, the record was already there.
+    assert CWD in client.pending_at_send[0]
+
+
+def test_case_d_writes_the_pending_record_before_it_types_chat(tmp_path):
+    """(D) shares `_open_space`, so it shares the ordering fix."""
+    client = FakeClient(state_path=ctx_path(tmp_path))
+    launch(make_ctx(tmp_path, client, FakeWatcher(), inside=True))
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert CWD in client.pending_at_send[0]
+
+
+def test_a_chat_that_fails_to_start_leaves_no_pending_record(tmp_path):
+    """A failure AFTER the record is written must not leave a pending record
+    pointing at a space: the space is closed, no session will ever claim the
+    record, and the bridge only prunes records whose workspace is GONE (this one
+    is live), so the launcher has to drop it itself."""
+    class NoPane(FakeClient):
+        def pane_run(self, pane_id, command):
+            raise RuntimeError("pane is gone")
+
+    client = NoPane(state_path=ctx_path(tmp_path))
+    with pytest.raises(RuntimeError):
+        launch(make_ctx(tmp_path, client, FakeWatcher()))
+
+    assert load_state(ctx_path(tmp_path))["pending"] == {}
+    assert client.params_of("workspace.close") == [{"workspace_id": "w1"}]
+
+
 # ---------------------------------------------------------------------------
 # (B) outside herdr, the session is already here
 # ---------------------------------------------------------------------------
@@ -449,20 +504,21 @@ def test_agents_pane_off_means_no_split(tmp_path):
     assert client.text_typed() == ["og chat"]
 
 
-def test_the_split_gives_the_chat_80_percent(tmp_path):
-    """`pane.split`'s `ratio` is the share RETAINED by the pane being split
-    (measured: 0.8 left the original at 172 columns, the new pane at 43), so 0.8
-    is chat-left 80 / agents-right 20. Asserted as the EXACT params dict, so a
-    dropped or renamed key — which silently restores herdr's 50/50 — fails here.
+def test_the_split_leaves_the_agents_pane_room_for_its_footer(tmp_path):
+    """`pane.split`'s `ratio` is the share RETAINED by the pane being split, so
+    0.7 leaves the agents pane ~30% — enough for its ~52-column footer and the
+    27-column QR; at 0.8 the operator's 215-column terminal clipped the footer.
+    Asserted as the EXACT params dict, so a dropped or renamed key — which
+    silently restores herdr's 50/50 — fails here.
     """
     client = FakeClient()
     launch(make_ctx(tmp_path, client, FakeWatcher()))
 
+    assert AGENTS_PANE_RATIO == 0.7
     assert client.split_params == {
         "target_pane_id": "w1:p1", "direction": "right",
-        "focus": False, "cwd": CWD, "ratio": 0.8,
+        "focus": False, "cwd": CWD, "ratio": AGENTS_PANE_RATIO,
     }
-    assert AGENTS_PANE_RATIO == 0.8
 
 
 def test_agents_pane_defaults_on_when_the_install_never_answered():
