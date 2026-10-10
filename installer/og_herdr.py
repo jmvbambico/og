@@ -55,17 +55,50 @@ DEFAULT_AGENT_LABEL = "omnigent"
 # one thing the dry run must not misreport.
 DRY_RUN_SPACE = "dry-run-space:"
 
-# Where the bridge records the workspaces it created, as
-# `{workspace_id: session_id}`. Keyed by the ID herdr minted, never by the
-# label: the labels are the operators' session titles verbatim (that display is
-# the point), so a prefix or a substring match would either wreck the label or
-# miss the match — and `--cleanup` closing a workspace it did not open is
-# unrecoverable in a terminal multiplexer.
+# Where the bridge records the spaces it knows about, so that `--cleanup` can
+# close exactly those and nothing else, AND so that a space already on screen
+# can be adopted rather than duplicated.
+#
+#     {"version": 2,
+#      "spaces":  {"<session_id>": {"workspace_id": …, "tab_id": …,
+#                                   "pane_id": …, "owner": …, "cwd": …}},
+#      "pending": {"<cwd>":         {"workspace_id": …, "tab_id": …,
+#                                   "pane_id": …, "owner": "launcher", …}}}
+#
+# v2 is keyed by SESSION ID where v1 was keyed by workspace id, because the two
+# callers want opposite lookups. `--cleanup` asks "is this space ours?" and is
+# happy with either key. Adoption asks "does this session already have a space?",
+# and only the session-keyed half answers it — v1 could not tell a session the
+# launcher had already put on screen from one it had never seen, which is
+# precisely the question that decides between adopting a space and opening a
+# second one for the same conversation.
+#
+# Every id here is the ID herdr minted, never the label: the labels are the
+# operators' session titles verbatim (that display is the point), so a prefix or
+# a substring match would either wreck the label or miss the match — and
+# `--cleanup` closing a workspace it did not open is unrecoverable in a
+# terminal multiplexer.
 #
 # Beside og-quota.json in the same $OMNIGENT_HOME, and named for the same
 # reason: state that has to outlive the process but is not worth a directory.
 STATE_FILENAME = "og-herdr.json"
-STATE_VERSION = 1
+STATE_VERSION = 2
+
+# The version this module used to write, `{"version": 1,
+# "workspaces": {workspace_id: session_id}}`. It is UPGRADED on read, never
+# discarded: a v1 file can describe spaces that are live on the operator's
+# screen right now, and throwing it away orphans them from `--cleanup` — which
+# leaves the operator closing spaces by hand, one per conversation.
+STATE_VERSION_V1 = 1
+
+# Who opened the space. Recorded, not enforced: the two sides differ in where a
+# session's pane comes from (the bridge types `omnigent attach` into a pane it
+# created; the launcher types `og chat` into one it created) but agree that a
+# space either of them opened is cleaned up the same way, so nothing branches on
+# this yet. It is here so the file can answer the question later without a
+# format change.
+OWNER_BRIDGE = "bridge"
+OWNER_LAUNCHER = "launcher"
 
 
 def attach_command(server: str, session_id: str) -> str:
@@ -285,31 +318,77 @@ class Bridge:
         # said which server with `--server` — the same string the watcher is
         # pointed at, and the one worth naming in the command.
         self.server = server
-        # Which of herdr's workspaces THIS bridge opened, so `--cleanup` can
-        # close exactly those and nothing else. Read at construction rather than
-        # at import so a test can point $OMNIGENT_HOME somewhere disposable.
+        # Which of herdr's workspaces THIS bridge opened, or the launcher did,
+        # so `--cleanup` can close exactly those and nothing else. Read at
+        # construction rather than at import so a test can point $OMNIGENT_HOME
+        # somewhere disposable.
         self.state_path = state_path or default_state_path()
         # Whatever `load_state` wants to say about the file it read. A list, not
         # a string, because there can be no note at all (a clean file) or exactly
         # one (missing, stale, unparseable) and the caller prints whichever.
         self._state_note: list[str] = []
-        self._owned: dict[str, str] = load_state(self.state_path, self._state_note)
+        state = load_state(self.state_path, self._state_note)
+        # `{session_id: record}` — a space this session already has, so it is
+        # adopted rather than duplicated — and `{cwd: record}` — a space the
+        # launcher opened before any session existed, waiting for the session
+        # that appears in that directory to claim it.
+        self._spaces: dict[str, dict] = state["spaces"]
+        self._pending: dict[str, dict] = state["pending"]
+        # `{workspace_id: info}` from workspace.list, for one reconcile pass.
+        # None on `_ws_index` means "not asked yet"; `_ws_ok` says whether the
+        # fetch SUCCEEDED, because an empty listing and an unreadable one are
+        # different answers — see `_workspace_index`.
+        self._ws_index: dict | None = None
+        self._ws_ok: bool = False
+        # Whatever the last workspace.list fetch failed with, reported once per
+        # pass so a listing that cannot be read is visible rather than silent.
+        self._ws_error: str | None = None
+        # Lines the adopt/claim path produced that are not about any one event —
+        # a pruned pending record, a stale record dropped — so they are
+        # reported even though no event asked for them. Reset per pass, and
+        # prepended to that pass's lines so they read first.
+        self._pass_notes: list[str] = []
         self._recs: dict[str, dict] = {}
 
     # -- public surface -----------------------------------------------------
+
+    @property
+    def _owned(self) -> dict[str, str]:
+        """`{workspace_id: session_id}` — the v1 view of what is ours, derived.
+
+        `--cleanup` wants the workspace-keyed half, and `_forget` wants to ask
+        "is this workspace still recorded?". Deriving it from `spaces` rather
+        than keeping a second copy is what stops the two from disagreeing: the
+        v1 bug shape was a map that was updated in one place and read in
+        another.
+        """
+        return {rec["workspace_id"]: sid
+                for sid, rec in self._spaces.items() if rec.get("workspace_id")}
 
     def reconcile(self, events) -> list:
         """Apply a batch of session events, returning human-readable action
         lines. One bad pane is recorded and skipped, never fatal: the bridge
         must survive a single failing herdr call and keep projecting the rest.
         """
-        lines: list[str] = []
+        # The workspace listing is a per-PASS snapshot, not a per-call one:
+        # adoption, claiming and pending-pruning all ask the same question of
+        # the same list, and a batch of ten new sessions must see one consistent
+        # answer rather than ten racing listings.
+        self._ws_index = None
+        self._ws_ok = False
+        self._ws_error = None
+        self._pass_notes = []
+        lines: list[str] = list(self._prune_pending())
         for event in self._roots_first(events):
             try:
                 lines.extend(self._apply(event))
             except _error_cls() as exc:
                 lines.append(_error_line(event.session_id, exc))
-        return lines
+        if self._ws_error:
+            lines.append(self._ws_error)
+            self._ws_error = None
+        # Notes raised mid-batch go FIRST, ahead of the actions they explain.
+        return self._pass_notes + lines
 
     @staticmethod
     def _roots_first(events) -> list:
@@ -358,11 +437,22 @@ class Bridge:
         by hand, one per conversation, in a multiplexer where a mis-click loses
         their work.
 
+        Both halves of the state file are closed, and that is the point of the
+        v2 shape rather than an extension of it. A `pending` record is a space
+        the LAUNCHER opened — for a directory, before any session existed — and
+        it is still a space on the operator's screen that something opened on
+        their behalf. Leaving it behind means `og start herdr` has no way back:
+        the space stays, the next run opens another, and the operator closes
+        them one at a time by hand. Whether the launcher or the bridge opened it
+        is recorded (`owner`) and deliberately does not change the decision —
+        today both are cleaned up alike, which is the safe direction while the
+        `owner` field exists to make a narrower mode possible later.
+
         Only ids in the state file are touched. The operator's own workspaces are
-        not in it and cannot be: herdr mints the id, the bridge records what the
-        id was in answer to its own create, and nothing else is ever written
-        there. A workspace closed here is unrecoverable, so the rule is not
-        "looks like ours" but "we opened it".
+        not in it and cannot be: herdr mints the id, this file records what the
+        id was in answer to a create, and nothing else is ever written there.
+        A workspace closed here is unrecoverable, so the rule is not "looks like
+        ours" but "we recorded it".
 
         `not_found` counts as done — somebody closed it by hand, which is the
         outcome this was after. Any OTHER error keeps the record, so a later
@@ -370,33 +460,34 @@ class Bridge:
         a space nobody ever closes.
         """
         lines: list[str] = list(self._state_note)
-        if not self._owned:
+        targets = self._recorded_workspaces()
+        if not targets:
             lines.append(f"no recorded workspaces in {self.state_path}; "
                          "nothing to close")
         before = {} if self.dry_run else self._space_labels(lines)
 
         closed: set[str] = set()
-        for ws_id, sid in sorted(self._owned.items()):
+        for ws_id, sid in sorted(targets.items()):
             name = before.get(ws_id)
             shown = f" '{name}'" if name else ""
+            who = f"session {sid}" if sid else "no session yet"
             if self.dry_run:
                 lines.append(f"dry-run cleanup: close workspace {ws_id}{shown} "
-                             f"(session {sid})")
+                             f"({who})")
                 closed.add(ws_id)
                 continue
             try:
                 self.client.workspace_close(ws_id)
             except _error_cls() as exc:
                 if getattr(exc, "code", None) == "not_found":
-                    lines.append(f"cleanup: workspace {ws_id}{shown} (session "
-                                 f"{sid}) was already gone")
+                    lines.append(f"cleanup: workspace {ws_id}{shown} ({who}) "
+                                 f"was already gone")
                     closed.add(ws_id)
                     continue
-                lines.append(_error_line(sid, exc))
+                lines.append(_error_line(sid or ws_id, exc))
                 continue
             closed.add(ws_id)
-            lines.append(f"cleanup: closed workspace {ws_id}{shown} "
-                         f"(session {sid})")
+            lines.append(f"cleanup: closed workspace {ws_id}{shown} ({who})")
 
         if self.dry_run:
             # Returned BEFORE the ownership record is touched: a dry run that
@@ -408,18 +499,41 @@ class Bridge:
 
         if closed:
             for ws_id in closed:
-                self._owned.pop(ws_id, None)
-            self._save_state()
+                self._forget_workspace(ws_id)
 
         # Report what is left, so "cleanup finished" is checkable: the operator
         # can see their own workspace survived rather than take it on faith.
         after = self._space_labels(lines)
         for ws_id, label in sorted(after.items()):
-            if ws_id in self._owned:
+            if ws_id in targets:
                 continue
             lines.append(f"cleanup: left workspace '{ws_id}' "
                          f"({label!r}) — not this bridge's")
         return lines
+
+    def _recorded_workspaces(self) -> dict[str, str | None]:
+        """`{workspace_id: session_id or None}` — every closeable space, once.
+
+        `spaces` and `pending` merged, deduplicated on the workspace id and
+        sorted for a stable report. The dedupe is belt-and-braces: a claim MOVES
+        a record, so the same workspace is never legitimately named twice — but
+        two closes of one workspace is a `not_found` and a confusing line, and
+        the merge is the one place that could produce it.
+
+        The value is None for a pending record, which has no session yet — that
+        is the whole difference between the two halves, and it is said in the
+        line rather than guessed at.
+        """
+        targets: dict[str, str | None] = {}
+        for sid, rec in self._spaces.items():
+            ws_id = rec.get("workspace_id")
+            if ws_id:
+                targets.setdefault(ws_id, sid)
+        for rec in self._pending.values():
+            ws_id = rec.get("workspace_id")
+            if ws_id:
+                targets.setdefault(ws_id, None)
+        return dict(sorted(targets.items()))
 
     def _space_labels(self, lines: list[str]) -> dict:
         """`{workspace_id: label}` from workspace.list, or {} if unreadable.
@@ -446,13 +560,24 @@ class Bridge:
 
     # -- the state file: which workspaces are ours ---------------------------
 
-    def _remember(self, sid: str, ws_id: str) -> None:
-        """Record a workspace as ours, so `--cleanup` can close it later."""
-        self._owned[ws_id] = sid
+    def _remember(self, sid: str, ws_id: str, tab_id=None, pane_id=None,
+                  cwd=None) -> None:
+        """Record a space as this session's, so `--cleanup` can close it later.
+
+        `owner` is `bridge` unconditionally: this is only reached from a create
+        the bridge itself just made. A space the launcher opened keeps
+        `owner: "launcher"` all the way through a claim (see `_claim_pending`),
+        because the owner records who opened it, not who is looking at it now.
+        """
+        self._spaces[sid] = {"workspace_id": ws_id, "owner": OWNER_BRIDGE,
+                             **({"tab_id": tab_id} if tab_id else {}),
+                             **({"pane_id": pane_id} if pane_id else {}),
+                             **({"cwd": cwd} if cwd else {})}
         self._save_state()
 
     def _save_state(self) -> None:
-        save_state(self.state_path, self._owned)
+        save_state(self.state_path, {"spaces": self._spaces,
+                                    "pending": self._pending})
 
     # -- event handlers -----------------------------------------------------
 
@@ -506,9 +631,48 @@ class Bridge:
         agent = agent_label(session)
         state = _state(session)
         parent = _parent_of(session)
-        # The space this session belongs in. A sub-agent's is its parent's; a
-        # root has none yet, and one has to be made.
-        space = self._space_of(parent)
+
+        # (2)/(3) A space may already be on screen for this session without the
+        # bridge having opened it in THIS process — because the launcher made it
+        # and ran `og chat` in it, or because the bridge restarted and its
+        # in-memory map went with the process. Both come out of the state file,
+        # which is why the file is keyed by session id as well as by workspace.
+        #
+        # Roots only. A sub-agent never owns a space (`_space_of` below), and a
+        # worker that appeared in the launcher's directory before its root would
+        # otherwise claim the launcher's whole space for itself and leave the
+        # root to open a second one — reintroducing through the back door the
+        # very duplicate this ordering exists to prevent.
+        space = None
+        if parent is None:
+            taken = self._existing_space(sid, session, title, cwd)
+            if taken is not None:
+                if self.dry_run:
+                    self._recs[sid] = {
+                        "workspace_id": taken["workspace_id"],
+                        "tab_id": taken["record"].get("tab_id"),
+                        "pane_id": taken["record"].get("pane_id"),
+                        "title": title, "agent": agent, "parent": parent,
+                        "owns_space": False, "step": 3, "ready": True,
+                    }
+                    return [f"dry-run: {taken['action']} '{title}' → space "
+                            f"{taken['workspace_id']} ({cwd}) — unverified, "
+                            f"read from the state file without asking herdr"]
+                # A record naming a pane we can confirm is finished with: the
+                # space, its tab and its pane all exist and something is already
+                # running in it. Re-running setup would type the attach command
+                # a second time into a live pane — for a launcher's space that
+                # is a second co-drive client on one session, which is the race
+                # `_state` exists to avoid. So: adopt it and touch nothing.
+                if taken["pane_ok"]:
+                    return self._adopt(sid, taken["record"], taken["action"],
+                                       title, agent, state, command)
+                # No pane to resume onto (an upgraded v1 record carries no pane
+                # id). The space is still this session's, so it becomes a TAB in
+                # that space rather than a second space beside it.
+                space = taken["workspace_id"]
+        if space is None:
+            space = self._space_of(parent)
 
         if self.dry_run:
             # A dry run creates nothing, so a root's space id does not exist
@@ -531,6 +695,270 @@ class Bridge:
                                    parent)
         return self._add_tab(sid, title, space, cwd, agent, state, command,
                              parent)
+
+    # -- adopting a space that is already on screen --------------------------
+    #
+    # The order below is the whole contract, and it runs before anything is
+    # created:
+    #
+    #   1. in `self._recs`                — this process is already on it
+    #   2. in `spaces[session_id]`        — a space is already this session's
+    #   3. a `pending` record for this cwd — the launcher's handshake
+    #   4. nothing                        — create
+    #
+    # 2 before 3 because a claimed record is ALSO in `spaces` afterwards, and
+    # 1 before both because a half-finished setup in this process outranks
+    # anything on disk: the in-memory record knows which pane to resume on and
+    # the file does not.
+
+    def _existing_space(self, sid: str, session: dict, title,
+                        cwd: str) -> dict | None:
+        """Take over a space this session already has, or None to create one.
+
+        Returns `{workspace_id, action, pane_ok, record}` — an envelope, and an
+        envelope rather than extra keys stamped onto the record itself because
+        the record is what `save_state` persists. Internal bookkeeping written
+        into it would end up in the operator's file, where the next reader would
+        have to know which keys are real.
+
+        `action` is "adopt" or "claim", for the log line. `pane_ok` says whether
+        the pane the record names can be confirmed live, which decides between
+        "already done" and "there is nothing to adopt onto".
+
+        EVERY branch requires the workspace to appear in `workspace.list`. A
+        record naming a workspace that is not there is DROPPED rather than
+        taken, because adopting it would hand the bridge a dead pane id and
+        every later `report_agent` would fail against it — the one failure mode
+        worse than a duplicate space, because a duplicate space the operator
+        can close and a dead pane they never find out about.
+        """
+        record = self._spaces.get(sid)
+        action = "adopt"
+        if record is None:
+            record = self._claim_pending(sid, cwd)
+            action = "claim"
+            if record is None:
+                return None
+        ws_id = record["workspace_id"]
+        # Three states, and collapsing any two of them is a bug:
+        #   index is a dict and ws_id is in it    — the space is there
+        #   index is a dict and ws_id is not in it — herdr says it is GONE
+        #   index is None                        — we could not find out
+        # A dry run cannot find out either (zero client calls is its whole
+        # contract), so its index is `{}` and the `dry_run` guard is what lets it
+        # adopt on the file's word and SAY the line is unverified. A real run
+        # that cannot find out adopts nothing: a wrong answer here means a dead
+        # pane id, which is the one outcome worse than a duplicate space.
+        index = self._workspace_index()
+        info = index.get(ws_id) if index is not None else None
+        if index is not None and info is None and not self.dry_run:
+            self._drop_space_record(sid, ws_id)
+            self._pass_notes.append(
+                f"state: dropped the {action} record for {sid} — workspace "
+                f"{ws_id} is no longer listed, so the record is stale and a "
+                f"fresh space is created instead")
+            return None
+
+        # `cwd` is INFORMATIONAL in the file: the session's own `workspace` from
+        # the API is authoritative, so this refreshes the cached copy and not
+        # the other way round. Nothing above rests on the cached value — the
+        # match in `_claim_pending` was made against the live session, not the
+        # file's copy of it.
+        if cwd:
+            record["cwd"] = cwd
+        # A workspace reporting no panes cannot hold the pane this record names,
+        # so `pane_ok` is False and the caller takes the `_add_tab` route
+        # instead. A proxy, not proof — only herdr knows — and it errs towards
+        # doing something rather than declaring the record unusable, because an
+        # upgraded v1 record never carries a pane id at all and because `info`
+        # is None whenever the listing could not be read, or the run is a dry
+        # run, which is the same "cannot confirm" the caller already absorbed.
+        pane_ok = bool(record.get("pane_id")) and \
+            bool((info or {}).get("pane_count"))
+        if info is not None:
+            self._rename_space(ws_id, title, info)
+        # NOT in a dry run, and that is the whole reason this save is guarded
+        # rather than left to `_save_state`: a dry run that claimed and wrote
+        # would consume the pending record and leave the NEXT REAL RUN with
+        # nothing to adopt — the same defect that makes a dry-run `--cleanup`
+        # dangerous, arriving through the adopt path instead of the cleanup one.
+        if not self.dry_run:
+            self._save_state()
+        return {"workspace_id": ws_id, "action": action, "pane_ok": pane_ok,
+                "record": record}
+
+    def _adopt(self, sid: str, record: dict, action: str, title, agent: str,
+               state: str, command: str) -> list:
+        """Rebuild the in-memory record from the state file and stop there.
+
+        Reached only when the record's pane has been CONFIRMED live, which is
+        what `_existing_space` gated on — so the record is marked ready without
+        a single setup call. That is not a shortcut: re-running setup would type
+        the attach command a second time into a pane that already has one, and
+        for a launcher's space that is a second co-drive client on one session,
+        which is the race `_state` exists to avoid.
+
+        `owns_space` follows the recorded OWNER, not the fact that this process
+        is taking over. A launcher-made space is the launcher's: when its
+        session is removed the bridge closes that TAB, not the whole workspace,
+        which is the narrowest correct blast radius (closing a space takes every
+        tab in it, and there may be an `og agents` split beside the chat).
+        """
+        ws_id = record["workspace_id"]
+        tab_id = record.get("tab_id")
+        pane_id = record.get("pane_id")
+        self._recs[sid] = {
+            "workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
+            "title": title, "agent": agent, "parent": None,
+            "owns_space": record.get("owner") == OWNER_BRIDGE,
+            "step": 3, "ready": True}
+        return [f"{action} {sid} → space {ws_id} tab {tab_id} pane "
+                f"{pane_id} '{title}' {command} [{state}] "
+                f"(pane already live; setup not re-run)"]
+
+    def _claim_pending(self, sid: str, cwd: str) -> dict | None:
+        """Move a `pending[cwd]` record into `spaces[sid]`, or return None.
+
+        This is the launcher handshake, and it is the only option that survives
+        `exec herdr`: the launcher opens a space and types `og chat` into it
+        BEFORE any session exists, so it has nothing to key a record by. It
+        writes the pending record and exits. The session that later appears in
+        that directory is — the launcher having run `og chat` there, and that
+        being the only thing in that directory — the session this space belongs
+        to.
+
+        Matched on the directory EXACTLY. A prefix or substring match would
+        hand one session a sibling checkout's space, and that is the one error
+        here no close or rename undoes.
+
+        `owner` stays whatever it was. The launcher opened this space, so it is
+        still the launcher's; claiming it transfers nothing, and a record that
+        claimed otherwise would misreport who to blame for a stray space.
+        """
+        record = self._pending.get(cwd) if cwd else None
+        if record is None:
+            return None
+        self._pending.pop(cwd, None)
+        self._spaces[sid] = record
+        return record
+
+    def _rename_space(self, ws_id: str, title, info: dict) -> None:
+        """Rename a taken-over space to the session title, when it differs.
+
+        The launcher's whole reason for labelling a space from the DIRECTORY is
+        that no session existed when it made one — there was no title to use.
+        Once the conversation has a name, the space is renamed to it, and that
+        rename IS the handoff. Skipped when the label already matches (the
+        common case for a bridge-created space, so a `workspace.rename` on
+        every adoption would be noise) and when there is no title yet.
+
+        Only ever called for a space being taken over, never for one this
+        process created — a bridge-created space is labelled with the title at
+        creation and never needs it back.
+        """
+        if not title or info.get("label") == title:
+            return
+        # `call` and not a named wrapper: `workspace.rename` has no wrapper on
+        # the client module, and the frame is pinned against herdr's vendored
+        # schema by a test in this file (see
+        # test_the_workspace_rename_frame_matches_herdrs_schema), so using the
+        # generic call does not quietly opt out of conformance.
+        self.client.call("workspace.rename", {"workspace_id": ws_id,
+                                              "label": title})
+
+    def _workspace_index(self) -> dict | None:
+        """`{workspace_id: info}` from workspace.list, once per reconcile pass.
+
+        Returns None when the listing could not be read — which is NOT the same
+        as `{}`, which means herdr was asked and answered that it has no
+        workspaces at all. That distinction is the difference between "this
+        space is gone" and "we do not know", and only herdr can tell them
+        apart. Callers treat None as UNCONFIRMED: nothing is adopted, nothing is
+        claimed, and nothing is pruned.
+
+        That is the conservative direction, and deliberately so. Treating
+        unknown as absent would turn one transient herdr hiccup into a
+        duplicate space for every live session. A duplicate is visible and
+        closable; a session that silently lost its space is a conversation the
+        operator cannot see at all.
+
+        A `--dry-run` never calls herdr, so it gets `{}` — it can neither
+        confirm nor deny anything, and the lines it prints say so.
+        """
+        if self._ws_index is not None:
+            return self._ws_index if self._ws_ok else None
+        if self.dry_run or self.client is None:
+            self._ws_index, self._ws_ok = {}, True
+            return self._ws_index
+        try:
+            spaces = self.client.workspace_list()
+        except _error_cls() as exc:
+            self._ws_index, self._ws_ok = {}, False
+            self._ws_error = "error: cannot list workspaces: {0}: {1}".format(
+                getattr(exc, "code", "herdr-error"),
+                getattr(exc, "message", exc))
+            return None
+        index = {}
+        for ws in spaces if isinstance(spaces, list) else []:
+            if not isinstance(ws, dict):
+                continue
+            ws_id = ws.get("workspace_id")
+            if isinstance(ws_id, str) and ws_id:
+                index[ws_id] = ws
+        self._ws_index, self._ws_ok = index, True
+        return index
+
+    def _drop_space_record(self, sid: str, ws_id: str) -> None:
+        """Forget a `spaces` record naming a workspace herdr no longer lists.
+
+        Guarded on the workspace id matching: `_spaces` is keyed by session, and
+        popping on the session alone would drop a good record because a
+        DIFFERENT stale one had the same key. It cannot have, in practice, but
+        the check costs one comparison and names the invariant.
+        """
+        record = self._spaces.get(sid)
+        if record is not None and record.get("workspace_id") == ws_id:
+            self._spaces.pop(sid, None)
+            self._save_state()
+
+    def _prune_pending(self) -> list:
+        """Drop `pending` entries whose workspace is not in workspace.list.
+
+        Existence is the WHOLE rule — no TTL, no clock, no age. A pending record
+        names a space, and if the space is gone the record means nothing: the
+        operator closed it, or the launch failed after the space was made. A
+        time-based rule would need a clock and would still be wrong about the
+        only case that matters — a space closed by hand must stop being
+        claimable IMMEDIATELY, because claiming it would hand a pane to a
+        workspace that no longer exists.
+
+        So the rule is deterministic (same file plus same listing, same answer),
+        which is what makes it testable at all, and it needs no field in the
+        file that only a clock could advance.
+
+        Pruned at the TOP of every pass, before the batch runs, so a stale
+        record cannot claim a session during the same pass that discovers it is
+        stale. An unreadable listing prunes nothing (see `_workspace_index`),
+        which is the only reason this is safe to run unconditionally.
+        """
+        if not self._pending or self.dry_run:
+            return []
+        index = self._workspace_index()
+        if index is None:
+            # We could not ask, so we cannot claim to know of a single dead
+            # space. Pruning on a failed listing would delete every pending
+            # record in the file — which is the same as losing every launcher
+            # space the operator has open.
+            return []
+        stale = [cwd for cwd, rec in self._pending.items()
+                 if rec.get("workspace_id") not in index]
+        if not stale:
+            return []
+        for cwd in stale:
+            self._pending.pop(cwd, None)
+        self._save_state()
+        return [f"state: pruned {len(stale)} pending launcher record(s) whose "
+                f"workspace no longer exists: {', '.join(sorted(stale))}"]
 
     def _space_of(self, parent: str | None) -> str | None:
         """The herdr workspace a sub-agent's tab belongs in, or None.
@@ -574,7 +1002,7 @@ class Bridge:
                "title": title, "agent": agent, "parent": parent,
                "owns_space": True, "step": 0, "ready": False}
         self._recs[sid] = rec
-        self._remember(sid, ws_id)
+        self._remember(sid, ws_id, tab_id=tab_id, pane_id=pane_id, cwd=cwd)
         self._setup_pane(sid, rec, state)
         return [f"add {sid} → space {ws_id} tab {tab_id} pane {pane_id} "
                 f"'{title}' '{command}' [{state}]"]
@@ -598,6 +1026,17 @@ class Bridge:
                "title": title, "agent": agent, "parent": parent,
                "owns_space": False, "step": 0, "ready": False}
         self._recs[sid] = rec
+        # A tab created INSIDE an adopted space: the space was already recorded
+        # against this session, and it now names a pane of its own, so the
+        # record is brought up to date rather than left pointing at nothing.
+        # Skipped for a plain sub-agent, whose parent owns the space and whose
+        # own tab is deliberately NOT recorded — a tab is not a workspace, and
+        # `--cleanup` closes workspaces.
+        known = self._spaces.get(sid)
+        if known is not None and known.get("workspace_id") == space:
+            known["tab_id"] = tab_id
+            known["pane_id"] = pane_id
+            self._save_state()
         self._setup_pane(sid, rec, state)
         return [f"add {sid} → space {space} tab {tab_id} pane {pane_id} "
                 f"'{title}' '{command}' [{state}]"]
@@ -720,6 +1159,13 @@ class Bridge:
         if rec is None:
             return []
         owns_space = rec["owns_space"]
+        # A record adopted from the state file may name a pane without naming
+        # the tab holding it — a v1 record carries neither, and a record written
+        # by hand can name one and not the other. Closing the SPACE is then the
+        # only thing left that can be closed by id, and it is the wider blast
+        # radius, so it is a fallback rather than the default.
+        if not owns_space and not rec["tab_id"]:
+            owns_space = True
         what = "space" if owns_space else "tab"
         target = rec["workspace_id"] if owns_space else rec["tab_id"]
         if self.dry_run:
@@ -774,6 +1220,22 @@ class Bridge:
         if owns_space:
             self._forget(True, target)
             self._drop_children(sid, lines)
+        elif rec["workspace_id"]:
+            # A claimed launcher's space dies with its last tab (measured:
+            # closing a workspace's last pane removes the workspace). The
+            # record has to go with it or the next session in that directory
+            # would claim a space that is not there — which the stale-adoption
+            # guard would catch anyway, but a poll later and with a line of
+            # noise attached.
+            #
+            # Scoped to the record held against THIS session, and that is not
+            # decoration: a sub-agent's record names its PARENT's workspace, and
+            # a worker's removal must not forget the root's space. Only a
+            # session whose own `spaces` entry names that workspace — a root,
+            # including one that claimed the launcher's — is the owner of it.
+            if self._spaces.get(sid, {}).get("workspace_id") == \
+                    rec["workspace_id"]:
+                self._forget_workspace(rec["workspace_id"])
         return lines
 
     def _forget(self, owns_space: bool, ws_id: str) -> None:
@@ -782,8 +1244,31 @@ class Bridge:
         Pruning the state file here is what keeps a later `--cleanup` from
         answering `not_found` for a workspace this bridge closed itself, which
         would be true but would read as a fault.
+
+        Takes the workspace id rather than deriving it, because the caller has
+        already decided what `target` was and re-deciding it here would be a
+        second opinion about the same close.
         """
-        if owns_space and self._owned.pop(ws_id, None) is not None:
+        if owns_space:
+            self._forget_workspace(ws_id)
+
+    def _forget_workspace(self, ws_id: str) -> None:
+        """Drop every record naming `ws_id`, from `spaces` and from `pending`.
+
+        Both halves, because a workspace is only ever named by one of them at a
+        time — claiming moves the record rather than copying it — and the two
+        are cleared together so a cleanup cannot leave half of a claim behind.
+        """
+        dropped = False
+        for sid, rec in list(self._spaces.items()):
+            if rec.get("workspace_id") == ws_id:
+                self._spaces.pop(sid, None)
+                dropped = True
+        for cwd, rec in list(self._pending.items()):
+            if rec.get("workspace_id") == ws_id:
+                self._pending.pop(cwd, None)
+                dropped = True
+        if dropped:
             self._save_state()
 
 
@@ -804,19 +1289,36 @@ def default_state_path() -> Path:
         / STATE_FILENAME
 
 
-def load_state(path: Path, note: list[str] | None = None) -> dict[str, str]:
-    """`{workspace_id: session_id}` from `path`; {} when there is nothing usable.
+def load_state(path: Path, note: list[str] | None = None) -> dict:
+    """`{"spaces": {...}, "pending": {...}}` at the CURRENT version; empty
+    dicts when there is nothing usable.
 
     A missing file is the NORMAL case — nothing has been created yet, or
     everything already was — so it is not an error. Neither is a file from a
-    different version, or one that cannot be parsed: all three read as "we
-    recorded nothing", which makes `--cleanup` a no-op and says so.
+    version this module does not know how to convert, or one that cannot be
+    parsed: all three read as "we recorded nothing", which makes `--cleanup` a
+    no-op and says so.
 
     That direction is the safe one on purpose. The alternative — treating an
     unreadable file as "everything we ever had" — cannot even be written, since
     there is nothing to read; and treating it as "everything herdr has" is
     exactly the mistake that would close the operator's own workspaces. Nothing
     outside this file is ever closed, so an empty answer can only under-report.
+
+    A v1 file is the exception, and it is UPGRADED IN PLACE. Its
+    `{workspace_id: session_id}` map is exactly what v2's `spaces` half wants,
+    just keyed the other way round, so the conversion is a transpose rather
+    than a guess. The rewrite happens HERE, at read time, rather than at the
+    first write, for the reason it matters: a run that only ever reads the file
+    (`--cleanup`) is still the run that migrates it, so the next process to look
+    finds one shape and one version.
+
+    A v1 record carries no tab or pane id, and none is invented: the session
+    still has its space, which is what `--cleanup` needs, but there is no pane
+    to resume setup onto and none is guessed at. The upgrade is best-effort in
+    exactly the way `save_state` is — a file that cannot be rewritten is left
+    alone, since the read already succeeded and the caller's work does not
+    depend on the migration landing.
     """
     def say(line: str) -> None:
         if note is not None:
@@ -827,38 +1329,105 @@ def load_state(path: Path, note: list[str] | None = None) -> dict[str, str]:
     except FileNotFoundError:
         say(f"no state file at {path} (nothing this bridge created is "
             f"recorded, so nothing is ours to close)")
-        return {}
+        return {"spaces": {}, "pending": {}}
     except OSError as exc:
         say(f"cannot read {path}: {exc} — treating it as no recorded workspaces")
-        return {}
+        return {"spaces": {}, "pending": {}}
     try:
         data = json.loads(raw)
     except ValueError as exc:
         say(f"{path} is not valid JSON ({exc}) — treating it as no recorded "
             f"workspaces; close any leftovers by hand")
-        return {}
-    if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+        return {"spaces": {}, "pending": {}}
+    if not isinstance(data, dict):
         say(f"{path} is not a v{STATE_VERSION} state file — treating it as no "
             f"recorded workspaces")
-        return {}
-    spaces = data.get("workspaces")
-    if not isinstance(spaces, dict):
-        return {}
-    # Only well-formed pairs survive: a half-written entry is not a workspace id,
-    # and guessing at one is how a cleanup ends up aimed at the wrong space.
-    return {ws: sid for ws, sid in spaces.items()
-            if isinstance(ws, str) and ws and isinstance(sid, str) and sid}
+        return {"spaces": {}, "pending": {}}
+
+    version = data.get("version")
+    if version == STATE_VERSION:
+        return {"spaces": _read_spaces(data.get("spaces")),
+                "pending": _read_spaces(data.get("pending"))}
+    if version == STATE_VERSION_V1:
+        upgraded = _upgrade_v1(data.get("workspaces"), path, say)
+        save_state(path, upgraded)
+        return upgraded
+    say(f"{path} is not a v{STATE_VERSION} state file — treating it as no "
+        f"recorded workspaces")
+    return {"spaces": {}, "pending": {}}
 
 
-def save_state(path: Path, owned: dict[str, str]) -> None:
+def _read_spaces(raw) -> dict:
+    """The well-formed records out of one `spaces` / `pending` map.
+
+    Only records carrying a non-empty string `workspace_id` survive. Every other
+    field is carried through only when it is a string, so a half-written entry
+    cannot smuggle a non-string where a caller expects an id — and a missing
+    `tab_id` / `pane_id` stays MISSING rather than becoming a guess, because
+    they are the difference between "this pane" and "some pane".
+    """
+    if not isinstance(raw, dict):
+        return {}
+    kept = {}
+    for key, entry in raw.items():
+        if not isinstance(key, str) or not key or not isinstance(entry, dict):
+            continue
+        ws_id = entry.get("workspace_id")
+        if not isinstance(ws_id, str) or not ws_id:
+            continue
+        rec = {"workspace_id": ws_id}
+        for field in ("tab_id", "pane_id", "owner", "cwd"):
+            value = entry.get(field)
+            if isinstance(value, str) and value:
+                rec[field] = value
+        kept[key] = rec
+    return kept
+
+
+def _upgrade_v1(raw, path: Path, say) -> dict:
+    """`{workspace_id: session_id}` → `{"spaces": {session_id: record}}`.
+
+    Said out loud because it rewrites a file the operator may be looking at: the
+    `workspaces` key is GONE, so a stale v1 reader would find nothing and close
+    nothing. That is the safe direction to fail, but it is still a change to a
+    file on disk and a silent one would be the wrong kind of clever.
+    """
+    pairs = raw if isinstance(raw, dict) else {}
+    spaces = {}
+    for ws_id, sid in pairs.items():
+        if not isinstance(ws_id, str) or not ws_id or \
+                not isinstance(sid, str) or not sid:
+            continue
+        # No tab_id, no pane_id, no cwd: v1 recorded only the pair, and the
+        # upgrade records only the pair. Inventing the rest would be a guess
+        # dressed as a fact, and a guessed pane id is what a stale adoption
+        # hands to every later report_agent.
+        spaces[sid] = {"workspace_id": ws_id, "owner": OWNER_BRIDGE}
+    count = len(spaces)
+    say(f"{path} is a v{STATE_VERSION_V1} state file — upgraded "
+        f"{count} record(s) to v{STATE_VERSION} in place (the `workspaces` key "
+        f"is now `spaces`, keyed by session id); no tab or pane id was recorded "
+        f"and none was invented")
+    return {"spaces": spaces, "pending": {}}
+
+
+def save_state(path: Path, state: dict) -> None:
     """Write the ownership state, atomically, and never raise at the caller.
 
     A failed write is swallowed: the worst case is a workspace that `--cleanup`
     does not know about, which the operator can close by hand, and the
     alternative — refusing to project a session because a local file could not
     be written — trades a cosmetic bookkeeping failure for a missing pane.
+
+    The file is NOT a lock and does not pretend to be one: the launcher and the
+    bridge both write it, whole and last-writer-wins. That is enough for this
+    content, where every writer re-reads before it writes and the only thing
+    lost in a race is a record whose workspace is closed on the next poll
+    anyway (see the pending-pruning rule in `Bridge._prune_pending`).
     """
-    payload = {"version": STATE_VERSION, "workspaces": owned}
+    payload = {"version": STATE_VERSION,
+               "spaces": state.get("spaces") or {},
+               "pending": state.get("pending") or {}}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic, for the same reason og_quota's is: a crash mid-write must not

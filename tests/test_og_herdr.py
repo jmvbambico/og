@@ -111,6 +111,13 @@ class RecordingClient:
                         ttl_ms=None):
         self._call("report_metadata", pane_id, source, title=title)
 
+    def call(self, method, params=None):
+        """The client's generic wire call, as `og_herdr_client.HerdrClient`
+        really has it. The bridge uses it for `workspace.rename`, which has no
+        named wrapper on the client module."""
+        self._call("call", method, params)
+        return {}
+
 
 class FakeWatcher:
     def __init__(self, batches):
@@ -1063,7 +1070,7 @@ def test_a_space_closed_by_hand_stops_being_recorded_as_ours(seams):
     client.fail = {"workspace_close": FakeHerdrError("not_found", "gone")}
     bridge.reconcile([Ev("removed", "s1", {})])
     assert bridge._owned == {}
-    assert json.loads(Path(bridge.state_path).read_text())["workspaces"] == {}
+    assert json.loads(Path(bridge.state_path).read_text())["spaces"] == {}
 
 
 def test_underlying_id_lookup_is_key_explicit_not_order_dependent():
@@ -1274,8 +1281,19 @@ def test_a_created_space_is_recorded_as_ours_by_id(seams):
     bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
 
     recorded = json.loads(Path(bridge.state_path).read_text())
-    assert recorded == {"version": m.STATE_VERSION,
-                        "workspaces": {"ws1": "root"}}, recorded
+    assert recorded["version"] == m.STATE_VERSION
+    assert recorded["pending"] == {}
+    # Keyed by SESSION id, not workspace id: `--cleanup` can work either way,
+    # but only this way answers "does this session already have a space?", which
+    # is what stops a second space for one conversation.
+    assert list(recorded["spaces"]) == ["root"], recorded
+    entry = recorded["spaces"]["root"]
+    assert entry["workspace_id"] == "ws1"
+    assert entry["tab_id"] == "tab1" and entry["pane_id"] == "pane1"
+    assert entry["owner"] == "bridge"
+    # cwd is INFORMATIONAL — cached, never the thing a decision rests on — so it
+    # is only written when there was one to cache.
+    assert entry["cwd"] == os.getcwd()
     # Under $OMNIGENT_HOME, beside og-quota.json.
     assert bridge.state_path.name == "og-herdr.json"
     assert bridge.state_path.parent == Path(os.environ["OMNIGENT_HOME"])
@@ -1338,7 +1356,8 @@ def test_dry_run_cleanup_closes_nothing_and_makes_no_call_at_all(seams):
 
     assert client.calls == [], "the dry run reached the live client"
     assert not bridge.state_path.exists() or \
-        json.loads(bridge.state_path.read_text())["workspaces"] == {"ws1": "root"}, \
+        json.loads(bridge.state_path.read_text())["spaces"] == {
+            "root": bridge._spaces["root"]}, \
         "a dry-run cleanup rewrote the ownership record"
     assert any(ln.startswith("dry-run cleanup: close workspace ws1")
                for ln in lines), lines
@@ -1360,14 +1379,17 @@ def test_cleanup_with_no_state_file_says_so_and_closes_nothing(seams, tmp_path):
 
 
 @pytest.mark.parametrize("name,content,expected", [
-    ("stale.json", json.dumps({"version": 0, "workspaces": {"wX": "s"}}), "v1"),
+    ("stale.json", json.dumps({"version": 0, "spaces": {}}), "is not a v2 state"),
     ("corrupt.json", "{ nope", "not valid JSON"),
-    ("wrong.json", json.dumps(["w1"]), "not a v1 state file"),
+    ("wrong.json", json.dumps(["w1"]), "is not a v2 state"),
 ])
 def test_a_stale_or_unreadable_state_file_is_not_an_error(
         seams, tmp_path, name, content, expected):
     # A stale file closes nothing rather than closing everything: an answer we
-    # cannot read must not become permission to guess at a workspace id.
+    # cannot read must not become permission to guess at a workspace id. The
+    # expectation is the BEHAVIOUR ("reads as nothing, says so") and not one
+    # version number spelled out — the note names the version the module wants,
+    # which is exactly the thing a bump changes and nothing else.
     client = RecordingClient(spaces=[PROJECTS])
     path = tmp_path / name
     path.write_text(content)
@@ -1378,19 +1400,32 @@ def test_a_stale_or_unreadable_state_file_is_not_an_error(
     assert _names(client) == ["workspace_list", "workspace_list"]
     assert any(expected in ln for ln in lines), lines
     assert any("nothing to close" in ln for ln in lines), lines
+    assert bridge._spaces == {} and bridge._pending == {}
 
 
 def test_a_state_file_of_wrong_shaped_entries_keeps_only_usable_ones(
         seams, tmp_path):
     client = RecordingClient(spaces=[PROJECTS])
     path = tmp_path / "mixed.json"
-    path.write_text(json.dumps({"version": m.STATE_VERSION, "workspaces": {
-        "ws1": "root", "": "s", "ws2": None, "ws3": "other"}}))
+    path.write_text(json.dumps({"version": m.STATE_VERSION, "spaces": {
+        "s1": {"workspace_id": "ws1"},
+        "": {"workspace_id": "wsZ"},             # no session key
+        "s2": {"workspace_id": None},            # no usable workspace id
+        "s3": "ws3",                             # not a record at all
+        "s4": {"workspace_id": "ws4", "tab_id": 7},   # non-string id kept out
+    }}))
     bridge = m.Bridge(FakeWatcher([]), client, state_path=path)
+    # Read back BEFORE the cleanup, which prunes what it closes.
+    assert bridge._spaces == {"s1": {"workspace_id": "ws1"},
+                              "s4": {"workspace_id": "ws4"}}, bridge._spaces
 
     bridge.cleanup()
+    # Only the two well-formed records survive, and the close order is the
+    # report's order — deterministic, so an operator reading the log knows
+    # which close is which.
     assert [c[1] for c in client.calls if c[0] == "workspace_close"] == \
-        [("ws1",), ("ws3",)]
+        [("ws1",), ("ws4",)]
+    assert bridge._spaces == {}
 
 
 def test_a_cleanup_failure_keeps_the_record_for_a_later_run(seams):
@@ -1453,14 +1488,16 @@ def test_cleanup_runs_without_a_watcher_or_a_poll(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "og_herdr_client", client_module)
 
     home = Path(os.environ["OMNIGENT_HOME"]) / "og-herdr.json"
-    m.save_state(home, {"ws1": "root"})
+    m.save_state(home, {"spaces": {"root": {"workspace_id": "ws1",
+                                            "owner": "bridge"}},
+                        "pending": {}})
 
     assert m.main(["--cleanup"]) == 0
     out = capsys.readouterr().out
     assert [c[1] for c in client.calls if c[0] == "workspace_close"] == [("ws1",)]
     assert "closed workspace ws1" in out
     assert "left workspace 'w1'" in out
-    assert json.loads(home.read_text())["workspaces"] == {}
+    assert json.loads(home.read_text())["spaces"] == {}
 
 
 def test_build_parser_exposes_cwd_with_process_cwd_default():
@@ -1511,3 +1548,636 @@ def test_siblings_are_imported_lazily_not_at_module_load():
     # simply deleted them cannot make this test pass vacuously.
     assert "og_herdr_watch" in lazy
     assert "og_herdr_client" in lazy
+
+
+# ---------------------------------------------------------------------------
+# the state file at v2: spaces keyed by SESSION, pending keyed by CWD
+#
+# v1 was `{"version": 1, "workspaces": {workspace_id: session_id}}`, which
+# answers "is this space ours?" — all `--cleanup` needs — but not "does this
+# session already have a space?", which is the whole of adoption. Once `og start
+# <mux>` exists, a space may be on screen for a session the bridge has no memory
+# of: the launcher made it, or the bridge restarted and its map died with the
+# process. Without the reverse lookup the bridge opens a second space for a
+# conversation that already has one.
+#
+# Every fake here is local: `RecordingClient` records calls and answers from its
+# own `spaces` list. Nothing in this section reaches a socket.
+# ---------------------------------------------------------------------------
+
+def space_info(ws_id, label, pane_count=1, tab_count=1):
+    """A `workspace.list` row, in the shape the vendored schema requires.
+
+    `pane_count` is what confirms a record's pane can still be addressed: a
+    workspace reporting no panes cannot hold the pane a record names.
+    """
+    return {"workspace_id": ws_id, "label": label, "pane_count": pane_count,
+            "tab_count": tab_count, "active_tab_id": ws_id + ":t1"}
+
+
+def write_state(home, **halves):
+    """Write a v2 state file by hand and return its path."""
+    path = Path(home) / m.STATE_FILENAME
+    path.write_text(json.dumps({"version": m.STATE_VERSION, **halves}))
+    return path
+
+
+# --- 1. v1 upgrades in place, and --cleanup still closes what it described ----
+
+def test_a_v1_state_file_is_upgraded_in_place_and_still_closed(seams, tmp_path):
+    # THE REGRESSION THIS SHAPE HAD TO AVOID. A v1 file can describe spaces that
+    # are live on the operator's screen right now. Discarding it would leave
+    # those spaces untracked — no `--cleanup` would ever close them, and the
+    # operator closes them by hand, one per conversation, in a multiplexer where
+    # a mis-click loses their work.
+    v1 = Path(os.environ["OMNIGENT_HOME"]) / m.STATE_FILENAME
+    v1.write_text(json.dumps({"version": 1, "workspaces": {"w9": "s9", "wA": "sA"}}))
+
+    client = RecordingClient(spaces=[PROJECTS, space_info("w9", "nine"),
+                                     space_info("wA", "A")])
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    # Migrated at READ time, so even a run that only reads migrates it — and the
+    # file is v2 on disk before anything is closed.
+    upgraded = json.loads(v1.read_text())
+    assert upgraded["version"] == m.STATE_VERSION
+    assert upgraded["spaces"] == {"s9": {"workspace_id": "w9",
+                                         "owner": "bridge"},
+                                  "sA": {"workspace_id": "wA",
+                                         "owner": "bridge"}}
+    assert upgraded["pending"] == {}
+    # Nothing was invented: v1 recorded no pane and no tab, and a guessed pane
+    # id is exactly what a stale adoption hands to every later report_agent.
+    for record in upgraded["spaces"].values():
+        assert "tab_id" not in record and "pane_id" not in record
+
+    lines = bridge.cleanup()
+
+    # The workspace ids survived the transpose — they are the only thing in a
+    # v1 record, and `--cleanup` closes by id.
+    assert [c[1] for c in client.calls if c[0] == "workspace_close"] == \
+        [("w9",), ("wA",)]
+    assert any("upgraded 2 record(s) to v2" in ln for ln in lines), lines
+    # ...and nothing was left behind for a second cleanup to chase.
+    assert json.loads(v1.read_text())["spaces"] == {}
+    assert bridge._spaces == {}
+
+
+def test_an_upgraded_v1_file_is_closed_only_once(seams):
+    v1 = Path(os.environ["OMNIGENT_HOME"]) / m.STATE_FILENAME
+    v1.write_text(json.dumps({"version": 1, "workspaces": {"w9": "s9"}}))
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient(spaces=[space_info("w9", "n")]))
+    bridge.cleanup()
+    # The migrated record is pruned, so a second cleanup has nothing to chase.
+    assert json.loads(v1.read_text())["spaces"] == {}
+
+
+# --- 2. a session the file already has a space for is ADOPTED -----------------
+
+def test_a_session_with_a_space_record_is_adopted_not_duplicated(seams):
+    # What a bridge restart looks like: the file remembers the space, this
+    # process does not. Opening a second one would give the operator two spaces
+    # for one conversation, which is the entire problem adoption exists to fix.
+    client = RecordingClient(spaces=[space_info("wA", "New Alignment")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "wA", "tab_id": "wA:t1", "pane_id": "wA:p1",
+               "owner": "bridge", "cwd": "/repo/og"}}, pending={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "New Alignment", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert _names(client).count("tab_create") == 0
+    assert _names(client) == ["workspace_list"]
+    assert lines[0].startswith("adopt s1 → space wA tab wA:t1 pane wA:p1"), lines
+
+    # The in-memory record was rebuilt FROM THE FILE, not re-derived: same
+    # three ids, and `owns_space` follows the recorded owner.
+    rec = bridge._recs["s1"]
+    assert (rec["workspace_id"], rec["tab_id"], rec["pane_id"]) == \
+        ("wA", "wA:t1", "wA:p1")
+    assert rec["owns_space"] is True and rec["parent"] is None
+    assert rec["ready"] is True
+
+
+def test_adoption_does_not_retype_the_attach_command_into_a_live_pane(seams):
+    # The pane is live and already running whatever it should run. Re-running
+    # setup would type `omnigent attach` a second time — and for a launcher's
+    # space that is a SECOND co-drive client on one session, which is the race
+    # `_state` exists to avoid: Omnigent parks a single Future for an
+    # elicitation, so the first resolver wins and every other client gets
+    # `not_found`.
+    client = RecordingClient(spaces=[space_info("wA", "New Alignment")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "wA", "tab_id": "wA:t1", "pane_id": "wA:p1",
+               "owner": "bridge"}}, pending={})
+    m.Bridge(FakeWatcher([]), client).reconcile(
+        [Ev("added", "s1", root_session("New Alignment"))])
+
+    for name in ("pane_run", "report_agent", "report_metadata"):
+        assert name not in _names(client), \
+            f"adoption re-ran {name} on a pane that already has it"
+
+
+def test_adoption_refreshes_the_cached_cwd_from_the_session(seams):
+    # `cwd` in the file is INFORMATIONAL; the session's own `workspace` from the
+    # API is authoritative. The claim is made against the LIVE value, and the
+    # cache is refreshed from it — never the other way round.
+    client = RecordingClient(spaces=[space_info("wB", "Moved")])
+    write_state(os.environ["OMNIGENT_HOME"], pending={
+        "/old/path": {"workspace_id": "wB", "tab_id": "wB:t1",
+                      "pane_id": "wB:p1", "owner": "launcher",
+                      "cwd": "/old/path"}}, spaces={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("Moved",
+                                                    workspace="/new/path"))])
+
+    assert bridge._spaces["s1"]["cwd"] == "/new/path"
+
+
+# --- 3. a stale spaces record is NOT adopted ---------------------------------
+
+def test_a_spaces_record_naming_a_dead_workspace_is_dropped_not_adopted(seams):
+    # THE GUARD. Adopting this would hand the bridge a pane id that does not
+    # exist, and every later `report_agent` would fail against it — a failure
+    # the operator sees as a session with no badge rather than as a stale file.
+    # A duplicate space is the cheaper mistake: it is visible and closable.
+    client = RecordingClient(spaces=[space_info("w1", "Fresh")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "wGone", "tab_id": "wGone:t1",
+               "pane_id": "wGone:p1", "owner": "bridge"}}, pending={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+
+    assert _names(client).count("workspace_create") == 1
+    assert _call(client, "workspace_create")[1] == ("T",)
+    assert any("wGone" in ln and "stale" in ln for ln in lines), lines
+    # The stale record is REPLACED, not merely shadowed: the fresh space is
+    # recorded under the same session id, and the dead id is nowhere in the file
+    # or in memory — otherwise the next restart would make the same decision.
+    assert bridge._spaces == {"s1": bridge._spaces["s1"]}
+    assert bridge._spaces["s1"]["workspace_id"] == "ws1"
+    assert "wGone" not in json.dumps(bridge._spaces)
+    assert "wGone" not in Path(bridge.state_path).read_text()
+    assert bridge._recs["s1"]["workspace_id"] == "ws1"
+
+
+def test_an_unreadable_workspace_list_adopts_nothing_and_prunes_nothing(seams):
+    # "Cannot tell" is not "absent". Treating an unreadable listing as an empty
+    # one would turn one transient herdr hiccup into a duplicate space for every
+    # live session — and into the silent loss of every pending record.
+    client = RecordingClient(
+        fail={"workspace_list": FakeHerdrError("boom", "cannot list")})
+    write_state(os.environ["OMNIGENT_HOME"],
+                spaces={"s1": {"workspace_id": "wA", "tab_id": "wA:t1",
+                               "pane_id": "wA:p1", "owner": "bridge"}},
+                pending={"/repo": {"workspace_id": "wB", "tab_id": "wB:t1",
+                                   "pane_id": "wB:p1", "owner": "launcher"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T"))])
+
+    assert any("cannot list workspaces" in ln for ln in lines), lines
+    assert not any("pruned" in ln for ln in lines), lines
+    # Both records survive untouched: nothing was proven dead.
+    assert set(bridge._spaces) == {"s1"}
+    assert set(bridge._pending) == {"/repo"}
+
+
+# --- 4/5. the launcher handshake: a pending record is CLAIMED -----------------
+
+def test_a_pending_record_for_this_directory_is_claimed_not_duplicated(seams):
+    # `og start <mux>` case (A): the launcher opens a space and types `og chat`
+    # into it BEFORE any session exists, so it has nothing to key a record by.
+    # It writes `pending[cwd]` and execs herdr. This is the session that space
+    # belongs to — and the old code would have opened a second space for it.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert _names(client).count("tab_create") == 0
+    assert lines[0].startswith("claim s1 → space wB"), lines
+
+    # MOVED, not copied: the pending half is empty and the record now hangs off
+    # the session id, which is the only key adoption can look up.
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["pending"] == {}
+    assert saved["spaces"]["s1"]["workspace_id"] == "wB"
+    # owner stays `launcher`: claiming transfers nothing, and a record claiming
+    # otherwise would misreport who to blame for a stray space.
+    assert saved["spaces"]["s1"]["owner"] == "launcher"
+    # ...and a launcher-made space is closed by TAB on removal, not by space.
+    assert bridge._recs["s1"]["owns_space"] is False
+
+
+def test_a_pending_record_for_a_different_directory_is_never_claimed(seams):
+    # The match is EXACT, deliberately. A prefix or substring match would hand
+    # this session the space of a sibling checkout — and that is the one error
+    # here that no close or rename undoes.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    bridge.reconcile([Ev("added", "s1", root_session("T", workspace="/repo/og-2"))])
+
+    assert _names(client).count("workspace_create") == 1
+    assert set(bridge._pending) == {"/repo/og"}
+
+
+def test_a_claimed_space_is_renamed_to_the_session_title(seams):
+    # The launcher's whole reason for labelling a space from the DIRECTORY is
+    # that no session existed when it made one. The rename is the handoff.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    # `call` is the client's generic wire method: (method, params).
+    rename = _call(client, "call")
+    assert rename[1][0] == "workspace.rename"
+    assert rename[1][1] == {"workspace_id": "wB", "label": "Fix the bridge"}
+
+
+def test_a_claimed_space_whose_label_already_matches_is_not_renamed(seams):
+    # Not cosmetics: a `workspace.rename` on every adoption of an already-correct
+    # space is noise in a log the operator reads to work out what happened.
+    #
+    # The positive control is IN this test, because the negative alone is
+    # vacuous: a module that never renames anything satisfies it for the wrong
+    # reason. Run both labels through the same setup and require exactly one
+    # rename out of the two.
+    def claim(label):
+        client = RecordingClient(spaces=[space_info("wB", label)])
+        write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+            "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1",
+                         "pane_id": "wB:p1", "owner": "launcher",
+                         "cwd": "/repo/og"}})
+        m.Bridge(FakeWatcher([]), client).reconcile(
+            [Ev("added", "s1", root_session("Fix the bridge",
+                                            workspace="/repo/og"))])
+        return [c for c in client.calls if c[0] == "call"]
+
+    assert claim("og"), "control: a DIFFERENT label must be renamed"
+    assert claim("Fix the bridge") == [], \
+        "a space already labelled with the session title was renamed anyway"
+
+
+def test_the_workspace_rename_frame_matches_herdrs_schema(seams):
+    # The bridge calls `call` directly because the client module has no
+    # `workspace_rename` wrapper — which would exempt this frame from the
+    # conformance guard in tests/test_og_herdr_client.py, since that guard
+    # enumerates wrappers by introspection. So the frame the bridge ACTUALLY
+    # emits is captured here and pinned against the same vendored schema.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    m.Bridge(FakeWatcher([]), client).reconcile(
+        [Ev("added", "s1", root_session("Fix the bridge", workspace="/repo/og"))])
+
+    method, params = _call(client, "call")[1]
+    assert method == "workspace.rename"
+
+    schema = json.loads((Path(__file__).parent / "fixtures"
+                         / "herdr_api_schema.json").read_text())
+    request = schema["schemas"]["request"]
+    variants = {v["properties"]["method"]["const"]: v["properties"]["params"]
+                for v in request["oneOf"]}
+    assert "workspace.rename" in variants, "herdr has no workspace.rename"
+
+    allowed = variants["workspace.rename"]
+    while "$ref" in allowed:
+        allowed = request["$defs"][allowed["$ref"].rsplit("/", 1)[1]]
+
+    # Every required param present, and nothing extra: herdr's `Workspace.
+    # RenameParams` requires both `workspace_id` and `label` and knows no other
+    # key, and serde DROPS an unknown one silently — the failure mode that put
+    # every tab in the focused workspace once already.
+    assert set(allowed["required"]) <= set(params), params
+    assert set(params) <= set(allowed["properties"]), params
+    assert set(params) == set(allowed["required"]), params
+    assert all(isinstance(v, str) for v in params.values()), params
+
+    # The negative control: a param herdr does not have must be caught by the
+    # comparison above, or every assertion here could pass for a typo'd key.
+    assert set(allowed["properties"]) != {"workspace_id", "name"}
+
+
+# --- 6. pending records are pruned by EXISTENCE, not by a clock ----------------
+
+def test_a_pending_record_whose_workspace_is_gone_is_pruned_and_claims_nothing(
+        seams):
+    # Existence is the whole rule — no TTL, no clock. A pending record names a
+    # space; if the operator closed that space, keeping the record means the
+    # next session in that directory claims a workspace that is not there.
+    client = RecordingClient(spaces=[space_info("wLive", "live")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/gone": {"workspace_id": "wGone", "tab_id": "wGone:t1",
+                       "pane_id": "wGone:p1", "owner": "launcher"},
+        "/repo/live": {"workspace_id": "wLive", "tab_id": "wLive:t1",
+                       "pane_id": "wLive:p1", "owner": "launcher"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([
+        Ev("added", "s1", root_session("T", workspace="/repo/gone")),
+        Ev("added", "s2", root_session("U", workspace="/repo/live")),
+    ])
+
+    assert any("pruned 1 pending" in ln and "/repo/gone" in ln
+               for ln in lines), lines
+    # Both were resolved in this one pass: the dead one pruned, the live one
+    # claimed by the session in its directory. What must never happen is the
+    # dead one being claimed, which would hand a pane to a workspace that is not
+    # there — so the two sessions took DIFFERENT paths, and that is the proof.
+    assert bridge._pending == {}
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["pending"] == {}
+    assert [r["workspace_id"] for r in saved["spaces"].values()] == \
+        ["ws1", "wLive"]
+    assert saved["spaces"]["s2"]["workspace_id"] == "wLive"
+    assert saved["spaces"]["s2"]["owner"] == "launcher"
+    assert _names(client).count("workspace_create") == 1
+    assert bridge._recs["s1"]["workspace_id"] == "ws1"
+    assert bridge._recs["s2"]["workspace_id"] == "wLive"
+
+
+def test_internal_bookkeeping_never_reaches_the_state_file(seams):
+    # The adopt path needs to know WHICH action it took and whether the pane was
+    # confirmed. Those are answers about this pass, not facts about a space, and
+    # a record that carried them would leave the next reader unable to tell
+    # which of its keys are real.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T",
+                                                    workspace="/repo/og"))])
+
+    saved = json.loads(Path(bridge.state_path).read_text())
+    for record in saved["spaces"].values():
+        assert set(record) <= {"workspace_id", "tab_id", "pane_id", "owner",
+                               "cwd"}, record
+
+
+def test_pruning_does_not_run_when_there_is_nothing_pending(seams):
+    # `workspace.list` costs a socket round trip, and a bridge that has been up
+    # for a week with an empty file must not pay it on every poll forever.
+    #
+    # The control is here for the same reason as everywhere else in this file: a
+    # bridge that never listed anything would satisfy the first half for the
+    # wrong reason. With a pending record present, the listing MUST happen.
+    client = RecordingClient(spaces=[space_info("wLive", "live")])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T"))])
+    assert "workspace_list" not in _names(client)
+    assert bridge._pending == {}
+
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wLive", "tab_id": "wLive:t1",
+                     "pane_id": "wLive:p1", "owner": "launcher"}})
+    client2 = RecordingClient(spaces=[space_info("wLive", "live")])
+    bridge2 = m.Bridge(FakeWatcher([]), client2)
+    bridge2.reconcile([Ev("added", "s2", root_session("T",
+                                                     workspace="/repo/og"))])
+    assert "workspace_list" in _names(client2)
+
+
+# --- 7. --cleanup over v2 closes both halves and nothing else -----------------
+
+def test_cleanup_closes_both_spaces_and_pending_and_leaves_the_operators_own(
+        seams):
+    # A pending record is a space the LAUNCHER opened for a directory, before
+    # any session existed. It is still a space on the operator's screen that
+    # something opened on their behalf; leaving it behind means `og start <mux>`
+    # has no way back and the operator closes spaces by hand.
+    client = RecordingClient(spaces=[PROJECTS, space_info("wA", "bridge"),
+                                     space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"],
+                spaces={"s1": {"workspace_id": "wA", "tab_id": "wA:t1",
+                               "pane_id": "wA:p1", "owner": "bridge"}},
+                pending={"/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1",
+                                     "pane_id": "wB:p1",
+                                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.cleanup()
+
+    assert [c[1] for c in client.calls if c[0] == "workspace_close"] == \
+        [("wA",), ("wB",)]
+    assert not [c for c in client.calls
+                if c[0] == "workspace_close" and c[1] == ("w1",)], \
+        "the operator's projects workspace was closed"
+    # The two halves are told apart in the report, because "which of these did
+    # og open?" is the question an operator asks when a space is left over.
+    assert any("closed workspace wA" in ln and "session s1" in ln
+               for ln in lines), lines
+    assert any("closed workspace wB" in ln and "no session yet" in ln
+               for ln in lines), lines
+    assert any("left workspace 'w1'" in ln and "projects" in ln
+               for ln in lines), lines
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["spaces"] == {} and saved["pending"] == {}
+
+
+def test_a_dry_run_cleanup_lists_both_halves_and_closes_nothing(seams):
+    client = RecordingClient()
+    write_state(os.environ["OMNIGENT_HOME"],
+                spaces={"s1": {"workspace_id": "wA", "owner": "bridge"}},
+                pending={"/repo": {"workspace_id": "wB", "owner": "launcher"}})
+    dry = m.Bridge(FakeWatcher([]), None, dry_run=True)
+
+    lines = dry.cleanup()
+
+    assert client.calls == []
+    assert any(ln.startswith("dry-run cleanup: close workspace wA")
+               for ln in lines), lines
+    assert any(ln.startswith("dry-run cleanup: close workspace wB")
+               for ln in lines), lines
+    assert any("would be closed" in ln and "2 " in ln for ln in lines), lines
+    # Nothing was pruned, so the NEXT real cleanup still has both.
+    assert set(dry._spaces) == {"s1"} and set(dry._pending) == {"/repo"}
+
+
+# --- 8. a broken file reads as empty, without raising -------------------------
+
+@pytest.mark.parametrize("body", [
+    "{ not json at all",
+    json.dumps(["not", "a", "dict"]),
+    json.dumps({"version": 99, "spaces": {"s1": {"workspace_id": "w1"}}}),
+])
+def test_a_corrupt_or_unknown_version_state_file_reads_as_empty(seams,
+                                                                tmp_path, body):
+    # A REGRESSION GUARD, not a bug witness: this holds on the pre-change module
+    # too, and is here because the v2 rewrite of `load_state` is exactly the
+    # kind of change that can quietly break it. The direction is the safe one —
+    # an answer we cannot read must never become permission to close something —
+    # and it must never raise, because a Bridge is constructed before any work
+    # is done and a raise there leaves the operator with no bridge rather than a
+    # quiet one.
+    path = tmp_path / "broken.json"
+    path.write_text(body)
+    client = RecordingClient(spaces=[PROJECTS])
+
+    bridge = m.Bridge(FakeWatcher([]), client, state_path=path)
+    lines = bridge.cleanup()
+    assert "workspace_close" not in _names(client)
+    assert any("nothing to close" in ln for ln in lines), lines
+
+
+@pytest.mark.parametrize("spaces,expected", [
+    ("nope", []),
+    ({}, []),
+    ({"s1": {"workspace_id": 7}}, []),          # no usable workspace id
+    ({"": {"workspace_id": "wZ"}}, []),        # no session key
+    ({"s1": "w1"}, []),                         # not a record at all
+    ({"s1": {"workspace_id": "w1"}}, [("w1",)]),        # the one good one
+    ({"s1": {"workspace_id": "w1", "tab_id": 9}}, [("w1",)]),  # non-string dropped
+    # The mixed case, and the one that matters: a bad record must not cost a
+    # good one. v1 rejected the whole file on a version mismatch, so it could
+    # never demonstrate this — it simply closed nothing, which is the same
+    # outcome for the bad entries and the wrong one for the good one.
+    ({"s1": {"workspace_id": 7}, "s2": {"workspace_id": "w2"}}, [("w2",)]),
+    ({"s1": "junk", "s2": {"workspace_id": "w2"}}, [("w2",)]),
+])
+def test_a_v2_state_file_of_wrong_shaped_entries_reads_as_empty(seams, tmp_path,
+                                                                spaces, expected):
+    # The v2 reader's own job, and new with the version: which malformed entries
+    # survive. The direction is the same as above — only a record carrying a
+    # usable `workspace_id` is one a close can be aimed at — but the shape it is
+    # checking did not exist before v2. A non-string `tab_id` is dropped while
+    # the record around it is kept: one bad field must not cost a workspace id
+    # that was fine.
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps({"version": m.STATE_VERSION,
+                                "spaces": spaces, "pending": "nope"}))
+    client = RecordingClient(spaces=[PROJECTS])
+
+    bridge = m.Bridge(FakeWatcher([]), client, state_path=path)
+    bridge.cleanup()
+
+    assert [c[1] for c in client.calls if c[0] == "workspace_close"] == expected
+
+
+def test_a_missing_state_file_reads_as_empty_without_raising(seams, tmp_path):
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient(),
+                      state_path=tmp_path / "absent.json")
+    assert bridge._spaces == {} and bridge._pending == {}
+
+
+# --- a dry run adopts from the file WITHOUT calling herdr ---------------------
+
+def test_a_dry_run_adopts_and_claims_without_making_a_single_call(seams):
+    # Zero client calls is the whole contract of a dry run, and it is what makes
+    # it safe to run against a live herdr at all. So its adopt/claim decision
+    # rests on the state file alone and is explicitly unverified — which is what
+    # the line says.
+    client = RecordingClient(spaces=[space_info("wA", "already"),
+                                     space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"],
+                spaces={"s1": {"workspace_id": "wA", "tab_id": "wA:t1",
+                               "pane_id": "wA:p1", "owner": "bridge"}},
+                pending={"/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1",
+                                     "pane_id": "wB:p1", "owner": "launcher"}})
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
+
+    lines = bridge.reconcile([
+        Ev("added", "s1", root_session("A", workspace="/repo/a")),
+        Ev("added", "s2", root_session("B", workspace="/repo/og")),
+    ])
+
+    assert client.calls == [], "the dry run reached the live client"
+    assert any("dry-run: adopt 'A' → space wA" in ln for ln in lines), lines
+    assert any("dry-run: claim 'B' → space wB" in ln for ln in lines), lines
+    # Idempotent, like every other dry run: the second pass finds the record.
+    assert bridge.reconcile([
+        Ev("added", "s1", root_session("A", workspace="/repo/a")),
+        Ev("added", "s2", root_session("B", workspace="/repo/og")),
+    ]) == []
+
+
+def test_a_dry_run_never_rewrites_the_state_file(seams):
+    # A dry run that claimed or pruned would destroy the very records the NEXT
+    # real run needs — the exact defect that makes a dry-run --cleanup
+    # dangerous, arriving through the adopt path instead of the cleanup one.
+    #
+    # The control is in this test: the SAME operation on a REAL run does rewrite
+    # the file (it has to — that is what claiming is). Without it, "the file is
+    # unchanged" would also be satisfied by a module that never writes it at all,
+    # which is the wrong reason to be green.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    path = write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1",
+                     "pane_id": "wB:p1", "owner": "launcher"}})
+    before = path.read_text()
+
+    m.Bridge(FakeWatcher([]), client, dry_run=True).reconcile(
+        [Ev("added", "s1", root_session("T", workspace="/repo/og"))])
+    assert path.read_text() == before
+
+    # Control: the real run claims it, and the file says so.
+    live = RecordingClient(spaces=[space_info("wB", "og")])
+    m.Bridge(FakeWatcher([]), live).reconcile(
+        [Ev("added", "s1", root_session("T", workspace="/repo/og"))])
+    saved = json.loads(path.read_text())
+    assert saved["pending"] == {}
+    assert saved["spaces"]["s1"]["workspace_id"] == "wB"
+
+
+# --- a worker never claims a space, before its root or otherwise --------------
+
+def test_a_worker_never_claims_the_launchers_space(seams):
+    # Roots only. A sub-agent never owns a space, and a worker that reached the
+    # launcher's directory BEFORE its root would claim the launcher's whole
+    # space for itself — leaving the root to open a second one, which is the
+    # exact duplicate this ordering exists to prevent, reintroduced from the
+    # other end. `parent_session_id` is the guard.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:fix", workspace="/repo/og"))])
+
+    assert set(bridge._pending) == {"/repo/og"}
+    # It got a space of its own (its parent has none yet), as a worker with no
+    # space to sit in always does.
+    assert _names(client).count("workspace_create") == 1
+
+
+def test_an_adopted_record_without_a_pane_id_becomes_a_tab_in_that_space(seams):
+    # An upgraded v1 record carries no pane id, so there is nothing to adopt ONTO
+    # — but the space is still this session's, and putting the session in a NEW
+    # tab inside it beats opening a SECOND space beside it. The operator sees one
+    # space for one conversation either way; this is the version with one extra
+    # tab rather than one extra space.
+    client = RecordingClient(spaces=[space_info("w9", "nine", pane_count=1)])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "w9", "owner": "bridge", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "T", workspace="/repo/og", state="idle"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert _call(client, "tab_create")[1] == ("w9",)
+    # ...and the record is brought up to date, so the next restart can adopt the
+    # pane this call created instead of falling back again.
+    assert bridge._spaces["s1"]["pane_id"] == "pane1"
+    assert bridge._spaces["s1"]["tab_id"] == "tab1"
