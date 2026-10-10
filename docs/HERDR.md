@@ -22,7 +22,7 @@ A bridge watches Omnigent's HTTP API and keeps herdr in sync:
    ├ GET  /v1/sessions?kind=any  ──┐       ┌── pane.report_agent   (state badge)
    ├ GET  /v1/sessions/{id}/stream─┤       ├── pane.report_metadata (title)
    └ POST /v1/sessions/{id}/events │       ├── tab.create / tab.close
-                                   │       └── pane.run "omnigent attach <id>"
+                                   │       └── pane.send_text "omnigent attach <id>\n"
                                    │                 │
                           ┌────────▼─────────────────▼────────┐
                           │  og herdr   (installer/og_herdr.py)│
@@ -112,7 +112,7 @@ ping, agent.list                                ->  pong, BrokenPipeError
 ```
 
 The method does not matter. Since the bridge issues four calls per session
-(`tab.create`, `pane.run`, `pane.report_agent`, `pane.report_metadata`), a
+(`tab.create`, `pane.send_text`, `pane.report_agent`, `pane.report_metadata`), a
 reused connection fails on every *second* call — alternating failure on every
 event. `og_herdr_client.py` therefore connects, sends, reads and closes per
 request. `events.subscribe` is the sole exception: there the subscription *is*
@@ -251,6 +251,45 @@ Probe the real thing before writing the contract, not after the tests pass.
 
 ---
 
+## Why the client is checked against herdr's own schema
+
+Four separate defects in this feature were the same mistake: the client's idea
+of the wire contract, written from a CLI help string or an example, never
+checked against herdr's actual contract.
+
+| Shipped | Reality |
+|---|---|
+| `pane.run` | not a method at all — a CLI subcommand. **No pane ever ran anything.** |
+| `tab.create {workspace: …}` | the key is `workspace_id`; serde drops unknown keys, so `--workspace` silently did nothing and every tab landed in the focused workspace |
+| `pane.read` → `text`/`output`/`content`/`data`/`lines` | the text is at `result["read"]["text"]`; none of the five ever matched |
+| `events.subscribe {types: […]}` | the key is `subscriptions` |
+
+None of these were visible to the fake server, because a fake answers whatever
+it is asked — `RESULTS.get(method, {})` returned a cheerful empty object for a
+method herdr has never had. The first one survived 223 tests, a full
+cross-vendor review, and a live dry run, and was only caught by running the
+bridge for real.
+
+herdr publishes its complete contract: `herdr api schema --json` — every method
+mapped to its parameters with required fields and enums. So
+`tests/fixtures/herdr_api_schema.json` is vendored (the fixture README records
+the protocol version and the regeneration command), and a conformance test
+drives **every** client wrapper against a recording fake, captures the frame
+each one emits, and asserts the method is a real variant, every key sent
+exists, every required key is present, and enum values are legal.
+
+It is driven by introspecting the client rather than from a hand-written list
+of methods, because a hand-written list rots exactly the way these comments
+did. A required parameter with no sample argument fails the test rather than
+skipping it.
+
+The distinction worth keeping: the strict fake catches a bad *method*; only the
+schema catches a bad *parameter*. When the `workspace` key was reintroduced as
+an experiment, the fake was perfectly happy and the call succeeded — the schema
+check was the only thing that failed.
+
+---
+
 ## Agent state: pushed, not detected
 
 herdr classifies agents into `working` / `blocked` / `done` / `idle` /
@@ -294,7 +333,7 @@ The mapping the bridge applies, elicitations taking priority over status:
 Reported agents are observable but **not drivable through the agent API**:
 `herdr agent prompt` refuses with `agent_not_ready: agent <pane> is not an
 active named agent`. Input must go through `pane.send_text` / `pane.send_keys`
-/ `pane.run`, which are unrestricted. This costs nothing when a human types in
+/ `pane.send_input`, which are unrestricted. This costs nothing when a human types in
 the pane; it only means the bridge drives panes rather than agents.
 
 ---
