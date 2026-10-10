@@ -167,12 +167,44 @@ Four traps, each of which had already shipped into the code:
 - **The id is `id`, not `session_id`**, and the array is `data`, not
   `sessions`. There is no `kind` field on a row at all; root versus sub-agent
   is `parent_session_id` being null or not.
-- **There is no `workspace` field**, so a session does not tell you its
-  directory. `og herdr` takes `--cwd`, defaulting to its own working directory.
+- **A listing row carries no `workspace`** — but the DETAIL endpoint does. See
+  "The listing row is not the whole session" below; this distinction cost a
+  defect.
 - **The listing is paginated**: default page 20, newest-first, cursor via
   `after=<last_id>`, with `has_more` saying whether more remain. There is **no
   server-side status filter** — `status=`, `statuses=` and `state=` are all
   ignored — so filtering is the client's job.
+
+### The listing row is not the whole session
+
+`GET /v1/sessions/{id}` returns a much larger object than a listing row, and
+three of its fields matter here:
+
+| Field | Listing row | Detail row |
+|---|---|---|
+| `workspace` | absent | the session's actual directory (`/Users/…/projects/ohmyproxy`) |
+| `kind` | absent | `"default"` / `"sub_agent"` |
+| `sub_agent_name` | absent | e.g. `"coder_zen"` |
+| `pending_elicitations` | a count only | the full list |
+
+This was documented here as "the API does not tell you a session's directory",
+which was wrong — it was true of the one endpoint that had been looked at. The
+bridge shipped opening *every* pane in whatever directory the daemon happened
+to start in, which on a machine with a dozen projects is the wrong directory
+almost every time.
+
+So the watcher enriches: on first sight of a session it fetches the detail once
+(never per poll) and merges `workspace` into the emitted event. A sub-agent's
+own `workspace` is null, so it inherits its parent's — an approximation, since
+a worker usually runs in a git worktree the API does not expose, but a far
+better one than the daemon's cwd. Parent lookups are cached and bounded, a
+failed fetch is retried rather than remembered as "no directory", and a fetch
+that fails for any reason simply omits the key so the bridge falls back to
+`--cwd`. Enrichment is a nicety and must never cost a poll.
+
+The enriched copy goes into the event; `_seen` keeps the raw listing row, so
+the diff still compares like with like and an enrichment cannot manufacture a
+`changed`.
 
 ### Why pagination is a correctness problem, not a performance one
 
