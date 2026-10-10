@@ -46,7 +46,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -223,6 +223,9 @@ class Launch:
     agents_pane: bool
     env: dict
     state_path: Path
+    # Extra environment for every pane this launch creates, handed to herdr on
+    # the create call so it reaches the pane's shell. Empty means "send none".
+    pane_env: dict = field(default_factory=dict)
     spawn: Callable[[], Any] = None  # start the mux's own server, if it is down
     log_path: Optional[Path] = None
 
@@ -258,6 +261,30 @@ def is_inside(env: dict) -> bool:
     value that a caller may legitimately not have.
     """
     return env.get("HERDR_ENV") == "1"
+
+
+def pane_env_for(environ: dict) -> dict:
+    """The environment every pane this launch creates is started with.
+
+    A mux launch asked for a TERMINAL interface, so the panes must not steal
+    focus with a browser. The panes run `og chat`, which is `omnigent run`, and
+    an interactive `omnigent run` opens the live conversation in the browser by
+    default (cli.py: `auto_open_conversation` defaults to `prompt is None`).
+    `omnigent run` has no --no-open and no env var for it, but `webbrowser` —
+    what it calls — honours `$BROWSER`, and pointing that at `true(1)` makes
+    `webbrowser.open()` run `/usr/bin/true <url>`: it succeeds and opens
+    nothing. So the suppression is this one variable.
+
+    It has to travel to the PANE, not to this process: an export here reaches
+    only the launcher, and the pane runs `og chat` in a fresh shell. herdr takes
+    an env map on every pane-creating call and installs it in that shell, which
+    is why `ctx.pane_env` is threaded through the creates rather than exported.
+
+    An operator who already set `$BROWSER` has expressed a preference — a real
+    browser — so it is passed through untouched; only an unset `$BROWSER` is
+    defaulted. Same rule the accounts auto-open guard in bin/og follows.
+    """
+    return {"BROWSER": environ["BROWSER"] if "BROWSER" in environ else "true"}
 
 
 def _attach_there(ctx: Launch, session: dict) -> str:
@@ -322,7 +349,8 @@ def _open_space(ctx: Launch, attach: bool) -> str:
     reply, so there is nothing to wait for.
     """
     label = os.path.basename(ctx.cwd.rstrip(os.sep)) or ctx.cwd
-    created = ctx.client.workspace_create(label=label, cwd=ctx.cwd, focus=True)
+    created = ctx.client.workspace_create(label=label, cwd=ctx.cwd, focus=True,
+                                          env=ctx.pane_env)
     if not isinstance(created, dict):
         created = {}
     ws_id = _id_of(created.get("workspace"), "workspace_id")
@@ -398,12 +426,17 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
 
     Best effort by design: the chat pane is the session, and losing the whole
     launch because a cosmetic second pane could not be found is the wrong trade.
+
+    `pane.split` makes a pane too, so it takes the same pane environment as the
+    space's own pane; the split runs `og agents`, which opens no browser, but a
+    pane og creates under a mux launch should carry the map regardless.
     """
+    params = {"target_pane_id": root_pane, "direction": "right",
+              "focus": False, "cwd": ctx.cwd, "ratio": AGENTS_PANE_RATIO}
+    if ctx.pane_env:
+        params["env"] = ctx.pane_env
     try:
-        reply = ctx.client.call("pane.split", {
-            "target_pane_id": root_pane, "direction": "right",
-            "focus": False, "cwd": ctx.cwd, "ratio": AGENTS_PANE_RATIO,
-        })
+        reply = ctx.client.call("pane.split", params)
     except Exception as exc:
         warn("could not open the og agents pane ({0}); the chat is up "
              "without it".format(exc))
@@ -513,7 +546,7 @@ def _adopt(ctx: Launch, session: dict) -> dict:
     label = session.get("title") or os.path.basename(ctx.cwd.rstrip(os.sep))
     cwd = session.get("workspace") or ctx.cwd
     created = ctx.client.workspace_create(label=str(label), cwd=str(cwd),
-                                         focus=True)
+                                         focus=True, env=ctx.pane_env)
     if not isinstance(created, dict):
         created = {}
     ws_id = _id_of(created.get("workspace"), "workspace_id")
@@ -675,6 +708,7 @@ def build_launch(args: argparse.Namespace) -> Launch:
                   server=args.server, agent=agent_name(config),
                   agents_pane=agents_pane_enabled(config), env=dict(os.environ),
                   state_path=default_state_path(),
+                  pane_env=pane_env_for(dict(os.environ)),
                   spawn=spawn_herdr_server(binary, log_path),
                   log_path=log_path)
 

@@ -391,7 +391,8 @@ class HerdrClient:
         """The `workspaces` array of workspace.list."""
         return self._field(self.call("workspace.list"), "workspaces", "workspace.list")
 
-    def workspace_create(self, label: str, cwd: str, focus: bool = False) -> dict:
+    def workspace_create(self, label: str, cwd: str, focus: bool = False,
+                         env: Optional[Dict[str, str]] = None) -> dict:
         """Create a workspace AND its first tab in ONE call; returns the result.
 
         herdr's UI calls these "spaces". The result is
@@ -416,10 +417,18 @@ class HerdrClient:
         `focus` defaults False and callers must keep it there: several sessions
         appear per poll, and a workspace that steals focus each time would
         rip the operator out of whatever they were typing.
+
+        `env` is the map herdr installs into the pane's shell. It is the only
+        way to reach a process the pane spawns — the pane runs a fresh shell, so
+        an `export` in the launcher never touches it. og passes `BROWSER` here
+        so the pane's `og chat` (-> `omnigent run`) cannot open a browser (see
+        og_herdr_launch.pane_env_for). Omitted when unset, so a caller with
+        nothing to set sends exactly the frame it always did.
         """
-        return self.call("workspace.create", {
-            "label": label, "cwd": cwd, "focus": focus,
-        })
+        params = {"label": label, "cwd": cwd, "focus": focus}
+        if env:
+            params["env"] = env
+        return self.call("workspace.create", params)
 
     def workspace_close(self, workspace_id: str) -> None:
         """Close a workspace and everything in it — its tabs and their panes.
@@ -451,7 +460,8 @@ class HerdrClient:
                                        "label": label})
 
     def tab_create(self, workspace_id: str, cwd: str, label: str,
-                   focus: bool = False) -> dict:
+                   focus: bool = False,
+                   env: Optional[Dict[str, str]] = None) -> dict:
         """Create a tab; returns the whole result — it carries `tab` and `root_pane`.
 
         The wire key is `workspace_id`, and it is spelled the same way on the
@@ -470,10 +480,19 @@ class HerdrClient:
         a space of its own — but the spelling stays pinned here, because the
         whole reason to name the key identically on both sides is that the wrong
         one fails silently.
+
+        `env` is the pane-shell environment map, spelled the same as on
+        `workspace_create`; see there for why it exists and why it is omitted
+        when unset.
         """
-        return self.call("tab.create", {
-            "workspace_id": workspace_id, "cwd": cwd, "label": label, "focus": focus,
-        })
+        # NOT _drop_none: `workspace_id` is string|null, and null is the wire's
+        # own "no preference" (the focused workspace), so it must be SENT when
+        # None rather than dropped.
+        params = {"workspace_id": workspace_id, "cwd": cwd, "label": label,
+                  "focus": focus}
+        if env:
+            params["env"] = env
+        return self.call("tab.create", params)
 
     def tab_close(self, tab_id: str) -> None:
         """Close a tab and its panes."""

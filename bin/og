@@ -1357,20 +1357,23 @@ mux_homepage() {
 }
 
 # A mux launch asked for a TERMINAL interface, so og must not steal focus with
-# a browser. THREE openers have to be shut, and only the first is omnigent's
-# server:
+# a browser. The openers, and where each is actually shut:
 #
 #   1. omnigent's server opens `_bootstrap_result.open_url` at boot when
 #      OMNIGENT_ACCOUNTS_AUTO_OPEN is truthy — default TRUE
-#      (omnigent/server/app.py:1674-1682). Belt-and-braces: that open is gated
-#      on a LOOPBACK OMNIGENT_ACCOUNTS_BASE_URL (accounts_bootstrap.py,
-#      _is_loopback_base_url) and og always points it at the LAN/tunnel address,
-#      so the server never fires it for og anyway (docs/TROUBLESHOOTING.md).
+#      (omnigent/server/app.py:1674-1682). suppress_server_autopen below sets it
+#      0, but that is a GUARD, NOT WORKING CODE TODAY: the open is additionally
+#      gated on a LOOPBACK OMNIGENT_ACCOUNTS_BASE_URL (accounts_bootstrap.py,
+#      _is_loopback_base_url) and og always points that at the LAN/tunnel
+#      address, so the server never fires it for og (docs/TROUBLESHOOTING.md).
+#      Kept only so a future change that points the base URL at loopback cannot
+#      silently reintroduce a browser.
 #   2. `og chat` -> `omnigent run` opens the live conversation in the browser for
-#      an INTERACTIVE launch (cli.py:8665-8673 — auto_open_conversation defaults
-#      to `prompt is None`, i.e. ON for a REPL). `omnigent run` has no --no-open
-#      and no env var for this; the only lever is the `auto_open_conversation`
-#      config key, so set that.
+#      an interactive launch (cli.py: auto_open_conversation defaults to
+#      `prompt is None`). This is the open that actually fired, and it is shut
+#      at the PANE, not here: the launcher passes BROWSER=true in herdr's pane
+#      env (og_herdr_launch.pane_env_for). An export from this shell would never
+#      reach it — the pane runs `og chat` in a fresh shell.
 #   3. og's OWN opener: the needs_setup create-admin path in cmd_start. That one
 #      asks og_browser_suppressed below.
 #
@@ -1384,26 +1387,13 @@ suppress_accounts_autopen() {
   [[ -n "${1:-}" ]] || return 0
   export OG_SUPPRESS_BROWSER=1
   suppress_server_autopen
-  suppress_conversation_autopen
 }
 
-# The server's own auto-open (opener 1 above). An explicit value wins.
+# Opener 1. A GUARD for a path that does not fire for og today (see above), kept
+# cheap; an explicit OMNIGENT_ACCOUNTS_AUTO_OPEN wins.
 suppress_server_autopen() {
   [[ -z "${OMNIGENT_ACCOUNTS_AUTO_OPEN+x}" ]] || return 0
   export OMNIGENT_ACCOUNTS_AUTO_OPEN=0
-}
-
-# The chat REPL's conversation auto-open (opener 2 above). Best effort on
-# purpose — a config that cannot be read or written must not fail the launch —
-# and only when the operator has expressed no preference, so an explicit
-# `auto_open_conversation` (either value) is left exactly as it is.
-suppress_conversation_autopen() {
-  command -v omnigent >/dev/null 2>&1 || return 0
-  local current
-  current="$(omnigent config list 2>/dev/null \
-    | sed -n 's/^[[:space:]]*auto_open_conversation=//p' | head -1 || true)"
-  [[ -z "$current" ]] || return 0
-  omnigent config set --global auto_open_conversation=false >/dev/null 2>&1 || true
 }
 
 # Whether og may auto-open a browser for this run. A mux launch sets this and

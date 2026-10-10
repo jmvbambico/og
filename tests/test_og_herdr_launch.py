@@ -27,6 +27,7 @@ from og_herdr_launch import (  # noqa: E402
     is_inside,
     launch,
     live_session,
+    pane_env_for,
 )
 from og_herdr_watch import SessionEvent  # noqa: E402
 
@@ -110,9 +111,14 @@ class FakeClient:
     def workspace_list(self):
         return self.call("workspace.list")["workspaces"]
 
-    def workspace_create(self, label, cwd, focus=False):
-        return self.call("workspace.create",
-                         {"label": label, "cwd": cwd, "focus": focus})
+    def workspace_create(self, label, cwd, focus=False, env=None):
+        # Mirrors the real wrapper: the `env` key is present only when the
+        # caller asked for one, so an assertion can prove a launch that passes
+        # no pane environment sends no `env` at all.
+        params = {"label": label, "cwd": cwd, "focus": focus}
+        if env:
+            params["env"] = env
+        return self.call("workspace.create", params)
 
     def workspace_close(self, workspace_id):
         self.call("workspace.close", {"workspace_id": workspace_id})
@@ -177,7 +183,7 @@ def root_session(sid="s1", cwd=CWD, status="idle", **extra):
 
 
 def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
-             agents_pane=True, spawn=None, agent="hivemind"):
+             agents_pane=True, spawn=None, agent="hivemind", pane_env=None):
     environment = {"HOME": str(tmp_path)} if env is None else dict(env)
     if inside:
         environment.setdefault("HERDR_ENV", "1")
@@ -185,6 +191,7 @@ def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
     return Launch(client=client, watcher=watcher, cwd=CWD, server=SERVER,
                   agent=agent, agents_pane=agents_pane, env=environment,
                   state_path=tmp_path / "og-herdr.json",
+                  pane_env={} if pane_env is None else pane_env,
                   spawn=spawn if spawn is not None else (lambda: None),
                   log_path=tmp_path / "logs" / "herdr-server.log")
 
@@ -519,6 +526,57 @@ def test_the_split_leaves_the_agents_pane_room_for_its_footer(tmp_path):
         "target_pane_id": "w1:p1", "direction": "right",
         "focus": False, "cwd": CWD, "ratio": AGENTS_PANE_RATIO,
     }
+
+
+# ---------------------------------------------------------------------------
+# the pane environment — how a mux launch keeps the browser shut
+# ---------------------------------------------------------------------------
+# The chat pane runs `og chat` in a FRESH shell, so the only way to reach it is
+# herdr's per-create env map. pane_env_for builds the map; these pin that it is
+# threaded onto every pane a launch creates, that an operator's own $BROWSER is
+# respected, and that a launch with no map sends no `env` key at all.
+
+def test_a_mux_launch_passes_browser_true_into_every_pane_it_creates(tmp_path):
+    """Asserted as the EXACT env map, so a dropped or renamed `env` key fails
+    here instead of as a stray browser tab the operator sees — and the map is
+    the whole point, since an export from the launcher never reaches the pane."""
+    client = FakeClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher(),
+                    pane_env={"BROWSER": "true"}))
+
+    assert client.params_of("workspace.create")[0]["env"] == {"BROWSER": "true"}
+    assert client.split_params["env"] == {"BROWSER": "true"}
+
+
+def test_the_adopted_space_also_carries_the_pane_env(tmp_path):
+    """(B)/(C) create their space through `_adopt`, a different call site from
+    `_open_space` — it must pass the same map, or launching into an existing
+    session would still let its pane open a browser."""
+    client = FakeClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher([root_session()]),
+                    pane_env={"BROWSER": "true"}))
+
+    assert client.params_of("workspace.create")[0]["env"] == {"BROWSER": "true"}
+
+
+def test_an_operator_browser_setting_is_passed_through_not_overridden():
+    """Someone whose $BROWSER names a real browser has expressed a preference,
+    and og uses it rather than replacing it with `true` — the same rule the
+    accounts auto-open guard follows."""
+    assert pane_env_for({"BROWSER": "/usr/bin/firefox"}) == {
+        "BROWSER": "/usr/bin/firefox"}
+    assert pane_env_for({}) == {"BROWSER": "true"}
+
+
+def test_a_launch_with_no_pane_env_sends_no_browser(tmp_path):
+    """The behaviour change is SCOPED: a launch built with no pane environment
+    sends no `env` key at all, so nothing that is not a mux suppression is
+    touched."""
+    client = FakeClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher()))  # pane_env defaults {}
+
+    assert "env" not in client.params_of("workspace.create")[0]
+    assert "env" not in client.split_params
 
 
 def test_agents_pane_defaults_on_when_the_install_never_answered():

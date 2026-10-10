@@ -780,6 +780,51 @@ def test_tab_create(fake):
     tab.close()
 
 
+def test_workspace_create_carries_the_pane_env(fake):
+    """`env` is the map herdr installs in the new pane's shell — the only way to
+    reach the process the pane spawns, since the pane runs a fresh shell. og
+    passes BROWSER in it so a pane's `og chat` cannot open a browser (see
+    og_herdr_launch.pane_env_for). Pinned on the exact frame: a dropped or
+    misspelled `env` key is silently discarded by serde, so the pane would just
+    start with the operator's ambient environment and open the browser again.
+    """
+    server = fake()
+    created = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    created.workspace_create("og", "/repo", focus=True,
+                             env={"BROWSER": "true"})
+    assert server.requests[0] == {
+        "id": "req_1", "method": "workspace.create",
+        "params": {"label": "og", "cwd": "/repo", "focus": True,
+                   "env": {"BROWSER": "true"}}}
+    created.close()
+
+
+def test_tab_create_carries_the_pane_env(fake):
+    """Same `env` as `workspace_create`, on the sub-agent tab path."""
+    server = fake()
+    tab = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    tab.tab_create("w1", "/repo", "og:coder", env={"BROWSER": "true"})
+    assert server.requests[0]["params"] == {
+        "workspace_id": "w1", "cwd": "/repo", "label": "og:coder",
+        "focus": False, "env": {"BROWSER": "true"}}
+    tab.close()
+
+
+def test_the_create_wrappers_omit_env_when_they_have_none(fake):
+    """Scoped: with no pane environment the frame is byte-for-byte what it always
+    was — no `env` key at all, not `"env": {}` or `"env": null`."""
+    server = fake()
+    created = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    created.workspace_create("og", "/repo")
+    created.tab_create("w1", "/repo", "coder")
+    assert server.requests[0]["params"] == {
+        "label": "og", "cwd": "/repo", "focus": False}
+    assert server.requests[1]["params"] == {
+        "workspace_id": "w1", "cwd": "/repo", "label": "coder",
+        "focus": False}
+    created.close()
+
+
 def test_tab_close(client):
     assert client.tab_close("tab_9") is None
 
@@ -1473,6 +1518,42 @@ def test_the_conformance_guard_covers_the_workspace_wrappers(fake, api_schema):
         assert refusal is None, "{0}: the fake refused it too — {1}".format(
             name, refusal)
         assert _frame_violations(api_schema, frame) == []
+
+
+def test_the_conformance_guard_covers_the_pane_env_parameter(fake, api_schema):
+    """`workspace_create` and `tab_create` grew an optional `env` param.
+
+    The systemic guard enumerates wrappers by introspection, so it calls them
+    automatically — but with the parameter's DEFAULT (None), which means the
+    `env` KEY is never in the frame it validates. So the key is checked here,
+    for both wrappers, against herdr's schema: a misnamed key, or a value that
+    is not an object of strings, is caught rather than silently dropped by serde
+    at run time (which is exactly how `tab.create`'s `workspace` shipped).
+    """
+    server = fake()
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    client.workspace_create("og", "/repo", env={"BROWSER": "true"})
+    client.tab_create("w1", "/repo", "coder", env={"BROWSER": "true"})
+    client.close()
+
+    assert [r["method"] for r in server.requests[:2]] == [
+        "workspace.create", "tab.create"]
+    for request in server.requests[:2]:
+        assert request["params"]["env"] == {"BROWSER": "true"}
+        assert _frame_violations(api_schema, request) == []
+
+
+def test_the_launchers_pane_split_frame_matches_the_schema(api_schema):
+    """The launcher builds `pane.split` by hand through the raw `call`, so the
+    introspection guard cannot see it — and it now carries the pane `env`.
+    Validate the whole frame against herdr's schema, so an unknown key (dropped
+    silently by serde) is caught here rather than as an agents pane that opened
+    with no BROWSER set."""
+    frame = {"id": "r", "method": "pane.split",
+             "params": {"target_pane_id": "w1:p1", "direction": "right",
+                        "focus": False, "cwd": "/repo", "ratio": 0.7,
+                        "env": {"BROWSER": "true"}}}
+    assert _frame_violations(api_schema, frame) == []
 
 
 def test_the_conformance_guard_accepts_the_schema_itself(fake, api_schema):
