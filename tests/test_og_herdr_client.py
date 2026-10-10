@@ -6,10 +6,12 @@ short-lived temp directory (see SOCKET_BASE for why not tmp_path), and an
 autouse fixture scrubs $HERDR_SOCKET_PATH / $HERDR_SESSION so even an
 accidental un-injected resolve cannot reach ~/.config/herdr/herdr.sock. Every
 client is still constructed with an explicit socket path. No `herdr` CLI is
-invoked either.
+invoked either; the schema fixture was captured out of band (see
+tests/fixtures/README.md) and is committed.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import socket
@@ -122,7 +124,10 @@ class FakeHerdr:
 
 
 # Canned results per wire method, matching the payload shape each wrapper
-# unwraps.
+# unwraps. `pane.send_text` and `pane.read` are nested exactly as
+# tests/fixtures/herdr_api_schema.json (success_response) nests them — the two
+# shapes this table used to get wrong are what let defect #20 (pane_read) and
+# defect #18 (pane.run, a method herdr has never had) through 223 green tests.
 RESULTS = {
     "ping": {"type": "pong"},
     "workspace.list": {"workspaces": [{"name": "dev", "active_tab": "tab_9"}]},
@@ -139,10 +144,20 @@ RESULTS = {
                                  "cwd": "/private/tmp", "agent_status": "unknown",
                                  "revision": 0}},
     "tab.close": {"closed": True},
-    "pane.run": {"started": True},
+    # pane.run is absent because it is not a request variant: `herdr pane run` is
+    # a CLI subcommand. pane.send_text is what a pane actually runs a command
+    # with, and returns the void `ok` result.
+    "pane.send_text": {"type": "ok"},
     "pane.close": {"closed": True},
     "pane.rename": {"label": "coder"},
-    "pane.read": {"text": "line one\nline two"},
+    # The measured pane.read reply: the text is inside `read`, one level deeper
+    # than anything the old wrapper looked at. Result keys were exactly
+    # ['type', 'read'] against the live server.
+    "pane.read": {"type": "pane_read",
+                  "read": {"format": "text", "pane_id": "w1:pQ", "revision": 3,
+                           "source": "recent", "tab_id": "w1:tG",
+                           "text": "line one\nline two", "truncated": False,
+                           "workspace_id": "w1"}},
     "pane.report_agent": {"ok": True},
     "pane.release_agent": {"ok": True},
     "pane.report_metadata": {"ok": True},
@@ -163,8 +178,29 @@ def echo_handler(request, send):
     This handler used to keep the connection open on the belief that herdr
     multiplexes; that belief was wrong, and it hid a client bug — see
     test_four_calls_in_a_row_each_get_their_own_connection.
+
+    `events.subscribe` is the one method that keeps its connection, because
+    there the stream IS the connection; it gets an ack plus one event frame.
+
+    An unrecognised method is REFUSED, in herdr's own words, rather than
+    answered with an empty object. `RESULTS.get(method, {})` is how `pane.run`
+    — a CLI subcommand, never a request variant — passed every test in this
+    file: the fake agreed with whatever it was asked, so it could never
+    disagree with a broken client. A fake that answers only what herdr would
+    answer is the precondition for the conformance test at the bottom of this
+    file meaning anything.
     """
-    send({"id": request["id"], "result": RESULTS.get(request["method"], {})})
+    method = request["method"]
+    if method == "events.subscribe":
+        send({"id": request["id"], "result": {"type": "subscription_started"}})
+        send({"id": "evt_1", "event": "pane.exit", "params": {}})
+        return False  # the stream stays open; the caller owns closing it
+    if method not in RESULTS:
+        send({"id": request["id"], "error": {
+            "code": "invalid_request",
+            "message": "invalid request: unknown variant `{0}`".format(method)}})
+        return True
+    send({"id": request["id"], "result": RESULTS[method]})
     return True
 
 
@@ -277,7 +313,7 @@ def test_four_calls_in_a_row_each_get_their_own_connection(fake):
     client.report_metadata("w1:pQ", "og", title="coder")
     # Four requests, four separate sockets, every one of them answered.
     assert [r["method"] for r in server.requests] == [
-        "tab.create", "pane.run", "pane.report_agent", "pane.report_metadata"]
+        "tab.create", "pane.send_text", "pane.report_agent", "pane.report_metadata"]
     assert server.connections == 4
     client.close()
 
@@ -635,8 +671,11 @@ def test_tab_create(fake):
     assert result["tab"]["tab_id"] == "w1:tG"
     assert result["root_pane"]["pane_id"] == "w1:pQ"
     assert result["root_pane"]["tab_id"] == "w1:tG"
+    # `workspace_id`, not `workspace`: herdr's TabCreateParams drops the latter
+    # as an unknown field, which silently sent every tab to the focused
+    # workspace and made `--workspace` a no-op that still read as isolation.
     assert server.requests[0]["params"] == {
-        "workspace": "dev", "cwd": "/repo", "label": "coder", "focus": True}
+        "workspace_id": "dev", "cwd": "/repo", "label": "coder", "focus": True}
     tab.close()
 
 
@@ -678,6 +717,163 @@ def test_agent_list(client):
 
 def test_agent_get(client):
     assert client.agent_get("coder") == {"name": "coder", "state": "working"}
+
+
+# --------------------------------------------------------------------------
+# the wire-contract defects that shipped
+# --------------------------------------------------------------------------
+
+def test_pane_run_sends_text_with_a_trailing_newline(fake):
+    """`pane.run` is a CLI subcommand; the method that runs text is `pane.send_text`.
+
+    The bridge's whole purpose is this call — it is what types
+    `omnigent attach <id>` into the pane — so when it was sent as `pane.run`,
+    every live session failed with `unknown variant 'pane.run'` and not one pane
+    started anything. The fake never noticed, because it answered any method.
+    The trailing newline is what submits the line.
+    """
+    server = fake()
+    run = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    run.pane_run("w1:pQ", "omnigent attach s_abc123")
+    assert server.requests[0] == {
+        "id": "req_1",
+        "method": "pane.send_text",
+        "params": {"pane_id": "w1:pQ", "text": "omnigent attach s_abc123\n"},
+    }
+    run.close()
+
+
+def test_pane_run_never_emits_the_cli_only_method(fake):
+    """Named separately so the regression is one grep away, not one edit away."""
+    server = fake()
+    run = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    run.pane_run("w1:pQ", "omnigent attach s_abc123")
+    assert "pane.run" not in {r["method"] for r in server.requests}
+    run.close()
+
+
+def test_tab_create_sends_workspace_id_and_never_workspace(fake):
+    """`tab.create` takes `workspace_id`; `workspace` is dropped, not rejected.
+
+    serde ignores unknown fields, so the wrong key did not fail — it was
+    discarded and `workspace_id` defaulted to null, putting every tab in the
+    focused workspace. `--workspace` looked like it isolated a run and did not.
+    """
+    server = fake()
+    create = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    create.tab_create("w4", "/repo", "og:abcdef12")
+    params = server.requests[0]["params"]
+    assert params == {"workspace_id": "w4", "cwd": "/repo",
+                      "label": "og:abcdef12", "focus": False}
+    assert "workspace" not in params
+    create.close()
+
+
+def test_tab_create_sends_a_null_workspace_id_when_none_was_asked_for(fake):
+    """`workspace_id` is string|null, so null is the wire's own "no preference".
+
+    That is the focused workspace — the same thing omitting the key means — so
+    the no-flag path is unchanged by the key rename.
+    """
+    server = fake()
+    create = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    create.tab_create(None, "/repo", "og:abcdef12")
+    assert server.requests[0]["params"]["workspace_id"] is None
+    create.close()
+
+
+def test_pane_read_returns_the_text_from_inside_the_read_object(fake):
+    """The text is at `result["read"]["text"]` — measured live.
+
+    The old wrapper looked for `text`, `output`, `content`, `data` and a `lines`
+    list at the top level and found none of them, so it raised `bad_response` on
+    100% of live reads. Five guessed spellings, all wrong.
+    """
+    def nested_read_handler(request, send):
+        send({"id": request["id"], "result": RESULTS["pane.read"]})
+        return True
+
+    server = fake(nested_read_handler)
+    read = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    assert read.pane_read("w1:pQ") == "line one\nline two"
+    assert server.requests[0]["params"] == {
+        "pane_id": "w1:pQ", "source": "recent", "lines": 40}
+    read.close()
+
+
+def test_pane_read_reports_a_missing_read_object_by_name(fake):
+    """A flat `{"text": …}` result is no longer accepted.
+
+    Tolerant unwrapping is what hid defect #20: it would have kept "working" if
+    any of its five guesses had been right. A shape change now names itself.
+    """
+    def flat_read_handler(request, send):
+        send({"id": request["id"], "result": {"type": "pane_read", "text": "hi"}})
+        return True
+
+    server = fake(flat_read_handler)
+    read = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    with pytest.raises(herdr.HerdrError) as excinfo:
+        read.pane_read("w1:pQ")
+    assert excinfo.value.code == "bad_response"
+    assert "'read'" in excinfo.value.message
+    read.close()
+
+
+def test_pane_read_reports_a_read_object_without_text_by_name(fake):
+    def textless_handler(request, send):
+        send({"id": request["id"],
+              "result": {"type": "pane_read", "read": {"pane_id": "w1:pQ"}}})
+        return True
+
+    server = fake(textless_handler)
+    read = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    with pytest.raises(herdr.HerdrError) as excinfo:
+        read.pane_read("w1:pQ")
+    assert excinfo.value.code == "bad_response"
+    assert "'text'" in excinfo.value.message
+    read.close()
+
+
+@pytest.mark.parametrize("source", ["visible", "recent", "recent_unwrapped",
+                                    "detection"])
+def test_pane_read_accepts_every_source_in_the_schema_enum(fake, source):
+    # ReadSource, spelled as the enum spells it. `recent_unwrapped` has an
+    # UNDERSCORE; the CLI's `recent-unwrapped` is in the rejected list below,
+    # because that is what serde refuses.
+    server = fake()
+    read = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    read.pane_read("w1:pQ", source=source)
+    assert server.requests[0]["params"]["source"] == source
+    read.close()
+
+
+@pytest.mark.parametrize("source", ["recent-unwrapped", "Recent", "screen", "", None])
+def test_pane_read_rejects_an_invalid_source_before_socket(fake, source):
+    server = fake()
+    read = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    with pytest.raises(ValueError):
+        read.pane_read("w1:pQ", source=source)
+    # Rejected client-side: nothing was written to the socket. On the wire this
+    # would be a serde enum error attributed to the request, not to the caller
+    # that misspelled the source.
+    assert server.requests == []
+    read.close()
+
+
+def test_fake_refuses_a_method_herdr_does_not_have(fake):
+    """The fake is strict, so a wrong method name fails here too.
+
+    `RESULTS.get(method, {})` answered whatever it was asked, which is why
+    `pane.run` — a method herdr has never had — was green across this whole file.
+    """
+    server = fake()
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    with pytest.raises(herdr.HerdrError) as excinfo:
+        client.call("pane.run", {"pane_id": "w1:pQ", "command": "echo hi"})
+    assert excinfo.value.code == "invalid_request"
+    assert "unknown variant `pane.run`" in excinfo.value.message
+    client.close()
 
 
 # --------------------------------------------------------------------------
@@ -910,3 +1106,318 @@ def test_events_subscribe_raises_on_an_error_ack_with_an_empty_id(fake):
     client.close()
     assert excinfo.value.code == "invalid_request"
     assert "missing field `subscriptions`" in excinfo.value.message
+
+
+# --------------------------------------------------------------------------
+# conformance against herdr's own published schema
+# --------------------------------------------------------------------------
+#
+# Four defects shipped with the client's idea of the wire contract never checked
+# against herdr's: `pane.run` (no such variant), `tab.create`'s `workspace`
+# (the key is `workspace_id`, and the wrong one is dropped silently), `pane.read`'s
+# five guessed payload spellings (the text is at `result["read"]["text"]`) and
+# `events.subscribe`'s `types` (the key is `subscriptions`). None were visible
+# here, because the fake answers whatever it is asked.
+#
+# So the expectation is not a list of method names someone maintains. It is the
+# frames the real client emits: every public wrapper on HerdrClient is invoked
+# against a recording fake, the frame it wrote is captured, and that frame is
+# validated against tests/fixtures/herdr_api_schema.json. A wrapper added later
+# is covered the day it is written; a hand-written list would rot exactly like the
+# comments did.
+
+# herdr's schema, vendored. See tests/fixtures/README.md for how to regenerate
+# it and how to tell whether it is stale (protocol 22, schema_version 1).
+SCHEMA_PATH = Path(__file__).parent / "fixtures" / "herdr_api_schema.json"
+
+# Wrappers that send nothing, so have no frame to validate:
+#   close              tears down a socket; there is no request behind it.
+#   call               the raw escape hatch every wrapper goes through; its
+#                      method name comes from the caller, so there is no fixed
+#                      expectation to build for it. The wrappers ARE the check.
+#   resolve_socket_path  pure path arithmetic, opens nothing.
+NON_REQUEST_MEMBERS = frozenset({"call", "close", "resolve_socket_path"})
+
+# A representative, schema-valid value for each parameter a wrapper may require.
+# Parameters that have defaults are called with those defaults, so this table
+# only has to cover the required ones. A required parameter that is missing here
+# makes the test FAIL (not skip): a silently skipped wrapper would be a case the
+# guard does not cover, which is the failure mode this whole file exists to stop.
+#
+# `source` is free-form on pane.report_agent (the reporting application's name,
+# "og" here) but an enum on pane.read — whose default of "recent" is used, since
+# it has one. Both spellings are correct because they are different parameters.
+SAMPLE_ARGUMENTS = {
+    "pane_id": "w1:pQ",
+    "tab_id": "w1:tG",
+    "target": "coder",
+    "workspace_id": "w1",
+    "cwd": "/repo",
+    "label": "og:abcdef12",
+    "source": "og",
+    "agent": "coder",
+    "state": "working",
+    "text": "echo MARKER\n",
+    "command": "omnigent attach s_abc123",
+}
+
+
+@pytest.fixture(scope="module")
+def api_schema():
+    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _request_params_by_method(schema):
+    """`{method name: params schema}` from the request schema's oneOf variants."""
+    request = schema["schemas"]["request"]
+    defs = request["$defs"]
+    prefix = "#/schemas/request/$defs/"
+    out = {}
+    for variant in request["oneOf"]:
+        method = variant["properties"]["method"]["const"]
+        assert method not in out, "duplicate request variant for {0}".format(method)
+        ref = variant["properties"]["params"]["$ref"]
+        # A params schema that is inlined rather than a $ref would mean herdr
+        # changed the schema's shape, and this table would quietly stop covering
+        # that method. Fail instead.
+        assert ref.startswith(prefix), "unhandled params $ref: " + ref
+        out[method] = defs[ref[len(prefix):]]
+    return out
+
+
+def _resolve(schema, node):
+    """Follow a `$ref` into the request `$defs`; anything else is returned as-is."""
+    prefix = "#/schemas/request/$defs/"
+    while isinstance(node, dict) and "$ref" in node:
+        ref = node["$ref"]
+        assert ref.startswith(prefix), "unhandled $ref: " + ref
+        node = schema["schemas"]["request"]["$defs"][ref[len(prefix):]]
+    return node
+
+
+def _frame_violations(schema, frame):
+    """Every way `frame` disagrees with herdr's request schema, as strings.
+
+    Three checks, one per shipped defect class:
+      1. the method is a real variant          — would have caught `pane.run`
+      2. every param key sent exists there     — would have caught `workspace`
+      3. every required param is actually sent — catches a dropped identifier
+    Plus a fourth, cheap one: a param whose schema is an inline enum must carry
+    a value from it. That is the `pane.read` source enum and `pane.report_agent`'s
+    state, both of which serde rejects at the request boundary.
+    """
+    method = frame["method"]
+    variants = _request_params_by_method(schema)
+    if method not in variants:
+        return ["`{0}` is not a request variant in herdr's schema ({1} exist) — "
+                "is it a CLI subcommand?".format(method, len(variants))]
+    params_schema = variants[method]
+    properties = params_schema.get("properties", {})
+    required = params_schema.get("required", [])
+    sent = frame.get("params", {})
+    problems = []
+
+    for key in sorted(sent):
+        if key not in properties:
+            problems.append(
+                "{0} sends `{1}`, which is not one of its params ({2}) — serde "
+                "drops an unknown key silently".format(
+                    method, key, ", ".join(sorted(properties)) or "none"))
+
+    for key in required:
+        if key not in sent:
+            problems.append(
+                "{0} requires `{1}`, which this client does not send".format(
+                    method, key))
+
+    for key, value in sorted(sent.items()):
+        enum = _resolve(schema, properties.get(key, {})).get("enum")
+        if enum is not None and value is not None and value not in enum:
+            problems.append("{0} param `{1}`: `{2}` is not in {3}".format(
+                method, key, value, enum))
+
+    return problems
+
+
+def _client_wrappers():
+    """Every public HerdrClient method that sends a request, by name."""
+    members = inspect.getmembers(herdr.HerdrClient, predicate=inspect.isfunction)
+    return [(name, fn) for name, fn in members
+            if not name.startswith("_") and name not in NON_REQUEST_MEMBERS]
+
+
+def _arguments_for(fn):
+    """(args, kwargs) that exercise `fn` with a schema-valid value per parameter.
+
+    `getmembers` hands back the plain functions off the class, so `self` is the
+    first parameter and is supplied by the caller, not by this table.
+    """
+    args, kwargs = [], {}
+    parameters = list(inspect.signature(fn).parameters.values())
+    assert parameters and parameters[0].name == "self", (
+        "{0}: expected an unbound method taking self".format(fn.__name__))
+    for param in parameters[1:]:
+        name = param.name
+        if param.kind is param.KEYWORD_ONLY:
+            if param.default is param.empty:
+                raise AssertionError(
+                    "{0}: keyword-only parameter {1!r} has no default; add it to "
+                    "SAMPLE_ARGUMENTS".format(fn.__name__, name))
+            kwargs[name] = param.default
+            continue
+        if param.default is not param.empty:
+            args.append(param.default)
+        elif name in SAMPLE_ARGUMENTS:
+            args.append(SAMPLE_ARGUMENTS[name])
+        else:
+            # Fail rather than skip: an unexercised wrapper is an unchecked one.
+            raise AssertionError(
+                "{0}: required parameter {1!r} has no sample in "
+                "SAMPLE_ARGUMENTS; add one so its frame gets validated".format(
+                    fn.__name__, name))
+    return args, kwargs
+
+
+def _captured_frames(fake):
+    """Invoke every wrapper; return `{name: (frame, refusal or None)}`.
+
+    A refusal is recorded rather than raised. echo_handler answers a method
+    herdr has never heard of with herdr's own `invalid_request`, so a wrapper
+    aimed at a non-existent variant would otherwise abort the whole capture
+    with a traceback and hide every OTHER frame from the report. The frame was
+    still written and still worth validating, which is how `pane.run` gets
+    named as a schema violation instead of as an exception from a fake.
+    """
+    frames = {}
+    for name, fn in _client_wrappers():
+        server = fake()
+        client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+        args, kwargs = _arguments_for(fn)
+        refusal = None
+        try:
+            outcome = fn(client, *args, **kwargs)
+            if inspect.isgenerator(outcome):
+                # events.subscribe is a generator: it sends on first pull, and
+                # echo_handler pushes one event so that pull returns.
+                next(outcome)
+                outcome.close()
+        except herdr.HerdrError as exc:
+            refusal = "{0}: {1}".format(exc.code, exc.message)
+        finally:
+            client.close()
+        assert len(server.requests) == 1, (
+            "{0} wrote {1} requests, expected exactly 1".format(
+                name, len(server.requests)))
+        frames[name] = (server.requests[0], refusal)
+    return frames
+
+
+def test_the_conformance_guard_covers_every_requesting_wrapper(fake):
+    """The inventory itself, so the guard cannot silently shrink to nothing."""
+    names = {name for name, _ in _client_wrappers()}
+    assert names == {
+        "ping", "workspace_list", "tab_create", "tab_close", "pane_run",
+        "pane_close", "pane_rename", "pane_read", "report_agent",
+        "release_agent", "report_metadata", "agent_list", "agent_get",
+        "events_subscribe",
+    }
+
+
+def test_every_frame_the_client_can_send_matches_herdrs_schema(fake, api_schema):
+    """The systemic guard: the client's wire contract, checked against herdr's.
+
+    Every public wrapper is invoked against a recording fake and the frame it
+    emits is validated against the vendored schema. Each of the four shipped
+    defects fails this test:
+        pane.run            not a request variant
+        {"workspace": …}    not a param of tab.create
+        {"types": …}         not a param of events.subscribe
+        pane.read params    validated against PaneReadParams + ReadSource
+    """
+    frames = _captured_frames(fake)
+    offenders = {}
+    for name, (frame, refusal) in sorted(frames.items()):
+        problems = _frame_violations(api_schema, frame)
+        if refusal is not None:
+            # The strict fake already refuses what herdr would refuse; saying so
+            # here too keeps the report readable when both agree.
+            problems.append("the fake refused this frame too — {0}".format(refusal))
+        if problems:
+            offenders[name] = "\n".join("      - " + p for p in problems)
+    assert not offenders, "client frames that disagree with herdr's schema:\n" + "\n".join(
+        "    {0}:\n{1}".format(name, detail) for name, detail in offenders.items())
+
+
+def test_the_conformance_guard_accepts_the_schema_itself(fake, api_schema):
+    """Sanity on the checker: herdr's own method/param pairs must pass.
+
+    Without this, a checker that rejected everything would make the test above
+    green for the wrong reason — the failure mode that let three of this
+    session's earlier tests pass while the client was broken.
+    """
+    frames = {
+        "ping": {"id": "r", "method": "ping", "params": {}},
+        "pane.send_text": {"id": "r", "method": "pane.send_text",
+                           "params": {"pane_id": "w1:pQ", "text": "hi\n"}},
+        "tab.create": {"id": "r", "method": "tab.create",
+                       "params": {"workspace_id": "w1", "cwd": "/repo",
+                                  "label": "l", "focus": False}},
+        "events.subscribe": {"id": "r", "method": "events.subscribe",
+                             "params": {"subscriptions": []}},
+    }
+    for name, frame in frames.items():
+        assert _frame_violations(api_schema, frame) == [], name
+
+
+def test_the_conformance_guard_catches_a_method_herdr_does_not_have(api_schema):
+    """Proof the guard bites, in the guard's own units: `pane.run` again."""
+    problems = _frame_violations(api_schema, {
+        "id": "req_1", "method": "pane.run",
+        "params": {"pane_id": "w1:pQ", "command": "omnigent attach s1"}})
+    assert any("`pane.run` is not a request variant" in p for p in problems)
+    assert any("CLI subcommand" in p for p in problems)
+
+
+def test_the_conformance_guard_catches_a_param_herdr_does_not_have(api_schema):
+    """Proof it bites, for the dropped-key class: `workspace` on tab.create."""
+    problems = _frame_violations(api_schema, {
+        "id": "req_1", "method": "tab.create",
+        "params": {"workspace": "w4", "cwd": "/repo", "label": "l", "focus": False}})
+    assert any("sends `workspace`" in p and "drops an unknown key silently" in p
+               for p in problems)
+
+
+def test_the_conformance_guard_catches_the_earlier_types_defect(api_schema):
+    """The fourth of the four: events.subscribe took `types`, not `subscriptions`."""
+    problems = _frame_violations(api_schema, {
+        "id": "req_1", "method": "events.subscribe", "params": {"types": []}})
+    assert any("sends `types`" in p for p in problems)
+    assert any("requires `subscriptions`" in p for p in problems)
+
+
+def test_the_conformance_guard_catches_a_dropped_required_param(api_schema):
+    problems = _frame_violations(api_schema, {
+        "id": "req_1", "method": "pane.close", "params": {"id": "w1:pQ"}})
+    assert any("sends `id`, which is not one of its params" in p for p in problems)
+    assert any("requires `pane_id`" in p for p in problems)
+
+
+def test_the_conformance_guard_catches_a_bad_enum_value(api_schema):
+    # The CLI's hyphenated spelling: valid-looking, refused by the wire.
+    problems = _frame_violations(api_schema, {
+        "id": "req_1", "method": "pane.read",
+        "params": {"pane_id": "w1:pQ", "source": "recent-unwrapped", "lines": 40}})
+    assert any("`recent-unwrapped` is not in" in p for p in problems)
+
+
+def test_the_conformance_guard_reads_a_fixture_with_all_herdrs_methods(api_schema):
+    """The fixture is the contract, not a subset: 102 variants, protocol 22.
+
+    A truncated or wrong-file fixture would still 'validate' most frames while
+    silently covering far less, so the two headline numbers are pinned here.
+    """
+    assert api_schema["protocol"] == 22
+    assert api_schema["schema_version"] == 1
+    assert len(_request_params_by_method(api_schema)) == 102
+    assert "pane.send_text" in _request_params_by_method(api_schema)
+    assert "pane.run" not in _request_params_by_method(api_schema)
