@@ -157,10 +157,12 @@ def test_added_defaults_cwd_to_process_cwd_and_label_to_session_id(seams):
     assert len(lines) == 1
 
 
-def test_realistic_session_row_without_workspace_key_uses_bridge_cwd(seams):
-    # A complete live session row: the HTTP object has NO directory key at all
-    # (this is the exact key set a live server returned), so the cwd must come
-    # from the bridge's invocation rather than from the row.
+def test_realistic_listing_row_without_workspace_key_uses_bridge_cwd(seams):
+    # The complete live LISTING row — the exact key set a live server returned
+    # from `GET /v1/sessions`. It has no directory, and the watcher merges one
+    # in from the detail endpoint before the bridge sees it; a row that reaches
+    # `_added` still bare (a detail fetch that failed, or any other source) must
+    # fall back to the bridge's own cwd.
     session = {
         "agent_id": "a1", "agent_name": "opencode", "archived": False,
         "comments_count": 0, "created_at": "2026-01-01T00:00:00Z",
@@ -175,6 +177,94 @@ def test_realistic_session_row_without_workspace_key_uses_bridge_cwd(seams):
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/under/test")
     bridge.reconcile([Ev("added", "s1", session)])
     assert _call(client, "tab_create")[2]["cwd"] == "/repo/under/test"
+
+
+# ---------------------------------------------------------------------------
+# the pane's directory is the SESSION's when the watcher supplied one
+# ---------------------------------------------------------------------------
+
+def test_a_session_workspace_wins_over_the_bridge_cwd(seams):
+    # The defect: run against a live server, every projected pane opened in
+    # whatever directory the daemon happened to start in, because the bridge
+    # read an absent key and used its own cwd — for a session about a different
+    # repository entirely.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/wherever/the/daemon/started")
+    bridge.reconcile([Ev("added", "s1", {
+        "title": "Fix bug", "state": "working",
+        "workspace": "/Users/cryogenix/projects/og"})])
+
+    assert _call(client, "tab_create")[2]["cwd"] == "/Users/cryogenix/projects/og"
+
+
+def test_a_workers_workspace_wins_over_the_bridge_cwd(seams):
+    # What the watcher sends for a worker is its PARENT's directory (the
+    # worker's own detail row is None). An approximation, and the best the API
+    # offers — but a far better one than the daemon's cwd.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/daemon/cwd")
+    bridge.reconcile([Ev("added", "w1", {
+        "title": "coder_zen:fix", "state": "working", "id": "w1",
+        "parent_session_id": "root",
+        "workspace": "/Users/cryogenix/projects/og"})])
+
+    assert _call(client, "tab_create")[2]["cwd"] == "/Users/cryogenix/projects/og"
+
+
+@pytest.mark.parametrize("session_workspace", [None, ""],
+                         ids=["absent_key", "empty_string"])
+def test_a_missing_or_empty_workspace_falls_back_to_the_bridge_cwd(
+        seams, session_workspace):
+    # The watcher omits the key when it knows nothing, so an empty value should
+    # not arrive — but `.get()` must treat both the same anyway, because an
+    # empty string as a cwd is a pane that opens nowhere.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/under/test")
+    session = {"title": "T", "state": "idle"}
+    if session_workspace is not None:
+        session["workspace"] = session_workspace
+    bridge.reconcile([Ev("added", "s1", session)])
+
+    assert _call(client, "tab_create")[2]["cwd"] == "/repo/under/test"
+
+
+def test_a_session_workspace_is_used_even_alongside_the_fallback(seams):
+    # The other side of the same pair: with a real directory present, --cwd is
+    # ignored. The two tests together pin "prefer the session, else --cwd",
+    # which a single one-sided assertion would not.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/under/test")
+    bridge.reconcile([Ev("added", "s1", {
+        "title": "T", "state": "idle", "workspace": "/repo/from/session"})])
+
+    assert _call(client, "tab_create")[2]["cwd"] == "/repo/from/session"
+
+
+def test_the_dry_run_line_reports_the_session_directory(seams):
+    # The dry-run output is how this was noticed at all ("every line showed the
+    # same cwd"), so it has to name the directory the pane would really open in.
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient(), dry_run=True,
+                      cwd="/daemon/cwd")
+    lines = bridge.reconcile([Ev("added", "s1", {
+        "title": "Fix bug", "state": "working",
+        "workspace": "/Users/cryogenix/projects/og"})])
+
+    assert lines == ["dry-run: add og:Fix bug "
+                     "(/Users/cryogenix/projects/og) → omnigent attach s1 "
+                     "[working]"]
+
+
+def test_the_bridge_makes_no_http_call_of_its_own():
+    # The bridge talks to herdr and to the watcher, and to nothing else. The
+    # directory rides on the session dict because the WATCHER owns every HTTP
+    # call: an enrichment fetch made from _added would raise through reconcile,
+    # which only catches herdr's HerdrError, and abort the whole batch.
+    source = Path(m.__file__).read_text()
+    names = {n.id for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Name)}
+    assert "urllib" not in names and "urlopen" not in names, (
+        "the bridge reached for the network directly; the session directory "
+        "must arrive on the event, not be fetched here"
+    )
 
 
 def test_changed_sequence_reports_state_and_title(seams):
