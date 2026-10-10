@@ -131,6 +131,25 @@ class FakeHerdr:
 RESULTS = {
     "ping": {"type": "pong"},
     "workspace.list": {"workspaces": [{"name": "dev", "active_tab": "tab_9"}]},
+    # The real workspace.create reply, measured against a live server. All THREE
+    # of workspace, tab and root_pane arrive in one call — the schema's own
+    # listing of this result is lossy and describes only `type` and `workspace`,
+    # which is why the wrapper returns the whole object rather than unwrapping.
+    "workspace.create": {"type": "workspace_created",
+                         "workspace": {"workspace_id": "w7",
+                                       "name": "projects", "label": "New Alignment",
+                                       "insert_index": 2, "active_tab": "w7:tA",
+                                       "tab_count": 1, "group_id": None},
+                         "tab": {"tab_id": "w7:tA", "workspace_id": "w7",
+                                 "number": 1, "label": "New Alignment",
+                                 "focused": False, "pane_count": 1,
+                                 "agent_status": "unknown"},
+                         "root_pane": {"pane_id": "w7:pA",
+                                       "terminal_id": "term_9c1f",
+                                       "workspace_id": "w7", "tab_id": "w7:tA",
+                                       "cwd": "/Users/cryogenix/projects/og",
+                                       "agent_status": "unknown", "revision": 0}},
+    "workspace.close": {"closed": True},
     # The real tab.create reply, measured against a live herdr 0.9.1 server.
     # Note there is no generic `id` key: the tab is `tab.tab_id` and the root
     # pane is `root_pane.pane_id`, and root_pane carries its `tab_id` too.
@@ -659,6 +678,67 @@ def test_ping(client):
 
 def test_workspace_list(client):
     assert client.workspace_list() == [{"name": "dev", "active_tab": "tab_9"}]
+
+
+def test_workspace_create_returns_the_whole_three_part_reply(fake):
+    """One call opens a space AND its first tab AND that tab's root pane.
+
+    The schema's own description of `workspace_created` lists only `type` and
+    `workspace`, which reads as if a caller would then need a `tab.create` and a
+    way to find the pane. The live reply carries all three; a wrapper that
+    unwrapped to `workspace` alone would have thrown away the two ids the bridge
+    needs and forced a second call that opens a SECOND tab, not a second pane.
+    """
+    server = fake()
+    created = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    result = created.workspace_create("New Alignment", "/repo/og")
+
+    assert result["type"] == "workspace_created"
+    assert result["workspace"]["workspace_id"] == "w7"
+    assert result["tab"]["tab_id"] == "w7:tA"
+    assert result["root_pane"]["pane_id"] == "w7:pA"
+    assert server.requests[0] == {
+        "id": "req_1", "method": "workspace.create",
+        "params": {"label": "New Alignment", "cwd": "/repo/og", "focus": False}}
+    created.close()
+
+
+def test_workspace_create_does_not_steal_focus_by_default(fake):
+    # Several sessions arrive in one poll. A space that focused itself each time
+    # would rip the operator out of whatever they were typing, once per session.
+    server = fake()
+    created = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    created.workspace_create("New Alignment", "/repo/og")
+    assert server.requests[0]["params"]["focus"] is False
+    created.close()
+
+
+def test_workspace_close_sends_only_the_workspace_id(fake):
+    # `close_group` is herdr's "take the whole group with it" and is not sent:
+    # these are the bridge's own workspaces, not a group the operator shares.
+    server = fake()
+    closed = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    assert closed.workspace_close("w7") is None
+    assert server.requests[0] == {"id": "req_1", "method": "workspace.close",
+                                  "params": {"workspace_id": "w7"}}
+    closed.close()
+
+
+def test_workspace_close_propagates_not_found(fake):
+    # The bridge depends on the CODE, not just on the exception: a `not_found`
+    # from a close means the outcome it wanted has already happened, and it is
+    # recorded as success rather than as a failed removal.
+    def refuse(request, send):
+        send({"id": request["id"],
+              "error": {"code": "not_found", "message": "workspace not found"}})
+        return True
+
+    server = fake(refuse)
+    closed = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    with pytest.raises(herdr.HerdrError) as caught:
+        closed.workspace_close("w7")
+    assert caught.value.code == "not_found"
+    closed.close()
 
 
 def test_tab_create(fake):
@@ -1316,7 +1396,8 @@ def test_the_conformance_guard_covers_every_requesting_wrapper(fake):
     """The inventory itself, so the guard cannot silently shrink to nothing."""
     names = {name for name, _ in _client_wrappers()}
     assert names == {
-        "ping", "workspace_list", "tab_create", "tab_close", "pane_run",
+        "ping", "workspace_list", "workspace_create", "workspace_close",
+        "tab_create", "tab_close", "pane_run",
         "pane_close", "pane_rename", "pane_read", "report_agent",
         "release_agent", "report_metadata", "agent_list", "agent_get",
         "events_subscribe",
@@ -1346,6 +1427,27 @@ def test_every_frame_the_client_can_send_matches_herdrs_schema(fake, api_schema)
             offenders[name] = "\n".join("      - " + p for p in problems)
     assert not offenders, "client frames that disagree with herdr's schema:\n" + "\n".join(
         "    {0}:\n{1}".format(name, detail) for name, detail in offenders.items())
+
+
+def test_the_conformance_guard_covers_the_workspace_wrappers(fake, api_schema):
+    """Named rather than implied: the space-per-root model lives on these two.
+
+    `workspace.create` is the call that opens a space together with its first
+    tab, and `workspace.close` is what `--cleanup` and a root's removal use. Both
+    are validated by the systemic guard above because it enumerates wrappers by
+    introspection — so this test exists to make that a checked claim rather than
+    an assumption: if either wrapper stopped being reachable, or started sending
+    a key herdr does not have, the guard's own report would name it, but only
+    someone reading the report would ever know to look.
+    """
+    frames = _captured_frames(fake)
+    for name, method in (("workspace_create", "workspace.create"),
+                         ("workspace_close", "workspace.close")):
+        frame, refusal = frames[name]
+        assert frame["method"] == method
+        assert refusal is None, "{0}: the fake refused it too — {1}".format(
+            name, refusal)
+        assert _frame_violations(api_schema, frame) == []
 
 
 def test_the_conformance_guard_accepts_the_schema_itself(fake, api_schema):

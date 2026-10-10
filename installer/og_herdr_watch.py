@@ -30,18 +30,21 @@ API facts this encodes, verified against a running server:
   There is no `session_id`, no `kind` and no `workspace` in a listing row.
 * A listing row is NOT the whole session. `GET /v1/sessions/{id}` — the DETAIL
   endpoint, one request per session — carries `workspace` (the directory the
-  session actually lives in), plus `kind`, `git_branch`, `sub_agent_name`,
-  `runner_online` and the full `pending_elicitations` LIST where the listing has
-  only its count. The listing being silent about a directory is not evidence
-  that the API has none: it is why every pane once opened wherever the bridge
-  happened to be started. So the watcher fetches the detail row ONCE per
-  session, on the `added` path, and merges the directory into the session
-  object it emits — see `_workspace_for` for what a sub-agent resolves to, and
-  why that answer is close but deliberately not exact. The same fetch is what
-  decides whether the session is worth projecting at all: `runner_online` lives
-  on the detail row only, and `attach` refuses a session with no live runner —
-  see `runner_is_offline`, which is why that rule is applied next to the fetch
-  rather than inside `should_project`.
+  session actually lives in), plus `kind`, `harness`, `git_branch`,
+  `sub_agent_name`, `runner_online` and the full `pending_elicitations` LIST
+  where the listing has only its count. The listing being silent about a
+  directory is not evidence that the API has none: it is why every pane once
+  opened wherever the bridge happened to be started. So the watcher fetches the
+  detail row ONCE per session, on the `added` path, and merges the directory
+  and the session's identity (`kind`, `harness`, `sub_agent_name`) into the
+  session object it emits — see `_workspace_for` for what a sub-agent resolves
+  to, and why that answer is close but deliberately not exact; see DETAIL_FIELDS
+  for why these three come from the detail row rather than from the listing
+  row's `agent_name`, which reads a different name entirely. The same fetch is
+  what decides whether the session is worth projecting at all: `runner_online`
+  lives on the detail row only, and `attach` refuses a session with no live
+  runner — see `runner_is_offline`, which is why that rule is applied next to
+  the fetch rather than inside `should_project`.
 * There is no server-side status filter: `status=`, `statuses=` and `state=`
   are all ignored and the server returns the same rows regardless. Any
   narrowing has to happen on this side — see `should_project`.
@@ -106,11 +109,32 @@ MAX_POLL_BACKOFF = 30.0
 
 # Ceiling on the parent-workspace cache (see _parent_workspace_for). The map
 # exists to collapse a FAN-OUT — four workers under one root must not fetch that
-# root four times — so its natural size is one entry per distinct root, which
-# is small. It is capped anyway: the process is meant to run for days, roots
-# come and go, and an unbounded second map beside `_seen` is a slow leak that
-# only shows up as memory nobody can account for. Evicting costs one re-fetch.
+# root four times — so its natural size is one entry per distinct root, which is
+# small. It is capped anyway: the process is meant to run for days, roots come
+# and go, and an unbounded second map beside `_seen` is a slow leak that only
+# shows up as memory nobody can account for. Evicting costs one re-fetch.
 MAX_PARENT_WORKSPACES = 64
+
+# Fields merged out of the DETAIL row onto the session object the consumer
+# receives, alongside `workspace`. All three answer "which worker is this":
+# `kind` is the server's own classification (default / sub_agent), `harness`
+# names the CLI driving the agent, and `sub_agent_name` is the delegated
+# worker's own name.
+#
+# WHY the DETAIL row and not the listing row's `agent_name`, when the listing
+# row appears to carry a name for the same thing: two sources, two answers, and
+# they disagree. Measured on one live server for one sub-agent, the LISTING row
+# read `agent_name: "hivemind"` — the ROOT's agent, leaked into the child's row
+# — while `GET /v1/sessions/{id}` read `agent_name: "coder_zen"`, the child's
+# own. Every worker in a conversation would therefore have been labelled with
+# the conversation's orchestrator, which is the one name guaranteed to be wrong
+# for all of them. The detail row is the authoritative one, and it is already
+# being fetched for the directory, so taking these three costs no request.
+#
+# Each is merged only when it is a non-empty STRING, so a row that reported
+# `sub_agent_name: null` for a root leaves the key absent rather than teaching
+# the consumer that the root's name is null.
+DETAIL_FIELDS = ("kind", "harness", "sub_agent_name")
 
 # Ceilings for the SSE parser. A session event is kilobytes; a megabyte is
 # already several orders of magnitude past anything real. Past these the peer is
@@ -1061,6 +1085,13 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         `runner_is_offline` for the rule and for why an unreadable detail row
         projects rather than hides.
 
+        The same fetch carries the session's IDENTITY — `kind`, `harness` and
+        `sub_agent_name` — which the consumer above needs to lay a delegated
+        worker out beside its parent. Those are detail-only fields too, so this
+        is one request buying five answers, not a second round trip for a label.
+        See DETAIL_FIELDS for why these three and not the listing row's
+        `agent_name`.
+
         The directory key is OMITTED when there is no directory to report,
         rather than set to None or "": `session.get("workspace")` on an absent
         key and on an empty one must mean the same thing to the consumer, which
@@ -1073,6 +1104,11 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         workspace = self._workspace_for(session, detail)
         if workspace:
             enriched["workspace"] = workspace
+        if detail:
+            for key in DETAIL_FIELDS:
+                value = detail.get(key)
+                if isinstance(value, str) and value:
+                    enriched[key] = value
         return enriched, not runner_is_offline(detail)
 
     def watch(self):

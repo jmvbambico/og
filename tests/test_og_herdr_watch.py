@@ -1123,6 +1123,152 @@ def test_the_detail_is_fetched_once_per_session_not_once_per_poll():
     assert len(opener.listing_requests) == 3
 
 
+# --------------------------------------------------------------------------
+# the session's IDENTITY: which worker is this? The consumer lays a delegated
+# worker out beside its parent, and it can only do that with `kind`, `harness`
+# and `sub_agent_name` — all three of which the LISTING row does not carry.
+# They ride the SAME detail fetch as the directory: one request, more answers.
+# --------------------------------------------------------------------------
+
+# The two rows the task's measured data is taken from, verbatim in the fields
+# that matter. The disagreement between them is the whole reason DETAIL_FIELDS
+# reads the detail row: a sub-agent's listing row says `agent_name: "hivemind"`,
+# which is its ROOT's agent, while its detail row says `coder_zen`.
+LISTED_ROOT = {
+    "id": "e29bf406", "parent_session_id": None,
+    "agent_name": "hivemind", "agent_id": "a1", "status": "running",
+    "title": "Omnigent Herdr Integration Feasibility", "archived": False,
+    "pending_elicitations_count": 0,
+}
+LISTED_SUB = {
+    "id": "de7c4242", "parent_session_id": "e29bf406",
+    "agent_name": "hivemind", "agent_id": "a1", "status": "running",
+    "title": "coder_zen:space-per-session", "archived": False,
+    "pending_elicitations_count": 0,
+}
+DETAIL_ROOT = {
+    "id": "e29bf406", "kind": "default", "sub_agent_name": None,
+    "agent_name": "hivemind", "harness": "claude-native",
+    "parent_session_id": None, "workspace": "/Users/cryogenix/projects/og",
+    "runner_online": True,
+}
+DETAIL_SUB = {
+    "id": "de7c4242", "kind": "sub_agent", "sub_agent_name": "coder_zen",
+    "agent_name": "coder_zen", "harness": "opencode-native",
+    "parent_session_id": "e29bf406", "workspace": None, "runner_online": True,
+}
+
+
+def test_a_roots_identity_reaches_the_event():
+    opener = RoutingOpener([envelope([LISTED_ROOT])],
+                           details={"e29bf406": DETAIL_ROOT})
+    session = w.SessionWatcher(opener=opener).poll_once()[0].session
+
+    assert session["kind"] == "default"
+    assert session["harness"] == "claude-native"
+    assert "sub_agent_name" not in session, (
+        "a root's sub_agent_name is null and must stay ABSENT, not be merged "
+        "as a null the consumer would have to treat as a name"
+    )
+
+
+def test_a_sub_agents_identity_reaches_the_event():
+    opener = RoutingOpener([envelope([LISTED_SUB])],
+                           details={"de7c4242": DETAIL_SUB,
+                                    "e29bf406": DETAIL_ROOT})
+    session = w.SessionWatcher(opener=opener).poll_once()[0].session
+
+    assert session["kind"] == "sub_agent"
+    assert session["harness"] == "opencode-native"
+    assert session["sub_agent_name"] == "coder_zen"
+
+
+def test_the_listing_agents_name_is_never_the_one_merged():
+    # The trap this exists to avoid: a sub-agent's LISTING row reads
+    # `agent_name: "hivemind"` — the ROOT's agent. Merging it would label every
+    # worker in a conversation with the conversation's orchestrator, which is
+    # wrong for all of them at once and looks entirely plausible on screen.
+    opener = RoutingOpener([envelope([LISTED_SUB])],
+                           details={"de7c4242": DETAIL_SUB,
+                                    "e29bf406": DETAIL_ROOT})
+    session = w.SessionWatcher(opener=opener).poll_once()[0].session
+
+    assert session["agent_name"] == "hivemind", "the listing row is untouched"
+    assert session["harness"] == "opencode-native", "the detail row is the one"
+    assert "coder_zen" not in session.get("agent_name", "")
+
+
+def test_the_identity_rides_the_same_fetch_as_the_directory():
+    # One request, more answers. A second round trip per session, purely to ask
+    # which worker this is, would double the cost of every poll that discovers
+    # something — and the answer was in the object already being fetched, which
+    # is why it is merged here rather than requested next door.
+    opener = RoutingOpener(
+        [envelope([LISTED_ROOT]), envelope([LISTED_ROOT])],
+        details={"e29bf406": DETAIL_ROOT},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+    added = watcher.poll_once()[0].session
+    watcher.poll_once()
+
+    assert added["harness"] == "claude-native"
+    assert added["kind"] == "default"
+    assert added["workspace"] == "/Users/cryogenix/projects/og"
+    assert len(opener.detail_requests) == 1, (
+        [r.full_url for r in opener.detail_requests])
+
+
+def test_a_sub_agents_identity_and_directory_come_from_its_own_fetch():
+    opener = RoutingOpener(
+        [envelope([LISTED_SUB]), envelope([LISTED_SUB])],
+        details={"de7c4242": DETAIL_SUB, "e29bf406": DETAIL_ROOT},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+    added = watcher.poll_once()[0].session
+    watcher.poll_once()
+
+    assert added["sub_agent_name"] == "coder_zen"
+    # Its own detail has workspace=None; the parent's directory is what the
+    # watcher resolves, exactly as before this change.
+    assert added["workspace"] == "/Users/cryogenix/projects/og"
+    # Two sessions were asked (the worker, then its parent for the directory) and
+    # neither was asked twice — the identity added no traffic to either.
+    asked = [r.full_url.rsplit("/", 1)[-1] for r in opener.detail_requests]
+    assert sorted(asked) == ["de7c4242", "e29bf406"], asked
+
+
+def test_a_null_identity_field_is_left_out_rather_than_merged_as_none():
+    opener = RoutingOpener(
+        [envelope([LISTED_ROOT])],
+        details={"e29bf406": dict(DETAIL_ROOT, kind=None, harness="",
+                                   sub_agent_name=None)},
+    )
+    session = w.SessionWatcher(opener=opener).poll_once()[0].session
+
+    for key in w.DETAIL_FIELDS:
+        assert key not in session, (
+            "{0} should have been omitted, not merged as {1!r}".format(
+                key, session.get(key)))
+
+
+def test_a_failed_detail_fetch_still_omits_the_identity_fields():
+    # The identity is an enrichment, exactly like the directory: a detail
+    # endpoint that is down must cost the harness and the sub-agent name, not
+    # the session. The bridge falls back to the raw/default label.
+    for bad in (HTTPError("http://x/v1/sessions/s1", 500, "Server Error", {}, None),
+                OSError(28, "No space left on device"),
+                json.JSONDecodeError("Expecting value", "{", 0)):
+        opener = RoutingOpener([envelope([dict(LISTED_SUB)])],
+                               details={"de7c4242": bad,
+                                        "e29bf406": DETAIL_ROOT})
+        event = w.SessionWatcher(opener=opener).poll_once()[0]
+
+        assert event.kind == "added", bad
+        for key in w.DETAIL_FIELDS:
+            assert key not in event.session, (key, bad)
+        assert event.session["title"] == "coder_zen:space-per-session"
+
+
 def test_a_changed_event_does_not_refetch_the_detail():
     # The other half of "once per session": a `changed` event is a session the
     # watcher already knows, so it must not cost a request either.
