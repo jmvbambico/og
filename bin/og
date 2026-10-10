@@ -1356,11 +1356,26 @@ mux_homepage() {
     END { exit(found ? 0 : 1) }'
 }
 
-# A mux launch asked for a TERMINAL interface, so do not let the server steal
-# focus with a browser. omnigent's server opens `_bootstrap_result.open_url` at
-# boot when OMNIGENT_ACCOUNTS_AUTO_OPEN is truthy — default TRUE
-# (omnigent/server/app.py:1674-1682). The OMNIGENT_ACCOUNTS_BASE_URL mitigation
-# the server-start comment names does not cover this path.
+# A mux launch asked for a TERMINAL interface, so og must not steal focus with
+# a browser. The openers, and where each is actually shut:
+#
+#   1. omnigent's server opens `_bootstrap_result.open_url` at boot when
+#      OMNIGENT_ACCOUNTS_AUTO_OPEN is truthy — default TRUE
+#      (omnigent/server/app.py:1674-1682). suppress_server_autopen below sets it
+#      0, but that is a GUARD, NOT WORKING CODE TODAY: the open is additionally
+#      gated on a LOOPBACK OMNIGENT_ACCOUNTS_BASE_URL (accounts_bootstrap.py,
+#      _is_loopback_base_url) and og always points that at the LAN/tunnel
+#      address, so the server never fires it for og (docs/TROUBLESHOOTING.md).
+#      Kept only so a future change that points the base URL at loopback cannot
+#      silently reintroduce a browser.
+#   2. `og chat` -> `omnigent run` opens the live conversation in the browser for
+#      an interactive launch (cli.py: auto_open_conversation defaults to
+#      `prompt is None`). This is the open that actually fired, and it is shut
+#      at the PANE, not here: the launcher passes BROWSER=true in herdr's pane
+#      env (og_herdr_launch.pane_env_for). An export from this shell would never
+#      reach it — the pane runs `og chat` in a fresh shell.
+#   3. og's OWN opener: the needs_setup create-admin path in cmd_start. That one
+#      asks og_browser_suppressed below.
 #
 # Scoped to the mux path: a plain `og start` auto-opening the UI on a first run
 # is existing behaviour nobody asked to change. An explicit setting from the
@@ -1370,8 +1385,21 @@ mux_homepage() {
 # parse_start_args exists.
 suppress_accounts_autopen() {
   [[ -n "${1:-}" ]] || return 0
+  export OG_SUPPRESS_BROWSER=1
+  suppress_server_autopen
+}
+
+# Opener 1. A GUARD for a path that does not fire for og today (see above), kept
+# cheap; an explicit OMNIGENT_ACCOUNTS_AUTO_OPEN wins.
+suppress_server_autopen() {
   [[ -z "${OMNIGENT_ACCOUNTS_AUTO_OPEN+x}" ]] || return 0
   export OMNIGENT_ACCOUNTS_AUTO_OPEN=0
+}
+
+# Whether og may auto-open a browser for this run. A mux launch sets this and
+# the one opener og owns itself (opener 3, the needs_setup path) asks it.
+og_browser_suppressed() {
+  [[ "${OG_SUPPRESS_BROWSER:-}" == "1" ]]
 }
 
 cmd_start() {
@@ -1674,8 +1702,15 @@ cmd_start() {
     # itself reads from (the credential store, not the browser's cookie session).
     if [[ -t 0 ]] && needs_setup; then
       echo
-      info "no account yet — opening $OG_PUBLIC_URL to create one"
-      open_in_browser "$OG_PUBLIC_URL"
+      if og_browser_suppressed; then
+        # A mux launch is a terminal interface, so print the URL instead of
+        # stealing focus with a browser (see suppress_accounts_autopen). The
+        # credential prompt below still runs here.
+        info "no account yet — open $OG_PUBLIC_URL in a browser to create one"
+      else
+        info "no account yet — opening $OG_PUBLIC_URL to create one"
+        open_in_browser "$OG_PUBLIC_URL"
+      fi
       echo "    Choose a username + password in the browser, then enter the same here:"
       prompt_and_store_credentials
       expires_in="$(mint_token)" \

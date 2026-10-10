@@ -27,6 +27,7 @@ from og_herdr_launch import (  # noqa: E402
     is_inside,
     launch,
     live_session,
+    pane_env_for,
 )
 from og_herdr_watch import SessionEvent  # noqa: E402
 
@@ -62,7 +63,7 @@ class FakeClient:
     """
 
     def __init__(self, workspaces=(), create=None, split=None, panes=None,
-                 pings_before_up=0):
+                 pings_before_up=0, state_path=None):
         self.calls = []
         self.socket_path = "/tmp/fake-herdr/herdr.sock"
         self.closed = False
@@ -75,6 +76,11 @@ class FakeClient:
         ]
         self._pings = pings_before_up
         self.split_params = None
+        # When set, every `pane.send_text` snapshots the pending records at the
+        # moment the line is sent. This is how the ORDERING defect is caught: a
+        # record written AFTER the send is absent from the snapshot.
+        self.state_path = state_path
+        self.pending_at_send = []
 
     # -- the recording seam -------------------------------------------------
 
@@ -105,16 +111,26 @@ class FakeClient:
     def workspace_list(self):
         return self.call("workspace.list")["workspaces"]
 
-    def workspace_create(self, label, cwd, focus=False):
-        return self.call("workspace.create",
-                         {"label": label, "cwd": cwd, "focus": focus})
+    def workspace_create(self, label, cwd, focus=False, env=None):
+        # Mirrors the real wrapper: the `env` key is present only when the
+        # caller asked for one, so an assertion can prove a launch that passes
+        # no pane environment sends no `env` at all.
+        params = {"label": label, "cwd": cwd, "focus": focus}
+        if env:
+            params["env"] = env
+        return self.call("workspace.create", params)
 
     def workspace_close(self, workspace_id):
         self.call("workspace.close", {"workspace_id": workspace_id})
 
     def pane_run(self, pane_id, command):
-        # The real wrapper appends the newline that submits the line; mirrored
-        # here so an assertion on the text sees what herdr receives.
+        # Snapshot the pending records BEFORE recording this send, so an
+        # assertion can prove the record was already on disk when the line
+        # went out. The real wrapper appends the newline that submits the line;
+        # mirrored here so an assertion on the text sees what herdr receives.
+        if self.state_path is not None:
+            self.pending_at_send.append(
+                dict(load_state(self.state_path).get("pending") or {}))
         self.call("pane.send_text", {"pane_id": pane_id,
                                      "text": command + "\n"})
 
@@ -167,7 +183,7 @@ def root_session(sid="s1", cwd=CWD, status="idle", **extra):
 
 
 def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
-             agents_pane=True, spawn=None, agent="hivemind"):
+             agents_pane=True, spawn=None, agent="hivemind", pane_env=None):
     environment = {"HOME": str(tmp_path)} if env is None else dict(env)
     if inside:
         environment.setdefault("HERDR_ENV", "1")
@@ -175,6 +191,7 @@ def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
     return Launch(client=client, watcher=watcher, cwd=CWD, server=SERVER,
                   agent=agent, agents_pane=agents_pane, env=environment,
                   state_path=tmp_path / "og-herdr.json",
+                  pane_env={} if pane_env is None else pane_env,
                   spawn=spawn if spawn is not None else (lambda: None),
                   log_path=tmp_path / "logs" / "herdr-server.log")
 
@@ -306,6 +323,51 @@ def test_case_a_writes_a_pending_record_the_bridge_can_read(tmp_path):
 
 def ctx_path(tmp_path):
     return tmp_path / "og-herdr.json"
+
+
+def test_case_a_writes_the_pending_record_before_it_types_chat(tmp_path):
+    """THE RACE THIS GUARDS: the bridge is already polling when the launcher
+    runs, and `og chat` mints the session the instant it is typed — so the
+    pending record must be on disk BEFORE that line goes out, or the poll can
+    see a root session with no record and open a second space.
+
+    This asserts the ORDER, not just that both happened: the snapshot is taken
+    at the instant the chat line is sent. A test that only checked the record
+    existed afterwards would pass on the broken tree (where it was written
+    last)."""
+    client = FakeClient(state_path=ctx_path(tmp_path))
+    launch(make_ctx(tmp_path, client, FakeWatcher()))
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert len(client.pending_at_send) == 2
+    # When `og chat` went out, the record was already there.
+    assert CWD in client.pending_at_send[0]
+
+
+def test_case_d_writes_the_pending_record_before_it_types_chat(tmp_path):
+    """(D) shares `_open_space`, so it shares the ordering fix."""
+    client = FakeClient(state_path=ctx_path(tmp_path))
+    launch(make_ctx(tmp_path, client, FakeWatcher(), inside=True))
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert CWD in client.pending_at_send[0]
+
+
+def test_a_chat_that_fails_to_start_leaves_no_pending_record(tmp_path):
+    """A failure AFTER the record is written must not leave a pending record
+    pointing at a space: the space is closed, no session will ever claim the
+    record, and the bridge only prunes records whose workspace is GONE (this one
+    is live), so the launcher has to drop it itself."""
+    class NoPane(FakeClient):
+        def pane_run(self, pane_id, command):
+            raise RuntimeError("pane is gone")
+
+    client = NoPane(state_path=ctx_path(tmp_path))
+    with pytest.raises(RuntimeError):
+        launch(make_ctx(tmp_path, client, FakeWatcher()))
+
+    assert load_state(ctx_path(tmp_path))["pending"] == {}
+    assert client.params_of("workspace.close") == [{"workspace_id": "w1"}]
 
 
 # ---------------------------------------------------------------------------
@@ -449,20 +511,72 @@ def test_agents_pane_off_means_no_split(tmp_path):
     assert client.text_typed() == ["og chat"]
 
 
-def test_the_split_gives_the_chat_80_percent(tmp_path):
-    """`pane.split`'s `ratio` is the share RETAINED by the pane being split
-    (measured: 0.8 left the original at 172 columns, the new pane at 43), so 0.8
-    is chat-left 80 / agents-right 20. Asserted as the EXACT params dict, so a
-    dropped or renamed key — which silently restores herdr's 50/50 — fails here.
+def test_the_split_leaves_the_agents_pane_room_for_its_footer(tmp_path):
+    """`pane.split`'s `ratio` is the share RETAINED by the pane being split, so
+    0.7 leaves the agents pane ~30% — enough for its ~52-column footer and the
+    27-column QR; at 0.8 the operator's 215-column terminal clipped the footer.
+    Asserted as the EXACT params dict, so a dropped or renamed key — which
+    silently restores herdr's 50/50 — fails here.
     """
     client = FakeClient()
     launch(make_ctx(tmp_path, client, FakeWatcher()))
 
+    assert AGENTS_PANE_RATIO == 0.7
     assert client.split_params == {
         "target_pane_id": "w1:p1", "direction": "right",
-        "focus": False, "cwd": CWD, "ratio": 0.8,
+        "focus": False, "cwd": CWD, "ratio": AGENTS_PANE_RATIO,
     }
-    assert AGENTS_PANE_RATIO == 0.8
+
+
+# ---------------------------------------------------------------------------
+# the pane environment — how a mux launch keeps the browser shut
+# ---------------------------------------------------------------------------
+# The chat pane runs `og chat` in a FRESH shell, so the only way to reach it is
+# herdr's per-create env map. pane_env_for builds the map; these pin that it is
+# threaded onto every pane a launch creates, that an operator's own $BROWSER is
+# respected, and that a launch with no map sends no `env` key at all.
+
+def test_a_mux_launch_passes_browser_true_into_every_pane_it_creates(tmp_path):
+    """Asserted as the EXACT env map, so a dropped or renamed `env` key fails
+    here instead of as a stray browser tab the operator sees — and the map is
+    the whole point, since an export from the launcher never reaches the pane."""
+    client = FakeClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher(),
+                    pane_env={"BROWSER": "true"}))
+
+    assert client.params_of("workspace.create")[0]["env"] == {"BROWSER": "true"}
+    assert client.split_params["env"] == {"BROWSER": "true"}
+
+
+def test_the_adopted_space_also_carries_the_pane_env(tmp_path):
+    """(B)/(C) create their space through `_adopt`, a different call site from
+    `_open_space` — it must pass the same map, or launching into an existing
+    session would still let its pane open a browser."""
+    client = FakeClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher([root_session()]),
+                    pane_env={"BROWSER": "true"}))
+
+    assert client.params_of("workspace.create")[0]["env"] == {"BROWSER": "true"}
+
+
+def test_an_operator_browser_setting_is_passed_through_not_overridden():
+    """Someone whose $BROWSER names a real browser has expressed a preference,
+    and og uses it rather than replacing it with `true` — the same rule the
+    accounts auto-open guard follows."""
+    assert pane_env_for({"BROWSER": "/usr/bin/firefox"}) == {
+        "BROWSER": "/usr/bin/firefox"}
+    assert pane_env_for({}) == {"BROWSER": "true"}
+
+
+def test_a_launch_with_no_pane_env_sends_no_browser(tmp_path):
+    """The behaviour change is SCOPED: a launch built with no pane environment
+    sends no `env` key at all, so nothing that is not a mux suppression is
+    touched."""
+    client = FakeClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher()))  # pane_env defaults {}
+
+    assert "env" not in client.params_of("workspace.create")[0]
+    assert "env" not in client.split_params
 
 
 def test_agents_pane_defaults_on_when_the_install_never_answered():

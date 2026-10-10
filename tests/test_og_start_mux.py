@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -406,3 +407,92 @@ def test_cmd_start_calls_the_helpers_it_is_meant_to():
     text = OG.read_text()
     assert re.search(r'^\s*suppress_accounts_autopen "\$mux"$', text, re.M)
     assert re.search(r'^\s*start_herdr_bridge$', text, re.M)
+
+
+# --------------------------------------------------------------------------
+# og's own openers, and the guarantee that none touches omnigent's config
+# --------------------------------------------------------------------------
+# Silencing the server is not enough (see suppress_accounts_autopen): the browser
+# the operator kept getting came from og's own openers. These pin that the mux
+# suppression (a) sets the flag og's own needs_setup path consults, and (b)
+# writes NOTHING to omnigent's config — the chat pane's browser is shut with
+# BROWSER in herdr's pane env instead (the launcher's pane_env_for), so omnigent
+# must not be invoked at all. The `omnigent` CLI is STUBBED so that an invocation
+# would be observed.
+
+def _stub_omnigent(tmp_path):
+    """A fake `omnigent` that records every invocation.
+
+    PATH is prepended with its dir so bin/og resolves THIS one. The calls file
+    is written only when something actually runs it, so its absence is proof
+    omnigent was never invoked.
+    """
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir(exist_ok=True)
+    calls = tmp_path / "omnigent-calls"
+    script = fakebin / "omnigent"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls))}\n"
+        "exit 0\n")
+    script.chmod(0o755)
+    return fakebin, calls
+
+
+def _path_with(fakebin):
+    return str(fakebin) + os.pathsep + os.environ.get("PATH", "")
+
+
+def test_suppress_accounts_autopen_sets_og_own_no_browser_flag(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    fakebin, _calls = _stub_omnigent(tmp_path)
+    body = "\n".join([
+        'suppress_accounts_autopen "herdr"',
+        'og_browser_suppressed && echo "browser=suppressed" || echo "browser=allowed"',
+    ])
+    result = _run_sourced(home, body, env={"PATH": _path_with(fakebin)})
+    assert result.returncode == 0, result.stderr
+    assert "browser=suppressed" in result.stdout
+
+
+def test_a_plain_start_leaves_og_own_browser_alone(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    fakebin, _calls = _stub_omnigent(tmp_path)
+    body = ('suppress_accounts_autopen ""\n'
+            'og_browser_suppressed && echo "browser=suppressed" '
+            '|| echo "browser=allowed"')
+    result = _run_sourced(home, body, env={"PATH": _path_with(fakebin)})
+    assert result.returncode == 0, result.stderr
+    assert "browser=allowed" in result.stdout
+
+
+def test_a_mux_launch_never_writes_global_omnigent_config(tmp_path):
+    """The browser is suppressed PER PANE now (BROWSER in herdr's pane env, see
+    og_herdr_launch.pane_env_for), not by mutating the operator's omnigent
+    config. An earlier fix ran `omnigent config set --global
+    auto_open_conversation=false`; that leaked one `og start herdr` into a
+    persistent, machine-wide change. This pins the behaviour (the suppression
+    invokes omnigent not at all) AND the spelling (so it cannot creep back)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    fakebin, calls = _stub_omnigent(tmp_path)
+    body = 'suppress_accounts_autopen "herdr"'
+    result = _run_sourced(home, body, env={"PATH": _path_with(fakebin)})
+    assert result.returncode == 0, result.stderr
+
+    # No invocation of omnigent at all — no config read, no config write.
+    assert not calls.exists(), calls.read_text()
+
+    text = OG.read_text()
+    assert "suppress_conversation_autopen" not in text
+    assert "config set --global auto_open_conversation" not in text
+
+
+def test_the_needs_setup_open_browser_is_gated_by_the_suppression():
+    """The one opener og owns itself (the create-admin path) must ask the flag
+    rather than call `open_in_browser` unconditionally."""
+    text = OG.read_text()
+    assert re.search(r'^\s*if og_browser_suppressed; then$', text, re.M)
+    assert re.search(r'^\s*open_in_browser "\$OG_PUBLIC_URL"$', text, re.M)

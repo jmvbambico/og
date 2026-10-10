@@ -25,6 +25,11 @@ no session id to record the space under, and the handshake is a `pending`
 record keyed by directory that og_herdr's bridge claims when a session appears
 there. (B) and (C) already have one, and adopt.
 
+The pending record is written BEFORE `og chat` is typed. The bridge is already
+running (bin/og starts it first) and polls every few seconds, so a record
+written AFTER the send can lose that race — the poll sees a root session with
+no record for its directory and opens a second space. See `_open_space`.
+
 Everything here is a view. `og start` works without a multiplexer at all, so a
 failure to open a space is reported and the og server is left running.
 
@@ -41,7 +46,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -67,11 +72,22 @@ DEFAULT_SERVER = "http://127.0.0.1:6767"
 CHAT_COMMAND = "og chat"
 AGENTS_COMMAND = "og agents"
 
-# The agents pane's share of the split — `pane.split`'s `ratio` is the fraction
-# RETAINED by the pane being split (measured: 0.8 left the original at 172
-# columns and the new pane at 43, so 0.8 is the 80/20 the operator asked for).
-# The chat is the session; the agents pane is a sidebar, hence 80/20 not 50/50.
-AGENTS_PANE_RATIO = 0.8
+# The agents pane's share of the split. `pane.split`'s `ratio` is the fraction
+# RETAINED by the pane being SPLIT (the chat), so the agents pane gets
+# 1 - ratio; it is the only geometry the API takes — there is no column count
+# to ask for, so a fraction has to be chosen rather than a floor computed. A
+# floor would need a trustworthy terminal width, and the launcher has none: the
+# split is relative and herdr owns the geometry, so the width that matters is
+# not the launcher's own.
+#
+# 0.7, not 0.8, because the agents pane must be able to show its OWN controls.
+# The `og agents` footer ("q quit  r refresh  ↑/↓ move  enter expand  a access")
+# is ~52 display columns — the widest fixed element the pane renders — and at
+# 0.8 on the operator's 215-column terminal the pane got ~43 and clipped it,
+# worse on a narrower terminal. 0.7 leaves ~30% (~64 columns there): the footer
+# fits with room to spare, and so does the 27-column QR. A pane that cannot
+# show its own controls is broken.
+AGENTS_PANE_RATIO = 0.7
 
 # Statuses that mean "this session is the one to come back to". `idle`
 # deliberately counts: a root reads idle for the whole time it waits for the
@@ -207,6 +223,9 @@ class Launch:
     agents_pane: bool
     env: dict
     state_path: Path
+    # Extra environment for every pane this launch creates, handed to herdr on
+    # the create call so it reaches the pane's shell. Empty means "send none".
+    pane_env: dict = field(default_factory=dict)
     spawn: Callable[[], Any] = None  # start the mux's own server, if it is down
     log_path: Optional[Path] = None
 
@@ -242,6 +261,30 @@ def is_inside(env: dict) -> bool:
     value that a caller may legitimately not have.
     """
     return env.get("HERDR_ENV") == "1"
+
+
+def pane_env_for(environ: dict) -> dict:
+    """The environment every pane this launch creates is started with.
+
+    A mux launch asked for a TERMINAL interface, so the panes must not steal
+    focus with a browser. The panes run `og chat`, which is `omnigent run`, and
+    an interactive `omnigent run` opens the live conversation in the browser by
+    default (cli.py: `auto_open_conversation` defaults to `prompt is None`).
+    `omnigent run` has no --no-open and no env var for it, but `webbrowser` —
+    what it calls — honours `$BROWSER`, and pointing that at `true(1)` makes
+    `webbrowser.open()` run `/usr/bin/true <url>`: it succeeds and opens
+    nothing. So the suppression is this one variable.
+
+    It has to travel to the PANE, not to this process: an export here reaches
+    only the launcher, and the pane runs `og chat` in a fresh shell. herdr takes
+    an env map on every pane-creating call and installs it in that shell, which
+    is why `ctx.pane_env` is threaded through the creates rather than exported.
+
+    An operator who already set `$BROWSER` has expressed a preference — a real
+    browser — so it is passed through untouched; only an unset `$BROWSER` is
+    defaulted. Same rule the accounts auto-open guard in bin/og follows.
+    """
+    return {"BROWSER": environ["BROWSER"] if "BROWSER" in environ else "true"}
 
 
 def _attach_there(ctx: Launch, session: dict) -> str:
@@ -295,9 +338,19 @@ def _open_space(ctx: Launch, attach: bool) -> str:
     exists: `og chat` below is what mints one, and og_herdr's bridge renames the
     space to the conversation title once it appears. That rename is the whole
     reason the pending record is written at all.
+
+    The pending record is written BEFORE `og chat` is typed, and that order is
+    the contract, not a detail. The bridge is already running (bin/og starts it
+    before exec'ing this) and polls every few seconds, while `og chat` mints the
+    session the instant it runs — so a record written after the send can lose
+    the race, and a poll that sees a root session with no record for its
+    directory opens a SECOND space (the duplicate-space bug this handshake
+    exists to prevent). Every id the record needs is in the workspace.create
+    reply, so there is nothing to wait for.
     """
     label = os.path.basename(ctx.cwd.rstrip(os.sep)) or ctx.cwd
-    created = ctx.client.workspace_create(label=label, cwd=ctx.cwd, focus=True)
+    created = ctx.client.workspace_create(label=label, cwd=ctx.cwd, focus=True,
+                                          env=ctx.pane_env)
     if not isinstance(created, dict):
         created = {}
     ws_id = _id_of(created.get("workspace"), "workspace_id")
@@ -309,12 +362,12 @@ def _open_space(ctx: Launch, attach: bool) -> str:
     # shell nobody is typing into, and it is NOT in the state file yet, so
     # `og herdr --cleanup` would not close it either. Closing it here is the only
     # thing that keeps the operator from finding stray empty spaces all week.
+    #
+    # This runs BEFORE the pending record below, so it cannot leave a record
+    # pointing at a workspace it just closed. (The one path that closes AFTER
+    # the record — a failed `pane_run` — drops the record itself; see below.)
     if ws_id and not (tab_id and pane_id):
-        try:
-            ctx.client.workspace_close(ws_id)
-        except Exception as exc:
-            warn("could not close the space {0} I just opened ({1}); close it "
-                 "by hand".format(ws_id, exc))
+        _close_quietly(ctx, ws_id)
         raise LaunchError(
             "workspace.create returned {0}; expected workspace, tab and "
             "root_pane".format(sorted(created) or "an empty result"))
@@ -323,18 +376,49 @@ def _open_space(ctx: Launch, attach: bool) -> str:
             "workspace.create returned no workspace id: {0!r}".format(created))
 
     ctx.client.call("tab.rename", {"tab_id": tab_id, "label": ctx.agent})
-    ctx.client.pane_run(pane_id, CHAT_COMMAND)
-    if ctx.agents_pane:
-        _split_agents(ctx, ws_id, tab_id, pane_id)
     # A pending record, not a space record: the session this space is for does
     # not exist yet, so there is no id to key it by. og_herdr claims it by
-    # directory when the session appears.
+    # directory when the session appears — and it must be on disk BEFORE the
+    # chat is typed, or the bridge's poll can beat the write (see docstring).
+    #
+    # A record left behind by a failure AFTER this point is deliberate and
+    # self-healing: the bridge prunes a pending record whose workspace is not in
+    # workspace.list (og_herdr._prune_pending), so a space the operator closes
+    # takes its record with it. The `pane_run` path below does not rest on that
+    # — the space SURVIVES a failed send, and a live-but-empty space is exactly
+    # what the bridge will not prune — so it drops the record itself.
     _record(ctx, "pending", ctx.cwd, {
         "workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
         "owner": OWNER_LAUNCHER, "cwd": ctx.cwd,
     })
+    try:
+        ctx.client.pane_run(pane_id, CHAT_COMMAND)
+    except Exception:
+        # No session was minted, so nothing will ever claim this record; drop it
+        # and close the space it named (the create-missing-pane rule above:
+        # "no stray empty spaces").
+        _unrecord(ctx, "pending", ctx.cwd)
+        _close_quietly(ctx, ws_id)
+        raise
+    if ctx.agents_pane:
+        _split_agents(ctx, ws_id, tab_id, pane_id)
     info("opened space {0} for {1}".format(ws_id, ctx.cwd))
     return "attach" if attach else "done"
+
+
+def _close_quietly(ctx: Launch, ws_id: str) -> None:
+    """Close a space this launch opened but cannot use.
+
+    Best effort by design: the launch is already failing or degrading, and a
+    close that itself fails must not replace the real error. The id is still
+    reported, because closing it by hand is then the only other way it goes
+    away.
+    """
+    try:
+        ctx.client.workspace_close(ws_id)
+    except Exception as exc:
+        warn("could not close the space {0} I just opened ({1}); close it by "
+             "hand".format(ws_id, exc))
 
 
 def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
@@ -342,12 +426,17 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
 
     Best effort by design: the chat pane is the session, and losing the whole
     launch because a cosmetic second pane could not be found is the wrong trade.
+
+    `pane.split` makes a pane too, so it takes the same pane environment as the
+    space's own pane; the split runs `og agents`, which opens no browser, but a
+    pane og creates under a mux launch should carry the map regardless.
     """
+    params = {"target_pane_id": root_pane, "direction": "right",
+              "focus": False, "cwd": ctx.cwd, "ratio": AGENTS_PANE_RATIO}
+    if ctx.pane_env:
+        params["env"] = ctx.pane_env
     try:
-        reply = ctx.client.call("pane.split", {
-            "target_pane_id": root_pane, "direction": "right",
-            "focus": False, "cwd": ctx.cwd, "ratio": AGENTS_PANE_RATIO,
-        })
+        reply = ctx.client.call("pane.split", params)
     except Exception as exc:
         warn("could not open the og agents pane ({0}); the chat is up "
              "without it".format(exc))
@@ -457,7 +546,7 @@ def _adopt(ctx: Launch, session: dict) -> dict:
     label = session.get("title") or os.path.basename(ctx.cwd.rstrip(os.sep))
     cwd = session.get("workspace") or ctx.cwd
     created = ctx.client.workspace_create(label=str(label), cwd=str(cwd),
-                                         focus=True)
+                                         focus=True, env=ctx.pane_env)
     if not isinstance(created, dict):
         created = {}
     ws_id = _id_of(created.get("workspace"), "workspace_id")
@@ -501,6 +590,18 @@ def _record(ctx: Launch, bucket: str, key: str, record: dict) -> None:
     """
     state = load_state(ctx.state_path)
     state.setdefault(bucket, {})[key] = record
+    save_state(ctx.state_path, state)
+
+
+def _unrecord(ctx: Launch, bucket: str, key: str) -> None:
+    """Drop one record, re-reading first for the same reason `_record` does.
+
+    Used when a record names a space that turned out to be unusable — the chat
+    never started, so no session will ever claim it. Missing key is not an
+    error: the bridge may have claimed it already, which is also a fine outcome.
+    """
+    state = load_state(ctx.state_path)
+    state.setdefault(bucket, {}).pop(key, None)
     save_state(ctx.state_path, state)
 
 
@@ -607,6 +708,7 @@ def build_launch(args: argparse.Namespace) -> Launch:
                   server=args.server, agent=agent_name(config),
                   agents_pane=agents_pane_enabled(config), env=dict(os.environ),
                   state_path=default_state_path(),
+                  pane_env=pane_env_for(dict(os.environ)),
                   spawn=spawn_herdr_server(binary, log_path),
                   log_path=log_path)
 
