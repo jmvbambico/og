@@ -433,7 +433,7 @@ class AgentModel:
         force: bool = False,
     ) -> Frame:
         """One listing walk -> a `Frame`. The only method that touches the wire."""
-        rows, truncated = self.watcher._fetch_listing(kind="any")
+        rows, truncated = self.watcher.fetch_listing(kind="any")
 
         # Only archived sessions are dropped. `og_herdr_watch.should_project` is
         # NOT applied here on purpose: it drops an idle sub-agent, which is

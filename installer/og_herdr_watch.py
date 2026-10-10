@@ -698,13 +698,19 @@ class SessionWatcher:
             body = resp.read()
         return json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
 
-    def _fetch_listing(self, kind: str = "any") -> tuple[list, bool]:
-        """Walk the listing to its end -> (rows, truncated).
+    def fetch_listing(self, kind: str = "any") -> tuple[list, bool]:
+        """Walk the listing to its end -> (rows, truncated). PUBLIC.
 
-        `truncated` means the walk stopped with rows left unfetched — the page
-        cap ran out, the row cap cut the tail off, the envelope promised more
-        but gave no cursor to ask for, or the server handed back a cursor it had
-        already given. A complete listing is `truncated is False`.
+        Returns `(rows, truncated)`, and `truncated` means the walk stopped with
+        rows left unfetched. It is NOT the same as "there are no more rows": a
+        complete listing is `truncated is False`, and only that turns the absence
+        of a session into evidence it is gone. `list_sessions` drops the flag
+        because it wants only the rows; a caller that decides anything from an
+        absence (poll_once, og_agents) needs both halves and calls this.
+
+        `truncated` is set when the page cap ran out, the row cap cut the tail
+        off, the envelope promised more but gave no cursor to ask for, or the
+        server handed back a cursor it had already given.
 
         The caller cannot invent the difference from the rows themselves: the
         rows of a truncated listing are indistinguishable from the rows of a
@@ -766,10 +772,10 @@ class SessionWatcher:
         stays bounded in requests and memory whatever the server holds. The cap
         drops the OLDEST rows, which are the ones this most needs — hence the
         order-of-magnitude headroom rather than a tight bound. Those rows also
-        stop being evidence of deletion: `_fetch_listing` reports when the walk
+        stop being evidence of deletion: `fetch_listing` reports when the walk
         stopped short, and poll_once acts on it.
         """
-        rows, _truncated = self._fetch_listing(kind)
+        rows, _truncated = self.fetch_listing(kind)
         return rows
 
     def poll_once(self) -> list:
@@ -834,7 +840,7 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         the very last statement, so a failure leaves the previously observed
         state untouched rather than half-updated.
         """
-        rows, truncated = self._fetch_listing(kind="any")
+        rows, truncated = self.fetch_listing(kind="any")
 
         # Every id that came back in this poll, whether or not it qualifies,
         # because "did not qualify" and "was never asked" are different facts

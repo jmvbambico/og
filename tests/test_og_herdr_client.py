@@ -150,6 +150,10 @@ RESULTS = {
                                        "cwd": "/Users/cryogenix/projects/og",
                                        "agent_status": "unknown", "revision": 0}},
     "workspace.close": {"closed": True},
+    # `workspace.rename` requires both params and answers with the
+    # `workspace_renamed` result; the wrapper ignores the body, but the fake
+    # must answer a real method rather than refuse it.
+    "workspace.rename": {"type": "workspace_renamed"},
     # The real tab.create reply, measured against a live herdr 0.9.1 server.
     # Note there is no generic `id` key: the tab is `tab.tab_id` and the root
     # pane is `root_pane.pane_id`, and root_pane carries its `tab_id` too.
@@ -739,6 +743,23 @@ def test_workspace_close_propagates_not_found(fake):
         closed.workspace_close("w7")
     assert caught.value.code == "not_found"
     closed.close()
+
+
+def test_workspace_rename_sends_both_required_params(fake):
+    """`WorkspaceRenameParams` requires both `workspace_id` and `label`.
+
+    The exact frame is pinned here — not merely "a call happened" — because the
+    launcher handoff rides on it: a dropped or misspelled key is dropped by
+    serde, so the space would keep its directory label and the rename would look
+    like it worked.
+    """
+    server = fake()
+    renamed = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    assert renamed.workspace_rename("wB", "Fix the bridge") is None
+    assert server.requests[0] == {
+        "id": "req_1", "method": "workspace.rename",
+        "params": {"workspace_id": "wB", "label": "Fix the bridge"}}
+    renamed.close()
 
 
 def test_tab_create(fake):
@@ -1397,6 +1418,7 @@ def test_the_conformance_guard_covers_every_requesting_wrapper(fake):
     names = {name for name, _ in _client_wrappers()}
     assert names == {
         "ping", "workspace_list", "workspace_create", "workspace_close",
+        "workspace_rename",
         "tab_create", "tab_close", "pane_run",
         "pane_close", "pane_rename", "pane_read", "report_agent",
         "release_agent", "report_metadata", "agent_list", "agent_get",
@@ -1433,16 +1455,19 @@ def test_the_conformance_guard_covers_the_workspace_wrappers(fake, api_schema):
     """Named rather than implied: the space-per-root model lives on these two.
 
     `workspace.create` is the call that opens a space together with its first
-    tab, and `workspace.close` is what `--cleanup` and a root's removal use. Both
-    are validated by the systemic guard above because it enumerates wrappers by
-    introspection — so this test exists to make that a checked claim rather than
-    an assumption: if either wrapper stopped being reachable, or started sending
-    a key herdr does not have, the guard's own report would name it, but only
-    someone reading the report would ever know to look.
+    tab, and `workspace.close` is what `--cleanup` and a root's removal use.
+    `workspace.rename` is the launcher handoff — a directory-labelled space
+    given the conversation's title. All three are validated by the systemic
+    guard above because it enumerates wrappers by introspection — so this test
+    exists to make that a checked claim rather than an assumption: if any
+    wrapper stopped being reachable, or started sending a key herdr does not
+    have, the guard's own report would name it, but only someone reading the
+    report would ever know to look.
     """
     frames = _captured_frames(fake)
     for name, method in (("workspace_create", "workspace.create"),
-                         ("workspace_close", "workspace.close")):
+                         ("workspace_close", "workspace.close"),
+                         ("workspace_rename", "workspace.rename")):
         frame, refusal = frames[name]
         assert frame["method"] == method
         assert refusal is None, "{0}: the fake refused it too — {1}".format(
