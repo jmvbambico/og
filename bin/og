@@ -114,14 +114,32 @@ info() { printf '\033[0;36m→\033[0m %s\n' "$*"; }
 ok() { printf '\033[0;32m✓\033[0m %s\n' "$*"; }
 
 # Render the public URL as a scannable QR block. Optional by design: a missing
-# qrencode must never fail a start, so this degrades to printing nothing and
-# the URL line below it still carries the address.
+# qrencode must never fail a start, and neither may a code too wide to fit — in
+# both cases this degrades to printing nothing, and the URL line below it still
+# carries the address.
 #   -m 1  one-module quiet zone; the default 4 makes it too tall for a terminal
 #   -s 1  smallest module size
 #   ANSIUTF8 packs two rows per line with half-blocks, so a v3 QR fits ~13 rows
 print_qr() {
   local url="$1"
   command -v qrencode >/dev/null 2>&1 || return 0
+  # Skip a code the pane cannot hold: wrapped to the next line, a QR is
+  # unreadable noise. The width is measured from the ASCII render because it is
+  # two SINGLE-BYTE characters per module, so bytes/2 is the column count under
+  # any locale — the ANSIUTF8 blocks are three bytes each under LC_ALL=C and
+  # would read three times too wide. The codes a human scans here measure 27-31
+  # columns (a LAN address, an ngrok/tunnl host). `tput cols` with an 80-column
+  # fallback when terminfo is absent (a pipe, cron, TERM unset).
+  local cols; cols="$(tput cols 2>/dev/null || true)"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols="${COLUMNS:-80}"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  local half
+  half="$(qrencode -t ASCII -m 1 -s 1 "$url" 2>/dev/null \
+          | awk '{ if (length > m) m = length } END { print m+0 }')"
+  [[ "$half" =~ ^[0-9]+$ ]] || half=0
+  if (( half > 0 )) && (( half / 2 > cols )); then
+    return 0
+  fi
   echo
   qrencode -t ANSIUTF8 -m 1 -s 1 "$url" 2>/dev/null || return 0
 }
@@ -701,6 +719,37 @@ show_access() {
   else
     echo "    loopback: http://127.0.0.1:$PORT"
   fi
+}
+
+# Recover the address a human should scan or open RIGHT NOW, from a process that
+# did NOT start the server — today the chat pane of a multiplexer launch, where
+# `og start`'s terminal was replaced by `exec <mux>` and its banner never seen.
+# Prefers a live tunnel URL (tunnel_url validates the cache against its owner's
+# pid), else this machine's LAN address. On success it sets OG_PUBLIC_URL — the
+# exact variable show_access() already prints — and OG_MODE, so the banner shows
+# the right caveat, and returns 0. Returns 1 when neither resolves and touches
+# nothing, so a caller shows no banner rather than a wrong address. It cannot
+# print the URL and let the caller capture it: the mode would be set inside a
+# command-substitution subshell and lost.
+#
+# cmd_start deliberately does NOT call this: its branches ESTABLISH the address,
+# and each owes a failure this read-only recovery cannot give — the tunneled
+# branch scrapes the provider and dumps its log when that fails, the local
+# branch dies naming the missing LAN IP. It also must not prefer a tunnel in
+# local mode. So this is recovery-only, for a process that inherits a running
+# setup.
+access_url() {
+  local url; url="$(tunnel_url || true)"
+  if [[ -n "$url" ]]; then
+    OG_PUBLIC_URL="$url"; OG_MODE=tunneled
+    return 0
+  fi
+  local ip; ip="$(lan_ip || true)"
+  if [[ -n "$ip" ]]; then
+    OG_PUBLIC_URL="http://$ip:$PORT"; OG_MODE=local
+    return 0
+  fi
+  return 1
 }
 
 # --- session lifecycle -------------------------------------------------------
@@ -2219,6 +2268,21 @@ cmd_chat() {
   # Same scoping the host daemon gets (see export_worker_scoping).
   export_worker_scoping
   info "starting a $AGENT_NAME session on http://127.0.0.1:$PORT"
+  # A multiplexer launch REPLACES `og start`'s terminal with `exec <mux>`, so the
+  # access banner show_access prints there is never seen — this pane only ever
+  # ran `og chat`. Recover the address and print the SAME banner before the REPL
+  # takes over; it is expected to scroll above the session. Only on a tty, so
+  # `og chat | …` and captured output stay clean, exactly as `og url` gates its
+  # QR. When access_url finds no address it returns 1 and there is no banner.
+  if [[ -t 1 ]]; then
+    # show_access's once-only guard is not a hazard here: the top of this script
+    # inits OG_ACCESS_SHOWN to 0, and the exec below means the 1 show_access
+    # sets can never suppress a later print. access_url has set OG_PUBLIC_URL
+    # and OG_MODE for it to read.
+    if access_url; then
+      show_access
+    fi
+  fi
   exec omnigent run "$AGENT_DIR" --server "http://127.0.0.1:$PORT" "$@"
 }
 
