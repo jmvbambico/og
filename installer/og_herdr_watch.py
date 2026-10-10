@@ -22,12 +22,22 @@ API facts this encodes, verified against a running server:
   honours `limit`; the next page is `?after=<last_id>` and `has_more` says
   whether one exists. Reading a single page silently drops the oldest rows —
   which is where the root session, the conversation the user is driving, lives.
-* A row carries `id` (its identity here), `status`, `title`, `agent_name`,
-  `parent_session_id` (null on a root), `pending_elicitations_count` —
-  PLURAL, `archived`, plus `external_session_id`, `agent_id`, `labels`,
-  `owner`, `permission_level`, `runner_id`, `created_at`, `updated_at`,
-  `comments_count`, `viewer_unread`. There is no `session_id`, no `kind` and no
-  `workspace` in a row.
+* A LISTING row carries `id` (its identity here), `status`, `title`,
+  `agent_name`, `parent_session_id` (null on a root),
+  `pending_elicitations_count` — PLURAL, `archived`, plus
+  `external_session_id`, `agent_id`, `labels`, `owner`, `permission_level`,
+  `runner_id`, `created_at`, `updated_at`, `comments_count`, `viewer_unread`.
+  There is no `session_id`, no `kind` and no `workspace` in a listing row.
+* A listing row is NOT the whole session. `GET /v1/sessions/{id}` — the DETAIL
+  endpoint, one request per session — carries `workspace` (the directory the
+  session actually lives in), plus `kind`, `git_branch`, `sub_agent_name` and
+  the full `pending_elicitations` LIST where the listing has only its count.
+  The listing being silent about a directory is not evidence that the API has
+  none: it is why every pane once opened wherever the bridge happened to be
+  started. So the watcher fetches the detail row ONCE per session, on the
+  `added` path, and merges the directory into the session object it emits —
+  see `_workspace_for` for what a sub-agent resolves to, and why that answer
+  is close but deliberately not exact.
 * There is no server-side status filter: `status=`, `statuses=` and `state=`
   are all ignored and the server returns the same rows regardless. Any
   narrowing has to happen on this side — see `should_project`.
@@ -90,6 +100,14 @@ MAX_LISTED_SESSIONS = 1000
 # that events start flowing again promptly once it is back.
 MAX_POLL_BACKOFF = 30.0
 
+# Ceiling on the parent-workspace cache (see _parent_workspace_for). The map
+# exists to collapse a FAN-OUT — four workers under one root must not fetch that
+# root four times — so its natural size is one entry per distinct root, which
+# is small. It is capped anyway: the process is meant to run for days, roots
+# come and go, and an unbounded second map beside `_seen` is a slow leak that
+# only shows up as memory nobody can account for. Evicting costs one re-fetch.
+MAX_PARENT_WORKSPACES = 64
+
 # Ceilings for the SSE parser. A session event is kilobytes; a megabyte is
 # already several orders of magnitude past anything real. Past these the peer is
 # either broken or hostile, and in a process meant to run for days the only
@@ -133,6 +151,38 @@ def _scrub(text: str) -> str:
     it is printed.
     """
     return _URL_USERINFO.sub("***@", text)
+
+
+def _say(line: str) -> bool:
+    """Write one diagnostic line to stderr; return whether it landed.
+
+    A watcher is a background process: its stderr is a pipe to whatever the
+    user launched it into, and it can be gone (broken pipe, closed descriptor,
+    full disk on a redirect). Every diagnostic this module prints goes through
+    here for that reason, and the reason is not tidiness: an unguarded
+    `sys.stderr.write` inside an error handler replaces the failure being
+    reported with the reporting, so a full disk plus one refused connection
+    would kill the daemon — arriving through the very branch whose whole job
+    is to make sure a transient failure cannot do that. OSError covers broken
+    pipe and ENOSPC, ValueError covers writing to a closed file; together they
+    are the whole failure surface of a one-line best-effort write, which is why
+    this is not a bare except.
+
+    The return value is what `_announce_listing` needs: it records its state as
+    announced only on a write that actually landed, so a transient failure is
+    retried instead of losing the notice for good.
+
+    Accepted wart: if write() succeeded and flush() then raised, the text can
+    still reach the stream later and the retry prints a second copy. A
+    duplicated line is strictly better than a lost one, and that is the tradeoff
+    to make deliberately rather than discover.
+    """
+    try:
+        sys.stderr.write(line)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _server_key(url: str) -> str:
@@ -512,6 +562,11 @@ class SessionWatcher:
         # Whether the last listing was truncated, so the notice written about
         # it is written once per transition rather than once per poll.
         self._listing_truncated = False
+        # parent session id -> the directory that parent reported, for the
+        # parent lookups a sub-agent needs. Bounded (MAX_PARENT_WORKSPACES);
+        # see _parent_workspace_for for why it exists and why it is not a
+        # second _seen.
+        self._parent_workspace: dict[str, str] = {}
 
     # -- auth ---------------------------------------------------------------
 
@@ -712,7 +767,12 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         events = []
         for sid, session in fresh.items():
             if sid not in self._seen:
-                events.append(SessionEvent("added", sid, dict(session), {}))
+                # Enriched HERE, on the first sighting only. A poll must stay
+                # one listing walk plus a handful of detail fetches, so the
+                # directory is resolved when the session is added and never
+                # looked up again for a session already in `_seen` — which is
+                # what "changed" events below are: same session, no new fetch.
+                events.append(SessionEvent("added", sid, self._enrich(session), {}))
             elif self._material_change(self._seen[sid], session):
                 events.append(SessionEvent("changed", sid, dict(session),
                                            dict(self._seen[sid])))
@@ -756,8 +816,19 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         truncated state, and coming back out of it.
 
         The state is recorded as announced only if the write actually landed —
-        see the except clause, which is the whole reason this method exists in
-        its present shape.
+        see `_say`, and the return value below, which is the whole reason this
+        method exists in its present shape.
+
+        A failure is swallowed AND the state is deliberately left unrecorded,
+        which is the part that matters. Recording it first (or moving the
+        assignment after the write without checking) loses the notice for good
+        on the first failure: every later poll sees no transition, returns
+        early, and the watcher then runs with removals suppressed and nothing
+        anywhere saying so. Leaving it unrecorded means a transient failure is
+        simply retried on the next poll and the notice still lands; a
+        permanently broken stderr means every poll tries, every try fails, and
+        so nothing is written, nothing is raised and nothing is recorded — no
+        spam, no poll-failure retry loop, cost one failed syscall per poll.
         """
         if truncated == self._listing_truncated:
             return
@@ -772,40 +843,134 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
                 f"og herdr watch: session listing complete again ({rows} rows); "
                 "removals resume\n"
             )
-        try:
-            sys.stderr.write(line)
-            sys.stderr.flush()
-        except (OSError, ValueError):
-            # stderr is a pipe to whatever the user launched us into, and it can
-            # be gone (broken pipe, closed descriptor, full disk on a redirect).
-            # OSError covers broken pipe and ENOSPC, ValueError covers writing
-            # to a closed file — the whole failure surface of a two-line
-            # best-effort write, which is why this is not a bare except.
-            #
-            # The failure is swallowed AND the state is deliberately left
-            # unrecorded, which is the part that matters. Recording it first (or
-            # moving the assignment after the write without the try) loses the
-            # notice for good on the first failure: every later poll sees no
-            # transition, returns early, and the watcher then runs with removals
-            # suppressed and nothing anywhere saying so. Leaving it unrecorded
-            # means a transient failure is simply retried on the next poll and
-            # the notice still lands; a permanently broken stderr means every
-            # poll tries, every try fails, and so nothing is written, nothing
-            # is raised and nothing is recorded — no spam, no poll-failure retry
-            # loop, cost one failed syscall per poll.
-            #
-            # Accepted wart: if write() succeeded and flush() then raised, the
-            # text can still reach the stream later and the retry prints a second
-            # copy. A duplicated notice is strictly better than a lost one, and
-            # this is the tradeoff to make deliberately rather than discover.
-            return
-        self._listing_truncated = truncated
+        if _say(line):
+            self._listing_truncated = truncated
 
     @staticmethod
     def _material_change(previous: dict, current: dict) -> bool:
         if herdr_state(previous) != herdr_state(current):
             return True
         return any(previous.get(f) != current.get(f) for f in MATERIAL_FIELDS)
+
+    # -- the session's directory ---------------------------------------------
+    #
+    # Everything in this section exists because the LISTING row is not the whole
+    # session. The list endpoint carries no `workspace`, and reading it as if it
+    # did is what made every pane open wherever the daemon happened to start;
+    # `GET /v1/sessions/{id}` carries the field, along with `kind`,
+    # `git_branch`, `sub_agent_name` and the full `pending_elicitations` list.
+    #
+    # The fetch lives HERE, in the watcher, and not in the bridge above: this
+    # module owns every HTTP call, which is what keeps the two independently
+    # testable — and an enrichment call made from the bridge's `_added` would
+    # raise straight through `reconcile`, which only catches herdr's own
+    # HerdrError, and take the whole batch down with it.
+
+    def _fetch_detail(self, session_id: str) -> Optional[dict]:
+        """GET /v1/sessions/{id}, or None if it could not be read.
+
+        Returns None for every reason the fetch can fail — a 404, a 500, a
+        refused connection, a timeout, a body that is not JSON — because a
+        directory is an ENRICHMENT and never a reason to lose a session. The
+        caller falls back to whatever it would have used anyway, which is a
+        strictly better outcome than a poll that died because an optional
+        request happened to be unhealthy: a watcher that cannot survive a
+        failing detail fetch is a worse bridge than one that never asks.
+
+        The swallow is deliberately NOT `_BUG_EXCEPTIONS`. A bug in this module
+        must still stop the watcher rather than be mistaken for a flaky server,
+        and the cheapest way to keep both properties is to scope the catch to
+        the fetch alone — nothing of ours is inside these lines, so nothing of
+        ours can hide here.
+        """
+        url = f"{self.base_url}/v1/sessions/{urllib.parse.quote(session_id)}"
+        try:
+            detail = self._get_json(url)
+        except (OSError, ValueError):
+            # OSError covers URLError, HTTPError and socket.timeout; ValueError
+            # covers JSONDecodeError and UnicodeDecodeError. That is the whole
+            # reachable failure surface of one GET.
+            return None
+        return detail if isinstance(detail, dict) else None
+
+    def _parent_workspace_for(self, parent_id: str) -> Optional[str]:
+        """The directory a parent session reported, cached by parent id.
+
+        A fan-out of four workers under one root would otherwise fetch that
+        root's detail four times, once per worker, to learn the same string.
+
+        Only a directory that was actually learned is cached. A parent whose
+        detail could not be read is re-asked on the next sub-agent rather than
+        remembered as "has no directory" — one extra request, and the answer
+        self-corrects as soon as the server is healthy again.
+
+        The map is capped at MAX_PARENT_WORKSPACES because its natural key is
+        the root set, which only holds while those roots are on screen, and
+        this process is meant to run for days. `_seen` already exists and
+        already holds one entry per live session; a second unbounded map beside
+        it is the kind of thing that only shows up as memory nobody can
+        account for.
+        """
+        cached = self._parent_workspace.get(parent_id)
+        if cached:
+            return cached
+        detail = self._fetch_detail(parent_id)
+        if not detail:
+            return None
+        workspace = detail.get("workspace")
+        if not isinstance(workspace, str) or not workspace:
+            return None
+        if len(self._parent_workspace) >= MAX_PARENT_WORKSPACES:
+            # Evict the oldest entry rather than refusing to cache: a stale
+            # cache costs one request, an uncached one costs it every time.
+            self._parent_workspace.pop(next(iter(self._parent_workspace)))
+        self._parent_workspace[parent_id] = workspace
+        return workspace
+
+    def _workspace_for(self, session: dict) -> Optional[str]:
+        """The directory this session belongs in, or None when nobody knows.
+
+        Resolution order:
+
+        1. the session's OWN detail row. A root is simply its own directory.
+        2. its PARENT's. A sub-agent's detail row carries `workspace: None` —
+           measured, not assumed — while the parent's is a real path, and a
+           worker of the og session belongs in the og tree. This is the best
+           answer the API can give, and it is NOT exact: a delegated worker
+           really runs in its own git worktree, which the API does not report
+           anywhere. Guessing the root beats opening the pane in whatever
+           directory the daemon happened to start in, by a wide margin — but it
+           is a considered approximation, so it is written down here rather than
+           left to look like a fact about the worker.
+        3. None. The consumer then uses its own default, which is the honest
+           outcome when neither row answered.
+        """
+        sid = _session_id(session)
+        if sid is not None:
+            detail = self._fetch_detail(sid)
+            if detail:
+                workspace = detail.get("workspace")
+                if isinstance(workspace, str) and workspace:
+                    return workspace
+        parent = session.get("parent_session_id")
+        if isinstance(parent, str) and parent:
+            return self._parent_workspace_for(parent)
+        return None
+
+    def _enrich(self, session: dict) -> dict:
+        """The session object to emit, with its directory merged in if known.
+
+        The key is OMITTED when there is no directory to report, rather than
+        set to None or "": `session.get("workspace")` on an absent key and on an
+        empty one must mean the same thing to the consumer, which is "ask me
+        for your default". The caller gets a fresh dict either way, so the
+        object in `_seen` stays exactly what the server listed.
+        """
+        enriched = dict(session)
+        workspace = self._workspace_for(session)
+        if workspace:
+            enriched["workspace"] = workspace
+        return enriched
 
     def watch(self):
         """Yield events forever, sleeping poll_interval between polls.
@@ -819,7 +984,9 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
 
         So a failed poll is reported on stderr and retried after a backoff that
         doubles up to MAX_POLL_BACKOFF and resets on the first success. Events
-        resume on their own when the server comes back.
+        resume on their own when the server comes back. Both reports go through
+        `_say`, so a stderr that refuses the line costs the message and nothing
+        else — the retry below still happens, and the raise above still happens.
 
         What is deliberately NOT retried is `_BUG_EXCEPTIONS` — see the tuple for
         why those four and only those four. They are re-raised immediately, not
@@ -846,24 +1013,27 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
                 # Raised, not logged and retried: see _BUG_EXCEPTIONS. The line
                 # is written first because "poll failed; retrying" would be a
                 # lie about why this stopped, and stopping quietly is worse.
-                try:
-                    sys.stderr.write(
-                        f"og herdr watch: poll raised {_scrub(repr(exc))}, which "
-                        "does not come from the transport; this looks like a bug "
-                        "in the watcher, so it is stopping rather than retrying\n"
-                    )
-                    sys.stderr.flush()
-                except (OSError, ValueError):
-                    # A broken stderr must not replace the bug it is reporting:
-                    # the TypeError leaving this generator is the useful thing.
-                    pass
+                # `_say` cannot raise even when this stderr is gone, so a broken
+                # stderr never replaces the bug it is reporting: the TypeError
+                # leaving this generator is the useful thing.
+                _say(
+                    f"og herdr watch: poll raised {_scrub(repr(exc))}, which "
+                    "does not come from the transport; this looks like a bug "
+                    "in the watcher, so it is stopping rather than retrying\n"
+                )
                 raise
             except Exception as exc:  # noqa: BLE001 — surviving this IS the job
-                sys.stderr.write(
+                # Same guard as the branch above, for the same reason: a stderr
+                # that will not take the line (a full disk under
+                # `og herdr > log 2>&1`, a closed pipe) must not turn an ordinary
+                # transport error into the daemon's death — arriving through the
+                # one path whose entire purpose is to prevent that. The retry
+                # happens either way; the line is a nicety, the backoff is the
+                # behaviour.
+                _say(
                     f"og herdr watch: poll failed ({_scrub(repr(exc))}); "
                     f"retrying in {backoff:g}s\n"
                 )
-                sys.stderr.flush()
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_POLL_BACKOFF)
                 continue

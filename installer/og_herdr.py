@@ -100,8 +100,9 @@ class Bridge:
         self.workspace = workspace
         self.dry_run = dry_run
         self.source = source
-        # The directory new panes open in. It comes from THIS process (see
-        # `_added`), so with no explicit --cwd it is the bridge's own cwd.
+        # The directory new panes open in when the session does not name one of
+        # its own (see `_added`). It comes from THIS process, so with no
+        # explicit --cwd it is the bridge's own cwd.
         self.cwd = os.getcwd() if cwd is None else cwd
         self._tabs: dict[str, dict] = {}
 
@@ -158,16 +159,25 @@ class Bridge:
             return [f"resume add {sid} → pane {rec['pane_id']} "
                     f"'omnigent attach {sid}' [{state}]"]
         title = session.get("title")
-        # The pane's directory comes from THIS process, never the session row:
-        # the HTTP session object carries no directory at all. Verified against
-        # a live server — its keys are agent_id, agent_name, archived,
-        # comments_count, created_at, external_session_id, id, labels, owner,
-        # parent_session_id, pending_elicitations_count, permission_level,
-        # runner_id, status, title, updated_at, viewer_unread, and there is no
-        # `workspace`. A lookup for that absent key always read None, so every
-        # pane silently opened in $HOME. `og herdr` is run from the repo whose
-        # sessions it projects, so the bridge's own cwd is the directory to use.
-        cwd = self.cwd
+        # The pane's directory is the SESSION's when the watcher supplied one,
+        # and this process's otherwise.
+        #
+        # The watcher fetches `GET /v1/sessions/{id}` once per newly seen
+        # session and merges the result in: the LISTING row has no `workspace`
+        # (measured against a live server — its keys are agent_id, agent_name,
+        # archived, comments_count, created_at, external_session_id, id,
+        # labels, owner, parent_session_id, pending_elicitations_count,
+        # permission_level, runner_id, status, title, updated_at, viewer_unread),
+        # while the detail row does. A sub-agent's own detail is None, so the
+        # watcher resolves it to its PARENT's directory, which is an
+        # approximation and the best the API offers — a delegated worker really
+        # runs in its own git worktree, which is reported nowhere.
+        #
+        # `--cwd` stays the fallback for every case where no directory is known:
+        # a detail fetch that failed, a parent whose own directory is unknown,
+        # or a session dict from any other source. `.get()` rather than `[""]`
+        # so an absent key falls through to the same place a `None` would.
+        cwd = session.get("workspace") or self.cwd
         label = "og:" + (title or sid[:8])
         state = _state(session)
         if self.dry_run:

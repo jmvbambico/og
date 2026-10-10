@@ -7,10 +7,12 @@ directly), so nothing here can touch the developer's live server on
 """
 from __future__ import annotations
 
+import inspect
 import io
 import json
+import urllib.parse
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -104,6 +106,60 @@ def urls(opener):
     return [r.full_url for r in opener.requests]
 
 
+class RoutingOpener:
+    """A stub that answers by URL instead of by call order.
+
+    The watcher fetches `GET /v1/sessions/{id}` once per newly seen session,
+    so a plain queue of bodies cannot express "the listing fails twice" — the
+    enrichment fetches would eat those bodies and the test would silently be
+    asserting about a different sequence than it thinks. Routing on the path
+    keeps the listing queue independent of the detail lookups, so a test can
+    say "the listing goes down for two polls" and mean it.
+
+    `listing` is a queue of bodies for `/v1/sessions` (the last one repeats);
+    `details` maps a session id to a body or to an exception to raise for that
+    id alone. An unmapped detail id raises AssertionError rather than falling
+    back to the listing body, so a lookup that was never expected fails loudly
+    instead of quietly looking like a session with no directory.
+    """
+
+    def __init__(self, listing, details=None):
+        self.listing = list(listing)
+        self.details = dict(details or {})
+        self.requests = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        path = urllib.parse.urlsplit(request.full_url).path
+        listing_path = "/v1/sessions"
+        if path == listing_path:
+            body = self.listing.pop(0) if len(self.listing) > 1 else self.listing[0]
+            if isinstance(body, BaseException):
+                raise body
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body).encode()
+            return FakeResponse(body)
+        assert path.startswith(listing_path + "/"), path
+        sid = urllib.parse.unquote(path[len(listing_path) + 1:])
+        assert sid in self.details, f"unexpected detail lookup for {sid!r}"
+        body = self.details[sid]
+        if isinstance(body, BaseException):
+            raise body
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        return FakeResponse(body)
+
+    @property
+    def listing_requests(self):
+        return [r for r in self.requests
+                if urllib.parse.urlsplit(r.full_url).path == "/v1/sessions"]
+
+    @property
+    def detail_requests(self):
+        return [r for r in self.requests
+                if urllib.parse.urlsplit(r.full_url).path != "/v1/sessions"]
+
+
 class RecordingStderr:
     """A stderr that keeps what it was handed, and can be told to fail.
 
@@ -135,6 +191,19 @@ class RecordingStderr:
     @property
     def text(self):
         return "".join(self.lines)
+
+
+class _Tee:
+    """A stderr that appends every line to a list."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def write(self, text):
+        self.sink.append(text)
+
+    def flush(self):
+        pass
 
 
 # One row exactly as it came off a live 0.17.0 server. Kept as text so it is
@@ -945,6 +1014,300 @@ def test_mutating_an_event_does_not_fabricate_the_next_changed_event():
 
 
 # --------------------------------------------------------------------------
+# the session's directory: the LISTING row has no `workspace`, the DETAIL row
+# does. Run against a live 0.17.0 server: every projected pane opened in
+# whatever directory the daemon happened to start in, because the bridge read
+# an absent key and used its own cwd.
+# --------------------------------------------------------------------------
+
+def detail(sid, workspace=None, parent=None, **extra):
+    """One `GET /v1/sessions/{id}` row, shaped like the real one.
+
+    The detail row is NOT the listing row: it carries `workspace`, plus
+    `kind`, `git_branch`, `sub_agent_name` and the full `pending_elicitations`
+    LIST where the listing has only its count. A sub-agent's workspace is
+    None on a live server — that is the fact the parent fallback exists for.
+    """
+    row = {
+        "id": sid,
+        "workspace": workspace,
+        "parent_session_id": parent,
+        "kind": "default" if parent is None else "sub_agent",
+        "sub_agent_name": None if parent is None else f"coder_{sid}",
+        "git_branch": None,
+        "pending_elicitations": [],
+        "status": "running",
+        "title": f"title-{sid}",
+    }
+    row.update(extra)
+    return row
+
+
+def test_a_roots_own_directory_reaches_the_event():
+    # The defect, stated in its smallest form: a root session's real workspace
+    # has to arrive on the event, or every pane opens in the daemon's cwd.
+    opener = RoutingOpener(
+        [envelope([session("s1")])],
+        details={"s1": detail("s1", workspace="/Users/cryogenix/projects/og")},
+    )
+    event = w.SessionWatcher(opener=opener).poll_once()[0]
+
+    assert event.kind == "added"
+    assert event.session["workspace"] == "/Users/cryogenix/projects/og"
+    assert event.session["id"] == "s1"
+
+
+def test_a_sub_agent_inherits_its_parents_directory():
+    # A sub-agent's OWN detail is None (measured). Its parent's is a real path,
+    # and a worker of the og session belongs in the og tree — which beats
+    # "wherever the daemon started" by a mile. It is an approximation: the
+    # worker's actual git worktree is not reported anywhere by the API.
+    opener = RoutingOpener(
+        [envelope([session("w1", status="running", parent="root")])],
+        details={
+            "w1": detail("w1", workspace=None, parent="root"),
+            "root": detail("root", workspace="/Users/cryogenix/projects/og"),
+        },
+    )
+    event = w.SessionWatcher(opener=opener).poll_once()[0]
+
+    assert event.session_id == "w1"
+    assert event.session["workspace"] == "/Users/cryogenix/projects/og"
+
+
+def test_a_sub_agent_with_no_directory_anywhere_emits_no_key():
+    # Neither the worker's own detail nor its parent's carried one. The key
+    # must be ABSENT, not None and not "": the bridge reads it with `.get()`
+    # and falls back on both, but an emitted null would be a claim that the
+    # directory is unknown-null rather than unknown — and it is exactly the
+    # difference the consumer's fallback exists to make.
+    opener = RoutingOpener(
+        [envelope([session("w1", status="running", parent="root")])],
+        details={
+            "w1": detail("w1", workspace=None, parent="root"),
+            "root": detail("root", workspace=None),
+        },
+    )
+    event = w.SessionWatcher(opener=opener).poll_once()[0]
+
+    # Both rows really were asked — otherwise this would pass on a module that
+    # never resolves a directory at all, which is the pre-fix state.
+    fetched = [r.full_url.rsplit("/", 1)[-1] for r in opener.detail_requests]
+    assert sorted(fetched) == ["root", "w1"], fetched
+    assert "workspace" not in event.session, event.session
+
+
+def test_the_detail_is_fetched_once_per_session_not_once_per_poll():
+    # A poll must stay one listing walk plus a few fetches. Re-reading every
+    # known session's detail each poll would turn a 3-second poll into a
+    # request storm proportional to the session count.
+    opener = RoutingOpener(
+        [envelope([session("s1")]), envelope([session("s1")]),
+         envelope([session("s1")])],
+        details={"s1": detail("s1", workspace="/repo/og")},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    first = watcher.poll_once()
+    assert first[0].session["workspace"] == "/repo/og"
+    assert watcher.poll_once() == []
+    assert watcher.poll_once() == []
+
+    assert len(opener.detail_requests) == 1, (
+        "the detail was re-read on a later poll; it is meant to be fetched "
+        "once, when the session is first seen"
+    )
+    assert len(opener.listing_requests) == 3
+
+
+def test_a_changed_event_does_not_refetch_the_detail():
+    # The other half of "once per session": a `changed` event is a session the
+    # watcher already knows, so it must not cost a request either.
+    opener = RoutingOpener(
+        [envelope([session("s1", status="running")]),
+         envelope([session("s1", status="idle")])],
+        details={"s1": detail("s1", workspace="/repo/og")},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    assert watcher.poll_once()[0].kind == "added"
+    changed = watcher.poll_once()[0]
+    assert changed.kind == "changed"
+    assert len(opener.detail_requests) == 1
+
+
+def test_a_fan_out_of_workers_fetches_the_parent_once():
+    # Four workers under one root must not fetch that root four times. This is
+    # the whole reason the parent cache exists.
+    rows = [session(f"w{i}", status="running", parent="root") for i in range(4)]
+    opener = RoutingOpener(
+        [envelope(rows)],
+        details={"root": detail("root", workspace="/repo/og"),
+                 **{f"w{i}": detail(f"w{i}", workspace=None, parent="root")
+                    for i in range(4)}},
+    )
+    events = w.SessionWatcher(opener=opener).poll_once()
+
+    assert [e.session["workspace"] for e in events] == ["/repo/og"] * 4
+    fetched = [r.full_url.rsplit("/", 1)[-1] for r in opener.detail_requests]
+    assert fetched.count("root") == 1, fetched
+
+
+def test_the_parent_cache_is_bounded():
+    # This process is meant to run for days. `_seen` already holds one entry per
+    # live session; a second unbounded map beside it is memory nobody can
+    # account for, so the parent cache evicts rather than growing.
+    cap = w.MAX_PARENT_WORKSPACES
+    roots = [f"root{i}" for i in range(cap + 5)]
+    details = {r: detail(r, workspace=f"/repo/{r}") for r in roots}
+    details.update({f"w{r}": detail(f"w{r}", workspace=None, parent=r)
+                    for r in roots})
+    rows = [session(f"w{r}", status="running", parent=r) for r in roots]
+    opener = RoutingOpener([envelope(rows)], details=details)
+
+    watcher = w.SessionWatcher(opener=opener)
+    watcher.poll_once()
+
+    assert len(watcher._parent_workspace) <= cap, (
+        "the parent cache grew past its ceiling"
+    )
+
+
+def test_a_detail_that_raises_still_emits_the_event():
+    # Enrichment is a nicety and must never cost a poll. A 404, a 500, a
+    # timeout or garbage JSON must cost the DIRECTORY and nothing else — the
+    # session is still reported, and the bridge still falls back to --cwd.
+    for bad in (HTTPError("http://x/v1/sessions/s1", 404, "Not Found", {}, None),
+                OSError(28, "No space left on device"),
+                json.JSONDecodeError("Expecting value", "{", 0)):
+        opener = RoutingOpener(
+            [envelope([session("s1")]), envelope([session("s1")])],
+            details={"s1": bad},
+        )
+        watcher = w.SessionWatcher(opener=opener)
+
+        event = watcher.poll_once()[0]
+        assert event.kind == "added", bad
+        assert len(opener.detail_requests) == 1, (
+            "the detail was never fetched, so this proves nothing about a "
+            "fetch that fails"
+        )
+        assert "workspace" not in event.session, (
+            "a failed detail fetch emitted a directory anyway"
+        )
+        assert event.session["id"] == "s1", "the session itself was lost"
+
+        # And the watcher is still a watcher afterwards.
+        assert watcher.poll_once() == []
+
+
+def test_a_detail_failure_is_retried_for_a_later_session_not_remembered():
+    # A parent whose detail failed must be re-asked on the next sub-agent, not
+    # remembered as "has no directory": caching a miss would make one transient
+    # 500 permanent for the rest of the process's life.
+    opener = RoutingOpener(
+        [envelope([session("w1", status="running", parent="root")]),
+         envelope([session("w1", status="running", parent="root"),
+                   session("w2", status="running", parent="root")])],
+        details={"w1": detail("w1", workspace=None, parent="root"),
+                 "w2": detail("w2", workspace=None, parent="root"),
+                 "root": OSError(503, "Service Unavailable")},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    assert "workspace" not in watcher.poll_once()[0].session
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("added", "w2")]
+    fetched = [r.full_url.rsplit("/", 1)[-1] for r in opener.detail_requests]
+    assert fetched.count("root") == 2, (
+        "a failed parent fetch was cached as an answer and never retried"
+    )
+
+
+def test_the_enrichment_does_not_swallow_a_bug():
+    # The swallow in _fetch_detail is scoped to the FETCH. A TypeError raised by
+    # a broken _get_json is a bug in this module, and poll_once must still let
+    # it out (watch() then stops on it) rather than have it read as a flaky
+    # server. Pre-fix this module never fetched, so the assertion is that the
+    # exception survives the enrichment path specifically: the listing below
+    # succeeds and only the DETAIL raises.
+    opener = RoutingOpener(
+        [envelope([session("s1")])],
+        details={"s1": TypeError("broken decoder")},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+    with pytest.raises(TypeError):
+        watcher.poll_once()
+
+
+def test_a_bug_inside_the_enrichment_still_stops_the_watcher(monkeypatch):
+    # The same guarantee from the other side: the catch is around the FETCH, so
+    # a mistake in the code that reads what it fetched is still a bug and not a
+    # server that would not answer. This is the line between "swallow the
+    # network" and "swallow everything", and it is the reason the except clause
+    # names (OSError, ValueError) rather than Exception.
+    monkeypatch.setattr(w.SessionWatcher, "_fetch_detail",
+                        lambda self, sid: (_ for _ in ()).throw(
+                            AttributeError("broken enrichment")))
+    watcher = w.SessionWatcher(opener=StubOpener(envelope([session("s1")])))
+    with pytest.raises(AttributeError):
+        watcher.poll_once()
+
+
+def test_the_retained_row_is_not_the_enriched_one():
+    # `_seen` holds what the server LISTED. The enrichment belongs to the event
+    # and to nothing else — otherwise the diff would be comparing an enriched
+    # object against a raw one, and a mutated event could rewrite what the
+    # watcher believes it saw.
+    opener = RoutingOpener(
+        [envelope([session("s1")]), envelope([session("s1", status="idle")])],
+        details={"s1": detail("s1", workspace="/repo/og")},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    added = watcher.poll_once()[0]
+    assert watcher._seen["s1"] == session("s1")
+    assert "workspace" not in watcher._seen["s1"]
+    assert added.session["workspace"] == "/repo/og"
+
+    changed = watcher.poll_once()[0]
+    assert changed.kind == "changed"
+    assert changed.previous == session("s1")
+    assert changed.session["status"] == "idle"
+
+
+def test_the_enrichment_does_not_make_a_workspace_change_material():
+    # A directory is not one of MATERIAL_FIELDS: a session whose workspace
+    # moved must not be reported as "changed", because a changed event does not
+    # move a pane — it only re-reports state and title.
+    opener = RoutingOpener(
+        [envelope([session("s1")]), envelope([session("s1")])],
+        details={"s1": detail("s1", workspace="/repo/og")},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+    first = watcher.poll_once()[0]
+    # The first poll really did carry a directory, so the second poll's silence
+    # is about the workspace changing rather than about there never being one.
+    assert first.session["workspace"] == "/repo/og"
+
+    opener.details["s1"] = detail("s1", workspace="/somewhere/else")
+    assert watcher.poll_once() == []
+
+
+def test_an_enriched_session_still_diffs_and_still_projects_correctly():
+    # The enrichment is a merge into a copy; it must not disturb the status
+    # logic, which reads a different half of the same object.
+    opener = RoutingOpener(
+        [envelope([session("s1", status="running",
+                           pending_elicitations_count=1)])],
+        details={"s1": detail("s1", workspace="/repo/og")},
+    )
+    event = w.SessionWatcher(opener=opener).poll_once()[0]
+    assert event.state == "blocked", "the elicitation count stopped counting"
+    assert event.session["workspace"] == "/repo/og"
+
+
+# --------------------------------------------------------------------------
 # SSE parsing
 # --------------------------------------------------------------------------
 
@@ -1274,11 +1637,12 @@ def drive_watch(monkeypatch, watcher, stop_after_sleeps):
 
 def test_watch_survives_a_failed_poll_and_keeps_yielding(monkeypatch, capsys):
     down = URLError(ConnectionRefusedError(111, "Connection refused"))
-    opener = StubOpener(
-        [session("s1")],   # poll 1: s1 live
-        down,              # poll 2: server restarting
-        down,              # poll 3: still down
-        [session("s1")],   # poll 4: back, unchanged
+    opener = RoutingOpener(
+        [envelope([session("s1")]),   # poll 1: s1 live
+         down,                       # poll 2: server restarting
+         down,                       # poll 3: still down
+         envelope([session("s1")])],  # poll 4: back, unchanged
+        details={"s1": {}},
     )
     watcher = w.SessionWatcher(poll_interval=0.5, token="super-secret",
                                opener=opener)
@@ -1291,9 +1655,12 @@ def test_watch_survives_a_failed_poll_and_keeps_yielding(monkeypatch, capsys):
     assert watcher._seen == {"s1": session("s1")}
 
     # It waited rather than spun, the wait grew while the server stayed down,
-    # and it went back to poll_interval once a poll succeeded.
+    # and it went back to poll_interval once a poll succeeded. Four LISTING
+    # requests for four polls — the per-session detail lookup does not turn a
+    # stable listing into per-poll traffic.
     assert sleeps == [0.5, 0.5, 1.0, 0.5]
-    assert len(opener.requests) == 4
+    assert len(opener.listing_requests) == 4
+    assert len(opener.detail_requests) == 1
 
     # The failure is visible to whoever is watching the daemon's stderr, and
     # the bearer token is not in it.
@@ -1306,10 +1673,11 @@ def test_watch_survives_a_failed_poll_and_keeps_yielding(monkeypatch, capsys):
 def test_watch_keeps_going_through_a_long_outage(monkeypatch):
     # Server gone for two polls, then a real change: the diff must be against
     # the last state actually seen, so only the status move is reported.
-    opener = StubOpener(
-        [session("s1", status="running")],
-        URLError("boom"), URLError("boom"),
-        [session("s1", status="idle")],
+    opener = RoutingOpener(
+        [envelope([session("s1", status="running")]),
+         URLError("boom"), URLError("boom"),
+         envelope([session("s1", status="idle")])],
+        details={"s1": {}},
     )
     watcher = w.SessionWatcher(poll_interval=0.5, opener=opener)
     events, sleeps = drive_watch(monkeypatch, watcher, stop_after_sleeps=4)
@@ -1318,6 +1686,11 @@ def test_watch_keeps_going_through_a_long_outage(monkeypatch):
         ("changed", "s1", "idle"),
     ]
     assert sleeps == [0.5, 0.5, 1.0, 0.5]
+    # The enrichment does not touch the outage path: no detail is fetched while
+    # the listing is down, and none on recovery either, because s1 has been in
+    # _seen since poll 1.
+    assert len(opener.detail_requests) == 1, [
+        r.full_url for r in opener.detail_requests]
 
 
 def test_watch_backoff_is_bounded(monkeypatch):
@@ -1530,3 +1903,87 @@ def test_watch_retries_an_exception_nobody_enumerated(monkeypatch, capsys):
     assert events == []
     assert sleeps == [0.5, 1.0, 2.0]
     assert "poll failed" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# a broken stderr in BOTH branches of watch(): the guard is one deliberate
+# pattern, not two accidents
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stderr_error", [
+    OSError(28, "No space left on device"),
+    ValueError("I/O operation on closed file"),
+], ids=["OSError", "ValueError"])
+def test_a_broken_stderr_does_not_kill_the_retry_branch(monkeypatch, stderr_error):
+    # The gap: the _BUG_EXCEPTIONS branch below guarded its stderr write and
+    # the broad `except Exception` branch above it did not. Broken stderr (a
+    # full disk under `og herdr > log 2>&1`) plus any ordinary transport error,
+    # and the OSError from the write escapes the handler, leaves watch() and
+    # kills the daemon — the silent death the broad catch exists to prevent,
+    # arriving through the one path we had not covered.
+    err = RecordingStderr(fail_times=10_000, error=stderr_error)
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(poll_interval=0.5,
+                               opener=StubOpener(URLError("down")))
+
+    # The transport error is STILL retried, with the same backoff as ever: the
+    # fix must not have bought survival by swallowing the retry.
+    events, sleeps = drive_watch(monkeypatch, watcher, stop_after_sleeps=3)
+
+    assert events == []
+    assert sleeps == [0.5, 1.0, 2.0], (
+        "a broken stderr changed the retry backoff, so the guard cost the "
+        "behaviour it was protecting"
+    )
+    assert err.attempts == 3, "the branch never tried to report the failure"
+
+
+def test_a_broken_stderr_does_not_kill_the_bug_branch(monkeypatch):
+    # The other half, now sharing one helper rather than duplicating a guard:
+    # the bug must still leave the generator, and the broken stderr must not
+    # replace it with an OSError that reads like a transport failure.
+    err = RecordingStderr(fail_times=10_000)
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(poll_interval=0.5, opener=StubOpener(TypeError("boom")))
+
+    with pytest.raises(TypeError):
+        list(watcher.watch())
+    assert err.attempts == 1
+
+
+def test_both_branches_report_through_the_one_guarded_writer():
+    # The two guards read as one pattern because they ARE one function. Pinned
+    # so that a third stderr write added later without the guard is visible here
+    # rather than in production, and so the helper cannot be deleted back into
+    # two hand-rolled try/excepts.
+    source = inspect.getsource(w.SessionWatcher.watch) + \
+        inspect.getsource(w.SessionWatcher._announce_listing)
+    assert source.count("sys.stderr") == 0, (
+        "watch()/_announce_listing wrote to stderr directly; every diagnostic "
+        "must go through _say so one guard covers all of them"
+    )
+
+
+def test_say_reports_whether_the_line_landed(monkeypatch):
+    # _announce_listing's correctness depends on this return value: it records
+    # its state as announced only on a write that landed.
+    err = RecordingStderr()
+    monkeypatch.setattr(w.sys, "stderr", err)
+    assert w._say("hello\n") is True
+    assert err.text == "hello\n"
+    assert err.flushes == 1
+
+    broken = RecordingStderr(fail_times=1)
+    monkeypatch.setattr(w.sys, "stderr", broken)
+    assert w._say("hello\n") is False
+    assert broken.text == ""
+
+
+def test_say_writes_the_line_it_was_handed(monkeypatch):
+    # _say stays a pure "write or give up": the URL-credential scrub is the
+    # caller's job (each formats its own line through _scrub), so a line that
+    # reaches _say has already been through it.
+    seen = []
+    monkeypatch.setattr(w.sys, "stderr", _Tee(seen))
+    assert w._say("already scrubbed\n") is True
+    assert seen == ["already scrubbed\n"]
