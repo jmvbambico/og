@@ -16,6 +16,7 @@
 #   og logs [-f]        tail the server log
 #   og audit [id]       what happened in the latest run: per-worker tools, stalls, reports
 #   og stats            per-agent quota/capacity: remaining, reset, tier, source
+#   og herdr [options]  project live omnigent sessions into herdr panes
 #   og update           pull the checkout and re-apply the install
 #   og version          print the installed version
 #
@@ -1690,6 +1691,22 @@ cmd_stats() {
   exec python3 "$repo/installer/og_stats.py" "$@"
 }
 
+# The herdr bridge ships on its own branch, so an install that predates it has
+# the checkout but not the script. A missing file must read as "reinstall", not
+# as python's cryptic "can't open file ... [Errno 2]" traceback — hence the
+# explicit check and exit 2 rather than letting exec fail.
+cmd_herdr() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_herdr.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  local bridge="$repo/installer/og_herdr.py"
+  [[ -f "$bridge" ]] || {
+    printf '\033[0;31merror:\033[0m og herdr is not installed (missing %s); re-run og setup\n' "$bridge" >&2
+    exit 2
+  }
+  exec python3 "$bridge" "$@"
+}
+
 cmd_stop() {
   local stopped=0
   if server_running; then
@@ -1984,10 +2001,11 @@ case "${1:-}" in
   logs)   shift; cmd_logs "$@" ;;
   audit)  shift; cmd_audit "$@" ;;
   stats)  shift; cmd_stats "$@" ;;
+  herdr)  shift; cmd_herdr "$@" ;;
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac
