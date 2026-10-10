@@ -4,8 +4,9 @@
 Omnigent runs coding agents and is normally driven from a browser; herdr is a
 terminal multiplexer for coding agents. This bridge watches the running Omnigent
 server for sessions coming and going and opens one herdr tab per session whose
-pane runs `omnigent attach <session_id>` — a thin co-drive client that streams
-that session's I/O, so the user can work from herdr instead of the browser.
+pane runs `omnigent attach --server <url> <session_id>` — a thin co-drive client
+that streams that session's I/O, so the user can work from herdr instead of the
+browser.
 
 The low-level work lives in two sibling modules, `og_herdr_client` (a herdr
 socket client) and `og_herdr_watch` (a session watcher). They are imported
@@ -17,11 +18,42 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
 DEFAULT_SERVER = "http://127.0.0.1:6767"
 DEFAULT_SOURCE = "og-bridge"
+
+
+def attach_command(server: str, session_id: str) -> str:
+    """The exact command a session's pane is given, built from parts.
+
+    `--server` is not optional decoration, it is the whole command. Measured in
+    a real pane, `omnigent attach <id>` answers
+
+        Error: No server to attach to. `attach` joins a LIVE session on a
+        running server — start one with `omnigent run`…
+
+    because `omnigent attach --help` says the server "defaults to the configured
+    server, or a local server already running in the background", and neither of
+    those defaults resolves from a plain shell in a herdr pane: there is no
+    configured server there and the discovery is a foreground operation. Naming
+    the server explicitly changes the answer to a *different* error — "has no
+    online runner on <url>" — which proves the server was found and leaves only
+    the runner question, which the watcher now answers before projecting
+    (og_herdr_watch.runner_is_offline). So every pane that was opened without it
+    was a pane that could only ever show "No server to attach to".
+
+    Each argument is quoted separately and the parts joined with spaces, rather
+    than one `shlex.quote` over the finished string: the quoting is what keeps a
+    server URL containing a space, a semicolon or a `$(…)` from breaking the
+    line — this string is TYPED INTO A SHELL, so a URL is operator input, not a
+    trusted constant — while the common case (a plain URL and a hex session id)
+    still comes out unquoted and readable in the pane and in the dry-run line.
+    """
+    return " ".join(shlex.quote(part) for part in
+                    ("omnigent", "attach", "--server", server, session_id))
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +126,7 @@ class Bridge:
     """
 
     def __init__(self, watcher, client, workspace=None, dry_run=False,
-                 source=DEFAULT_SOURCE, cwd=None):
+                 source=DEFAULT_SOURCE, cwd=None, server=DEFAULT_SERVER):
         self.watcher = watcher
         self.client = client
         self.workspace = workspace
@@ -104,6 +136,12 @@ class Bridge:
         # its own (see `_added`). It comes from THIS process, so with no
         # explicit --cwd it is the bridge's own cwd.
         self.cwd = os.getcwd() if cwd is None else cwd
+        # The Omnigent server those panes attach to. Held here rather than read
+        # from the watcher's base_url because the pane runs the CLI in a
+        # separate shell with no idea the watcher exists, and because the user
+        # said which server with `--server` — the same string the watcher is
+        # pointed at, and the one worth naming in the command.
+        self.server = server
         self._tabs: dict[str, dict] = {}
 
     # -- public surface -----------------------------------------------------
@@ -145,6 +183,7 @@ class Bridge:
         return []
 
     def _added(self, sid: str, session: dict) -> list:
+        command = attach_command(self.server, sid)
         rec = self._tabs.get(sid)
         if rec is not None:
             # One tab per session: a redelivered `added` either finds setup
@@ -157,7 +196,7 @@ class Bridge:
             state = _state(session)
             self._setup_pane(sid, rec, state)
             return [f"resume add {sid} → pane {rec['pane_id']} "
-                    f"'omnigent attach {sid}' [{state}]"]
+                    f"'{command}' [{state}]"]
         title = session.get("title")
         # The pane's directory is the SESSION's when the watcher supplied one,
         # and this process's otherwise.
@@ -183,8 +222,7 @@ class Bridge:
         if self.dry_run:
             self._tabs[sid] = {"tab_id": None, "pane_id": None, "title": title,
                                "step": 3, "ready": True}
-            return [f"dry-run: add {label} ({cwd}) → omnigent attach {sid} "
-                    f"[{state}]"]
+            return [f"dry-run: add {label} ({cwd}) → {command} [{state}]"]
         result = self.client.tab_create(self.workspace, cwd=cwd, label=label)
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
@@ -199,8 +237,7 @@ class Bridge:
                "step": 0, "ready": False}
         self._tabs[sid] = rec
         self._setup_pane(sid, rec, state)
-        return [f"add {sid} → tab {tab_id} pane {pane_id} "
-                f"'omnigent attach {sid}' [{state}]"]
+        return [f"add {sid} → tab {tab_id} pane {pane_id} '{command}' [{state}]"]
 
     def _setup_pane(self, sid: str, rec: dict, state: str) -> None:
         """Run the post-`tab_create` setup steps for a session's pane.
@@ -213,7 +250,7 @@ class Bridge:
         """
         pane_id = rec["pane_id"]
         if rec["step"] <= 0:
-            self.client.pane_run(pane_id, "omnigent attach " + sid)
+            self.client.pane_run(pane_id, attach_command(self.server, sid))
             rec["step"] = 1
         if rec["step"] <= 1:
             self.client.report_agent(pane_id, self.source, agent="omnigent",
@@ -378,7 +415,11 @@ def main(argv=None) -> int:
         client = HerdrClient(socket_path=args.socket)
 
     bridge = Bridge(watcher, client, workspace=args.workspace,
-                    dry_run=args.dry_run, source=args.source, cwd=args.cwd)
+                    dry_run=args.dry_run, source=args.source, cwd=args.cwd,
+                    # The same URL the watcher polls, and the one the pane's
+                    # `omnigent attach --server` has to name: the pane cannot
+                    # discover it (see attach_command).
+                    server=args.server)
 
     if args.once:
         for line in bridge.run_once():

@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import os
+import shlex
 from pathlib import Path
 
 import pytest
@@ -132,7 +133,8 @@ def test_added_sequence(seams):
     assert tc[1] == ("ws",)
     assert tc[2]["cwd"] == "/tmp/ws"
     assert tc[2]["label"] == "og:Fix bug"
-    assert _call(client, "pane_run")[1] == ("pane1", "omnigent attach s1")
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
     ra = _call(client, "report_agent")
     assert ra[1] == ("pane1", "og-bridge")
     assert ra[2] == {"agent": "omnigent", "state": "working"}
@@ -250,8 +252,8 @@ def test_the_dry_run_line_reports_the_session_directory(seams):
         "workspace": "/Users/cryogenix/projects/og"})])
 
     assert lines == ["dry-run: add og:Fix bug "
-                     "(/Users/cryogenix/projects/og) → omnigent attach s1 "
-                     "[working]"]
+                     "(/Users/cryogenix/projects/og) → omnigent attach "
+                     "--server http://127.0.0.1:6767 s1 [working]"]
 
 
 def test_the_bridge_makes_no_http_call_of_its_own():
@@ -265,6 +267,128 @@ def test_the_bridge_makes_no_http_call_of_its_own():
         "the bridge reached for the network directly; the session directory "
         "must arrive on the event, not be fetched here"
     )
+
+
+# ---------------------------------------------------------------------------
+# the pane's command: `omnigent attach --server <url> <session_id>`
+#
+# Measured in a real pane on a live server:
+#   $ omnigent attach cf3999846e1f45fe8c2e6f835a7e905a
+#   Error: No server to attach to. `attach` joins a LIVE session on a running
+#   server — start one with `omnigent run`…
+# `--help` says the server "defaults to the configured server, or a local server
+# already running in the background", and neither default resolves from a plain
+# shell inside a herdr pane. With the URL named, the same session answers a
+# DIFFERENT error ("has no online runner on http://127.0.0.1:6767"), which is
+# the server being found — and that second condition is the watcher's business
+# (og_herdr_watch.runner_is_offline). Every pane the bridge opened without
+# `--server` was a pane that could only ever show "No server to attach to".
+# ---------------------------------------------------------------------------
+
+ATTACH = "omnigent attach --server http://127.0.0.1:6767 s1"
+
+
+def test_the_pane_command_names_the_server_and_the_session(seams):
+    # The exact string, not a containment check: the command is TYPED INTO A
+    # SHELL, so a flag in the wrong place is not a cosmetic difference.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+
+    assert _call(client, "pane_run")[1] == ("pane1", ATTACH)
+
+
+def test_a_non_default_server_reaches_the_pane_command(seams):
+    # `--server` is the user's choice of server, and the pane runs in a shell
+    # with no way to learn it: a hardcoded default here would attach a remote
+    # user's session to their own loopback.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo",
+                      server="https://og.example:8443")
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server https://og.example:8443 s1")
+
+
+def test_the_bridge_defaults_to_the_documented_server_url(seams):
+    # The default is what the CLI documents and what the watcher polls, so a
+    # Bridge built without --server must not name some other server.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    assert _call(client, "pane_run")[1] == ("pane1", ATTACH)
+    assert m.DEFAULT_SERVER == "http://127.0.0.1:6767"
+
+
+def test_the_dry_run_line_shows_the_whole_command(seams):
+    # The dry run is worth exactly what this line is worth: it is how a command
+    # that cannot work is spotted before a pane runs it. Printing a shortened
+    # form here would make the dry run lie about the only thing it reports.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True, cwd="/daemon/cwd",
+                      server="https://og.example:8443")
+    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+
+    assert lines == ["dry-run: add og:T (/daemon/cwd) → omnigent attach "
+                     "--server https://og.example:8443 s1 [idle]"]
+    assert client.calls == []
+
+
+def test_a_server_url_with_shell_metacharacters_still_parses_as_one_command():
+    # The URL is operator input typed into a shell, not a trusted constant, so
+    # each part is quoted separately. The proof is not that quotes appear — it is
+    # that the line splits back into exactly the five arguments it was built
+    # from: a URL carrying a space, a separator or a command substitution can
+    # then neither break the line nor run anything.
+    nasty = "http://h:6767/a b;rm -rf /$(whoami)"
+    command = m.attach_command(nasty, "s1")
+
+    assert shlex.split(command) == [
+        "omnigent", "attach", "--server", nasty, "s1"]
+    # ...and the ordinary case stays unquoted, so the pane and the dry-run line
+    # read as the command rather than as an escaped one.
+    assert m.attach_command("http://127.0.0.1:6767", "s1") == ATTACH
+
+
+def test_main_threads_the_cli_server_into_the_bridge(monkeypatch, tmp_path):
+    # The wiring is the defect's other half: a --server that reached the watcher
+    # but not the Bridge would leave every pane on the default while the bridge
+    # correctly polled somewhere else.
+    import sys
+    import types
+
+    captured = {}
+
+    # main() reads the real token store; point it at an empty directory so this
+    # test never touches the developer's ~/.omnigent.
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+
+    class StubWatcher:
+        def __init__(self, base_url=None, token=None):
+            captured["base_url"] = base_url
+
+        def poll_once(self):
+            return []
+
+    # The sibling modules may legitimately be absent from the tree (they live on
+    # other branches), so main() is driven against stubs in sys.modules rather
+    # than against whatever happens to be importable here.
+    stub_module = types.ModuleType("og_herdr_watch")
+    stub_module.SessionWatcher = StubWatcher
+    monkeypatch.setitem(sys.modules, "og_herdr_watch", stub_module)
+
+    real_bridge = m.Bridge
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_bridge(FakeWatcher([]), None, dry_run=True)
+
+    monkeypatch.setattr(m, "Bridge", spy)
+
+    assert m.main(["--once", "--dry-run", "--server", "https://og.example:8443"]) == 0
+    assert captured["base_url"] == "https://og.example:8443"
+    assert captured["server"] == "https://og.example:8443"
 
 
 def test_changed_sequence_reports_state_and_title(seams):
@@ -368,7 +492,8 @@ def test_partial_setup_failure_retries_on_the_same_pane_without_a_second_tab(
     second = bridge.reconcile([Ev("added", "s1", session)])
     assert _names(client).count("tab_create") == 0
     assert _names(client) == ["pane_run", "report_agent", "report_metadata"]
-    assert _call(client, "pane_run")[1] == ("pane1", "omnigent attach s1")
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
     assert "resume add s1" in second[0]
     assert bridge._tabs["s1"]["ready"] is True
 

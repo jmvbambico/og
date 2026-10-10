@@ -30,14 +30,18 @@ API facts this encodes, verified against a running server:
   There is no `session_id`, no `kind` and no `workspace` in a listing row.
 * A listing row is NOT the whole session. `GET /v1/sessions/{id}` — the DETAIL
   endpoint, one request per session — carries `workspace` (the directory the
-  session actually lives in), plus `kind`, `git_branch`, `sub_agent_name` and
-  the full `pending_elicitations` LIST where the listing has only its count.
-  The listing being silent about a directory is not evidence that the API has
-  none: it is why every pane once opened wherever the bridge happened to be
-  started. So the watcher fetches the detail row ONCE per session, on the
-  `added` path, and merges the directory into the session object it emits —
-  see `_workspace_for` for what a sub-agent resolves to, and why that answer
-  is close but deliberately not exact.
+  session actually lives in), plus `kind`, `git_branch`, `sub_agent_name`,
+  `runner_online` and the full `pending_elicitations` LIST where the listing has
+  only its count. The listing being silent about a directory is not evidence
+  that the API has none: it is why every pane once opened wherever the bridge
+  happened to be started. So the watcher fetches the detail row ONCE per
+  session, on the `added` path, and merges the directory into the session
+  object it emits — see `_workspace_for` for what a sub-agent resolves to, and
+  why that answer is close but deliberately not exact. The same fetch is what
+  decides whether the session is worth projecting at all: `runner_online` lives
+  on the detail row only, and `attach` refuses a session with no live runner —
+  see `runner_is_offline`, which is why that rule is applied next to the fetch
+  rather than inside `should_project`.
 * There is no server-side status filter: `status=`, `statuses=` and `state=`
   are all ignored and the server returns the same rows regardless. Any
   narrowing has to happen on this side — see `should_project`.
@@ -276,6 +280,43 @@ def herdr_state(session: dict) -> str:
 LIVE_STATES = frozenset({"working", "blocked"})
 
 
+def runner_is_offline(detail: Any) -> bool:
+    """Whether a DETAIL row says this session has no live runner, so a pane for
+    it could only ever show an error.
+
+    `omnigent attach` joins a LIVE session on a running server and refuses
+    anything else — measured against a live server:
+
+        Error: Session cf399984… has no online runner on http://127.0.0.1:6767
+
+    Two of the seven sessions the bridge projected had an offline runner, and
+    each would have opened a tab whose entire content is that line: noise, and on
+    a machine with a long history of finished root sessions, most of them.
+
+    ONLY an explicit boolean false suppresses a projection. A missing key, a
+    null, a differently-typed value, or a detail row that never arrived (a 404, a
+    500, a refused connection — `_fetch_detail` reports every one of them as
+    None) all mean "unknown", and unknown projects. The asymmetry IS the
+    decision: projecting a session whose runner turns out to be dead costs the
+    user one tab showing an error, while hiding a session on a guess costs them a
+    session they never knew existed and cannot get back by waiting, because the
+    refusal would be invisible. An unreachable detail endpoint must not be able
+    to empty the user's workspace.
+
+    This is deliberately NOT folded into `should_project`: that function decides
+    from the LISTING row alone, and `runner_online` is not on a listing row —
+    measured keys are agent_id, agent_name, archived, comments_count, created_at,
+    external_session_id, id, labels, owner, parent_session_id,
+    pending_elicitations_count, permission_level, runner_id, status, title,
+    updated_at, viewer_unread. Deciding it there would cost a detail fetch per
+    listing row per poll — every row, every poll, for good — to learn one boolean
+    about the handful of sessions about to get a pane. So the rule is this one
+    predicate, applied by `_enrich` where the detail row is already in hand and
+    was fetched anyway.
+    """
+    return isinstance(detail, dict) and detail.get("runner_online") is False
+
+
 def should_project(session: dict) -> bool:
     """Whether a listed session is worth projecting to whatever sits above.
 
@@ -300,6 +341,12 @@ def should_project(session: dict) -> bool:
 
     Note there is no server-side filter to push this into — status=, statuses=
     and state= are all ignored by the API — so this has to be decided here.
+
+    What this decides from a LISTING row alone is deliberately everything it can:
+    `runner_online`, the other thing that makes a session unattachable, is not
+    on a listing row at all, so it is `runner_is_offline`, applied where the
+    detail row is already fetched. Two places holding halves of one rule would
+    read as two rules.
     """
     if not isinstance(session, dict):
         return False
@@ -711,6 +758,24 @@ class SessionWatcher:
         is handed the live set and nothing else; a sub-agent finishing reads as
         "removed" because that is what it is.
 
+        One more session is refused, and it is the one the LISTING row cannot
+        decide: a session whose detail row reports `runner_online: False` gets
+        no event at all, because `omnigent attach` refuses it and its pane could
+        show nothing but that error (see `runner_is_offline`). It is refused on
+        the `added` path only — where the detail row is fetched for its directory
+        anyway — and it is refused by NOT entering `fresh`, so it never reaches
+        `_seen` and therefore never produces a `removed` either. Which also
+        means no permanent negative: it is re-asked on every poll, and the moment
+        its runner is online the next poll projects it and it gets its pane.
+
+        An already-projected session whose runner later goes offline is NOT
+        retired. Re-checking it would cost a detail fetch per live session per
+        poll, and closing the pane of a root session that is merely between
+        turns — a root reads "idle" whenever it waits for the human, which is
+        most of its life — is the exact failure the root rule above exists to
+        prevent. A runner coming and going is the server's state to report; it is
+        not a reason to take away a pane the user is working in.
+
 A TRUNCATED listing cannot mean anything by an absence — but only for the
         rows it never fetched. Those are past the cap, and since the listing is
         newest-first they are the oldest sessions: the roots, the panes the user
@@ -762,20 +827,41 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
             if sid is not None:
                 fetched[sid] = (session, should_project(session))
 
-        fresh = {sid: row for sid, (row, qualifies) in fetched.items() if qualifies}
-
+        fresh: dict[str, dict] = {}
         events = []
-        for sid, session in fresh.items():
-            if sid not in self._seen:
-                # Enriched HERE, on the first sighting only. A poll must stay
-                # one listing walk plus a handful of detail fetches, so the
-                # directory is resolved when the session is added and never
-                # looked up again for a session already in `_seen` — which is
-                # what "changed" events below are: same session, no new fetch.
-                events.append(SessionEvent("added", sid, self._enrich(session), {}))
-            elif self._material_change(self._seen[sid], session):
-                events.append(SessionEvent("changed", sid, dict(session),
-                                           dict(self._seen[sid])))
+        for sid, (session, qualifies) in fetched.items():
+            if not qualifies:
+                continue
+            if sid in self._seen:
+                fresh[sid] = session
+                if self._material_change(self._seen[sid], session):
+                    events.append(SessionEvent("changed", sid, dict(session),
+                                               dict(self._seen[sid])))
+                continue
+            # Enriched HERE, on the first sighting only. A poll must stay one
+            # listing walk plus a handful of detail fetches, so the directory is
+            # resolved when the session is added and never looked up again for a
+            # session already in `_seen` — which is what "changed" events above
+            # are: same session, no new fetch.
+            enriched, projectable = self._enrich(session)
+            if not projectable:
+                # An offline runner: no pane is worth opening (see
+                # `runner_is_offline`). Deliberately NOT recorded in `fresh`, and
+                # therefore not in `_seen`, which buys both halves of what has to
+                # be true here:
+                #   - it is re-asked on every poll rather than remembered as
+                #     "unattachable", because a runner can come back online and
+                #     the session must then get its pane. The cost is one detail
+                #     fetch per such session per poll, bounded by how many there
+                #     are (measured: 2 of 7), and a permanent negative cache
+                #     would strand those sessions for the life of the process.
+                #   - it never produces a `removed`, because `removed` is
+                #     derived from `_seen` below and this session was never in
+                #     it. A phantom removal would close a pane that does not
+                #     exist and, on a later poll, look like a session re-added.
+                continue
+            fresh[sid] = session
+            events.append(SessionEvent("added", sid, enriched, {}))
 
         retired = []
         for sid, session in self._seen.items():
@@ -870,12 +956,17 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         """GET /v1/sessions/{id}, or None if it could not be read.
 
         Returns None for every reason the fetch can fail — a 404, a 500, a
-        refused connection, a timeout, a body that is not JSON — because a
-        directory is an ENRICHMENT and never a reason to lose a session. The
+        refused connection, a timeout, a body that is not JSON — because what it
+        carries is an ENRICHMENT and never a reason to lose a session. The
         caller falls back to whatever it would have used anyway, which is a
         strictly better outcome than a poll that died because an optional
         request happened to be unhealthy: a watcher that cannot survive a
         failing detail fetch is a worse bridge than one that never asks.
+
+        None now also feeds the runner rule, and there it is read as "unknown",
+        which projects — `runner_is_offline` spells out why the direction is
+        that way round. Both uses agree: the same fetch that cannot tell us the
+        directory must not be able to hide the session either.
 
         The swallow is deliberately NOT `_BUG_EXCEPTIONS`. A bug in this module
         must still stop the watcher rather than be mistaken for a flaky server,
@@ -927,8 +1018,14 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         self._parent_workspace[parent_id] = workspace
         return workspace
 
-    def _workspace_for(self, session: dict) -> Optional[str]:
+    def _workspace_for(self, session: dict,
+                      detail: Optional[dict]) -> Optional[str]:
         """The directory this session belongs in, or None when nobody knows.
+
+        `detail` is the session's OWN detail row, already fetched by `_enrich`;
+        it is passed in rather than fetched here so the one request this poll
+        spends on a session buys both the directory and the runner answer, and so
+        a caller cannot accidentally spend a second.
 
         Resolution order:
 
@@ -945,32 +1042,38 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         3. None. The consumer then uses its own default, which is the honest
            outcome when neither row answered.
         """
-        sid = _session_id(session)
-        if sid is not None:
-            detail = self._fetch_detail(sid)
-            if detail:
-                workspace = detail.get("workspace")
-                if isinstance(workspace, str) and workspace:
-                    return workspace
+        if detail:
+            workspace = detail.get("workspace")
+            if isinstance(workspace, str) and workspace:
+                return workspace
         parent = session.get("parent_session_id")
         if isinstance(parent, str) and parent:
             return self._parent_workspace_for(parent)
         return None
 
-    def _enrich(self, session: dict) -> dict:
-        """The session object to emit, with its directory merged in if known.
+    def _enrich(self, session: dict) -> tuple[dict, bool]:
+        """The session object to emit, and whether it is attachable at all.
 
-        The key is OMITTED when there is no directory to report, rather than
-        set to None or "": `session.get("workspace")` on an absent key and on an
-        empty one must mean the same thing to the consumer, which is "ask me
-        for your default". The caller gets a fresh dict either way, so the
-        object in `_seen` stays exactly what the server listed.
+        Returns `(enriched, projectable)`. Both answers come from ONE detail
+        fetch, which is why this is the place the runner rule lives: the
+        directory and `runner_online` are both detail-only fields, so a session
+        is fully decided here, on the one request already being made. See
+        `runner_is_offline` for the rule and for why an unreadable detail row
+        projects rather than hides.
+
+        The directory key is OMITTED when there is no directory to report,
+        rather than set to None or "": `session.get("workspace")` on an absent
+        key and on an empty one must mean the same thing to the consumer, which
+        is "ask me for your default". The caller gets a fresh dict either way,
+        so the object in `_seen` stays exactly what the server listed.
         """
+        sid = _session_id(session)
+        detail = self._fetch_detail(sid) if sid is not None else None
         enriched = dict(session)
-        workspace = self._workspace_for(session)
+        workspace = self._workspace_for(session, detail)
         if workspace:
             enriched["workspace"] = workspace
-        return enriched
+        return enriched, not runner_is_offline(detail)
 
     def watch(self):
         """Yield events forever, sleeping poll_interval between polls.
