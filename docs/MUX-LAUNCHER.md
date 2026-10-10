@@ -444,11 +444,22 @@ up instead of implying they are interchangeable.
 
 ## 10. Open decisions
 
-| # | Decision | Default if unanswered |
+All three are now **resolved**; the sections above describe the resolution.
+
+| # | Decision | Resolved as |
 |---|---|---|
-| 1 | Deferred write in case (A) — pending-by-cwd record and its staleness rule (§3) | bridge adopts by directory; pending entries expire |
-| 2 | `og agents` scope: current tree or everything (§6) | current tree, `--all` for the rest |
-| 3 | Non-zero exit when a required mux is missing (§1) | warn and proceed; add `--require-mux` only if it bites |
+| 1 | Deferred write in case (A) (§3) | Launcher writes a `pending` record keyed by cwd. The bridge claims it when a session appears in that directory. **Staleness is by existence, not by clock**: a pending record whose `workspace_id` is no longer in `workspace.list` is pruned on the next poll. Deterministic, self-cleaning, nothing to tune. |
+| 2 | `og agents` scope (§6) | Scope by cwd, the same rule the launcher uses: a session whose `workspace` is `$PWD` → that tree; otherwise all live roots. `--all` forces the wide view. This also means the TUI needs no session id passed in, which matters because at split-pane time there is not one yet. |
+| 3 | Missing multiplexer (§1) | Warn and proceed. `--require-mux` only if a script ever needs the distinction. |
+
+### Why decision 1 could not go the other way
+
+`og chat` is `exec omnigent run "$AGENT_DIR" --server …` — the session is minted
+by `omnigent run` inside the pane, so the id does not exist when the launcher
+needs it, and the launcher ends in `exec herdr` so it cannot wait around to
+learn it. Creating the session over the API instead would mean duplicating what
+`omnigent run` does for worker scoping and environment, which is a far worse
+trade than a pending record.
 
 ## 11. Explicitly out of scope
 
