@@ -26,10 +26,10 @@ three separate trials, one connection each:
 
 So this client connects, sends, reads and closes for every request. Reusing a
 connection made every *second* call fail on a peer that had already hung up —
-for a four-call session (tab.create, pane.run, report_agent, report_metadata)
-that is alternating failure on every event. ``events.subscribe`` is the one
-exception: there the subscription genuinely *is* the connection, so it keeps
-its socket open for as long as the stream runs.
+for a four-call session (tab.create, pane.send_text, report_agent,
+report_metadata) that is alternating failure on every event.
+``events.subscribe`` is the one exception: there the subscription genuinely *is*
+the connection, so it keeps its socket open for as long as the stream runs.
 
 A reply echoes the request's id — unless herdr could not read the request
 -----------------------------------------------------------------------------
@@ -60,6 +60,26 @@ of mistaken for a result. See :meth:`HerdrClient._await_reply` and
 Everything here is stdlib (json + socket) and every socket error — refused,
 timed out, closed mid-reply, malformed frame — is funnelled into
 :class:`HerdrError`, so callers have exactly one exception type to catch.
+
+The wire contract is checked against herdr's own schema, not against a comment
+--------------------------------------------------------------------------------
+Method names and param keys below are not invented. They come from
+``herdr api schema --json``, which is vendored at
+``tests/fixtures/herdr_api_schema.json`` (protocol 22, schema_version 1) and
+asserted by ``test_og_herdr_client.py``: every frame this client can emit is
+captured against a recording fake and validated — method must be a real
+request variant, every param key must exist in that variant's params schema,
+and every required param must be one the client actually sends.
+
+That guard exists because four defects shipped with the client's own idea of the
+contract unchecked, and a fake that answers whatever it is asked made all four
+invisible: ``pane.run`` (a CLI subcommand, not a method), ``tab.create``'s
+``workspace`` (silently dropped; the key is ``workspace_id``), ``pane.read``'s
+payload (the text is at ``result["read"]["text"]``), and
+``events.subscribe``'s ``types`` (the key is ``subscriptions``). A wrong method
+name or a misspelled param is the cheapest possible mistake to catch and the
+most expensive one to discover at run time, so the check is a test rather than a
+prose promise.
 """
 from __future__ import annotations
 
@@ -81,6 +101,12 @@ SESSION_SOCKET_NAME = "herdr.sock"
 # unknown-state dot, so a typo here would fail *visually* and silently rather
 # than loudly — reject it client-side instead.
 AGENT_STATES = ("idle", "working", "blocked", "unknown")
+
+# The sources `pane.read` accepts, from the schema's ReadSource enum. Note the
+# UNDERSCORE in `recent_unwrapped`; the CLI spells it `recent-unwrapped`, and
+# that spelling is exactly what serde rejects here — hence validating against
+# this tuple rather than passing whatever a CLI user typed through.
+READ_SOURCES = ("visible", "recent", "recent_unwrapped", "detection")
 
 
 class HerdrError(Exception):
@@ -365,10 +391,25 @@ class HerdrClient:
         """The `workspaces` array of workspace.list."""
         return self._field(self.call("workspace.list"), "workspaces", "workspace.list")
 
-    def tab_create(self, workspace: str, cwd: str, label: str, focus: bool = False) -> dict:
-        """Create a tab; returns the whole result — it carries `tab` and `root_pane`."""
+    def tab_create(self, workspace_id: str, cwd: str, label: str,
+                   focus: bool = False) -> dict:
+        """Create a tab; returns the whole result — it carries `tab` and `root_pane`.
+
+        The wire key is `workspace_id`, and it is spelled the same way on the
+        parameter as on the wire so a caller cannot reintroduce the bug this
+        client shipped with: it used to send `{"workspace": …}`, which serde
+        discards as an unknown field rather than rejecting, so `workspace_id`
+        defaulted to null and **every tab landed in the focused workspace**. A
+        `--workspace` that appears to isolate a run but does not is worse than
+        no flag at all — it was the basis for telling an operator their tabs
+        would stay out of their live session.
+
+        Measured after the fix: `{"workspace_id": "w4", …}` puts the tab in w4.
+        A null workspace_id is legal (`string|null`) and means the focused
+        workspace, which is what omitting it means too.
+        """
         return self.call("tab.create", {
-            "workspace": workspace, "cwd": cwd, "label": label, "focus": focus,
+            "workspace_id": workspace_id, "cwd": cwd, "label": label, "focus": focus,
         })
 
     def tab_close(self, tab_id: str) -> None:
@@ -376,8 +417,29 @@ class HerdrClient:
         self.call("tab.close", {"tab_id": tab_id})
 
     def pane_run(self, pane_id: str, command: str) -> None:
-        """Type a command into a pane and submit it."""
-        self.call("pane.run", {"pane_id": pane_id, "command": command})
+        """Type `command` into a pane and submit it.
+
+        The wrapper is named for the intent; the wire method is `pane.send_text`.
+        It is NOT `pane.run` — no such request variant exists. `herdr pane run <id>
+        <cmd>` is a CLI *subcommand*, and the two being different things is a
+        mistake this client actually made and shipped: every session of the first
+        live bridge run failed with
+
+            invalid_request: unknown variant `pane.run`, expected one of `ping`,
+            `server.stop`, …
+
+        so not one pane ever started anything, and the fake passed it 223 times
+        because the fake answered any method name it was given.
+
+        Measured on a throwaway pane, both candidates run the command:
+        `pane.send_text {"pane_id": p, "text": "echo MARKER_A\\n"}` -> `{"type":"ok"}`
+        with the marker appearing in a following pane.read, and
+        `pane.send_input {"text": …, "keys": ["Enter"]}` likewise. `send_text` is
+        the one to use: it is a single call and it does not depend on herdr's
+        key-name vocabulary. The trailing newline appended here is the
+        submission — without it the text sits in the pane unexecuted.
+        """
+        self.call("pane.send_text", {"pane_id": pane_id, "text": command + "\n"})
 
     def pane_close(self, pane_id: str) -> None:
         """Close one pane."""
@@ -390,25 +452,41 @@ class HerdrClient:
     def pane_read(self, pane_id: str, source: str = "recent", lines: int = 40) -> str:
         """Read pane content back as text.
 
-        `source` is herdr's pane buffer selector (`"recent"`, `"visible"`, ...).
-        pane.read has shipped more than one payload spelling, so accept a bare
-        string result or any of the usual text keys rather than guessing once
-        and raising KeyError on the other shapes.
+        The text is one level down. A pane.read result is
+
+            {"type": "pane_read", "read": {… PaneReadResult …}}
+
+        and the text is `result["read"]["text"]` — measured live, the result's
+        keys were exactly `['type', 'read']`.
+
+        This wrapper used to try `text`, `output`, `content`, `data` and then a
+        `lines` list, and matched none of them, so it raised `bad_response` on
+        every live call: five invented spellings, all wrong, and tolerant enough
+        to hide it. There is no fallback here on purpose. `PaneReadResult.text`
+        is *required* by the schema, so a `read` object without it means the
+        shape changed — and a strict read says so, where the guess reported
+        "carried no text" and looked like an empty pane.
+
+        `source` is validated against :data:`READ_SOURCES` here rather than on
+        the wire, for the same reason `report_agent` validates `state`: an
+        unrecognised enum arrives as a serde message attributed to the request,
+        not to the line of caller that misspelled it.
         """
+        if source not in READ_SOURCES:
+            raise ValueError(
+                "unknown pane.read source {0!r}; expected one of {1} "
+                "(note: recent_unwrapped, underscore)".format(
+                    source, ", ".join(READ_SOURCES)))
         result = self.call("pane.read", {
             "pane_id": pane_id, "source": source, "lines": lines,
         })
-        if isinstance(result, str):
-            return result
-        if isinstance(result, dict):
-            for key in ("text", "output", "content", "data"):
-                value = result.get(key)
-                if isinstance(value, str):
-                    return value
-            value = result.get("lines")
-            if isinstance(value, list):
-                return "\n".join(str(line) for line in value)
-        raise HerdrError("bad_response", "pane.read reply carried no text: {0!r}".format(result))
+        read = self._field(result, "read", "pane.read")
+        if not isinstance(read, dict):
+            raise HerdrError(
+                "bad_response",
+                "pane.read `read` was {0}, want object: {1!r}".format(
+                    type(read).__name__, read))
+        return self._field(read, "text", "pane.read `read`")
 
     def report_agent(self, pane_id: str, source: str, agent: str, state: str,
                      message: Optional[str] = None, seq: Optional[int] = None,
