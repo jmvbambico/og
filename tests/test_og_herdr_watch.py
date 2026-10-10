@@ -1024,9 +1024,11 @@ def detail(sid, workspace=None, parent=None, **extra):
     """One `GET /v1/sessions/{id}` row, shaped like the real one.
 
     The detail row is NOT the listing row: it carries `workspace`, plus
-    `kind`, `git_branch`, `sub_agent_name` and the full `pending_elicitations`
-    LIST where the listing has only its count. A sub-agent's workspace is
-    None on a live server — that is the fact the parent fallback exists for.
+    `kind`, `git_branch`, `sub_agent_name`, `runner_online` and the full
+    `pending_elicitations` LIST where the listing has only its count. A
+    sub-agent's workspace is None on a live server — that is the fact the parent
+    fallback exists for. `runner_online` is here too, which is why the runner
+    rule cannot live in `should_project`: no listing row carries it.
     """
     row = {
         "id": sid,
@@ -1036,6 +1038,7 @@ def detail(sid, workspace=None, parent=None, **extra):
         "sub_agent_name": None if parent is None else f"coder_{sid}",
         "git_branch": None,
         "pending_elicitations": [],
+        "runner_online": None,
         "status": "running",
         "title": f"title-{sid}",
     }
@@ -1305,6 +1308,197 @@ def test_an_enriched_session_still_diffs_and_still_projects_correctly():
     event = w.SessionWatcher(opener=opener).poll_once()[0]
     assert event.state == "blocked", "the elicitation count stopped counting"
     assert event.session["workspace"] == "/repo/og"
+
+
+# --------------------------------------------------------------------------
+# a session whose runner is offline gets no pane at all
+#
+# `omnigent attach` joins a LIVE session on a running server and refuses
+# anything else — measured in a real pane:
+#
+#     Error: Session cf399984… has no online runner on http://127.0.0.1:6767
+#
+# Measured across the seven sessions the bridge projected:
+#
+#     f9548b99  sub_agent  running  runner_online=True
+#     d1c2c91b  sub_agent  idle     runner_online=True
+#     3e9a0249  sub_agent  running  runner_online=True
+#     dfadeb68  default    idle     runner_online=True   host_online=True
+#     e29bf406  default    running  runner_online=True   host_online=True
+#     5be56e58  default    idle     runner_online=False  host_online=True
+#     cf399984  default    idle     runner_online=False  host_online=True
+#
+# Two of seven would open a tab whose whole content is that error. On a machine
+# with a long history of finished root sessions it would be most of them.
+#
+# `runner_online` is on the DETAIL row — no listing row carries it — so the rule
+# is `runner_is_offline`, applied by `_enrich` where that row is already fetched
+# for the directory, and NOT folded into `should_project`, which decides from
+# listing rows alone.
+# --------------------------------------------------------------------------
+
+def test_a_session_with_an_offline_runner_is_not_projected():
+    # The defect, in its smallest form: the offline session is dropped from the
+    # event stream, so no pane is ever opened for a command that can only fail.
+    opener = RoutingOpener(
+        [envelope([session("offline"), session("online")])],
+        details={"offline": detail("offline", workspace="/repo/og",
+                                   runner_online=False),
+                 "online": detail("online", workspace="/repo/og",
+                                  runner_online=True)},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    assert [(e.kind, e.session_id) for e in watcher.poll_once()] == [
+        ("added", "online")]
+    assert set(watcher._seen) == {"online"}
+    # Both details really were fetched: otherwise this would pass on a module
+    # that never asks, which is a different (and already-fixed) defect.
+    assert len(opener.detail_requests) == 2
+
+
+def test_a_session_with_an_online_runner_is_still_projected():
+    # The other side of the same pair. Without it, a rule that dropped everything
+    # would satisfy the test above, and a workspace that empties itself looks
+    # exactly like a clean bill of health.
+    opener = RoutingOpener(
+        [envelope([session("s1")])],
+        details={"s1": detail("s1", workspace="/repo/og", runner_online=True)},
+    )
+    event = w.SessionWatcher(opener=opener).poll_once()[0]
+
+    assert event.kind == "added"
+    assert event.session["id"] == "s1"
+    # One fetch still bought both answers.
+    assert event.session["workspace"] == "/repo/og"
+    assert len(opener.detail_requests) == 1
+
+
+def test_the_runner_rule_does_not_depend_on_the_session_kind():
+    # Both of the measured offline sessions were roots, but `attach` refuses by
+    # runner, not by kind: a worker whose runner died is equally unattachable.
+    # Pinning it both ways stops the rule from being quietly narrowed to roots.
+    rows = [session("root-off", parent=None),
+            session("root-on", parent=None),
+            session("w-off", status="running", parent="root-on"),
+            session("w-on", status="running", parent="root-on")]
+    opener = RoutingOpener(
+        [envelope(rows)],
+        details={
+            "root-off": detail("root-off", workspace="/repo/og",
+                               runner_online=False),
+            "root-on": detail("root-on", workspace="/repo/og", runner_online=True),
+            "w-off": detail("w-off", workspace=None, parent="root-on",
+                            runner_online=False),
+            "w-on": detail("w-on", workspace=None, parent="root-on",
+                           runner_online=True),
+        },
+    )
+
+    assert [e.session_id for e in w.SessionWatcher(opener=opener).poll_once()] == [
+        "root-on", "w-on"]
+
+
+def test_a_session_whose_runner_comes_back_is_projected_on_a_later_poll():
+    # No permanent negative. A refused session must never be remembered as
+    # unattachable, because a runner CAN come back — and a refusal cached for the
+    # life of the process would strand that session's pane for good, invisibly.
+    row = session("s1")
+    opener = RoutingOpener(
+        [envelope([row]), envelope([row])],
+        details={"s1": detail("s1", workspace="/repo/og", runner_online=False)},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+    assert watcher.poll_once() == []
+
+    # The runner comes back up; nothing about the refusal was sticky.
+    opener.details["s1"] = detail("s1", workspace="/repo/og", runner_online=True)
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("added", "s1")]
+    assert events[0].session["workspace"] == "/repo/og"
+
+
+def test_a_session_refused_for_an_offline_runner_never_enters_seen():
+    # `_seen` is what "removed" is derived from, so staying out of it is what
+    # keeps a never-projected session from manufacturing the removal of a pane
+    # that was never opened. It is also what makes the refusal re-checkable.
+    opener = RoutingOpener(
+        [envelope([session("s1")])],
+        details={"s1": detail("s1", workspace="/repo/og", runner_online=False)},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    for poll in range(3):
+        assert watcher.poll_once() == [], (
+            f"poll {poll} produced an event for a session with no pane")
+
+    assert "s1" not in watcher._seen
+    # Re-asked on every poll — the cost is one detail fetch per such session per
+    # poll, bounded by how many there are (measured: 2 of 7), and never a
+    # cached "no".
+    assert len(opener.detail_requests) == 3
+
+
+def test_a_never_projected_session_that_vanishes_reports_no_removal():
+    # The absence case, which is where a `_seen` mistake would show: the session
+    # leaves the listing entirely having never been projected. There is nothing
+    # to release and nothing to close, and a `removed` here would have the
+    # bridge closing a tab handle that was never issued.
+    opener = RoutingOpener(
+        [envelope([session("s1")]), envelope([])],
+        details={"s1": detail("s1", workspace="/repo/og", runner_online=False)},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    assert watcher.poll_once() == []
+    assert watcher.poll_once() == []
+    assert watcher._seen == {}
+
+
+def test_a_failed_detail_fetch_projects_rather_than_hiding():
+    # THE CHOSEN DIRECTION, and why: a detail row we could not read is UNKNOWN,
+    # and unknown projects. Hiding on a guess costs the user a session they never
+    # knew existed and cannot get back by waiting, because nothing would say it
+    # was dropped; projecting a session whose runner turns out to be dead costs
+    # one tab showing an error. An unreachable detail endpoint must never be able
+    # to empty the workspace, so `runner_is_offline` treats None as "no".
+    failures = [
+        HTTPError("http://x/v1/sessions/s1", 404, "Not Found", {}, None),
+        HTTPError("http://x/v1/sessions/s1", 500, "Server Error", {}, None),
+        OSError(28, "No space left on device"),
+        URLError("connection refused"),
+        json.JSONDecodeError("Expecting value", "{", 0),
+        [session("s1")],  # a body that is not a detail row at all
+    ]
+    for bad in failures:
+        opener = RoutingOpener(
+            [envelope([session("s1")])],
+            details={"s1": bad},
+        )
+        watcher = w.SessionWatcher(opener=opener)
+
+        events = watcher.poll_once()
+        # The fetch really was attempted, so this is a test about a FAILING fetch
+        # and not about a module that never asks.
+        assert len(opener.detail_requests) == 1, bad
+        assert [(e.kind, e.session_id) for e in events] == [("added", "s1")], bad
+        assert "workspace" not in events[0].session, bad
+        # And it stays in the set, so it is a normal live session from here on.
+        assert "s1" in watcher._seen, bad
+
+
+def test_runner_is_offline_is_false_for_everything_but_an_explicit_false():
+    # The rule itself, stated as a function of its input. None (the unreadable
+    # fetch), a row without the key, a null, and a non-boolean "false" all
+    # project: only a JSON false is a server telling us the runner is down.
+    assert w.runner_is_offline({"runner_online": False}) is True
+    for detail_row in (None, {}, [], "false",
+                       {"runner_online": None},
+                       {"runner_online": "false"},
+                       {"runner_online": 0},
+                       {"runner_online": True},
+                       {"workspace": "/repo"}):
+        assert w.runner_is_offline(detail_row) is False, detail_row
 
 
 # --------------------------------------------------------------------------
