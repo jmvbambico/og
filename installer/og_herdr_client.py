@@ -391,6 +391,47 @@ class HerdrClient:
         """The `workspaces` array of workspace.list."""
         return self._field(self.call("workspace.list"), "workspaces", "workspace.list")
 
+    def workspace_create(self, label: str, cwd: str, focus: bool = False) -> dict:
+        """Create a workspace AND its first tab in ONE call; returns the result.
+
+        herdr's UI calls these "spaces". The result is
+
+            {"type": "workspace_created",
+             "workspace":  {workspace_id, label, …},
+             "tab":        {tab_id, workspace_id, …},
+             "root_pane":  {pane_id, tab_id, cwd, …}}
+
+        all three of which arrive together — so a workspace never exists without
+        a pane already in it, and one call is the whole of "open a space".
+
+        The schema's own listing of the result is LOSSY: it describes
+        `workspace_created` as carrying only `type` and `workspace`, which reads
+        as if a caller would have to follow up with a `tab.create` and then find
+        the pane some other way. The live reply carries `tab` and `root_pane`
+        too (measured); the schema describes the request half of the protocol
+        precisely and the result half only loosely. This wrapper therefore
+        returns the whole object and its callers read the three ids they need —
+        a second create call here would be a second tab, not a second pane.
+
+        `focus` defaults False and callers must keep it there: several sessions
+        appear per poll, and a workspace that steals focus each time would
+        rip the operator out of whatever they were typing.
+        """
+        return self.call("workspace.create", {
+            "label": label, "cwd": cwd, "focus": focus,
+        })
+
+    def workspace_close(self, workspace_id: str) -> None:
+        """Close a workspace and everything in it — its tabs and their panes.
+
+        `close_group` is deliberately not sent. It is herdr's option for taking
+        the whole group down with the workspace, and this client's own workspaces
+        are the ones being cleaned up, not a group the operator shares; defaulting
+        it server-side is the conservative direction and there is nothing here
+        that needs the wider blast radius.
+        """
+        self.call("workspace.close", {"workspace_id": workspace_id})
+
     def tab_create(self, workspace_id: str, cwd: str, label: str,
                    focus: bool = False) -> dict:
         """Create a tab; returns the whole result — it carries `tab` and `root_pane`.
@@ -406,7 +447,11 @@ class HerdrClient:
 
         Measured after the fix: `{"workspace_id": "w4", …}` puts the tab in w4.
         A null workspace_id is legal (`string|null`) and means the focused
-        workspace, which is what omitting it means too.
+        workspace, which is what omitting it means too. The `--workspace` flag
+        that was riding on this wrapper is GONE now that each root session owns
+        a space of its own — but the spelling stays pinned here, because the
+        whole reason to name the key identically on both sides is that the wrong
+        one fails silently.
         """
         return self.call("tab.create", {
             "workspace_id": workspace_id, "cwd": cwd, "label": label, "focus": focus,

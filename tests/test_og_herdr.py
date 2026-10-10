@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import json
 import os
 import shlex
 from pathlib import Path
@@ -36,12 +37,17 @@ class Ev:
 
 
 class RecordingClient:
-    def __init__(self, fail=None, create_results=None):
+    """Records every call. `workspace_create` and `tab_create` share one counter
+    so the ids a test sees read like a real session's layout."""
+
+    def __init__(self, fail=None, create_results=None, spaces=None):
         self.calls = []
         self.fail = fail or {}
-        # Queued tab_create returns, so a test can hand back a malformed reply
+        # Queued create returns, so a test can hand back a malformed reply
         # (missing ids) that the default well-formed shape never produces.
         self.create_results = list(create_results) if create_results else []
+        # What workspace_list reports, for the operator's own workspaces.
+        self.spaces = list(spaces) if spaces else []
         self._seq = 0
 
     def _call(self, name, *args, **kwargs):
@@ -53,14 +59,33 @@ class RecordingClient:
         if exc is not None:
             raise exc
 
-    def tab_create(self, workspace, cwd, label, focus=False):
-        self._call("tab_create", workspace, cwd=cwd, label=label)
+    def _next(self):
+        self._seq += 1
+        return self._seq
+
+    def workspace_create(self, label, cwd, focus=False):
+        """The MEASURED workspace.create reply: workspace, tab AND root_pane, all
+        three in one call — the schema's own result listing is lossy."""
+        self._call("workspace_create", label, cwd=cwd, focus=focus)
         if self.create_results:
             return self.create_results.pop(0)
-        self._seq += 1
+        n = self._next()
+        return {"type": "workspace_created",
+                "workspace": {"workspace_id": f"ws{n}", "label": label},
+                "tab": {"tab_id": f"tab{n}", "workspace_id": f"ws{n}"},
+                "root_pane": {"pane_id": f"pane{n}", "tab_id": f"tab{n}"}}
+
+    def workspace_close(self, workspace_id):
+        self._call("workspace_close", workspace_id)
+
+    def tab_create(self, workspace_id, cwd, label, focus=False):
+        self._call("tab_create", workspace_id, cwd=cwd, label=label)
+        if self.create_results:
+            return self.create_results.pop(0)
+        n = self._next()
         # The REAL herdr 0.9.3 shape: `tab_id` / `pane_id`, never a generic `id`.
-        return {"tab": {"tab_id": f"tab{self._seq}"},
-                "root_pane": {"pane_id": f"pane{self._seq}"}}
+        return {"tab": {"tab_id": f"tab{n}"},
+                "root_pane": {"pane_id": f"pane{n}"}}
 
     def tab_close(self, tab_id):
         self._call("tab_close", tab_id)
@@ -73,7 +98,7 @@ class RecordingClient:
 
     def workspace_list(self):
         self._call("workspace_list")
-        return []
+        return self.spaces
 
     def report_agent(self, pane_id, source, agent, state, message=None,
                      seq=None, agent_session_id=None):
@@ -108,6 +133,39 @@ def seams(monkeypatch):
     monkeypatch.setattr(m, "_error_cls", lambda: FakeHerdrError)
 
 
+@pytest.fixture(autouse=True)
+def isolated_omnigent_home(tmp_path, monkeypatch):
+    """Point $OMNIGENT_HOME at a scratch directory for every test here.
+
+    The bridge records which herdr workspaces it created there, so without this
+    a single test that projected a session would append to the developer's real
+    ~/.omnigent/og-herdr.json — and the next `--cleanup` would then close live
+    workspaces in the operator's terminal.
+    """
+    home = tmp_path / ".omnigent"
+    home.mkdir()
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+    return home
+
+
+# The measured shape of a delegated worker: a LISTING row (which carries
+# `parent_session_id` and `agent_name`, and NOT `harness`) with the DETAIL row's
+# identity merged in by the watcher.
+def root_session(title="Omnigent Herdr Integration Feasibility", **extra):
+    session = {"title": title, "state": "working", "parent_session_id": None,
+               "harness": "claude-native", "kind": "default"}
+    session.update(extra)
+    return session
+
+
+def sub_session(parent, title="coder_zen:space-per-root", **extra):
+    session = {"title": title, "state": "working",
+               "parent_session_id": parent, "harness": "opencode-native",
+               "kind": "sub_agent", "sub_agent_name": "coder_zen"}
+    session.update(extra)
+    return session
+
+
 def _names(client):
     return [c[0] for c in client.calls]
 
@@ -122,22 +180,24 @@ def _call(client, name):
 
 def test_added_sequence(seams):
     client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws",
-                      source="og-bridge", cwd="/tmp/ws")
-    session = {"title": "Fix bug", "state": "working"}
+    bridge = m.Bridge(FakeWatcher([]), client, source="og-bridge",
+                      cwd="/tmp/ws")
+    session = root_session("Fix bug")
     lines = bridge.reconcile([Ev("added", "s1", session)])
 
-    assert _names(client) == ["tab_create", "pane_run", "report_agent",
+    # A ROOT opens a workspace, and the one call brings the space, its first tab
+    # and that tab's root pane back together.
+    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
                               "report_metadata"]
-    tc = _call(client, "tab_create")
-    assert tc[1] == ("ws",)
-    assert tc[2]["cwd"] == "/tmp/ws"
-    assert tc[2]["label"] == "og:Fix bug"
+    wc = _call(client, "workspace_create")
+    assert wc[1] == ("Fix bug",)
+    assert wc[2]["cwd"] == "/tmp/ws"
+    assert wc[2]["focus"] is False
     assert _call(client, "pane_run")[1] == (
         "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
     ra = _call(client, "report_agent")
     assert ra[1] == ("pane1", "og-bridge")
-    assert ra[2] == {"agent": "omnigent", "state": "working"}
+    assert ra[2] == {"agent": "Claude Code", "state": "working"}
     assert _call(client, "report_metadata")[2]["title"] == "Fix bug"
     assert len(lines) == 1 and "add s1" in lines[0]
 
@@ -145,8 +205,8 @@ def test_added_sequence(seams):
 def test_cwd_flag_is_honoured_for_new_panes(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/srv/repo")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
-    assert _call(client, "tab_create")[2]["cwd"] == "/srv/repo"
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+    assert _call(client, "workspace_create")[2]["cwd"] == "/srv/repo"
 
 
 def test_added_defaults_cwd_to_process_cwd_and_label_to_session_id(seams):
@@ -154,8 +214,11 @@ def test_added_defaults_cwd_to_process_cwd_and_label_to_session_id(seams):
     bridge = m.Bridge(FakeWatcher([]), client)
     lines = bridge.reconcile([Ev("added", "abcdef123456", {})])
     # No --cwd: the pane opens in the bridge's own cwd, not a hardcoded path.
-    assert _call(client, "tab_create")[2]["cwd"] == os.getcwd()
-    assert _call(client, "tab_create")[2]["label"] == "og:abcdef12"
+    assert _call(client, "workspace_create")[2]["cwd"] == os.getcwd()
+    # And a session with no title is named by its id — bare, NOT "og:<id>". The
+    # space label IS the session title the operator reads; a prefix on it would
+    # wreck the one display they asked for.
+    assert _call(client, "workspace_create")[1] == ("abcdef12",)
     assert len(lines) == 1
 
 
@@ -178,7 +241,7 @@ def test_realistic_listing_row_without_workspace_key_uses_bridge_cwd(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/under/test")
     bridge.reconcile([Ev("added", "s1", session)])
-    assert _call(client, "tab_create")[2]["cwd"] == "/repo/under/test"
+    assert _call(client, "workspace_create")[2]["cwd"] == "/repo/under/test"
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +255,11 @@ def test_a_session_workspace_wins_over_the_bridge_cwd(seams):
     # repository entirely.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/wherever/the/daemon/started")
-    bridge.reconcile([Ev("added", "s1", {
-        "title": "Fix bug", "state": "working",
-        "workspace": "/Users/cryogenix/projects/og"})])
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix bug", workspace="/Users/cryogenix/projects/og"))])
 
-    assert _call(client, "tab_create")[2]["cwd"] == "/Users/cryogenix/projects/og"
+    assert _call(client, "workspace_create")[2]["cwd"] == \
+        "/Users/cryogenix/projects/og"
 
 
 def test_a_workers_workspace_wins_over_the_bridge_cwd(seams):
@@ -205,12 +268,12 @@ def test_a_workers_workspace_wins_over_the_bridge_cwd(seams):
     # offers — but a far better one than the daemon's cwd.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/daemon/cwd")
-    bridge.reconcile([Ev("added", "w1", {
-        "title": "coder_zen:fix", "state": "working", "id": "w1",
-        "parent_session_id": "root",
-        "workspace": "/Users/cryogenix/projects/og"})])
+    bridge.reconcile([Ev("added", "root", root_session("Fix"))])
+    bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:fix", workspace="/Users/cryogenix/projects/og"))])
 
-    assert _call(client, "tab_create")[2]["cwd"] == "/Users/cryogenix/projects/og"
+    assert _call(client, "tab_create")[2]["cwd"] == \
+        "/Users/cryogenix/projects/og"
 
 
 @pytest.mark.parametrize("session_workspace", [None, ""],
@@ -222,12 +285,12 @@ def test_a_missing_or_empty_workspace_falls_back_to_the_bridge_cwd(
     # empty string as a cwd is a pane that opens nowhere.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/under/test")
-    session = {"title": "T", "state": "idle"}
+    session = root_session("T", state="idle")
     if session_workspace is not None:
         session["workspace"] = session_workspace
     bridge.reconcile([Ev("added", "s1", session)])
 
-    assert _call(client, "tab_create")[2]["cwd"] == "/repo/under/test"
+    assert _call(client, "workspace_create")[2]["cwd"] == "/repo/under/test"
 
 
 def test_a_session_workspace_is_used_even_alongside_the_fallback(seams):
@@ -236,10 +299,10 @@ def test_a_session_workspace_is_used_even_alongside_the_fallback(seams):
     # which a single one-sided assertion would not.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/under/test")
-    bridge.reconcile([Ev("added", "s1", {
-        "title": "T", "state": "idle", "workspace": "/repo/from/session"})])
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "T", state="idle", workspace="/repo/from/session"))])
 
-    assert _call(client, "tab_create")[2]["cwd"] == "/repo/from/session"
+    assert _call(client, "workspace_create")[2]["cwd"] == "/repo/from/session"
 
 
 def test_the_dry_run_line_reports_the_session_directory(seams):
@@ -247,11 +310,10 @@ def test_the_dry_run_line_reports_the_session_directory(seams):
     # same cwd"), so it has to name the directory the pane would really open in.
     bridge = m.Bridge(FakeWatcher([]), RecordingClient(), dry_run=True,
                       cwd="/daemon/cwd")
-    lines = bridge.reconcile([Ev("added", "s1", {
-        "title": "Fix bug", "state": "working",
-        "workspace": "/Users/cryogenix/projects/og"})])
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix bug", workspace="/Users/cryogenix/projects/og"))])
 
-    assert lines == ["dry-run: add og:Fix bug "
+    assert lines == ["dry-run: add 'Fix bug' → space "
                      "(/Users/cryogenix/projects/og) → omnigent attach "
                      "--server http://127.0.0.1:6767 s1 [working]"]
 
@@ -293,7 +355,7 @@ def test_the_pane_command_names_the_server_and_the_session(seams):
     # SHELL, so a flag in the wrong place is not a cosmetic difference.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
 
     assert _call(client, "pane_run")[1] == ("pane1", ATTACH)
 
@@ -305,7 +367,7 @@ def test_a_non_default_server_reaches_the_pane_command(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo",
                       server="https://og.example:8443")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
 
     assert _call(client, "pane_run")[1] == (
         "pane1", "omnigent attach --server https://og.example:8443 s1")
@@ -316,7 +378,7 @@ def test_the_bridge_defaults_to_the_documented_server_url(seams):
     # Bridge built without --server must not name some other server.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     assert _call(client, "pane_run")[1] == ("pane1", ATTACH)
     assert m.DEFAULT_SERVER == "http://127.0.0.1:6767"
 
@@ -328,10 +390,10 @@ def test_the_dry_run_line_shows_the_whole_command(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, dry_run=True, cwd="/daemon/cwd",
                       server="https://og.example:8443")
-    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
 
-    assert lines == ["dry-run: add og:T (/daemon/cwd) → omnigent attach "
-                     "--server https://og.example:8443 s1 [idle]"]
+    assert lines == ["dry-run: add 'T' → space (/daemon/cwd) → omnigent "
+                     "attach --server https://og.example:8443 s1 [idle]"]
     assert client.calls == []
 
 
@@ -394,15 +456,19 @@ def test_main_threads_the_cli_server_into_the_bridge(monkeypatch, tmp_path):
 def test_changed_sequence_reports_state_and_title(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
-    bridge.reconcile([Ev("added", "s1", {"title": "Old", "state": "idle"})])
+    bridge.reconcile([Ev("added", "s1", root_session("Old", state="idle"))])
     client.calls.clear()
 
     lines = bridge.reconcile([
-        Ev("changed", "s1", {"title": "New", "state": "working"},
-           previous={"title": "Old", "state": "idle"})])
+        Ev("changed", "s1", root_session("New", state="working"),
+           previous=root_session("Old", state="idle"))])
 
     assert _names(client) == ["report_agent", "report_metadata"]
     assert _call(client, "report_agent")[2]["state"] == "working"
+    # The STORED label, not one re-derived from this event: a `changed` carries
+    # the listing row, which has no `harness` to derive from, and reporting a
+    # different agent string would make herdr show two markers for one pane.
+    assert _call(client, "report_agent")[2]["agent"] == "Claude Code"
     assert _call(client, "report_metadata")[2]["title"] == "New"
     assert "update s1" in lines[0]
 
@@ -410,26 +476,28 @@ def test_changed_sequence_reports_state_and_title(seams):
 def test_changed_without_title_change_skips_metadata(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
-    bridge.reconcile([Ev("added", "s1", {"title": "Same", "state": "idle"})])
+    bridge.reconcile([Ev("added", "s1", root_session("Same", state="idle"))])
     client.calls.clear()
 
-    bridge.reconcile([Ev("changed", "s1", {"title": "Same", "state": "working"},
-                         previous={"title": "Same", "state": "idle"})])
+    bridge.reconcile([Ev("changed", "s1", root_session("Same", state="working"),
+                         previous=root_session("Same", state="idle"))])
     assert _names(client) == ["report_agent"]
 
 
 def test_removed_sequence(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     client.calls.clear()
 
     lines = bridge.reconcile([Ev("removed", "s1", {})])
-    assert _names(client) == ["release_agent", "tab_close"]
+    # The root's own pane is released, then the WORKSPACE goes — which takes its
+    # tabs with it, so there is no tab to close separately.
+    assert _names(client) == ["release_agent", "workspace_close"]
     ra = _call(client, "release_agent")
     assert ra[1] == ("pane1", "og-bridge")
-    assert ra[2] == {"agent": "omnigent"}
-    assert _call(client, "tab_close")[1] == ("tab1",)
+    assert ra[2] == {"agent": "Claude Code"}
+    assert _call(client, "workspace_close")[1] == ("ws1",)
     assert "remove s1" in lines[0]
 
     # The mapping is dropped, so a repeat of the same removal is a no-op.
@@ -445,12 +513,293 @@ def test_removed_sequence(seams):
 def test_duplicate_added_yields_one_tab(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
-    session = {"title": "T", "state": "idle"}
+    session = root_session("T", state="idle")
     first = bridge.reconcile([Ev("added", "s1", session)])
     second = bridge.reconcile([Ev("added", "s1", session)])
     assert len(first) == 1
     assert second == []
+    assert _names(client).count("workspace_create") == 1
+    assert _names(client).count("tab_create") == 0
+
+
+def test_duplicate_added_of_a_sub_agent_yields_one_tab(seams):
+    # The sub-agent half of the same guard: a redelivered `added` for a worker
+    # must not open a second TAB either, and — the part that is new with a space
+    # per root — must not open a second workspace.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session())])
+    session = sub_session("root")
+    first = bridge.reconcile([Ev("added", "w1", session)])
+    second = bridge.reconcile([Ev("added", "w1", session)])
+
+    assert len(first) == 1
+    assert second == []
     assert _names(client).count("tab_create") == 1
+    assert _names(client).count("workspace_create") == 1
+
+
+# ---------------------------------------------------------------------------
+# THE LAYOUT: a workspace per ROOT session, its sub-agents as tabs inside it.
+#
+# This is the operator's list:
+#
+#     space  "Omnigent Herdr Integration Feasibility"
+#       tab  Claude Code
+#       tab  coder_zen:space-per-root
+#       tab  coder_cmdcode:fix-stale-comments
+#
+# A sub-agent never gets a space of its own while its parent has one.
+# ---------------------------------------------------------------------------
+
+def test_a_root_opens_a_space_labelled_with_its_title(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "e29bf406", root_session(
+        "Omnigent Herdr Integration Feasibility",
+        workspace="/Users/cryogenix/projects/og"))])
+
+    wc = _call(client, "workspace_create")
+    assert wc[1] == ("Omnigent Herdr Integration Feasibility",), wc
+    # cwd is the SESSION's directory, not the bridge's --cwd.
+    assert wc[2]["cwd"] == "/Users/cryogenix/projects/og"
+    # focus=False, always: several sessions appear per poll and each stealing
+    # focus would rip the operator out of what they were typing.
+    assert wc[2]["focus"] is False
+    assert _names(client).count("workspace_create") == 1
+    assert _names(client).count("tab_create") == 0
+
+
+def test_a_sub_agent_opens_a_tab_in_its_parents_space(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:space-per-root"))])
+
+    tc = _call(client, "tab_create")
+    assert tc[1] == ("ws1",), "the tab went somewhere other than the root's space"
+    assert tc[2]["label"] == "coder_zen:space-per-root"
+    assert tc[2]["cwd"] == "/repo/og"
+    # ...and no second workspace: the whole point of the layout.
+    assert _names(client).count("workspace_create") == 0
+    assert _names(client).count("tab_create") == 1
+
+
+def test_a_worker_emitted_before_its_root_still_lands_in_its_space(seams):
+    # THE ORDERING TRAP. The listing is NEWEST-FIRST and a sub-agent is newer
+    # than the root that spawned it, so the child is emitted FIRST — on the very
+    # first poll and on every poll where a new worker appears. Handled in
+    # arrival order the child finds no space for a parent that has not been
+    # created yet, and gets one of its own: the operator's conversation split in
+    # two, which is exactly what the layout exists to prevent.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    lines = bridge.reconcile([
+        Ev("added", "w1", sub_session("root", "coder_zen:space-per-root")),
+        Ev("added", "root", root_session("New Alignment")),
+    ])
+
+    assert _names(client).count("workspace_create") == 1
+    # The root went first, so its space existed when the child looked.
+    assert _call(client, "tab_create")[1] == ("ws1",)
+    assert lines[0].startswith("add root"), lines
+
+
+def test_the_reordering_is_stable_within_each_group(seams):
+    # Roots first, but the listing's own order survives inside each group — so
+    # the log still reads the way the operator expects, and a batch of five roots
+    # is still five roots in listing order.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "w2", sub_session("r2")),
+        Ev("added", "r1", root_session("A")),
+        Ev("added", "w1", sub_session("r1")),
+        Ev("added", "r2", root_session("B")),
+    ])
+    # The two spaces were opened for r1 then r2 (listing order among roots), and
+    # the two tabs went into their own parents' spaces, children in arrival
+    # order (w2 before w1).
+    creates = [c for c in client.calls if c[0] == "workspace_create"]
+    assert [c[1] for c in creates] == [("A",), ("B",)]
+    tabs = [c for c in client.calls if c[0] == "tab_create"]
+    assert [t[1] for t in tabs] == [("ws2",), ("ws1",)]
+
+
+def test_a_worker_whose_parent_has_no_space_gets_one_of_its_own(seams):
+    # Reachable: the parent's runner is offline, so the watcher never projected
+    # it (runner_is_offline). Dropping the worker would hide an agent that is
+    # actively working, so it gets its own space labelled from its own title.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    lines = bridge.reconcile([
+        Ev("added", "w1", sub_session("never-seen", "coder_zen:fix"))])
+
+    assert _names(client).count("workspace_create") == 1
+    assert _names(client).count("tab_create") == 0
+    assert _call(client, "workspace_create")[1] == ("coder_zen:fix",)
+    assert "add w1" in lines[0]
+
+
+def test_a_roots_removal_closes_the_space_and_drops_its_workers(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("New Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix")),
+    ])
+    client.calls.clear()
+
+    lines = bridge.reconcile([Ev("removed", "root", {})])
+
+    # Closing the workspace takes its tabs down with it, so there is one close
+    # and it is the workspace.
+    assert _names(client) == ["release_agent", "workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("ws1",)
+    # The worker's record went with it: its pane died with the space.
+    assert "w1" not in bridge._recs
+    assert any("remove w1" in ln for ln in lines)
+    # ...and the space is no longer recorded as ours, or `--cleanup` would chase
+    # a workspace this bridge closed itself.
+    assert bridge._owned == {}
+
+
+def test_a_later_worker_removal_after_its_roots_is_a_safe_no_op(seams):
+    # The half that has to hold: without the records being dropped, this removal
+    # would answer `not_found` against a tab closed some time ago — true, but it
+    # reads as a fresh fault on every worker of every finished conversation.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("New Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix")),
+    ])
+    bridge.reconcile([Ev("removed", "root", {})])
+    client.calls.clear()
+
+    assert bridge.reconcile([Ev("removed", "w1", {})]) == []
+    assert client.calls == []
+
+
+def test_a_workers_removal_closes_only_its_tab(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("New Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix")),
+        Ev("added", "w2", sub_session("root", "coder_cmdcode:fix-stale")),
+    ])
+    client.calls.clear()
+
+    lines = bridge.reconcile([Ev("removed", "w1", {})])
+
+    assert _names(client) == ["release_agent", "tab_close"]
+    # tab2 is the worker's own tab: the root's workspace.create took tab1.
+    assert _call(client, "tab_close")[1] == ("tab2",)
+    assert "remove w1" in lines[0]
+    # The root's space and its other worker are untouched.
+    assert bridge._recs["root"]["workspace_id"] == "ws1"
+    assert "w2" in bridge._recs
+    assert "root" in bridge._recs
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_a_nested_worker_lands_beside_its_own_parent(seams):
+    # The same lookup by parent_session_id serves a grandchild, so the layout
+    # does not need a second index and does not go flat at depth two.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("New Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix")),
+        Ev("added", "g1", sub_session("w1", "coder_zen:sub-task"))])
+    tabs = [c for c in client.calls if c[0] == "tab_create"]
+    assert [t[1] for t in tabs] == [("ws1",), ("ws1",)]
+
+
+# ---------------------------------------------------------------------------
+# the agent column: a TOOL name, not an id
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("harness,expected", [
+    ("claude-native", "Claude Code"),
+    ("opencode-native", "OpenCode (Zen)"),
+])
+def test_the_reported_agent_is_the_registrys_product_name(harness, expected):
+    assert m.agent_label({"harness": harness}) == expected
+
+
+def test_an_unlisted_harness_falls_back_to_its_raw_id():
+    # Ugly, but honest: it names exactly what ran. And it must not raise — a
+    # harness og has no catalog row for is a new tool, not a broken pane.
+    assert m.agent_label({"harness": "brand-new-native"}) == "brand-new-native"
+
+
+@pytest.mark.parametrize("session", [{}, {"harness": None}, {"harness": ""},
+                                      {"harness": 7}, "not a dict", None])
+def test_a_session_naming_no_harness_gets_the_default_label(session):
+    assert m.agent_label(session) == m.DEFAULT_AGENT_LABEL
+    assert m.DEFAULT_AGENT_LABEL, "herdr requires a non-empty agent string"
+
+
+def test_the_bridge_reports_the_registry_label_and_releases_the_same_one(seams):
+    # herdr matches a claim by (source, agent): a release naming anything other
+    # than what was reported leaves our marker sitting on a closed pane.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, source="og-bridge")
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "New Alignment", harness="claude-native"))])
+    assert _call(client, "report_agent")[2]["agent"] == "Claude Code"
+
+    bridge.reconcile([Ev("removed", "s1", {})])
+    assert _call(client, "release_agent")[2]["agent"] == "Claude Code"
+
+
+def test_the_session_title_goes_to_metadata_not_the_agent_column(seams):
+    # Together they give the operator's list: the tool on one side, the worker
+    # and its task on the other.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "Omnigent Herdr Integration Feasibility", harness="claude-native"))])
+
+    assert _call(client, "report_agent")[2]["agent"] == "Claude Code"
+    assert _call(client, "report_metadata")[2]["title"] == \
+        "Omnigent Herdr Integration Feasibility"
+
+
+def test_the_registry_labels_are_read_from_this_repos_catalog():
+    # Not from a second hard-coded table here. If a harness is renamed in
+    # installer/registry.json, the pane must follow without an edit here.
+    catalog = json.loads(Path(m.REGISTRY_PATH).read_text())
+    rows = {row["harness"]: row["label"] for row in catalog["agents"]}
+    for harness, label in rows.items():
+        assert m.harness_labels()[harness] == label
+
+
+def test_a_broken_registry_costs_the_label_not_the_pane(monkeypatch, tmp_path):
+    # A missing or malformed catalog degrades the agent column to raw harness
+    # ids. It must never raise: the bridge cannot tell a broken catalog from an
+    # unfamiliar harness, and a pane lost over a cosmetic failure is a far worse
+    # outcome than a pane labelled `claude-native`.
+    #
+    # Every case redirects REGISTRY_PATH at a scratch file. Writing over the
+    # real installer/registry.json to test a failure mode would be a test that
+    # deletes a source file when it is interrupted.
+    for name, content in (("missing.json", None),
+                          ("broken.json", "{ not json"),
+                          ("wrong-shape.json", '{"agents": "nope"}'),
+                          ("a-list.json", "[]")):
+        monkeypatch.setattr(m, "_REGISTRY_LABELS", None)
+        path = tmp_path / name
+        if content is not None:
+            path.write_text(content)
+        monkeypatch.setattr(m, "REGISTRY_PATH", path)
+        assert m.harness_labels() == {}, name
+        assert m.agent_label({"harness": "claude-native"}) == "claude-native", name
 
 
 def test_unmapped_changed_is_ignored(seams):
@@ -473,44 +822,48 @@ def test_unmapped_removed_is_ignored(seams):
 # recovery from a herdr call that fails part-way through one event
 # ---------------------------------------------------------------------------
 
-def test_partial_setup_failure_retries_on_the_same_pane_without_a_second_tab(
+def test_partial_setup_failure_retries_on_the_same_pane_without_a_second_space(
         seams):
-    # pane_run fails once. The tab and pane already exist, so the redelivered
-    # `added` must resume setup on them rather than create a second tab.
+    # pane_run fails once. The space, its tab and the pane already exist, so the
+    # redelivered `added` must resume setup on them rather than open a second
+    # workspace — which for a root would leave the operator with a duplicate
+    # space and two panes running the same session.
     client = RecordingClient(fail={"pane_run": FakeHerdrError("boom", "pane gone")})
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    session = {"title": "T", "state": "idle"}
+    bridge = m.Bridge(FakeWatcher([]), client)
+    session = root_session("T", state="idle")
 
     first = bridge.reconcile([Ev("added", "s1", session)])
     assert any("error s1" in ln for ln in first)
-    # The mapping was recorded after tab_create, so the pane stays tracked.
-    assert bridge._tabs["s1"]["tab_id"] == "tab1"
-    assert bridge._tabs["s1"]["pane_id"] == "pane1"
-    assert _names(client).count("tab_create") == 1
+    # The mapping was recorded after workspace_create, so the pane stays tracked.
+    assert bridge._recs["s1"]["workspace_id"] == "ws1"
+    assert bridge._recs["s1"]["tab_id"] == "tab1"
+    assert bridge._recs["s1"]["pane_id"] == "pane1"
+    assert _names(client).count("workspace_create") == 1
     client.calls.clear()
 
     second = bridge.reconcile([Ev("added", "s1", session)])
-    assert _names(client).count("tab_create") == 0
+    assert _names(client).count("workspace_create") == 0
     assert _names(client) == ["pane_run", "report_agent", "report_metadata"]
     assert _call(client, "pane_run")[1] == (
         "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
     assert "resume add s1" in second[0]
-    assert bridge._tabs["s1"]["ready"] is True
+    assert bridge._recs["s1"]["ready"] is True
 
 
 def test_added_with_no_usable_ids_records_error_and_never_reports_on_none(
         seams):
-    client = RecordingClient(create_results=[{"tab": {}, "root_pane": {}}])
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
+    client = RecordingClient(create_results=[{"workspace": {}, "tab": {},
+                                              "root_pane": {}}])
+    bridge = m.Bridge(FakeWatcher([]), client)
     lines = bridge.reconcile([
-        Ev("added", "bad", {"title": "bad", "state": "idle"}),
-        Ev("added", "good", {"title": "good", "state": "idle"}),
+        Ev("added", "bad", root_session("bad", state="idle")),
+        Ev("added", "good", root_session("good", state="idle")),
     ])
     assert any("error bad" in ln for ln in lines)
     assert any("add good" in ln for ln in lines)
     # Nothing usable was stored for the malformed create, and none of the
     # follow-up calls were made with a None pane.
-    assert "bad" not in bridge._tabs
+    assert "bad" not in bridge._recs
     assert _names(client).count("pane_run") == 1
     assert _call(client, "report_agent")[1][0] == "pane1"
 
@@ -521,27 +874,58 @@ def test_added_with_no_usable_ids_records_error_and_never_reports_on_none(
     assert client.calls == []
 
 
+def test_a_rejected_workspace_create_closes_the_orphan_space(seams):
+    # The space came back without its tab or pane. There IS a handle to close —
+    # the workspace — and closing it takes the tab and pane with it, so there is
+    # nothing further to close and no second call to fail.
+    client = RecordingClient(create_results=[
+        {"workspace": {"workspace_id": "wsZ"}, "tab": {}, "root_pane": {}}])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+
+    assert any("error s1" in ln for ln in lines)
+    assert _names(client) == ["workspace_create", "workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("wsZ",)
+    assert "s1" not in bridge._recs
+    # ...and it was never recorded as ours, so `--cleanup` will not chase it.
+    assert bridge._owned == {}
+
+
+def test_failed_orphan_space_close_is_recorded_not_raised(seams):
+    client = RecordingClient(
+        create_results=[{"workspace": {"workspace_id": "wsZ"}, "tab": {},
+                         "root_pane": {}}],
+        fail={"workspace_close": FakeHerdrError("boom", "cannot close")})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+    assert sum("error s1" in ln for ln in lines) == 2
+    assert _names(client) == ["workspace_create", "workspace_close"]
+    assert "s1" not in bridge._recs
+
+
 def test_added_with_tab_id_but_no_pane_id_closes_the_orphan_tab(seams):
+    # No workspace id in the reply at all: the tab is the outermost thing we can
+    # still name, so it is what gets closed.
     client = RecordingClient(create_results=[{"tab": {"tab_id": "tabZ"},
                                               "root_pane": {}}])
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     assert any("error s1" in ln for ln in lines)
-    assert _names(client) == ["tab_create", "tab_close"]
+    assert _names(client) == ["workspace_create", "tab_close"]
     assert _call(client, "tab_close")[1] == ("tabZ",)
-    assert "s1" not in bridge._tabs
+    assert "s1" not in bridge._recs
 
 
 def test_failed_orphan_tab_close_is_recorded_not_raised(seams):
     client = RecordingClient(
         create_results=[{"tab": {"tab_id": "tabZ"}, "root_pane": {}}],
         fail={"tab_close": FakeHerdrError("boom", "cannot close")})
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     # Both the malformed-reply line and the failed cleanup line are recorded.
     assert sum("error s1" in ln for ln in lines) == 2
-    assert _names(client) == ["tab_create", "tab_close"]
-    assert "s1" not in bridge._tabs
+    assert _names(client) == ["workspace_create", "tab_close"]
+    assert "s1" not in bridge._recs
 
 
 def test_added_with_pane_id_but_no_tab_id_closes_the_orphan_pane(seams):
@@ -549,54 +933,54 @@ def test_added_with_pane_id_but_no_tab_id_closes_the_orphan_pane(seams):
     # close it directly so it is not left behind.
     client = RecordingClient(create_results=[
         {"tab": {}, "root_pane": {"pane_id": "paneZ"}}])
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     assert any("error s1" in ln for ln in lines)
-    assert _names(client) == ["tab_create", "pane_close"]
+    assert _names(client) == ["workspace_create", "pane_close"]
     assert _call(client, "pane_close")[1] == ("paneZ",)
-    assert "s1" not in bridge._tabs
+    assert "s1" not in bridge._recs
 
 
 def test_failed_orphan_pane_close_is_recorded_not_raised(seams):
     client = RecordingClient(
         create_results=[{"tab": {}, "root_pane": {"pane_id": "paneZ"}}],
         fail={"pane_close": FakeHerdrError("boom", "cannot close")})
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    lines = bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     assert sum("error s1" in ln for ln in lines) == 2
-    assert _names(client) == ["tab_create", "pane_close"]
-    assert "s1" not in bridge._tabs
+    assert _names(client) == ["workspace_create", "pane_close"]
+    assert "s1" not in bridge._recs
 
 
 def test_failed_removal_keeps_the_mapping_for_a_retry(seams):
     client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     client.calls.clear()
 
     client.fail = {"release_agent": FakeHerdrError("boom", "cannot release")}
     lines = bridge.reconcile([Ev("removed", "s1", {})])
     assert any("error s1" in ln for ln in lines)
     # Cleanup failed, so the mapping survives and a later `removed` can retry.
-    assert "s1" in bridge._tabs
+    assert "s1" in bridge._recs
     client.calls.clear()
 
     again = bridge.reconcile([Ev("removed", "s1", {})])
-    assert _names(client) == ["release_agent", "tab_close"]
+    assert _names(client) == ["release_agent", "workspace_close"]
     assert "remove s1" in again[0]
-    assert "s1" not in bridge._tabs
+    assert "s1" not in bridge._recs
 
 
 def test_removal_where_herdr_says_not_found_is_treated_as_done(seams):
     client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     client.calls.clear()
 
     client.fail = {"release_agent": FakeHerdrError("not_found", "pane not found")}
     lines = bridge.reconcile([Ev("removed", "s1", {})])
     # Already-gone is success for us: drop the mapping and do not retry.
-    assert "s1" not in bridge._tabs
+    assert "s1" not in bridge._recs
     assert any("remove s1" in ln for ln in lines)
     client.calls.clear()
 
@@ -604,66 +988,82 @@ def test_removal_where_herdr_says_not_found_is_treated_as_done(seams):
     assert client.calls == []
 
 
-def test_release_agent_not_found_still_attempts_tab_close(seams):
+def test_release_agent_not_found_still_attempts_the_close(seams):
     # A `not_found` from release_agent means only "there was no marker to
-    # release" — it does NOT mean the tab is gone (setup may have failed before
-    # reporting the marker, leaving the tab open). So tab_close must still run.
+    # release" — it does NOT mean the space is gone (setup may have failed before
+    # reporting the marker, leaving it wide open). So the close must still run.
     client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     client.calls.clear()
 
     client.fail = {"release_agent": FakeHerdrError("not_found", "no marker")}
     lines = bridge.reconcile([Ev("removed", "s1", {})])
 
-    assert _names(client) == ["release_agent", "tab_close"]
-    assert _call(client, "tab_close")[1] == ("tab1",)
-    # tab_close succeeded, so only now is the mapping dropped.
-    assert "s1" not in bridge._tabs
+    assert _names(client) == ["release_agent", "workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("ws1",)
+    # The close succeeded, so only now is the mapping dropped.
+    assert "s1" not in bridge._recs
     assert any("remove s1" in ln for ln in lines)
 
 
-def test_release_agent_not_found_then_tab_close_failure_keeps_the_mapping(seams):
-    # release_agent says "no marker" (swallowed), but tab_close then fails with a
-    # real error: the tab's fate is unknown, so the mapping must survive and a
+def test_release_agent_not_found_then_close_failure_keeps_the_mapping(seams):
+    # release_agent says "no marker" (swallowed), but the close then fails with a
+    # real error: the space's fate is unknown, so the mapping must survive and a
     # later `removed` must retry the whole cleanup.
     client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     client.calls.clear()
 
     client.fail = {"release_agent": FakeHerdrError("not_found", "no marker"),
-                   "tab_close": FakeHerdrError("boom", "cannot close")}
+                   "workspace_close": FakeHerdrError("boom", "cannot close")}
     lines = bridge.reconcile([Ev("removed", "s1", {})])
-    assert _names(client) == ["release_agent", "tab_close"]
+    assert _names(client) == ["release_agent", "workspace_close"]
     assert any("error s1" in ln for ln in lines)
-    assert "s1" in bridge._tabs
+    assert "s1" in bridge._recs
     client.calls.clear()
 
     again = bridge.reconcile([Ev("removed", "s1", {})])
-    assert _names(client) == ["release_agent", "tab_close"]
+    assert _names(client) == ["release_agent", "workspace_close"]
     assert "remove s1" in again[0]
-    assert "s1" not in bridge._tabs
+    assert "s1" not in bridge._recs
 
 
-def test_tab_close_not_found_is_treated_as_already_gone(seams):
-    # Only a `not_found` from tab_close proves the tab is gone (closing a tab's
-    # only pane removes the tab, so a later tab.close answers tab_not_found):
-    # drop the mapping and never retry.
+def test_a_close_not_found_is_treated_as_already_gone(seams):
+    # Only a `not_found` from the close proves the thing itself is gone (closing
+    # a tab's only pane removes the tab, so a later tab.close answers
+    # tab_not_found, and a closed workspace answers the same way): drop the
+    # mapping and never retry.
     client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, workspace="ws")
-    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "idle"})])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
     client.calls.clear()
 
-    client.fail = {"tab_close": FakeHerdrError("not_found", "tab_not_found")}
+    client.fail = {"workspace_close": FakeHerdrError("not_found", "not_found")}
     lines = bridge.reconcile([Ev("removed", "s1", {})])
-    assert _names(client) == ["release_agent", "tab_close"]
+    assert _names(client) == ["release_agent", "workspace_close"]
     assert "already gone" in lines[0]
-    assert "s1" not in bridge._tabs
+    assert "s1" not in bridge._recs
     client.calls.clear()
 
     assert bridge.reconcile([Ev("removed", "s1", {})]) == []
     assert client.calls == []
+
+
+def test_a_space_closed_by_hand_stops_being_recorded_as_ours(seams):
+    # `not_found` means somebody closed it, which is the outcome this bridge
+    # wanted — so the ownership record is pruned too. Leaving it would make the
+    # next `--cleanup` answer `not_found` for a space this bridge closed itself.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+    assert bridge._owned == {"ws1": "s1"}
+
+    client.fail = {"workspace_close": FakeHerdrError("not_found", "gone")}
+    bridge.reconcile([Ev("removed", "s1", {})])
+    assert bridge._owned == {}
+    assert json.loads(Path(bridge.state_path).read_text())["workspaces"] == {}
 
 
 def test_underlying_id_lookup_is_key_explicit_not_order_dependent():
@@ -672,8 +1072,10 @@ def test_underlying_id_lookup_is_key_explicit_not_order_dependent():
     root_pane = {"pane_id": "w1:pQ", "terminal_id": "term",
                  "workspace_id": "w1", "tab_id": "w1:tG"}
     tab = {"tab_id": "w1:tG"}
+    workspace = {"workspace_id": "w1"}
     assert m._id_of(root_pane, "pane_id") == "w1:pQ"
     assert m._id_of(root_pane, "tab_id") == "w1:tG"
+    assert m._id_of(workspace, "workspace_id") == "w1"
     assert m._id_of(tab, "tab_id") == "w1:tG"
     assert m._id_of(tab, "pane_id") is None
 
@@ -686,37 +1088,47 @@ def test_fake_client_returns_the_real_api_key_names():
     assert "pane_id" in result["root_pane"] and "id" not in result["root_pane"]
 
 
+def test_workspace_create_returns_workspace_tab_and_root_pane_together():
+    # The measured reply. The schema's own result listing describes only `type`
+    # and `workspace`, so a wrapper that unwrapped to the workspace alone would
+    # throw away the two ids the bridge needs and force a second call — which
+    # opens a SECOND TAB, not a second pane.
+    result = RecordingClient().workspace_create("New Alignment", "/repo")
+    assert set(result) == {"type", "workspace", "tab", "root_pane"}
+    assert result["workspace"]["workspace_id"] == "ws1"
+    assert result["tab"]["tab_id"] == "tab1"
+    assert result["root_pane"]["pane_id"] == "pane1"
+
+
 # ---------------------------------------------------------------------------
 # error handling
 # ---------------------------------------------------------------------------
 
 def test_herdr_error_is_recorded_and_not_fatal(seams):
-    client = RecordingClient(fail={"tab_create": FakeHerdrError("no-sock",
-                                                                "cannot reach herdr")})
-    bridge = m.Bridge(FakeWatcher([]), client,
-                      # a second, healthy session must still be processed
-                      )
+    client = RecordingClient(fail={"workspace_create": FakeHerdrError(
+        "no-sock", "cannot reach herdr")})
+    bridge = m.Bridge(FakeWatcher([]), client)
     lines = bridge.reconcile([
-        Ev("added", "bad", {"title": "bad", "state": "idle"}),
-        Ev("added", "good", {"title": "good", "state": "idle"}),
+        Ev("added", "bad", root_session("bad", state="idle")),
+        Ev("added", "good", root_session("good", state="idle")),
     ])
     assert any("error bad" in ln and "no-sock" in ln for ln in lines)
-    # the good session still got its pane despite the earlier failure
+    # the good session still got its space despite the earlier failure
     assert any("add good" in ln for ln in lines)
-    assert _names(client).count("tab_create") == 2
+    assert _names(client).count("workspace_create") == 2
 
 
 def test_herdr_error_on_update_does_not_abort_remaining_events(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
-    bridge.reconcile([Ev("added", "a", {"state": "idle"})])
+    bridge.reconcile([Ev("added", "a", root_session(state="idle"))])
     client.calls.clear()
     # Arm the update's report_agent to fail once; the following add must still go
     # through, proving one bad call does not abort the rest of the batch.
     client.fail = {"report_agent": FakeHerdrError("x", "y")}
     lines = bridge.reconcile([
-        Ev("changed", "a", {"state": "working"}),
-        Ev("added", "c", {"state": "idle"}),
+        Ev("changed", "a", root_session(state="working")),
+        Ev("added", "c", root_session(state="idle")),
     ])
     assert any("error a" in ln for ln in lines)
     assert any("add c" in ln for ln in lines)
@@ -730,9 +1142,9 @@ def test_dry_run_makes_zero_client_calls(seams):
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
     lines = bridge.reconcile([
-        Ev("added", "s1", {"title": "T", "state": "idle"}),
-        Ev("changed", "s1", {"title": "U", "state": "working"},
-           previous={"title": "T", "state": "idle"}),
+        Ev("added", "s1", root_session("T", state="idle")),
+        Ev("changed", "s1", root_session("U", state="working"),
+           previous=root_session("T", state="idle")),
         Ev("removed", "s1", {}),
     ])
     assert client.calls == []
@@ -742,10 +1154,24 @@ def test_dry_run_makes_zero_client_calls(seams):
 
 def test_dry_run_is_still_idempotent(seams):
     bridge = m.Bridge(FakeWatcher([]), None, dry_run=True)
-    first = bridge.reconcile([Ev("added", "s1", {"title": "T"})])
-    second = bridge.reconcile([Ev("added", "s1", {"title": "T"})])
+    first = bridge.reconcile([Ev("added", "s1", root_session("T"))])
+    second = bridge.reconcile([Ev("added", "s1", root_session("T"))])
     assert len(first) == 1
     assert second == []
+
+
+def test_a_dry_run_reports_a_worker_in_its_parents_space(seams):
+    # The dry run is the only place this layout can be checked before it exists,
+    # so it must describe the layout a real run WOULD produce — including a
+    # worker landing beside its parent rather than in a space of its own.
+    bridge = m.Bridge(FakeWatcher([]), None, dry_run=True, cwd="/repo")
+    lines = bridge.reconcile([
+        Ev("added", "w1", sub_session("root", "coder_zen:space-per-root")),
+        Ev("added", "root", root_session("New Alignment")),
+    ])
+    # Roots first, whatever order the listing emitted them in.
+    assert lines[0].startswith("dry-run: add 'New Alignment' → space (/repo)")
+    assert "→ tab in space dry-run-space:root (/repo)" in lines[1]
 
 
 # ---------------------------------------------------------------------------
@@ -756,11 +1182,11 @@ def test_blocked_is_reported_not_resolved(seams, monkeypatch):
     monkeypatch.setattr(m, "_state", lambda s: "blocked")
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
-    bridge.reconcile([Ev("added", "s1", {"title": "T"})])
+    bridge.reconcile([Ev("added", "s1", root_session("T"))])
     ra = _call(client, "report_agent")
     assert ra[2]["state"] == "blocked"
     # only reporting calls happened; nothing that could resolve an elicitation
-    assert _names(client) == ["tab_create", "pane_run", "report_agent",
+    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
                               "report_metadata"]
 
 
@@ -788,7 +1214,7 @@ def test_source_never_calls_an_elicitation_resolver():
 
 def test_run_once_polls_and_reconciles(seams):
     client = RecordingClient()
-    watcher = FakeWatcher([[Ev("added", "s1", {"title": "T"})]])
+    watcher = FakeWatcher([[Ev("added", "s1", root_session("T"))]])
     bridge = m.Bridge(watcher, client)
     lines = bridge.run_once()
     assert watcher.polls == 1
@@ -803,22 +1229,238 @@ def test_build_parser_defaults():
     args = m.build_parser().parse_args([])
     assert args.once is False
     assert args.dry_run is False
+    assert args.cleanup is False
     assert args.server == "http://127.0.0.1:6767"
     assert args.socket is None
-    assert args.workspace is None
     assert args.source == "og-bridge"
 
 
 def test_build_parser_overrides():
     args = m.build_parser().parse_args([
         "--once", "--dry-run", "--server", "http://example:1",
-        "--socket", "/tmp/s.sock", "--workspace", "w1", "--source", "me",
+        "--socket", "/tmp/s.sock", "--source", "me",
     ])
     assert args.once and args.dry_run
     assert args.server == "http://example:1"
     assert args.socket == "/tmp/s.sock"
-    assert args.workspace == "w1"
     assert args.source == "me"
+
+
+def test_workspace_flag_is_gone():
+    # There is no shared target workspace any more: a root's space is its own,
+    # and a worker's tab is its parent's. A `--workspace` here could only be
+    # ignored, and an ignored flag that reads like isolation is the exact defect
+    # this project already shipped once (tab.create's dropped `workspace` key).
+    parser = m.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--workspace", "w1"])
+    assert not hasattr(parser.parse_args([]), "workspace")
+
+
+# ---------------------------------------------------------------------------
+# --cleanup: with a space per root there is no single scratch workspace to
+# close, so without this a test run leaves the operator closing spaces by hand.
+#
+# Ownership is recorded in a small state file under $OMNIGENT_HOME, keyed by the
+# workspace id herdr minted — never by the label, which is the operator's session
+# title verbatim and the one display they asked for.
+# ---------------------------------------------------------------------------
+
+PROJECTS = {"workspace_id": "w1", "label": "projects"}
+
+
+def test_a_created_space_is_recorded_as_ours_by_id(seams):
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient())
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+
+    recorded = json.loads(Path(bridge.state_path).read_text())
+    assert recorded == {"version": m.STATE_VERSION,
+                        "workspaces": {"ws1": "root"}}, recorded
+    # Under $OMNIGENT_HOME, beside og-quota.json.
+    assert bridge.state_path.name == "og-herdr.json"
+    assert bridge.state_path.parent == Path(os.environ["OMNIGENT_HOME"])
+
+
+def test_a_sub_agents_space_is_not_recorded_because_it_created_none(seams):
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient())
+    bridge.reconcile([
+        Ev("added", "root", root_session("New Alignment")),
+        Ev("added", "w1", sub_session("root"))])
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_cleanup_closes_only_what_it_recorded(seams):
+    # The operator's own `projects` workspace is in the listing and is not ours.
+    # Closing it would take real work with it, and it was never recorded because
+    # this bridge never opened it.
+    client = RecordingClient(spaces=[PROJECTS, {"workspace_id": "ws1",
+                                               "label": "New Alignment"}])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+
+    lines = bridge.cleanup()
+
+    assert _names(client).count("workspace_close") == 1
+    assert _call(client, "workspace_close")[1] == ("ws1",)
+    assert not [c for c in client.calls
+                if c[0] == "workspace_close" and c[1] == ("w1",)], \
+        "the operator's projects workspace was closed"
+    assert any("closed workspace ws1" in ln for ln in lines)
+    # It says what was left, so "the cleanup finished" is checkable rather than
+    # something the operator takes on faith.
+    assert any("left workspace 'w1'" in ln and "projects" in ln for ln in lines), lines
+
+
+def test_cleanup_is_idempotent_because_the_record_is_pruned(seams):
+    client = RecordingClient(spaces=[PROJECTS])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+
+    bridge.cleanup()
+    client.calls.clear()
+    lines = bridge.cleanup()
+
+    assert "workspace_close" not in _names(client), (
+        "a second cleanup re-closed a space the first one already closed")
+    assert any("nothing to close" in ln for ln in lines)
+
+
+def test_dry_run_cleanup_closes_nothing_and_makes_no_call_at_all(seams):
+    client = RecordingClient(spaces=[PROJECTS])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+
+    dry = m.Bridge(FakeWatcher([]), None, dry_run=True)
+    assert dry.state_path == bridge.state_path
+    lines = dry.cleanup()
+
+    assert client.calls == [], "the dry run reached the live client"
+    assert not bridge.state_path.exists() or \
+        json.loads(bridge.state_path.read_text())["workspaces"] == {"ws1": "root"}, \
+        "a dry-run cleanup rewrote the ownership record"
+    assert any(ln.startswith("dry-run cleanup: close workspace ws1")
+               for ln in lines), lines
+    assert any("would be closed" in ln for ln in lines), lines
+
+
+def test_cleanup_with_no_state_file_says_so_and_closes_nothing(seams, tmp_path):
+    # A missing file is the normal case — nothing has been created, or
+    # everything already was. It is not an error, and it is said out loud so a
+    # silent no-op is distinguishable from a clean run.
+    client = RecordingClient(spaces=[PROJECTS])
+    bridge = m.Bridge(FakeWatcher([]), client, state_path=tmp_path / "absent.json")
+
+    lines = bridge.cleanup()
+
+    assert _names(client) == ["workspace_list", "workspace_list"]
+    assert any("no state file" in ln and "absent.json" in ln for ln in lines), lines
+    assert any("nothing to close" in ln for ln in lines), lines
+
+
+@pytest.mark.parametrize("name,content,expected", [
+    ("stale.json", json.dumps({"version": 0, "workspaces": {"wX": "s"}}), "v1"),
+    ("corrupt.json", "{ nope", "not valid JSON"),
+    ("wrong.json", json.dumps(["w1"]), "not a v1 state file"),
+])
+def test_a_stale_or_unreadable_state_file_is_not_an_error(
+        seams, tmp_path, name, content, expected):
+    # A stale file closes nothing rather than closing everything: an answer we
+    # cannot read must not become permission to guess at a workspace id.
+    client = RecordingClient(spaces=[PROJECTS])
+    path = tmp_path / name
+    path.write_text(content)
+    bridge = m.Bridge(FakeWatcher([]), client, state_path=path)
+
+    lines = bridge.cleanup()
+
+    assert _names(client) == ["workspace_list", "workspace_list"]
+    assert any(expected in ln for ln in lines), lines
+    assert any("nothing to close" in ln for ln in lines), lines
+
+
+def test_a_state_file_of_wrong_shaped_entries_keeps_only_usable_ones(
+        seams, tmp_path):
+    client = RecordingClient(spaces=[PROJECTS])
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps({"version": m.STATE_VERSION, "workspaces": {
+        "ws1": "root", "": "s", "ws2": None, "ws3": "other"}}))
+    bridge = m.Bridge(FakeWatcher([]), client, state_path=path)
+
+    bridge.cleanup()
+    assert [c[1] for c in client.calls if c[0] == "workspace_close"] == \
+        [("ws1",), ("ws3",)]
+
+
+def test_a_cleanup_failure_keeps_the_record_for_a_later_run(seams):
+    # A transient failure must not turn one space into a space nobody ever
+    # closes — the operator would have no way to tell which one it was.
+    client = RecordingClient(fail={"workspace_close": FakeHerdrError(
+        "boom", "cannot close")})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+
+    lines = bridge.cleanup()
+    assert any("error root" in ln and "boom" in ln for ln in lines), lines
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_a_cleanup_of_an_already_gone_space_counts_as_done(seams):
+    client = RecordingClient(fail={"workspace_close": FakeHerdrError(
+        "not_found", "workspace_not_found")})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+
+    lines = bridge.cleanup()
+    assert any("already gone" in ln for ln in lines), lines
+    assert bridge._owned == {}
+
+
+def test_an_unreadable_workspace_list_does_not_skip_the_cleanup(seams):
+    # The listing only makes the REPORT readable. A failure there must not stop
+    # the closes, which are the part that matters.
+    client = RecordingClient(fail={"workspace_list": FakeHerdrError(
+        "boom", "no such thing")})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+
+    lines = bridge.cleanup()
+    assert _call(client, "workspace_close")[1] == ("ws1",)
+    assert any("cannot list workspaces" in ln for ln in lines), lines
+
+
+def test_cleanup_runs_without_a_watcher_or_a_poll(monkeypatch, capsys):
+    # `og herdr --cleanup` is about herdr. Constructing a SessionWatcher would
+    # mean an HTTP round trip whose only possible effect is to start projecting
+    # the sessions we are in the middle of closing.
+    import sys
+    import types
+
+    boom = types.ModuleType("og_herdr_watch")
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("--cleanup must not build a watcher")
+
+    boom.SessionWatcher = refuse
+    monkeypatch.setitem(sys.modules, "og_herdr_watch", boom)
+
+    client = RecordingClient(spaces=[PROJECTS])
+    client_module = types.ModuleType("og_herdr_client")
+    client_module.HerdrClient = lambda socket_path=None: client
+    client_module.HerdrError = FakeHerdrError
+    monkeypatch.setitem(sys.modules, "og_herdr_client", client_module)
+
+    home = Path(os.environ["OMNIGENT_HOME"]) / "og-herdr.json"
+    m.save_state(home, {"ws1": "root"})
+
+    assert m.main(["--cleanup"]) == 0
+    out = capsys.readouterr().out
+    assert [c[1] for c in client.calls if c[0] == "workspace_close"] == [("ws1",)]
+    assert "closed workspace ws1" in out
+    assert "left workspace 'w1'" in out
+    assert json.loads(home.read_text())["workspaces"] == {}
 
 
 def test_build_parser_exposes_cwd_with_process_cwd_default():
