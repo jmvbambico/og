@@ -709,6 +709,64 @@ def _first_line(path: str) -> Optional[str]:
     return None
 
 
+# The tunnel providers bin/og recognises by name — its `tunnel_url` case arm,
+# the same set `normalize_tunnel_provider` canonicalises to. A cached URL whose
+# provider record names anything else is not vouched for.
+_TUNNEL_PROVIDERS = ("ngrok", "tunnl")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether `pid` names a live process: the Python form of `kill -0`.
+
+    `os.kill(pid, 0)` sends no signal; it only asks the kernel to resolve the
+    pid, which is exactly what bin/og's `tunnel_pid` tests with `kill -0`. Any
+    OSError counts as dead, including EPERM — `kill -0` also exits non-zero for a
+    process belonging to another user (verified: `kill -0 1` prints "Operation
+    not permitted" and exits 1), so this mirrors the shell check rather than
+    second-guessing it. A pidfile naming someone else's process is stale anyway.
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _cached_tunnel_url(home: str) -> Optional[str]:
+    """The cached public URL, but only while the tunnel that wrote it is alive.
+
+    The three gates of bin/og's `tunnel_url`, in its order: a non-empty URL file,
+    a provider record naming a provider og recognises, and that provider's
+    pidfile holding a live pid. Any gate failing reads as "there is no cache", so
+    the caller falls through to the LAN address — a dead tunnel URL looks
+    authoritative and is the worst address to hand a phone, worse than an honest
+    same-wifi address that visibly fails.
+
+    Deliberately does NOT clear the cache on a stale entry, unlike bin/og: `og
+    agents` is a read-only viewer (the test AST guard pins that), and the
+    operator's state files are `og`'s to clean up, not a viewer's to delete. The
+    stale value is ignored instead; `og start`/`tunnel_url` will clear it.
+
+    The legacy `og-ngrok.pid` is NOT consulted, matching `tunnel_url`: a tunnel
+    that predates the provider record writes no `og-tunnel.provider`, so the
+    second gate already reads it as no tunnel.
+    """
+    url = _first_line(os.path.join(home, "og-tunnel.url"))
+    if not url:
+        return None
+    provider = _first_line(os.path.join(home, "og-tunnel.provider"))
+    if provider not in _TUNNEL_PROVIDERS:
+        return None
+    pid_text = _first_line(os.path.join(home, f"og-tunnel-{provider}.pid"))
+    if not pid_text:
+        return None
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return None
+    return url if _pid_alive(pid) else None
+
+
 def _server_port(server: str) -> int:
     """The port in the `--server` URL, or the default.
 
@@ -731,21 +789,23 @@ def access_info(server: str, environ: Optional[dict] = None) -> Access:
     and runs in any terminal with no dependency on `og` being on PATH, so
     shelling out to the shell script would be the wrong coupling. bin/og's
     counterparts are `access_url` (the dispatcher), `tunnel_url` (the cache
-    read, which also validates the tunnel's pid — this view trusts the cache,
-    which `og start` writes and `og stop` clears), `lan_ip`, and `show_access`
+    read — `_cached_tunnel_url` mirrors its three gates, including the owning
+    tunnel's pid, but IGNORES a stale entry instead of clearing it, since a
+    viewer must not delete the operator's state), `lan_ip`, and `show_access`
     (whose caveat wording the notes above mirror). Consolidating the two is one
     edit here.
 
     Order, and why: a cached tunnel URL is a public address that works from
-    anywhere, so it wins when present; otherwise the host's LAN address at the
-    server's port is the same-wifi fallback. When neither resolves the panel
-    names no address at all — a banner pointing somewhere dead is worse than
-    none, because someone will scan it and get nothing.
+    anywhere, so it wins when present AND its tunnel is still alive; otherwise
+    the host's LAN address at the server's port is the same-wifi fallback. When
+    neither resolves the panel names no address at all — a banner pointing
+    somewhere dead is worse than none, because someone will scan it and get
+    nothing.
     """
     env = os.environ if environ is None else environ
     home = env.get("OMNIGENT_HOME") or os.path.join(
         os.path.expanduser("~"), ".omnigent")
-    cached = _first_line(os.path.join(home, "og-tunnel.url"))
+    cached = _cached_tunnel_url(home)
     if cached:
         return Access(url=cached, qr=qr_lines(cached), note=TUNNEL_NOTE)
     ip = _lan_ip()
