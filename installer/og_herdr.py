@@ -858,13 +858,11 @@ class Bridge:
         """
         if not title or info.get("label") == title:
             return
-        # `call` and not a named wrapper: `workspace.rename` has no wrapper on
-        # the client module, and the frame is pinned against herdr's vendored
-        # schema by a test in this file (see
-        # test_the_workspace_rename_frame_matches_herdrs_schema), so using the
-        # generic call does not quietly opt out of conformance.
-        self.client.call("workspace.rename", {"workspace_id": ws_id,
-                                              "label": title})
+        # Through the client's NAMED wrapper, not the generic `call`: the schema
+        # conformance guard in tests/test_og_herdr_client.py enumerates wrappers
+        # by introspection, so a frame sent via `call` is invisible to it — which
+        # is how `pane.run`, a method herdr never had, survived 223 tests.
+        self.client.workspace_rename(ws_id, title)
 
     def _workspace_index(self) -> dict | None:
         """`{workspace_id: info}` from workspace.list, once per reconcile pass.
@@ -1540,12 +1538,6 @@ def main(argv=None) -> int:
         for line in bridge.run_once():
             print(line)
         return 0
-    try:
-        bridge.run_forever()
-    except KeyboardInterrupt:
-        return 0
-    return 0
-
     try:
         bridge.run_forever()
     except KeyboardInterrupt:

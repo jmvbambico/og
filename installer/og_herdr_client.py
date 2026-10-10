@@ -432,6 +432,24 @@ class HerdrClient:
         """
         self.call("workspace.close", {"workspace_id": workspace_id})
 
+    def workspace_rename(self, workspace_id: str, label: str) -> None:
+        """Rename a workspace (herdr's UI calls these "spaces").
+
+        The wire method is `workspace.rename` and its `WorkspaceRenameParams`
+        requires BOTH `workspace_id` and `label`; there is no partial rename.
+        The bridge uses this for the launcher handoff — a space labelled from
+        the directory, because no session existed when it was made, is given the
+        conversation's title once there is one.
+
+        A named wrapper and not the generic `call`, so the frame is covered by
+        the schema conformance guard in tests/test_og_herdr_client.py: that guard
+        enumerates wrappers by introspection, so a frame sent through `call` is
+        invisible to it — which is how `pane.run`, a method herdr never had,
+        survived 223 green tests.
+        """
+        self.call("workspace.rename", {"workspace_id": workspace_id,
+                                       "label": label})
+
     def tab_create(self, workspace_id: str, cwd: str, label: str,
                    focus: bool = False) -> dict:
         """Create a tab; returns the whole result — it carries `tab` and `root_pane`.

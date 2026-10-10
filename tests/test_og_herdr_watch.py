@@ -498,28 +498,28 @@ def cap_pages(monkeypatch, pages=1):
 def test_a_complete_listing_is_not_truncated():
     rows, truncated = w.SessionWatcher(
         opener=StubOpener(envelope([session("s1")]))
-    )._fetch_listing()
+    ).fetch_listing()
     assert ([r["id"] for r in rows], truncated) == (["s1"], False)
 
 
 def test_the_page_cap_is_reported_as_truncated(monkeypatch):
     cap_pages(monkeypatch)
     opener = StubOpener(envelope([session("s1")], has_more=True, last_id="s1"))
-    rows, truncated = w.SessionWatcher(opener=opener)._fetch_listing()
+    rows, truncated = w.SessionWatcher(opener=opener).fetch_listing()
     assert ([r["id"] for r in rows], truncated) == (["s1"], True)
 
 
 def test_a_server_that_will_not_say_where_to_continue_is_truncated():
     # has_more with no cursor to use: more exists and none of it was fetched.
     payload = {"object": "list", "data": [{"status": "running"}], "has_more": True}
-    _rows, truncated = w.SessionWatcher(opener=StubOpener(payload))._fetch_listing()
+    _rows, truncated = w.SessionWatcher(opener=StubOpener(payload)).fetch_listing()
     assert truncated is True
 
 
 def test_a_repeated_cursor_is_reported_as_truncated():
     page = envelope([session("s1")], has_more=True, last_id="same")
     opener = StubOpener(page)
-    rows, truncated = w.SessionWatcher(opener=opener)._fetch_listing()
+    rows, truncated = w.SessionWatcher(opener=opener).fetch_listing()
     assert truncated is True
     assert len(rows) == 2, "both fetches landed before the walk gave up"
 
@@ -527,8 +527,17 @@ def test_a_repeated_cursor_is_reported_as_truncated():
 def test_the_row_cap_is_reported_as_truncated(monkeypatch):
     monkeypatch.setattr(w, "MAX_LISTED_SESSIONS", 1)
     opener = StubOpener(envelope([session("s1"), session("s2")]))
-    rows, truncated = w.SessionWatcher(opener=opener)._fetch_listing()
+    rows, truncated = w.SessionWatcher(opener=opener).fetch_listing()
     assert ([r["id"] for r in rows], truncated) == (["s1"], True)
+
+
+def test_fetch_listing_is_public_and_the_private_name_is_gone():
+    # `fetch_listing` is the public name the truncation flag is read through
+    # (og_agents does). The old private spelling is deliberately removed rather
+    # than aliased, so a straggler caller fails loudly on `AttributeError`
+    # instead of silently reading a name that no longer means anything.
+    assert hasattr(w.SessionWatcher, "fetch_listing")
+    assert not hasattr(w.SessionWatcher, "_fetch_listing")
 
 
 def test_a_truncated_listing_does_not_manufacture_removals(monkeypatch):

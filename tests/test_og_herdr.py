@@ -111,12 +111,12 @@ class RecordingClient:
                         ttl_ms=None):
         self._call("report_metadata", pane_id, source, title=title)
 
-    def call(self, method, params=None):
-        """The client's generic wire call, as `og_herdr_client.HerdrClient`
-        really has it. The bridge uses it for `workspace.rename`, which has no
-        named wrapper on the client module."""
-        self._call("call", method, params)
-        return {}
+    def workspace_rename(self, workspace_id, label):
+        """The client's NAMED `workspace.rename` wrapper, matching
+        `og_herdr_client.HerdrClient`. The bridge routes the launcher handoff
+        through it, so the frame is covered by the introspection guard in
+        tests/test_og_herdr_client.py rather than by the generic `call`."""
+        self._call("workspace_rename", workspace_id, label)
 
 
 class FakeWatcher:
@@ -458,6 +458,37 @@ def test_main_threads_the_cli_server_into_the_bridge(monkeypatch, tmp_path):
     assert m.main(["--once", "--dry-run", "--server", "https://og.example:8443"]) == 0
     assert captured["base_url"] == "https://og.example:8443"
     assert captured["server"] == "https://og.example:8443"
+
+
+def test_main_returns_zero_when_the_forever_loop_is_interrupted(
+        monkeypatch, tmp_path):
+    # A daemon the operator stops with Ctrl-C must exit cleanly: the forever
+    # path catches KeyboardInterrupt and returns 0 rather than letting it
+    # propagate out of main. `--once` and `--cleanup` are the other two exits
+    # and are covered by the two tests around this one.
+    import sys
+    import types
+
+    # main() reads the real token store; keep it off the developer's ~/.omnigent.
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+
+    class StubWatcher:
+        def __init__(self, base_url=None, token=None):
+            pass
+
+    stub_module = types.ModuleType("og_herdr_watch")
+    stub_module.SessionWatcher = StubWatcher
+    monkeypatch.setitem(sys.modules, "og_herdr_watch", stub_module)
+
+    class Interrupted:
+        def run_forever(self):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(m, "Bridge", lambda *args, **kwargs: Interrupted())
+
+    # No --once, no --cleanup: this is the forever path. --dry-run keeps main()
+    # from constructing the herdr client (and so touching a socket).
+    assert m.main(["--dry-run"]) == 0
 
 
 def test_changed_sequence_reports_state_and_title(seams):
@@ -1806,10 +1837,8 @@ def test_a_claimed_space_is_renamed_to_the_session_title(seams):
     bridge.reconcile([Ev("added", "s1", root_session(
         "Fix the bridge", workspace="/repo/og"))])
 
-    # `call` is the client's generic wire method: (method, params).
-    rename = _call(client, "call")
-    assert rename[1][0] == "workspace.rename"
-    assert rename[1][1] == {"workspace_id": "wB", "label": "Fix the bridge"}
+    # The client's named wrapper: (workspace_id, label).
+    assert _call(client, "workspace_rename")[1] == ("wB", "Fix the bridge")
 
 
 def test_a_claimed_space_whose_label_already_matches_is_not_renamed(seams):
@@ -1829,7 +1858,7 @@ def test_a_claimed_space_whose_label_already_matches_is_not_renamed(seams):
         m.Bridge(FakeWatcher([]), client).reconcile(
             [Ev("added", "s1", root_session("Fix the bridge",
                                             workspace="/repo/og"))])
-        return [c for c in client.calls if c[0] == "call"]
+        return [c for c in client.calls if c[0] == "workspace_rename"]
 
     assert claim("og"), "control: a DIFFERENT label must be renamed"
     assert claim("Fix the bridge") == [], \
@@ -1837,11 +1866,13 @@ def test_a_claimed_space_whose_label_already_matches_is_not_renamed(seams):
 
 
 def test_the_workspace_rename_frame_matches_herdrs_schema(seams):
-    # The bridge calls `call` directly because the client module has no
-    # `workspace_rename` wrapper — which would exempt this frame from the
-    # conformance guard in tests/test_og_herdr_client.py, since that guard
-    # enumerates wrappers by introspection. So the frame the bridge ACTUALLY
-    # emits is captured here and pinned against the same vendored schema.
+    # Now that the client has a named `workspace_rename` wrapper, the wire frame
+    # is ALSO covered by the introspection conformance guard in
+    # tests/test_og_herdr_client.py. This stays as the bridge-side specific case:
+    # it pins that the bridge passes exactly the workspace id and the session
+    # title — the two params `WorkspaceRenameParams` requires, and no others —
+    # so a change at the bridge (a dropped label, a stray key) is named here
+    # rather than only in the client's report.
     client = RecordingClient(spaces=[space_info("wB", "og")])
     write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
         "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
@@ -1849,17 +1880,19 @@ def test_the_workspace_rename_frame_matches_herdrs_schema(seams):
     m.Bridge(FakeWatcher([]), client).reconcile(
         [Ev("added", "s1", root_session("Fix the bridge", workspace="/repo/og"))])
 
-    method, params = _call(client, "call")[1]
-    assert method == "workspace.rename"
+    # The wrapper maps its two arguments onto the wire params one-for-one.
+    ws_id, title = _call(client, "workspace_rename")[1]
+    method = "workspace.rename"
+    params = {"workspace_id": ws_id, "label": title}
 
     schema = json.loads((Path(__file__).parent / "fixtures"
                          / "herdr_api_schema.json").read_text())
     request = schema["schemas"]["request"]
     variants = {v["properties"]["method"]["const"]: v["properties"]["params"]
                 for v in request["oneOf"]}
-    assert "workspace.rename" in variants, "herdr has no workspace.rename"
+    assert method in variants, "herdr has no workspace.rename"
 
-    allowed = variants["workspace.rename"]
+    allowed = variants[method]
     while "$ref" in allowed:
         allowed = request["$defs"][allowed["$ref"].rsplit("/", 1)[1]]
 
