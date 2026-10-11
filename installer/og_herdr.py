@@ -303,11 +303,22 @@ class Bridge:
     """
 
     def __init__(self, watcher, client, dry_run=False, source=DEFAULT_SOURCE,
-                 cwd=None, server=DEFAULT_SERVER, state_path=None):
+                 cwd=None, server=DEFAULT_SERVER, state_path=None, filer=None):
         self.watcher = watcher
         self.client = client
         self.dry_run = dry_run
         self.source = source
+        # Files each new ROOT session under the install's project folder
+        # (og_projects.ProjectFiler), or None to leave filing off. It is a seam
+        # and not a call made here, because the bridge is AST-guarded against
+        # reaching for the network of its own accord (see the tests) — the
+        # watcher owns every HTTP call it makes, and this one arrives injected.
+        self.filer = filer
+        # Whether a filing failure has already been reported. Filing is a
+        # convenience, not the job, so a broken server warns ONCE per bridge and
+        # never once per session — a daemon that logs a line per new root for the
+        # life of the process is the noise this flag exists to prevent.
+        self._file_warned = False
         # The directory new panes open in when the session does not name one of
         # its own (see `_added`). It comes from THIS process, so with no
         # explicit --cwd it is the bridge's own cwd.
@@ -592,6 +603,39 @@ class Bridge:
             return self._removed(sid)
         return []
 
+    def _file_under_project(self, sid: str) -> list:
+        """File a newly-seen ROOT session under this install's project folder.
+
+        The write lives HERE, in the bridge, and not in the watcher: the watcher
+        is read-only by contract — `og_agents` depends on that and says so — and
+        the bridge is the component that already acts on session events. The HTTP
+        itself belongs to the injected `filer`, so the bridge stays free of any
+        network call of its own (the tests pin that with an AST scan).
+
+        The name is the orchestrator bundle from the install plan, read here
+        rather than hard-coded, so a user's `hivemind` folder is the one the
+        session lands in. It defaults the same way the launcher's does, via
+        `og_herdr_launch`, so there is one spelling of the key and its fallback.
+
+        Best effort throughout. A dry run makes no calls at all; an already-filed
+        session is left exactly as it was (by the filer); and a failure is warned
+        ONCE and never raised, so it can neither take the bridge down nor keep the
+        session's pane from opening. There is no retry: a session is filed once.
+        """
+        if self.filer is None or self.dry_run:
+            return []
+        from og_herdr_launch import agent_name, install_config
+
+        name = agent_name(install_config())
+        status, detail = self.filer.file(sid, name)
+        if status == "filed":
+            return [f"filed {sid} under the '{name}' project"]
+        if status == "failed" and not self._file_warned:
+            self._file_warned = True
+            return [f"warn: could not file session {sid} under the '{name}' "
+                    f"project ({detail}); it stays unfiled"]
+        return []
+
     def _added(self, sid: str, session: dict) -> list:
         command = attach_command(self.server, sid)
         rec = self._recs.get(sid)
@@ -632,6 +676,13 @@ class Bridge:
         state = _state(session)
         parent = _parent_of(session)
 
+        # File this ROOT under the install's project folder, once, on first
+        # sighting. A sub-agent is skipped: it nests under its root in the
+        # sidebar already and must stay unlabelled, or every worker would sprout
+        # a folder of its own. The lines are folded into whichever return below
+        # fires, so a filing failure is reported without ever touching the pane.
+        filed = self._file_under_project(sid) if parent is None else []
+
         # (2)/(3) A space may already be on screen for this session without the
         # bridge having opened it in THIS process — because the launcher made it
         # and ran `og chat` in it, or because the bridge restarted and its
@@ -655,9 +706,10 @@ class Bridge:
                         "title": title, "agent": agent, "parent": parent,
                         "owns_space": False, "step": 3, "ready": True,
                     }
-                    return [f"dry-run: {taken['action']} '{title}' → space "
-                            f"{taken['workspace_id']} ({cwd}) — unverified, "
-                            f"read from the state file without asking herdr"]
+                    return filed + [
+                        f"dry-run: {taken['action']} '{title}' → space "
+                        f"{taken['workspace_id']} ({cwd}) — unverified, "
+                        f"read from the state file without asking herdr"]
                 # A record naming a pane we can confirm is finished with: the
                 # space, its tab and its pane all exist and something is already
                 # running in it. Re-running setup would type the attach command
@@ -665,8 +717,9 @@ class Bridge:
                 # is a second co-drive client on one session, which is the race
                 # `_state` exists to avoid. So: adopt it and touch nothing.
                 if taken["pane_ok"]:
-                    return self._adopt(sid, taken["record"], taken["action"],
-                                       title, agent, state, command)
+                    return filed + self._adopt(sid, taken["record"],
+                                               taken["action"], title, agent,
+                                               state, command)
                 # No pane to resume onto (an upgraded v1 record carries no pane
                 # id). The space is still this session's, so it becomes a TAB in
                 # that space rather than a second space beside it.
@@ -687,14 +740,14 @@ class Bridge:
                 "step": 3, "ready": True,
             }
             where = f"tab in space {space}" if space else "space"
-            return [f"dry-run: add '{title}' → {where} ({cwd}) → "
-                    f"{command} [{state}]"]
+            return filed + [f"dry-run: add '{title}' → {where} ({cwd}) → "
+                            f"{command} [{state}]"]
 
         if space is None:
-            return self._add_space(sid, title, cwd, agent, state, command,
-                                   parent)
-        return self._add_tab(sid, title, space, cwd, agent, state, command,
-                             parent)
+            return filed + self._add_space(sid, title, cwd, agent, state,
+                                           command, parent)
+        return filed + self._add_tab(sid, title, space, cwd, agent, state,
+                                     command, parent)
 
     # -- adopting a space that is already on screen --------------------------
     #
@@ -1518,21 +1571,27 @@ def main(argv=None) -> int:
 
     from og_herdr_watch import SessionWatcher
 
-    watcher = SessionWatcher(base_url=args.server, token=_load_token(args.server))
+    token = _load_token(args.server)
+    watcher = SessionWatcher(base_url=args.server, token=token)
     client = None
+    filer = None
     if not args.dry_run:
-        # Constructed only for a real run: --dry-run must make zero herdr calls,
-        # and building the client is the one step that could touch the socket.
+        # Constructed only for a real run: --dry-run must make zero calls, and
+        # building either is the step that could reach a socket or the network.
         from og_herdr_client import HerdrClient
+        from og_projects import ProjectFiler
 
         client = HerdrClient(socket_path=args.socket)
+        # Files og's own new root sessions into the install's project folder,
+        # against the same server and token the watcher uses.
+        filer = ProjectFiler(args.server, token=token)
 
     bridge = Bridge(watcher, client,
                     dry_run=args.dry_run, source=args.source, cwd=args.cwd,
                     # The same URL the watcher polls, and the one the pane's
                     # `omnigent attach --server` has to name: the pane cannot
                     # discover it (see attach_command).
-                    server=args.server)
+                    server=args.server, filer=filer)
 
     if args.once:
         for line in bridge.run_once():
