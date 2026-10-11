@@ -5,7 +5,7 @@ It shows the orchestrator (a ROOT session) and the workers it delegated to,
 built from two sources and nothing else:
 
   * the SESSION LISTING, which supplies the tree (`parent_session_id`), the
-    titles and the statuses; and
+    titles, the statuses, the timestamps and the pending-elicitation counts; and
   * the DETAIL row (`GET /v1/sessions/{id}`), read lazily, which supplies the
     `workspace` (to resolve "which session is this directory") and the report
     SNIPPET.
@@ -14,21 +14,25 @@ The listing is cheap and drives the live view; the detail row is 121 KB and is
 fetched as little as possible. See `AgentModel.refresh` for the budget and why a
 per-row-per-poll fetch is a defect rather than a slow path.
 
+The shape of the view: one plain header per root (the harness label), then a
+full box per worker — `├─`/`└─` down a tree spine, a `▸` caret on the selected
+box, one ASCII glyph per state, a 6-dot braille spinner for anything working, a
+boxed access panel sized to its own content, and a one-line footer. `render` is
+a pure function from state to a list of lines and curses only paints them; that
+separation is what lets the view be tested with `--once`, with no tty in sight.
+
 This module is deliberately NOT herdr-specific: it reads Omnigent's HTTP API and
 must run in any terminal. It never writes to a session — no prompting, no
 answering an elicitation, no dispatches. The only requests it makes are GETs,
 and they all go through `og_herdr_watch`, which owns the transport, pagination,
 `kind=any` default, truncation handling and per-server token matching. None of
 that is re-implemented here.
-
-The renderer is a pure function from state to a list of lines (`render`), and
-the curses layer only paints that list; that separation is what lets the view be
-tested with `--once`, with no tty in sight.
 """
 from __future__ import annotations
 
 import argparse
 import ipaddress
+import math
 import os
 import re
 import shutil
@@ -47,33 +51,59 @@ from og_herdr_watch import (
     herdr_state,
 )
 
-# The status glyph shown beside a worker. Keyed by `og_herdr_watch.herdr_state`
-# so there is one state vocabulary in the project; anything the viewer does not
-# recognise is "?" rather than a wrong guess.
+DEFAULT_INTERVAL = 3.0
+
+# The status glyph shown beside a worker. ASCII on purpose: a pane that renders
+# this view's box-drawing characters correctly is not guaranteed to have the
+# geometric shapes, and a `?` where a tick should be reads as "I do not know
+# this state" when the state is merely idle. `working` has no glyph here — it
+# gets the spinner (`state_glyph`), because a moving dot is the one glyph that
+# says "this is live" without a legend.
 STATE_GLYPH = {
-    "working": "●",
-    "idle": "✓",
-    "blocked": "⏸",
+    "idle": "+",
+    "blocked": "!",
+    "failed": "x",
     "unknown": "?",
 }
 
-DEFAULT_INTERVAL = 3.0
+# The spinner: SIX braille dots, and only the top two rows of each cell (dots
+# 1-6, never the 7/8 descenders). That restriction is the whole reason for the
+# choice — the 7/8 forms hang below the baseline, so a spinner that used them
+# would change the glyph's height every frame and make the row it sits in jitter
+# as the box is redrawn. Six frames at SPIN_TICK is one ~0.7s cycle.
+SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴"
+SPIN_TICK = 0.12
+
+# The DISPLAY state `herdr_state` does not have. See `display_state` for why it
+# is derived here instead of being added to the shared vocabulary.
+FAILED_STATUSES = frozenset({"failed", "error", "errored", "cancelled", "canceled"})
 
 # Ceilings. The view is meant to run for a long time, so its two caches are
 # bounded rather than growing one entry per session the machine has ever seen.
 # Both are order-of-magnitude above anything real: MAX_ROOT_DETAILS is the
-# number of live roots whose detail is worth a 121 KB fetch at startup (the
-# "handful" the design budgets for), and MAX_SNIPPETS is a window of reports.
+# number of roots whose detail is worth a 121 KB fetch at startup (the "handful"
+# the design budgets for, and the ceiling on the cwd probe in `_match_cwd_root`
+# — same dict, same eviction), and MAX_SNIPPETS is a window of reports.
 MAX_ROOT_DETAILS = 32
 MAX_SNIPPETS = 256
 
 # The access panel (the `a` toggle). It is pinned to the bottom of the pane and
-# sized to its content — the QR block, one URL line and one caveat — never to a
-# fraction of the terminal. The list above it shrinks to make room but keeps at
+# sized to its own content — the QR block, one URL line and one caveat — never to
+# a fraction of the terminal. The list above it shrinks to make room but keeps at
 # least ACCESS_LIST_FLOOR rows, so the toggle can never squeeze the tree out of
-# view entirely. Three is the smallest number that still shows a root and a
+# view entirely. Three is the smallest number that still shows a header and a
 # worker or two, which is enough to stay oriented on a short pane.
 ACCESS_LIST_FLOOR = 3
+
+# Two borders plus one space of padding on each side: what a box costs around
+# its widest line. The panel is sized to this, not to the pane.
+BOX_PADDING = 4
+
+ACCESS_TITLE = "access"
+
+# A long meta line would eat the worker's name inside the box, which is the one
+# thing in it that has to stay readable.
+MAX_META = 28
 
 # The width `render` assumes when it is not told one: the classic terminal. The
 # live view always passes the real width from curses; `--once` falls back here.
@@ -81,7 +111,7 @@ DEFAULT_WIDTH = 80
 
 # The footer. Its own constant so the tests can assert the binding is listed
 # without driving a tty.
-FOOTER = "q quit   r refresh   ↑/↓ move   enter expand   a access"
+FOOTER = "q quit  r refresh  ↑/↓ move  enter expand  a access"
 
 # The caveats shown under the address, mirroring bin/og's `show_access`: the
 # operator must know whether the address is scannable only on the same wifi or
@@ -90,6 +120,15 @@ FOOTER = "q quit   r refresh   ↑/↓ move   enter expand   a access"
 LAN_NOTE = "same wifi only — not reachable from outside your network"
 TUNNEL_NOTE = "public — anyone with this link can open the session"
 NO_ADDRESS_NOTE = "access: no address resolved (no tunnel URL cached, no LAN IP)"
+
+# A truncated listing is missing rows beyond the page cap, and since the listing
+# is newest-first those are the OLDEST sessions. Say so rather than let an
+# absence read as a finished conversation.
+TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
+
+# The paint role of a line. Plain strings so the composer stays pure and
+# testable; the curses attributes that go with them live in `_run_tui`.
+NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
 # is `http://127.0.0.1:6767`.
@@ -145,6 +184,164 @@ def snippet_from_detail(detail: Any) -> Optional[str]:
         ]
         return "\n".join(parts) if parts else None
     return None
+
+
+# ---------------------------------------------------------------------------
+# pure: the display state, the worker's identity, and its clock
+# ---------------------------------------------------------------------------
+
+def display_state(session: Any) -> str:
+    """The state this view DRAWS: `herdr_state`, plus `failed`.
+
+    Deliberately NOT a change to `og_herdr_watch.herdr_state`. That function is
+    shared with the herdr bridge, which feeds `should_project` (which sessions
+    get a herdr tab) and the pane badges; widening its vocabulary to a fifth
+    state would change which sessions are projected and what a pane reads — for
+    every consumer — to serve one view's glyph. So the extra case is derived
+    here.
+
+    The ONLY difference from `herdr_state` is `unknown` -> `failed`: a failed
+    session is exactly what `herdr_state` calls unknown (a status outside its
+    two known sets), and `x` is the one thing the operator must not be left to
+    infer from an absence. `blocked` still wins over `failed` — a worker holding
+    an elicitation is waiting on a human, whatever its status also says.
+    """
+    state = herdr_state(session)
+    if state != "unknown":
+        return state
+    status = session.get("status") if isinstance(session, dict) else None
+    if isinstance(status, str) and status.strip().lower() in FAILED_STATUSES:
+        return "failed"
+    return state
+
+
+def state_glyph(state: str, spin: int) -> str:
+    """The glyph for a display state: the spinner for `working`, else ASCII.
+
+    Pure in `spin`: the caller owns the frame counter, so render stays a
+    function of its arguments and `--once` (which passes 0) has no animation to
+    be inconsistent about.
+    """
+    if state == "working":
+        return SPIN_FRAMES[spin % len(SPIN_FRAMES)]
+    return STATE_GLYPH.get(state, "?")
+
+
+def split_title(title: Any) -> tuple[Optional[str], str]:
+    """(`zen`, `stock-concurrency-lock`) from `coder_zen:stock-concurrency-lock`.
+
+    A delegated worker's title is `<role>_<agent>:<task>`. The ROLE is dropped
+    because it says who dispatched, not what is running; the agent name is what
+    tells two workers running side by side apart, and the task is what the
+    operator is actually looking for.
+
+    `sub_agent_name` would name the agent too, but it is NOT on the listing row
+    (measured: it is a detail field), so reading it would cost a 121 KB fetch per
+    worker to learn what the title already carries.
+
+    A title with no colon yields `(None, title)`: an older session or one the
+    server titled plainly still has to render as a row. A role prefix other than
+    `coder_` is kept whole rather than guessed at — the box has room for it, and
+    inventing a second parse rule would mislabel more titles than it fixes.
+    """
+    text = title if isinstance(title, str) else ""
+    prefix, sep, task = text.partition(":")
+    if not sep:
+        return None, text
+    agent = prefix[len("coder_"):] if prefix.startswith("coder_") else prefix
+    return agent or None, task.strip() or text
+
+
+def _epoch(value: Any) -> Optional[float]:
+    """A LISTING timestamp as epoch seconds, or None when there is not one.
+
+    `bool` is excluded explicitly: it is an `int` in Python, and `True` as a
+    timestamp is data the server did not send.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _age(seconds: float) -> str:
+    """A duration as `41s`, `2m14s`, `1h04m`. Compact, no leading zero.
+
+    Below a minute the seconds are the useful precision; above it they are noise
+    on a line two columns from the worker's name.
+    """
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, rest = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _ago(seconds: float) -> str:
+    """How long ago, coarse: `12s ago`, `6m ago`, `2h ago`.
+
+    "How long since" is read at a glance, so it drops to the largest unit that
+    still says something; `_age` is for the running figure, which is watched
+    ticking.
+    """
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s ago"
+    if total < 3600:
+        return f"{total // 60}m ago"
+    return f"{total // 3600}h ago"
+
+
+# The listing row fields a failure reason might arrive in, if it ever does. The
+# listing carries none of them today (see og_herdr_watch's measured key list),
+# so `_failure_reason` normally finds nothing and the row reads plain `failed`.
+_FAILURE_KEYS = ("failure_reason", "error_message", "error", "reason")
+
+
+def _failure_reason(session: dict) -> Optional[str]:
+    """A short reason for a failed session, from the LISTING row only.
+
+    Free when the server carries one — no fetch, no wait, and the operator gets
+    `boot failed` instead of a bare `x` — which is the only reason to look: a
+    detail fetch per failed worker would be a new bill for information the
+    listing row is the right place to put.
+    """
+    for key in _FAILURE_KEYS:
+        value = session.get(key)
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.split())
+    return None
+
+
+def worker_meta(session: dict, state: str, now: float) -> str:
+    """The right half of a worker's second line: `2m14s`, `waiting on you`, …
+
+    The clock is honest about what it actually knows. BOTH timestamps come off
+    the LISTING row (so no detail fetch buys a clock on every row), and neither
+    is a measured start: `created_at` is when the server created the session
+    ROW, and `updated_at` is its LAST ACTIVITY — a worker that has been thinking
+    for ten minutes updates it constantly. So:
+
+      * working -> how long the session has EXISTED. For a worker dispatched to
+        run a task that is close to its runtime, and it is labelled for what it
+        is rather than dressed up as a measured duration.
+      * idle -> `updated_at` IS when it stopped, so `done 6m ago` is exact.
+
+    A row with no usable timestamp falls back to a plain word rather than a
+    figure derived from the epoch.
+    """
+    if state == "blocked":
+        return "waiting on you"
+    if state == "failed":
+        reason = _failure_reason(session)
+        return _clip(reason, MAX_META) if reason else "failed"
+    if state == "working":
+        created = _epoch(session.get("created_at"))
+        return _age(now - created) if created is not None else "working"
+    updated = _epoch(session.get("updated_at"))
+    return f"done {_ago(now - updated)}" if updated is not None else "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -226,30 +423,48 @@ def _index(sessions: Iterable[dict]):
 
 
 def _preorder(by_id: dict, children: dict, root_ids: Iterable[str]):
-    """`[(session_id, depth)]` for the selected roots' trees, pre-order.
+    """`[(session_id, depth, spine, last)]` for the selected roots' trees.
+
+    Pre-order, and `spine` is the tree columns ABOVE this row: one two-column
+    entry per ancestor level, `│ ` while something follows at that level and `  `
+    once nothing does. `last` says the same thing for this row's own level, and
+    is what picks `└─` over `├─`. A root carries no spine and is always `last`:
+    it is drawn as a plain header, so its workers start in the first column and
+    nothing can hang off an edge that was never drawn.
 
     A `seen` set makes a malformed listing — a cycle, or a session that is its
     own parent — terminate rather than recurse forever.
     """
-    out: list[tuple[str, int]] = []
+    out: list[tuple[str, int, tuple[str, ...], bool]] = []
     seen: set[str] = set()
 
-    def walk(sid: str, depth: int) -> None:
+    def walk(sid: str, depth: int, spine: tuple[str, ...], last: bool) -> None:
         if sid in seen or sid not in by_id:
             return
         seen.add(sid)
-        out.append((sid, depth))
-        for child in children.get(sid, []):
-            walk(child, depth + 1)
+        out.append((sid, depth, spine, last))
+        kids = children.get(sid, [])
+        # A root is a header: it draws no edge, so its workers start in the
+        # first column and there is nothing above them to continue. A worker's
+        # children inherit its column, closed once nothing follows at that level.
+        kid_spine = spine if depth == 0 else spine + ("  " if last else "│ ",)
+        for position, child in enumerate(kids):
+            walk(child, depth + 1, kid_spine, position == len(kids) - 1)
 
     for rid in root_ids:
-        walk(rid, 0)
+        walk(rid, 0, (), True)
     return out
 
 
 @dataclass
 class Row:
-    """One line of the tree, before it is turned into text."""
+    """One row of the tree, before it is turned into text.
+
+    A ROOT row is a header: `text` is the harness label and nothing else is
+    drawn. A WORKER row is a box: `text` is the task (the title with its
+    `<role>_<agent>:` prefix removed), `agent` and `meta` are the second line,
+    and `last`/`spine` place it in the tree.
+    """
 
     session_id: str
     text: str
@@ -258,6 +473,10 @@ class Row:
     is_root: bool = False
     snippet: Optional[str] = None
     expanded: bool = False
+    agent: Optional[str] = None
+    meta: str = ""
+    last: bool = True
+    spine: tuple[str, ...] = ()
 
 
 @dataclass
@@ -266,8 +485,8 @@ class Access:
 
     `url` is None when nothing resolved, and then `note` is the one honest line
     the panel shows instead of a fabricated address. `qr` holds the candidate
-    ANSIUTF8 block, already generated; whether it is actually drawn is decided
-    at render time against the pane's width, where the width is known.
+    block, already generated; whether it is actually drawn is decided at render
+    time against the pane's width, where the width is known.
     """
 
     url: Optional[str] = None
@@ -277,12 +496,33 @@ class Access:
 
 @dataclass
 class Frame:
-    """The whole view at one instant: the rows, plus anything to say about it."""
+    """The whole view at one instant: the rows, plus anything to say about it.
+
+    `selected` is an index into `rows` and `spin` is the spinner frame counter.
+    Both live on the frame rather than being read from a clock so `render` stays
+    pure: the same frame rendered twice is the same two screens.
+    """
 
     rows: list[Row] = field(default_factory=list)
     truncated: bool = False
     notice: Optional[str] = None
     access: Optional[Access] = None
+    selected: int = 0
+    spin: int = 0
+
+
+@dataclass
+class Pane:
+    """The composed view: every line with its paint role, and where the list ends.
+
+    `items` is parallel with itself — `items[i] == (text, role)` — and
+    `list_rows` counts the lines above the tail, so the TUI can scroll the list
+    and pin the panel and the footer to the bottom of the pane without
+    re-deriving the layout that produced them.
+    """
+
+    items: list[tuple[str, str]] = field(default_factory=list)
+    list_rows: int = 0
 
 
 def harness_label(harness: Any) -> str:
@@ -309,38 +549,56 @@ def build_rows(
     root_ids: Iterable[str],
     snippets: Optional[dict[str, Optional[str]]] = None,
     expanded_ids: Iterable[str] = (),
+    now: Optional[float] = None,
 ) -> list[Row]:
     """The display rows for the selected roots' trees, in listing order.
 
     A root row is labelled by its harness (the product name), matching the
-    orchestrator header the operator's web UI shows. A worker row is labelled by
-    its title and carries a status glyph. `snippets` is consulted per row, and a
+    orchestrator header the operator's web UI shows, and carries no glyph: it is
+    a header, not a worker. A worker row is labelled by its task and carries the
+    agent name, a glyph and a meta line. `snippets` is consulted per row, and a
     row is marked expanded only when its id is in `expanded_ids` AND it has a
     snippet to show.
+
+    `now` is the clock the meta lines are measured against; it defaults to the
+    wall clock so a caller that only wants a tree need not supply one. Every
+    test passes it explicitly — a duration asserted against the real clock is a
+    flake waiting for a slow machine.
     """
     snippets = snippets or {}
     expanded = set(expanded_ids)
+    clock = time.time() if now is None else now
     sessions = list(sessions)
     by_id, children = _index(sessions)
     rows: list[Row] = []
-    for sid, depth in _preorder(by_id, children, root_ids):
+    for sid, depth, spine, last in _preorder(by_id, children, root_ids):
         session = by_id[sid]
+        state = display_state(session)
         if depth == 0:
             harness = session.get("harness")
             label = harness_label(harness) if isinstance(harness, str) \
                 and harness else None
-            text = label or session.get("title") or sid
-        else:
-            text = session.get("title") or sid
+            rows.append(Row(
+                session_id=sid,
+                text=label or session.get("title") or sid,
+                state=state,
+                depth=depth,
+                is_root=True,
+            ))
+            continue
+        agent, task = split_title(session.get("title"))
         snippet = snippets.get(sid)
         rows.append(Row(
             session_id=sid,
-            text=text,
-            state=herdr_state(session),
+            text=task,
+            state=state,
             depth=depth,
-            is_root=depth == 0,
             snippet=snippet,
             expanded=sid in expanded and snippet is not None,
+            agent=agent,
+            meta=worker_meta(session, state, clock),
+            last=last,
+            spine=spine,
         ))
     return rows
 
@@ -354,22 +612,30 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
-def row_line(row: Row) -> str:
-    """The primary line for one row."""
-    if row.is_root:
-        return row.text
-    indent = "  " * row.depth
-    return f"{indent}• {STATE_GLYPH.get(row.state, '?')}  {row.text}"
+def _clip(text: str, width: int) -> str:
+    """`text` cut to `width` columns, with an ellipsis if it had to be cut.
+
+    An ellipsis rather than a hard cut because a silently truncated row reads as
+    the whole name, and the operator goes looking for a session that does not
+    exist under the name they were shown.
+    """
+    if width <= 0:
+        return ""
+    return text if len(text) <= width else text[:max(0, width - 1)] + "…"
 
 
-def snippet_line(row: Row) -> str:
-    """The indented report line under an expanded row."""
-    indent = "  " * (row.depth + 1)
-    return f"{indent}{_oneline(row.snippet or '')}"
+def _pad(text: str, width: int) -> str:
+    """`text` clipped to `width` and right-padded out to exactly `width`."""
+    return _clip(text, width).ljust(width)
 
 
-# SGR colour escapes: `\x1b[` … `m`. qrencode -t ANSIUTF8 wraps every line in
-# one of these, and counting them as glyphs is the bug this strips away.
+# SGR colour escapes: `\x1b[` … `m`. `qrencode -t ANSIUTF8` wraps every line in
+# one of these, and they must never reach `addnstr`: curses does not interpret
+# escapes, it PRINTS them, which is how the operator's pane came to show
+# `^[[40;37;1m` down both sides of the code. `--once` looked fine only because
+# the terminal running it interpreted them. Stripping is safe because the escapes
+# carry no information here: ANSIUTF8's `40;37` is black-on-white, which is what
+# a dark terminal already gives the block characters.
 _ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -379,8 +645,7 @@ def _visible_width(line: str) -> int:
     `len(line)` counts the escapes as visible characters, so a `qrencode -t
     ANSIUTF8` block measures two to three times too wide that way — a code that
     fits is judged not to, and the panel silently degrades to URL-only forever.
-    Stripping the escapes measures what the terminal actually paints. (The
-    equivalent for measurement only is bin/og's `print_qr`, which reads the
+    (The equivalent for measurement only is bin/og's `print_qr`, which reads the
     ASCII render — two single-byte characters per module, so bytes/2 is the
     column count — but this view already has the displayed block in hand, so it
     measures that instead of spending a second `qrencode` call.)
@@ -388,62 +653,217 @@ def _visible_width(line: str) -> int:
     return len(_ANSI_SGR.sub("", line))
 
 
+def _boxed(lines: Iterable[str], width: int) -> list[str]:
+    """`lines` in a box as wide as their widest row, never wider than `width`.
+
+    Content-sized, not pane-sized: a QR boxed out to eighty columns is mostly
+    border, and the border is what the eye lands on when scanning for the code.
+    """
+    rows = [_clip(text, max(1, width - BOX_PADDING)) for text in lines]
+    # Never narrower than the title rule, or the box loses its rectangle.
+    inner = max(max((len(row) for row in rows), default=0),
+                len(ACCESS_TITLE) + 3) + 2
+    head = f"┌─ {ACCESS_TITLE} " + "─" * (inner - len(ACCESS_TITLE) - 3) + "┐"
+    body = [f"│ {row.ljust(inner - 2)} │" for row in rows]
+    return [head] + body + ["└" + "─" * inner + "┘"]
+
+
 def access_lines(access: Access, width: int) -> list[str]:
-    """The bottom panel's lines: the QR when it fits, then the URL and caveat.
+    """The access panel, as a titled box sized to its own content.
 
-    The panel is content-sized, never a fraction of the pane: exactly the QR
-    rows plus two info lines (the URL and its caveat), or one honest line when
-    no address resolved. The TUI reserves exactly these rows at the bottom.
+    Flush LEFT on purpose: it is not a worker, so a tree spine in front of it
+    would read as one more agent in the tree — and the operator has been reading
+    this pane for a month with the workers indented under a header.
 
-    The QR is drawn only when its WIDTH fits. A code wrapped to the next line
-    is unreadable noise — worse than none, because someone will still try to
-    scan it — so it is dropped and the URL alone carries the address.
+    The QR is drawn only when the box can be at least as wide as the code. A
+    wrapped code is unreadable noise — worse than none, because someone will
+    still try to scan it — so a pane narrower than the code keeps the URL line,
+    which is still a usable address.
+
+    Every line out of here is stripped of ANSI SGR escapes: curses prints what
+    it is given, so an escape that reaches `addnstr` shows up as `^[` in the
+    pane rather than as a colour.
     """
     if access.url is None:
-        return [access.note or NO_ADDRESS_NOTE]
-    lines: list[str] = []
-    if access.qr and max(_visible_width(line) for line in access.qr) <= width:
-        lines.extend(access.qr)
-    lines.append(f"open: {access.url}")
+        return _boxed([access.note or NO_ADDRESS_NOTE], width)
+    content: list[str] = []
+    qr = [_ANSI_SGR.sub("", line) for line in access.qr]
+    # Measured with `_visible_width` rather than `len`: "does the code fit" is a
+    # question about the columns the terminal will paint, and the rule that says
+    # so lives in one place.
+    if qr and max(_visible_width(row) for row in qr) + BOX_PADDING <= width:
+        content.extend(qr)
+        # A blank row between the code and the prose, so the eye lands on the
+        # code first and the URL is not read as part of it.
+        content.append("")
+    content.append(access.url)
     if access.note:
-        lines.append(access.note)
+        content.append(access.note)
+    return _boxed(content, width)
+
+
+def row_block(row: Row, width: int, spin: int = 0,
+              selected: bool = False) -> list[str]:
+    """One worker as a full box: four rows, or five with its report expanded.
+
+    The tree spine is BAKED INTO the returned rows rather than added by the
+    caller, so the tree reads top to bottom whatever a box costs in rows — the
+    `├─` on the top row, `│ ` beside the middle rows while something follows,
+    and spaces once this is the last row.
+
+    The caret goes on the FIRST row only. Repeating it down the box would read
+    as four selected things.
+    """
+    inner = max(4, width - 6 - 2 * len(row.spine))
+    prefix = "".join(row.spine)
+    elbow = "└─" if row.last else "├─"
+    side = "  " if row.last else "│ "
+    caret = "▸" if selected else " "
+    info = f"{row.agent} · {row.meta}" if row.agent else row.meta
+
+    def body(content: str) -> str:
+        return f"{prefix}{side}  │" + _pad(content, inner) + "│"
+
+    lines = [
+        f"{prefix}{elbow} {caret}┌" + "─" * inner + "┐",
+        body(f" {state_glyph(row.state, spin)} {row.text}"),
+        body(f"   {info}"),
+    ]
+    if row.expanded and row.snippet:
+        lines.append(body(f"   {_clip(_oneline(row.snippet), inner - 3)}"))
+    lines.append(f"{prefix}{side}  └" + "─" * inner + "┘")
     return lines
+
+
+def frame_working(frame: Frame) -> bool:
+    """Whether any WORKER is working — the only thing that animates.
+
+    A root is a plain header and carries no glyph, so a working root changes
+    nothing on screen and must not schedule a repaint; see `paint_needed`.
+    """
+    return any(not row.is_root and row.state == "working" for row in frame.rows)
+
+
+def _workers(rows: list[Row]) -> list[int]:
+    """The indexes of the rows that draw a box — everything but the headers."""
+    return [i for i, row in enumerate(rows) if not row.is_root]
+
+
+def snap_selection(rows: list[Row], selected: int) -> int:
+    """`selected` if it still names a worker row, else the first one.
+
+    Run after every refresh, when the row list has just changed underneath the
+    caret. The fallback is the first worker rather than row 0 because row 0 is
+    the group header, which draws no box and therefore no caret: a view that
+    opened on it would look like it had no selection at all.
+    """
+    workers = _workers(rows)
+    if not workers:
+        return 0
+    return selected if selected in workers else workers[0]
+
+
+def move_selection(rows: list[Row], selected: int, delta: int) -> int:
+    """The selection after a keypress: the next or previous WORKER.
+
+    Headers are stepped over instead of landed on, for the same reason
+    `snap_selection` prefers a worker: the caret belongs to a box.
+    """
+    workers = _workers(rows)
+    if not workers:
+        return 0
+    at = workers.index(selected) if selected in workers else -1
+    return workers[min(max(at + (1 if delta > 0 else -1), 0), len(workers) - 1)]
+
+
+def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
+          height: Optional[int] = None) -> Pane:
+    """The frame composed into lines with their paint roles. Pure.
+
+    The single place the view is put together: `render` returns just the text,
+    and the TUI paints these same lines with the attributes their roles name.
+    `height`, when given, is the pane's content height — the tail (panel and
+    footer) is kept whole and the list above it is trimmed to fit, never below
+    ACCESS_LIST_FLOOR rows and never by cutting a box in half.
+    """
+    items: list[tuple[str, str]] = []
+    if frame.notice:
+        items.append((_clip(frame.notice, width), NORMAL))
+    elif frame.truncated:
+        items.append((_clip(TRUNCATED_NOTICE, width), NORMAL))
+
+    blocks: list[list[tuple[str, str]]] = []
+    for index, row in enumerate(frame.rows):
+        if row.is_root:
+            blocks.append([(_clip(row.text, width), NORMAL)])
+            continue
+        role = SELECTED if index == frame.selected else NORMAL
+        blocks.append([(line, role)
+                       for line in row_block(row, width, frame.spin,
+                                             index == frame.selected)])
+
+    tail: list[tuple[str, str]] = [("", NORMAL)]
+    if frame.access is not None:
+        tail.extend((line, DIM) for line in access_lines(frame.access, width))
+        tail.append(("", NORMAL))
+    tail.append((_clip(FOOTER, width), DIM))
+
+    room = None if height is None else max(ACCESS_LIST_FLOOR, height - len(tail))
+    kept: list[list[tuple[str, str]]] = []
+    used = 0
+    for block in blocks:
+        if room is not None and kept and used + len(block) > room:
+            break
+        kept.append(block)
+        used += len(block)
+
+    for block in kept:
+        items.extend(block)
+    return Pane(items=items + tail, list_rows=len(items))
 
 
 def render(frame: Frame, width: int = DEFAULT_WIDTH,
            height: Optional[int] = None) -> list[str]:
-    """A frame as a list of plain-text lines. Pure; no terminal involved.
+    """A frame as a list of plain-text lines. Pure; no terminal, no clock.
 
     This is the whole renderer. curses paints exactly these lines, and `--once`
     prints them, so the shape of the view is tested here without a tty — the
-    access panel included, since it is part of the lines and not something
-    drawn onto the window.
+    access panel included, since it is part of the lines and not something drawn
+    onto the window.
 
-    `width` is the pane's column count, used only to decide whether the QR
-    fits. `height`, when given, is the content height: the panel is reserved at
-    the bottom and the list is trimmed above it, but the list never drops below
-    `ACCESS_LIST_FLOOR` rows. `--once` and the tests pass height=None, meaning
-    "show everything".
+    `width` is the pane's column count. `height`, when given, is the content
+    height: the tail is reserved and the list is trimmed above it. `--once` and
+    the tests pass height=None, meaning "show everything".
     """
-    lines: list[str] = []
-    if frame.notice:
-        lines.append(frame.notice)
-    elif frame.truncated:
-        # A truncated listing is missing rows beyond the page cap, and since the
-        # listing is newest-first those are the OLDEST sessions. Say so rather
-        # than let an absence read as a finished conversation.
-        lines.append("… partial listing: some sessions may be missing")
-    for row in frame.rows:
-        lines.append(row_line(row))
-        if row.expanded:
-            lines.append(snippet_line(row))
-    if frame.access is None:
-        return lines
-    panel = access_lines(frame.access, width)
-    if height is None:
-        return lines + panel
-    room = max(ACCESS_LIST_FLOOR, height - len(panel))
-    return lines[:room] + panel
+    return [text for text, _role in _pane(frame, width, height).items]
+
+
+def paint_needed(items: list[tuple[str, str]],
+                 painted: Optional[list[tuple[str, str]]]) -> bool:
+    """Whether these lines have to be written to the screen.
+
+    Nothing is repainted unless the composed view actually changed: a new data
+    poll that brought something new, a keypress that moved the caret, a resize,
+    or a spinner frame while something is working. That is the difference
+    between an `og agents` pane an operator leaves open all day and one that
+    redraws itself forever — with nothing working there is no spinner to
+    advance, the render is identical, and this is False, so `erase`/`refresh`
+    never run and the loop blocks on the keyboard instead.
+    """
+    return painted is None or items != painted
+
+
+def next_wait(now: float, poll_due: float, working: bool,
+              tick: float = SPIN_TICK) -> float:
+    """Seconds to block on the keyboard before anything could change on screen.
+
+    Nothing working: only the next data poll can change the view, so block until
+    then — the pane wakes once per poll rather than eight times a second.
+    Something working: the spinner advances on its own tick, so wake then,
+    unless the poll comes first.
+    """
+    wake = min(now + tick, poll_due) if working else poll_due
+    return max(0.0, wake - now)
 
 
 # ---------------------------------------------------------------------------
@@ -454,15 +874,17 @@ class AgentModel:
     """Builds a `Frame` from the listing, fetching detail only when it must.
 
     THE BUDGET. One refresh is exactly one listing walk plus a bounded number of
-    detail fetches, and detail fetches happen on these three occasions and no
-    others:
+    detail fetches, and detail fetches happen on these occasions and no others:
 
       1. once per LIVE ROOT, to learn its `workspace` (the cwd rule needs it)
          and its `harness` (the header label). Roots come and go, so this is
          "once per root, on its first sighting", not "once per poll".
-      2. once per worker that has gone IDLE, to capture the report it just
+      2. once per root the cwd rule probes past the live set, and only until one
+         matches (see `_match_cwd_root`). Also once per root, because the result
+         is cached under the same session id.
+      3. once per worker that has gone IDLE, to capture the report it just
          produced. An idle report stops changing, so it is fetched once and kept.
-      3. once for a row the user SELECTED, so its snippet can be read on demand
+      4. once for a row the user SELECTED, so its snippet can be read on demand
          (and refetched when the user forces a refresh, while it is still
          running).
 
@@ -498,6 +920,15 @@ class AgentModel:
         has to mean once, and a root whose detail endpoint is unhealthy for a
         while must not turn every poll into a retry. The cost is that the cwd
         rule cannot narrow on that root until the process restarts.
+
+        The cache is FIFO-bounded at MAX_ROOT_DETAILS, which is also the bound
+        on how far the cwd probe in `_match_cwd_root` can walk.
+
+        The report is extracted from the same response and seeded into the
+        snippet cache. It is already in hand, and a root that becomes the scope
+        — which is exactly what the cwd probe does to a quiet root — is idle by
+        definition, so without this the lazy "first idle" fetch would pay for a
+        SECOND 121 KB read of a row this one just read.
         """
         if session_id in self._root_info:
             return self._root_info[session_id]
@@ -513,6 +944,8 @@ class AgentModel:
             if isinstance(harness, str) and harness:
                 info["harness"] = harness
         self._root_info[session_id] = info
+        if session_id not in self._snippets:
+            self._snippets[session_id] = snippet_from_detail(detail)
         return info
 
     def _snippet(self, session_id: str) -> Optional[str]:
@@ -532,6 +965,40 @@ class AgentModel:
 
     # -- refresh ------------------------------------------------------------
 
+    def _match_cwd_root(self, by_id: dict, live_root_ids: list[str],
+                        asked: set[str]) -> Optional[str]:
+        """The root session whose `workspace` is `$PWD`, or None.
+
+        Checked against the live roots first (their details are already in hand,
+        so this costs nothing), and only then against the roots the live
+        heuristic EXCLUDED. That second pass is the fix for the wrong-directory
+        bug: "live" means working, blocked, or the parent of a worker, so a
+        brand-new `og chat` in this directory — idle, nothing dispatched yet —
+        is not live, its `workspace` was never fetched, nothing matched `$PWD`,
+        and the view fell back to every root on the machine. The cwd question is
+        not a question about activity, so it is answered independently of it.
+
+        The probe stops at the first match and every result is cached per session
+        id (`_root_detail`), so this is one fetch per root ONCE, not one per
+        poll; `asked` records which roots were put to the question this refresh
+        so the prune keeps exactly their cache entries.
+        """
+        target = _norm_path(self.cwd)
+        for sid in live_root_ids:
+            workspace = self._root_info.get(sid, {}).get("workspace")
+            if isinstance(workspace, str) and workspace and \
+                    _norm_path(workspace) == target:
+                return sid
+        for sid, session in by_id.items():
+            if sid in asked or not _is_root(session):
+                continue
+            asked.add(sid)
+            workspace = self._root_detail(sid).get("workspace")
+            if isinstance(workspace, str) and workspace and \
+                    _norm_path(workspace) == target:
+                return sid
+        return None
+
     def refresh(
         self,
         selected_id: Optional[str] = None,
@@ -549,7 +1016,7 @@ class AgentModel:
         sessions = [s for s in rows
                     if isinstance(s, dict) and not s.get("archived")]
 
-        by_id, children = _index(sessions)
+        by_id, _children = _index(sessions)
         workers: dict[str, list[dict]] = {}
         for session in sessions:
             parent = session.get("parent_session_id")
@@ -560,39 +1027,55 @@ class AgentModel:
             sid for sid, session in by_id.items()
             if _is_root(session) and self._is_live_root(session, workers.get(sid, []))
         ]
+        asked: set[str] = set(live_root_ids)
+        for sid in live_root_ids:
+            self._root_detail(sid)
 
-        # Merge each live root's detail into its session object so the pure
-        # layer below can decide the cwd match and the header label without
-        # knowing anything about HTTP.
-        merged = []
-        for session in sessions:
-            sid = _session_id(session)
-            copy = dict(session)
-            if sid in live_root_ids:
-                copy.update(self._root_detail(sid))
-            merged.append(copy)
-
-        # Root caches are pruned to the live set: a root that is gone (or has
-        # gone quiet) costs one re-fetch if it comes back, and the cache cannot
-        # grow without bound across a long-running process.
-        for sid in list(self._root_info):
-            if sid not in live_root_ids:
-                del self._root_info[sid]
-
-        by_id, children = _index(merged)
         scope = select_scope(
             [by_id[sid] for sid in live_root_ids if sid in by_id],
             self.cwd,
             self.all_roots,
         )
+        # `select_scope` reports "nothing matched `$PWD`" by handing back exactly
+        # what it was given, so the equality IS the no-match signal — the rule
+        # itself stays defined in one place.
+        if self.cwd and not self.all_roots and scope == live_root_ids:
+            match = self._match_cwd_root(by_id, live_root_ids, asked)
+            if match is not None:
+                # A match IS the scope: one root's tree, not the live set plus
+                # this one.
+                scope = [match]
+
+        # Merge each root's detail into its session object so the pure layer
+        # below can decide the cwd match and the header label without knowing
+        # anything about HTTP.
+        merged = []
+        for session in sessions:
+            sid = _session_id(session)
+            copy = dict(session)
+            if sid in asked:
+                copy.update(self._root_detail(sid))
+            merged.append(copy)
+
+        # Root caches are pruned to the roots this refresh actually asked about:
+        # a root that is gone (or has gone quiet) costs one re-fetch if it comes
+        # back, and the cache cannot grow without bound across a long run. The
+        # probed roots are IN `asked`, so pruning cannot turn the cwd probe into
+        # a per-poll refetch — which is exactly what it did before this
+        # separation existed.
+        for sid in list(self._root_info):
+            if sid not in asked:
+                del self._root_info[sid]
+
+        by_id, children = _index(merged)
         order = _preorder(by_id, children, scope)
 
         # The lazy fetches. An idle worker is read once and kept; a selected row
         # is read once on selection, and re-read only on a forced refresh.
-        for sid, _depth in order:
+        for sid, _depth, _spine, _last in order:
             if sid not in by_id:
                 continue
-            if herdr_state(by_id[sid]) == "idle":
+            if display_state(by_id[sid]) == "idle":
                 self._snippet(sid)
             if sid == selected_id:
                 if force:
@@ -617,6 +1100,10 @@ class AgentModel:
         and no activity is a finished solo conversation; dropping it is what
         keeps "all live roots" — and its per-root detail fetches — to a handful
         on a machine with a long history of sessions.
+
+        This decides what is WORTH SHOWING, never which directory the operator is
+        in: a quiet root in `$PWD` is still the answer to that question, and
+        `_match_cwd_root` asks it of every root regardless.
         """
         if herdr_state(root) in ("working", "blocked"):
             return True
@@ -634,6 +1121,13 @@ def qr_lines(url: str) -> list[str]:
     the URL line below it still carries the address. Mirrors bin/og's
     `print_qr` flags: `-m 1` is a one-module quiet zone (the default 4 makes
     the code too tall for a terminal) and `-s 1` the smallest module.
+
+    The ANSI SGR escapes are stripped HERE, at the source. qrencode colours each
+    module `40;37` (black on white) and terminates every line; curses does not
+    interpret escapes, it prints them, so handing those lines to `addnstr` put
+    a literal `^[[40;37;1m` down both sides of the operator's code. The block
+    characters alone render correctly and already read as black-on-white on a
+    dark terminal.
     """
     if shutil.which("qrencode") is None:
         return []
@@ -646,7 +1140,8 @@ def qr_lines(url: str) -> list[str]:
         return []
     if done.returncode != 0:
         return []
-    return [line for line in done.stdout.splitlines() if line]
+    lines = [_ANSI_SGR.sub("", line) for line in done.stdout.splitlines()]
+    return [line for line in lines if line]
 
 
 def _probe(argv: list[str]) -> str:
@@ -723,7 +1218,7 @@ def _pid_alive(pid: int) -> bool:
     OSError counts as dead, including EPERM — `kill -0` also exits non-zero for a
     process belonging to another user (verified: `kill -0 1` prints "Operation
     not permitted" and exits 1), so this mirrors the shell check rather than
-    second-guessing it. A pidfile naming someone else's process is stale anyway.
+    second-guessing it. A pidfile naming someone else's pid is stale anyway.
     """
     try:
         os.kill(pid, 0)
@@ -832,109 +1327,142 @@ def _tty_available() -> bool:
 
 def _run_tui(model: AgentModel, interval: float, server: str,
              start_access: bool = False) -> int:
-    """The live view. curses paints `render`'s lines; keys drive the model.
+    """The live view. curses paints exactly what `render` returns; keys drive
+    the model.
 
     Keys: `q` quits, `r` forces a refresh, the arrows (or `j`/`k`) move the
     selection, Enter expands or collapses the selected row's snippet, and `a`
     toggles the access panel. It is a viewer: it never sends anything to a
     session.
+
+    TWO CLOCKS, deliberately. The data poll (`interval`, 3s) asks the server for
+    new rows; the spinner tick (SPIN_TICK, 120ms) only advances a counter that
+    render turns into a glyph. Driving the spinner off the poll would make a
+    three-second-wide animation, and driving the poll off the tick would ask the
+    server for the listing eight times a second.
+
+    And nothing is painted unless the composed lines actually CHANGE
+    (`paint_needed`). With nothing working there is no spinner to advance, the
+    render is byte-identical to the last one, and the loop skips `erase` and
+    `refresh` entirely — it blocks on the keyboard until the next poll
+    (`next_wait`) instead. An `og agents` pane an operator leaves open all day
+    then costs one wakeup per poll, not eight repaints a second forever.
     """
     import curses
 
     def loop(stdscr) -> None:
         curses.curs_set(0)
         stdscr.keypad(True)
-        stdscr.timeout(250)
         selected = 0
         offset = 0
         expanded: set[str] = set()
+        # `poll` asks for a refresh now; `force` additionally drops the selected
+        # row's cached report so it is read again. They are separate so Enter can
+        # redraw the tree this tick without paying for a second 121 KB fetch.
+        poll = True
         force = True
-        last = 0.0
         frame = Frame()
         show_access = start_access
         # Resolved once, on the toggle: the address does not change while the
         # view runs, and probing for it every poll would shell out on a timer.
         access: Optional[Access] = access_info(server) if show_access else None
-        while True:
-            height, width = stdscr.getmaxyx()
-            selected_ids = [r.session_id for r in frame.rows]
-            sel_id = selected_ids[selected] if 0 <= selected < len(selected_ids) else None
+        spin = 0
+        next_spin = 0.0
+        next_poll = 0.0
+        painted: Optional[list[tuple[str, str]]] = None
 
-            if force or time.monotonic() - last >= interval:
-                frame = model.refresh(
-                    selected_id=sel_id, expanded_ids=expanded, force=force)
-                last = time.monotonic()
-                force = False
-                selected_ids = [r.session_id for r in frame.rows]
-                selected = min(selected, max(0, len(frame.rows) - 1))
+        def put(row: int, text: str, role: str) -> None:
+            """One `addnstr`, tolerant of the edges.
 
-            # The panel is part of the frame, so `render` is the source of what
-            # is painted; here it only decides how many list rows fit above it.
-            frame.access = access if show_access else None
-            panel = access_lines(frame.access, width) if frame.access else []
-            list_view = max(ACCESS_LIST_FLOOR, height - 1 - len(panel))
-
-            # Each row is one display line, plus one when its snippet is shown.
-            display: list[tuple[str, Optional[int]]] = []
-            if frame.truncated:
-                display.append(("… partial listing: some sessions may be missing",
-                                None))
-            for index, row in enumerate(frame.rows):
-                display.append((row_line(row), index))
-                if row.expanded:
-                    display.append((snippet_line(row), index))
-
-            sel_line = next(
-                (i for i, (_, index) in enumerate(display) if index == selected),
-                0,
-            )
-            if sel_line < offset:
-                offset = sel_line
-            elif sel_line >= offset + list_view:
-                offset = max(0, sel_line - (list_view - 1))
-
-            stdscr.erase()
-            for screen_row, (text, index) in enumerate(display[offset:offset + list_view]):
-                attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-                try:
-                    stdscr.addnstr(screen_row, 0, text, width - 1, attr)
-                except curses.error:
-                    # Writing the very last cell raises; the line is already
-                    # drawn, so this is a no-op rather than a lost frame.
-                    pass
-            # The panel sits under the list and above the footer. On a pane too
-            # short to hold both its content-sized height and the list floor it
-            # clips at the footer rather than pushing the tree away.
-            for i, text in enumerate(panel):
-                row = list_view + i
-                if row >= height - 1:
-                    break
-                try:
-                    stdscr.addnstr(row, 0, text, width - 1, curses.A_DIM)
-                except curses.error:
-                    pass
+            curses raises when a write touches the last cell of the window, and
+            a line one column too long lands exactly there — the rest of the
+            line is already on screen, so swallowing it is a no-op rather than a
+            lost frame.
+            """
+            if not 0 <= row < height or width < 1:
+                return
+            attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_REVERSE,
+                    DIM: curses.A_DIM}[role]
             try:
-                stdscr.addnstr(height - 1, 0, FOOTER, width - 1, curses.A_DIM)
+                stdscr.addnstr(row, 0, text, width - 1, attr)
             except curses.error:
                 pass
-            stdscr.refresh()
 
+        while True:
+            height, width = stdscr.getmaxyx()
+            now = time.monotonic()
+
+            if poll or now >= next_poll:
+                ids = [row.session_id for row in frame.rows]
+                sel_id = ids[selected] if 0 <= selected < len(ids) else None
+                frame = model.refresh(selected_id=sel_id,
+                                      expanded_ids=expanded, force=force)
+                selected = snap_selection(frame.rows, selected)
+                next_poll = now + interval
+                poll = False
+                force = False
+
+            # The panel is part of the frame, so `render` stays the source of
+            # what is painted — and it is set HERE, not inside the refresh, so
+            # the `a` toggle takes effect on the next paint rather than on the
+            # next poll.
+            frame.access = access if show_access else None
+            frame.selected = selected
+            frame.spin = spin
+            working = frame_working(frame)
+            if working and now >= next_spin:
+                spin += 1
+                next_spin = now + SPIN_TICK
+
+            pane = _pane(frame, width)
+            items = pane.items
+            tail_len = len(items) - pane.list_rows
+
+            # Keep the selected box on screen: the list scrolls, the tail stays
+            # pinned to the bottom of the pane.
+            list_view = max(1, height - tail_len)
+            first_selected = next((i for i, (_, role) in enumerate(items)
+                                   if role == SELECTED), None)
+            if first_selected is not None:
+                if first_selected < offset:
+                    offset = first_selected
+                elif first_selected >= offset + list_view:
+                    offset = first_selected - list_view + 1
+            offset = max(0, min(offset, max(0, pane.list_rows - list_view)))
+
+            if paint_needed(items, painted):
+                painted = items
+                stdscr.erase()
+                for row, (text, role) in enumerate(
+                        items[offset:offset + list_view]):
+                    put(row, text, role)
+                tail_top = max(0, height - tail_len)
+                for i, (text, role) in enumerate(items[pane.list_rows:]):
+                    put(tail_top + i, text, role)
+                stdscr.refresh()
+
+            # Two clocks, and the wait is whichever comes first: the next data
+            # poll, or the next spinner frame when something is working. With
+            # nothing working this is a single blocking `getch` per poll, so the
+            # loop costs nothing at all between polls.
+            stdscr.timeout(max(1, math.ceil(next_wait(time.monotonic(),
+                                                     next_poll, working) * 1000)))
             key = stdscr.getch()
             if key == -1:
                 continue
             if key in (ord("q"), 27):
                 return
             if key == ord("r"):
-                force = True
+                poll = force = True
                 continue
             if key == ord("a"):
                 show_access = not show_access
                 if show_access:
                     access = access_info(server)
             if key in (curses.KEY_UP, ord("k")):
-                selected = max(0, selected - 1)
+                selected = move_selection(frame.rows, selected, -1)
             elif key in (curses.KEY_DOWN, ord("j")):
-                selected = min(max(0, len(frame.rows) - 1), selected + 1)
+                selected = move_selection(frame.rows, selected, 1)
             elif key in (curses.KEY_ENTER, 10, 13):
                 if 0 <= selected < len(frame.rows):
                     sid = frame.rows[selected].session_id
@@ -942,6 +1470,10 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                         expanded.discard(sid)
                     else:
                         expanded.add(sid)
+                    # Redraw on this tick rather than up to three seconds from
+                    # now; the report is already cached, so this costs nothing
+                    # beyond the listing walk.
+                    poll = True
 
     curses.wrapper(loop)
     return 0
@@ -999,6 +1531,10 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
         frame = model.refresh()
         if args.access:
             frame.access = access_info(args.server)
+        # No animation headless: one frame, at spinner frame 0, with the caret
+        # where the live view opens it — on the first worker.
+        frame.spin = 0
+        frame.selected = snap_selection(frame.rows, frame.selected)
         # The real pane width drives the QR fit; off a tty there is none, so
         # fall back to the classic 80 columns.
         width = shutil.get_terminal_size((DEFAULT_WIDTH, 24)).columns
