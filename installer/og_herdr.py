@@ -263,6 +263,43 @@ def harness_labels() -> dict[str, str]:
     return labels
 
 
+# The sibling of `_REGISTRY_LABELS`, read from the same catalog for the same
+# reason: `vendor` is a registry fact (it drives the cross-vendor review check),
+# so the view that draws a per-vendor mark reads it from here rather than
+# keeping a second harness->vendor table that could drift from the catalog.
+_REGISTRY_VENDORS: dict[str, str] | None = None
+
+
+def harness_vendors() -> dict[str, str]:
+    """`{harness id: vendor}` from installer/registry.json, cached.
+
+    The same degradation contract as `harness_labels`, and for the same reason:
+    never raises and never returns a half-read table. A missing, unreadable or
+    malformed catalog yields `{}`, and a harness that is absent falls back to no
+    vendor — the caller (a mark, a review check) then renders nothing rather
+    than guessing a vendor the registry does not name. A broken catalog must
+    cost a cosmetic detail, never a pane.
+    """
+    global _REGISTRY_VENDORS
+    if _REGISTRY_VENDORS is not None:
+        return _REGISTRY_VENDORS
+    vendors: dict[str, str] = {}
+    try:
+        catalog = json.loads(REGISTRY_PATH.read_text())
+    except (OSError, ValueError):
+        catalog = None
+    rows = catalog.get("agents") if isinstance(catalog, dict) else None
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        harness, vendor = row.get("harness"), row.get("vendor")
+        if isinstance(harness, str) and harness and \
+                isinstance(vendor, str) and vendor:
+            vendors[harness] = vendor
+    _REGISTRY_VENDORS = vendors
+    return vendors
+
+
 def agent_label(session: dict) -> str:
     """The name herdr shows in a pane's agent column for this session.
 

@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import types
+import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -22,6 +23,7 @@ from urllib.error import URLError
 import pytest
 
 import og_agents as a
+import og_herdr as h
 import og_herdr_watch as w
 
 
@@ -742,6 +744,142 @@ def test_harness_label_defaults_when_there_is_no_harness():
     assert a.harness_label(None) == a.DEFAULT_AGENT_LABEL
     assert a.harness_label("") == a.DEFAULT_AGENT_LABEL
     assert a.harness_label(7) == a.DEFAULT_AGENT_LABEL
+
+
+# ---------------------------------------------------------------------------
+# 8b. the harness mark (vendor brand glyph, in its two-column slot)
+# ---------------------------------------------------------------------------
+
+# The operator's tier-0 picks, copied here so the test states the decision
+# rather than reading it back out of the module it is checking. A drift in
+# `_HARNESS_MARKS` is exactly what this is meant to catch.
+MARK = {
+    "anthropic": "\u2733",
+    "opencode-zen": "\u25AF",
+    "google": "\u2726",
+    "openai": "\u2B21",
+    "deepseek": "\U0001319E",
+    "kilo": "\U0001F13A",
+    "aws-kiro": "\U0001680C",
+    "cursor": "\u21D7",
+    "goose": "\U0001316F",
+    "hermes": "\u2624",
+    "xai": "\U0001D54F",
+    "cognition": "\u26EF",
+    "z-ai": "\u2554",
+    "moonshotai": "\u2318",
+}
+# The three East Asian AMBIGUOUS picks: the slot charges them two cells and so
+# pads them not at all. The other eleven are Narrow and get one trailing space.
+AMBIGUOUS = {"kilo", "cognition", "z-ai"}
+
+
+def _catalog():
+    """The repo catalog, read through the same path the pane resolves against."""
+    return json.loads((Path(a.__file__).parent / "registry.json").read_text())
+
+
+def _harness_for_vendor():
+    """{vendor: harness} from the catalog, first row wins (matches the loader)."""
+    out = {}
+    for row in _catalog()["agents"]:
+        out.setdefault(row["vendor"], row["harness"])
+    return out
+
+
+def test_the_mark_table_is_pinned_to_the_catalog_vendors():
+    # Adding an agent with a NEW vendor to installer/registry.json must add a
+    # mark here in the same commit. Without this, that new vendor resolves
+    # through the harness->vendor hop to nothing and draws a silent blank — the
+    # pane would look like it had decided not to mark the agent, when the truth
+    # is that nobody had chosen a glyph yet.
+    vendors = {row["vendor"] for row in _catalog()["agents"]}
+    assert set(a._HARNESS_MARKS) == vendors, (
+        "the mark table and the registry's vendors disagree; a vendor with no "
+        "mark would draw a silent blank")
+
+
+def test_every_vendor_resolves_to_its_mark_in_a_two_column_slot():
+    harnesses = _harness_for_vendor()
+    assert set(MARK) == set(harnesses), "test and catalog disagree on vendors"
+    for vendor, mark in MARK.items():
+        got = a.harness_mark(harnesses[vendor])
+        # The glyph is the operator's pick, not something the slot invented.
+        assert got.strip() == mark, (vendor, got)
+        # ...and whatever its own width, the slot is exactly two columns.
+        assert a._display_width(got) == 2, (vendor, got)
+
+
+def test_ambiguous_marks_are_not_padded_but_narrow_ones_are():
+    # The pessimistic ruler charges Ambiguous two cells, so those three fill the
+    # slot unpadded; a Narrow mark gets the single trailing space that brings it
+    # to two. This IS the slot's contract — assert it on both sides.
+    harnesses = _harness_for_vendor()
+    for vendor, mark in MARK.items():
+        got = a.harness_mark(harnesses[vendor])
+        if vendor in AMBIGUOUS:
+            assert got == mark, (vendor, repr(got))
+        else:
+            assert got == mark + " ", (vendor, repr(got))
+    # And the classes are what the test claims them to be, not assumed.
+    for vendor in AMBIGUOUS:
+        assert unicodedata.east_asian_width(MARK[vendor]) == "A", vendor
+
+
+def test_the_blank_slot_is_exactly_two_spaces():
+    assert a.harness_mark(None) == "  "
+    assert a._display_width(a.harness_mark(None)) == 2
+
+
+def test_every_return_is_exactly_two_columns_including_the_blank():
+    for row in _catalog()["agents"]:
+        assert a._display_width(a.harness_mark(row["harness"])) == 2, row["id"]
+    for degenerate in ("brand-new-native", "", None, 7, "  "):
+        assert a._display_width(a.harness_mark(degenerate)) == 2, degenerate
+
+
+def test_the_mark_degrades_to_a_blank_slot_never_a_raise():
+    # An unknown harness, and a non-string harness, must not raise and must not
+    # guess a vendor: both are the blank slot, exactly as harness_label degrades
+    # to a raw id. A pane has to render with no marks rather than not render.
+    assert a.harness_mark("brand-new-native") == "  "
+    assert a.harness_mark(None) == "  "
+    assert a.harness_mark("") == "  "
+    assert a.harness_mark(7) == "  "
+
+
+def test_an_unknown_vendor_gets_the_blank_slot(monkeypatch):
+    # A registry row naming a vendor the mark table does not carry (a catalog
+    # edited before the table) is a cosmetic failure, not a crash.
+    monkeypatch.setattr(a, "harness_vendors",
+                        lambda: {"mystery-native": "unknown-vendor"})
+    assert a.harness_mark("mystery-native") == "  "
+
+
+def test_a_broken_registry_degrades_every_mark_to_blank(monkeypatch, tmp_path):
+    # Mirrors the label test in tests/test_og_herdr.py: a missing, malformed or
+    # wrong-shaped catalog yields an empty vendor table, and every mark falls
+    # back to the blank slot. Never a raise.
+    for name, content in (("missing.json", None),
+                          ("broken.json", "{ not json"),
+                          ("wrong-shape.json", '{"agents": "nope"}'),
+                          ("a-list.json", "[]")):
+        monkeypatch.setattr(h, "_REGISTRY_VENDORS", None)
+        path = tmp_path / name
+        if content is not None:
+            path.write_text(content)
+        monkeypatch.setattr(h, "REGISTRY_PATH", path)
+        assert h.harness_vendors() == {}, name
+        assert a.harness_mark("claude-native") == "  ", name
+
+
+def test_harness_vendors_reads_this_repos_catalog():
+    # The harness -> vendor hop is a registry fact, read through the same loader
+    # the labels use, so it cannot drift from the catalog.
+    rows = {row["harness"]: row["vendor"] for row in _catalog()["agents"]}
+    vendors = h.harness_vendors()
+    for harness, vendor in rows.items():
+        assert vendors[harness] == vendor
 
 
 # ---------------------------------------------------------------------------
