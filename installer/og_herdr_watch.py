@@ -44,7 +44,9 @@ API facts this encodes, verified against a running server:
   what decides whether the session is worth projecting at all: `runner_online`
   lives on the detail row only, and `attach` refuses a session with no live
   runner — see `runner_is_offline`, which is why that rule is applied next to
-  the fetch rather than inside `should_project`.
+  the fetch rather than inside `should_project`. A dead ROOT is still projected
+  (as a history space, not an attach), so the refusal is scoped to sub-agents by
+  `_projectable`.
 * There is no server-side status filter: `status=`, `statuses=` and `state=`
   are all ignored and the server returns the same rows regardless. Any
   narrowing has to happen on this side — see `should_project`.
@@ -317,15 +319,17 @@ def runner_is_offline(detail: Any) -> bool:
     each would have opened a tab whose entire content is that line: noise, and on
     a machine with a long history of finished root sessions, most of them.
 
-    ONLY an explicit boolean false suppresses a projection. A missing key, a
-    null, a differently-typed value, or a detail row that never arrived (a 404, a
-    500, a refused connection — `_fetch_detail` reports every one of them as
-    None) all mean "unknown", and unknown projects. The asymmetry IS the
-    decision: projecting a session whose runner turns out to be dead costs the
-    user one tab showing an error, while hiding a session on a guess costs them a
-    session they never knew existed and cannot get back by waiting, because the
-    refusal would be invisible. An unreachable detail endpoint must not be able
-    to empty the user's workspace.
+    ONLY an explicit boolean false suppresses a projection, and only for a
+    SUB-AGENT; a ROOT is projected regardless, as a history space (see
+    `SessionWatcher._projectable` for that split). A missing key, a null, a
+    differently-typed value, or a detail row that never arrived (a 404, a 500, a
+    refused connection — `_fetch_detail` reports every one of them as None) all
+    mean "unknown", and unknown projects. The asymmetry IS the decision:
+    projecting a session whose runner turns out to be dead costs the user one tab
+    showing an error, while hiding a session on a guess costs them a session they
+    never knew existed and cannot get back by waiting, because the refusal would
+    be invisible. An unreachable detail endpoint must not be able to empty the
+    user's workspace.
 
     This is deliberately NOT folded into `should_project`: that function decides
     from the LISTING row alone, and `runner_online` is not on a listing row —
@@ -789,14 +793,17 @@ class SessionWatcher:
         "removed" because that is what it is.
 
         One more session is refused, and it is the one the LISTING row cannot
-        decide: a session whose detail row reports `runner_online: False` gets
+        decide: a SUB-AGENT whose detail row reports `runner_online: False` gets
         no event at all, because `omnigent attach` refuses it and its pane could
-        show nothing but that error (see `runner_is_offline`). It is refused on
-        the `added` path only — where the detail row is fetched for its directory
-        anyway — and it is refused by NOT entering `fresh`, so it never reaches
-        `_seen` and therefore never produces a `removed` either. Which also
-        means no permanent negative: it is re-asked on every poll, and the moment
-        its runner is online the next poll projects it and it gets its pane.
+        show nothing but that error (see `runner_is_offline`). A ROOT is the
+        exception and the feature: a dead root is projected anyway, as a history
+        space, so a past conversation stays visible (see `_projectable`). It is
+        refused on the `added` path only — where the detail row is fetched for its
+        directory anyway — and it is refused by NOT entering `fresh`, so it never
+        reaches `_seen` and therefore never produces a `removed` either. Which
+        also means no permanent negative: it is re-asked on every poll, and the
+        moment its runner is online the next poll projects it and it gets its
+        pane.
 
         An already-projected session whose runner later goes offline is NOT
         retired. Re-checking it would cost a detail fetch per live session per
@@ -1082,14 +1089,15 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         return None
 
     def _enrich(self, session: dict) -> tuple[dict, bool]:
-        """The session object to emit, and whether it is attachable at all.
+        """The session object to emit, and whether it is projected at all.
 
         Returns `(enriched, projectable)`. Both answers come from ONE detail
         fetch, which is why this is the place the runner rule lives: the
         directory and `runner_online` are both detail-only fields, so a session
         is fully decided here, on the one request already being made. See
         `runner_is_offline` for the rule and for why an unreadable detail row
-        projects rather than hides.
+        projects rather than hides, and `_projectable` for why that rule now
+        suppresses only a sub-agent.
 
         The same fetch carries the session's IDENTITY — `kind`, `harness` and
         `sub_agent_name` — which the consumer above needs to lay a delegated
@@ -1097,6 +1105,13 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         is one request buying five answers, not a second round trip for a label.
         See DETAIL_FIELDS for why these three and not the listing row's
         `agent_name`.
+
+        `runner_online` is forwarded as well, when the detail row carries a real
+        boolean. It is not decoration: the consumer lays a LIVE session out one
+        way (a submitted `attach`) and a dead ROOT another (a shell holding the
+        resume line unsubmitted), so it has to be able to tell them apart from
+        the event alone. Only a boolean is forwarded — a missing or null value
+        teaches the consumer nothing and must not read as "offline".
 
         The directory key is OMITTED when there is no directory to report,
         rather than set to None or "": `session.get("workspace")` on an absent
@@ -1115,7 +1130,36 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
                 value = detail.get(key)
                 if isinstance(value, str) and value:
                     enriched[key] = value
-        return enriched, not runner_is_offline(detail)
+            runner = detail.get("runner_online")
+            if isinstance(runner, bool):
+                enriched["runner_online"] = runner
+        return enriched, self._projectable(session, detail)
+
+    @staticmethod
+    def _projectable(session: dict, detail: Optional[dict]) -> bool:
+        """Whether a session reaches the consumer at all, given its detail row.
+
+        An offline runner makes a session UNATTACHABLE — `omnigent attach`
+        refuses it — so it is dropped rather than given a pane that can only show
+        that refusal. The exception is a ROOT: a dead root is not dropped, it is
+        projected as a HISTORY space, a plain shell holding the resume line
+        unsubmitted, so the operator can find a past conversation in the
+        workspace listing and press Enter to resume it (see og_herdr). That is
+        the whole point of this predicate being separate from `runner_is_offline`:
+        the runner fact is one thing, and what a session deserves because of it
+        depends on whether it is a conversation or a delegated worker.
+
+        A sub-agent's behaviour is deliberately unchanged: a dead worker is noise
+        (measured: 91 idle, 8 failed on one machine), and a worker whose parent
+        has no space shows nothing worth a pane of its own.
+
+        An unreadable detail row is "unknown" and projects for either kind (see
+        `runner_is_offline`): unknown must never hide a session.
+        """
+        if not runner_is_offline(detail):
+            return True
+        parent = session.get("parent_session_id") if isinstance(session, dict) else None
+        return parent is None or parent == ""
 
     def watch(self):
         """Yield events forever, sleeping poll_interval between polls.

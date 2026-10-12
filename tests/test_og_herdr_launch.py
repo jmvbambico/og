@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "installer"))
 
-from og_herdr import load_state  # noqa: E402  (the bridge's own reader)
+from og_herdr import DEFAULT_SPACE_CAP, load_state  # noqa: E402  (the bridge's own readers)
 from og_herdr_launch import (  # noqa: E402
     AGENTS_PANE_RATIO,
     DEFAULT_AGENT_NAME,
@@ -28,6 +28,7 @@ from og_herdr_launch import (  # noqa: E402
     launch,
     live_session,
     pane_env_for,
+    session_space_cap,
 )
 from og_herdr_watch import SessionEvent  # noqa: E402
 
@@ -586,6 +587,25 @@ def test_agents_pane_defaults_on_when_the_install_never_answered():
     assert agents_pane_enabled({"herdr_agents_pane": None}) is True
     assert agents_pane_enabled({"herdr_agents_pane": True}) is True
     assert agents_pane_enabled({"herdr_agents_pane": False}) is False
+
+
+def test_session_space_cap_defaults_to_no_limit_and_reads_the_install_key():
+    """0 means no limit, and 0 is the default: every non-archived root is listed.
+
+    Same shape as `agents_pane_enabled`: one key in og-install.json, read through
+    one function with a default, so an install that predates the key lists
+    EVERYTHING rather than being handed a cut nobody asked for.
+    """
+    assert DEFAULT_SPACE_CAP == 0
+    assert session_space_cap({}) == 0
+    assert session_space_cap({"herdr_session_space_cap": 0}) == 0
+    assert session_space_cap({"herdr_session_space_cap": 50}) == 50
+    # Anything that is not a real, non-negative int falls back to no limit rather
+    # than raising: this feeds a background daemon, and a hand-edited number must
+    # not kill it. `True` is an int in Python, so it is refused explicitly — a cap
+    # of 1 is not what `true` means.
+    for bad in (None, "5", 3.5, -1, True, False, [5], {"n": 5}):
+        assert session_space_cap({"herdr_session_space_cap": bad}) == 0, bad
 
 
 def test_a_split_reply_that_names_the_pane_is_believed(tmp_path):
