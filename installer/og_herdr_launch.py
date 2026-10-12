@@ -68,6 +68,13 @@ from og_herdr import (
     workspace_index,
 )
 
+# The runner rule, imported rather than re-implemented: `poll_once` applies it
+# for a SUB-AGENT but deliberately withholds it from a ROOT (a dead root is a
+# history space, the spaces feature), so `live_session` is the one caller that
+# has to ask it again — see the note there. The watcher is stdlib-only and
+# imports nothing of ours at module load, so this is a cheap, acyclic import.
+from og_herdr_watch import runner_is_offline
+
 # The only multiplexer with a backend. A registry row buys detection and
 # documentation; the code behind it is written per multiplexer (see
 # docs/MUX-LAUNCHER.md §8), so an id this module does not implement degrades to
@@ -214,9 +221,29 @@ def live_session(watcher, cwd: str) -> Optional[dict]:
     """The live ROOT session whose detail-row `workspace` is `cwd`, or None.
 
     Read through `og_herdr_watch.SessionWatcher` rather than by fetching the API
-    directly, so pagination, `kind=any`, per-server token matching and the
-    runner-offline rule all stay in one place — re-implementing any of them here
-    is how a launcher and a bridge start disagreeing about what is live.
+    directly, so pagination, `kind=any` and per-server token matching stay in one
+    place — re-implementing any of them here is how a launcher and a bridge start
+    disagreeing about what is live.
+
+    The runner rule is the exception, and it is applied HERE rather than inherited
+    from `poll_once`. That predicate answers the BRIDGE's question — "should this
+    session get a space?" — and its answer is yes for a dead ROOT, on purpose: a
+    past conversation becomes a history space (the spaces feature). So an event
+    from `poll_once` is NOT the same thing as a session to attach to. A dead root
+    reads `status: "idle"`, passes every filter below, and would otherwise be
+    returned as "the live session"; `launch` would take case (B) and
+    `_attach_there` would type an `omnigent attach` that dies with:
+
+        Error: Session … has no online runner … its host is offline.
+
+    Applying `runner_is_offline` here is what keeps `poll_once` free to project
+    dead roots for the bridge. The unknown direction is chosen to match the error
+    below: only an explicit `runner_online: False` is dead, so an absent or
+    unreadable answer counts as LIVE. Guessing "none" on a session whose runner
+    state we merely could not read is the one outcome that cannot be undone — it
+    opens a second space and types a second `og chat` into a conversation the
+    operator already had — while attaching to a session that turns out to be dead
+    is a visible error the operator can simply re-run.
 
     `poll_once` is used rather than `list_sessions` because the directory is on
     the DETAIL row only; poll_once enriches exactly the sessions it has not seen
@@ -243,6 +270,13 @@ def live_session(watcher, cwd: str) -> Optional[dict]:
         if session.get("archived"):
             continue
         if session.get("status") not in LIVE_STATUSES:
+            continue
+        # THE RUNNER RULE, re-applied here and NOT inherited from poll_once: a
+        # dead root is projected on purpose (it becomes a history space in the
+        # bridge), has status "idle", and so passes everything above. Handing it
+        # back would send `launch` down case (B) and type an attach that dies. See
+        # the docstring for why an unreadable runner answer counts as live.
+        if runner_is_offline(session):
             continue
         # The directory is on the DETAIL row, which is why poll_once was used.
         if session.get("workspace") != cwd:

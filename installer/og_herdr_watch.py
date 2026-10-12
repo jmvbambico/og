@@ -816,6 +816,16 @@ class SessionWatcher:
         moment its runner is online the next poll projects it and it gets its
         pane.
 
+        TWO CONSUMERS, TWO QUESTIONS, and this predicate answers only the first.
+        The set below is the BRIDGE's set — "which sessions deserve a space" — and
+        a dead root qualifies for it (a history space). It is NOT the launcher's
+        set — "which session should `og start` attach to" — for which a dead root
+        does not qualify. A dead root reads `status: "idle"` and passes every
+        listing-row filter, so a consumer asking the launcher's question MUST apply
+        `runner_is_offline` itself; `og_herdr_launch.live_session` does exactly
+        that, and narrowing this projection instead would take the spaces feature
+        away from the bridge.
+
         An already-projected session whose runner later goes offline is NOT
         retired. Re-checking it would cost a detail fetch per live session per
         poll, and closing the pane of a root session that is merely between

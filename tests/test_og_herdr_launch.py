@@ -259,6 +259,55 @@ def test_an_unreadable_session_list_is_an_error_not_an_empty_answer(tmp_path):
         live_session(UnreadableWatcher(), CWD)
 
 
+# --- the runner rule, re-applied here because poll_once withholds it for ROOTS ---
+# THE REGRESSION THIS PINS: poll_once projects a dead ROOT on purpose — it becomes
+# a history space in the bridge — so an event is not the same thing as a session
+# to attach to. A dead root reads status "idle" and passes every listing filter, so
+# without this check it wins the "is there a live session here?" question and
+# `launch` types an attach that dies with "no online runner — its host is offline".
+
+def test_a_dead_root_in_this_directory_is_not_the_live_session(tmp_path):
+    assert live_session(FakeWatcher([root_session(runner_online=False)]), CWD) is None
+
+
+def test_a_live_root_in_this_directory_is_still_the_live_session(tmp_path):
+    """The other side of the same pair: the check must not refuse a root whose
+    runner IS online. `runner_online: True` is forwarded onto the event, so this is
+    the exact object live_session sees in production."""
+    found = live_session(FakeWatcher([root_session(runner_online=True)]), CWD)
+    assert found["id"] == "s1"
+
+
+def test_an_unreadable_runner_answer_still_counts_as_live(tmp_path):
+    """THE CHOSEN DIRECTION for the three-state field. Only an explicit
+    `runner_online: False` is dead; an absent key — a detail row never read, or one
+    that carried no boolean — is UNKNOWN and counts as LIVE. Refusing it would be
+    the one outcome that cannot be undone: a second space and a second `og chat`
+    into a conversation the operator already had. The ambiguous case therefore errs
+    toward attaching, which is at worst a visible, re-runnable error."""
+    assert live_session(FakeWatcher([root_session()]), CWD)["id"] == "s1"
+    # A None spelling is the same "unknown" — the fetcher could not fill it — and
+    # must likewise stay live, not read as "offline".
+    assert live_session(
+        FakeWatcher([root_session(runner_online=None)]), CWD)["id"] == "s1"
+
+
+def test_a_dead_root_does_not_mask_a_live_one_behind_it(tmp_path):
+    """The skip CONTINUES the scan rather than stopping it: a directory with a dead
+    past conversation AND a live one still finds the live one."""
+    watcher = FakeWatcher([root_session("s-dead", runner_online=False),
+                           root_session("s-live", runner_online=True)])
+    assert live_session(watcher, CWD)["id"] == "s-live"
+
+
+def test_a_dead_root_in_another_directory_does_not_interfere(tmp_path):
+    """Not ours is not ours, dead or alive — a dead root elsewhere leaves THIS
+    directory with no session, so its launch still opens a fresh space."""
+    watcher = FakeWatcher([root_session("s-dead", cwd="/elsewhere",
+                                        runner_online=False)])
+    assert live_session(watcher, CWD) is None
+
+
 def test_is_inside_reads_herdr_env():
     assert is_inside({"HERDR_ENV": "1"}) is True
     assert is_inside({"HERDR_ENV": "0"}) is False
@@ -296,6 +345,46 @@ def test_case_a_creates_a_space_runs_chat_and_asks_to_attach(tmp_path):
     assert client.params_of("pane.send_text")[1]["pane_id"] == "w1:p2"
     assert client.split_params["direction"] == "right"
     assert client.split_params["target_pane_id"] == "w1:p1"
+
+
+def test_a_dead_root_in_the_cwd_opens_a_new_space_and_splits_the_agents_pane(tmp_path):
+    """THE REGRESSION, end to end. A project whose only session is a dead past
+    conversation must fall through to case (A): open a space, run `og chat`, and
+    split the agents pane — NOT take case (B) and type a doomed attach.
+
+    The split is asserted because it is the SECOND symptom: case (B) never splits,
+    so a directory that wrongly takes (B) silently loses its agents pane too, which
+    is the unexplained missing-pane report this shares a root cause with."""
+    client = FakeClient()
+    ctx = make_ctx(tmp_path, client, FakeWatcher([root_session(runner_online=False)]))
+
+    assert launch(ctx) == "attach"
+
+    assert client.methods == [
+        "ping",                      # is the herdr server up?
+        "workspace.create",
+        "tab.rename",
+        "pane.send_text",            # og chat — a FRESH conversation
+        "pane.split",                # the agents pane IS split
+        "pane.list",
+        "pane.send_text",            # og agents
+    ]
+    assert client.text_typed() == ["og chat", "og agents"]
+    # The doomed attach is exactly what must NOT have been typed.
+    assert "omnigent attach --server {0} s1".format(SERVER) not in client.text_typed()
+
+
+def test_a_live_root_in_the_cwd_still_attaches_and_never_splits(tmp_path):
+    """"Unchanged" pinned on purpose. A root whose runner is online still takes
+    case (B) and adopts with an attach; a runner check that refused EVERYTHING
+    would satisfy the regression test above — and an attach that never happens
+    looks exactly like a launch that worked."""
+    client = FakeClient()
+    ctx = make_ctx(tmp_path, client, FakeWatcher([root_session(runner_online=True)]))
+
+    assert launch(ctx) == "attach"
+    assert client.text_typed() == ["omnigent attach --server {0} s1".format(SERVER)]
+    assert "pane.split" not in client.methods
 
 
 def test_case_a_starts_the_herdr_server_when_it_is_down(tmp_path):
