@@ -813,12 +813,37 @@ def _herdr_call_methods(source: str) -> list:
     """The string method names `source` hands to a `HerdrClient.call(...)`.
 
     `HerdrClient.call` is the view's only outbound seam, so the set of literal
-    first arguments IS the set of requests it can send. A `.call(...)` whose
-    method is not spelled as a string literal cannot be checked and is rejected
-    rather than skipped — "we cannot tell what it sends" must fail closed.
+    first arguments IS the set of requests it can send.
+
+    This scan FAILS CLOSED: anything it cannot read is refused rather than
+    skipped, because "we cannot tell what it sends" must never pass as "it sends
+    nothing". Three things are refused outright:
+
+      * a `.call(...)` whose method is not a string literal (a variable, an
+        f-string, a `+` concatenation, `.format`) — the method is unreadable;
+      * the `call` attribute used as a VALUE rather than called directly
+        (`send = client.call`, `return client.call`, a method passed into a
+        helper). Such an alias is what the original guard walked straight past:
+        the call site becomes a bare `send(...)`, a `Name` call no attribute walk
+        sees. Following an alias to its call sites needs dataflow this scan does
+        NOT do, and this module has no legitimate reason to alias the seam, so it
+        is refused — the simple, safe rule;
+      * `getattr(<obj>, "call")` (and `__getattribute__("call")`): the seam is
+        fetched by string, hiding it from an `Attribute` walk while still
+        reaching it.
+
+    It does NOT catch a seam name that is itself data — `getattr(client, some_var)`,
+    a method pulled from a dict, `exec` — where no node names `call`. See
+    `test_the_ast_guard_catches_every_planted_bypass` for the honest boundary.
     """
+    tree = ast.parse(source)
+    directly_called = {
+        id(node.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
     methods = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                 and node.func.attr == "call":
             args = node.args
@@ -826,11 +851,35 @@ def _herdr_call_methods(source: str) -> list:
                 and isinstance(args[0].value, str), \
                 "a .call(...) must spell its method as a literal: " + ast.dump(node)
             methods.append(args[0].value)
+        elif isinstance(node, ast.Attribute) and node.attr == "call" \
+                and id(node) not in directly_called:
+            raise AssertionError(
+                "the `call` seam is used as a value, not called directly; an "
+                "alias it could be invoked through cannot be followed: "
+                + ast.dump(node))
+        elif isinstance(node, ast.Call) \
+                and getattr(node.func, "attr", "") == "__getattribute__" \
+                and len(node.args) >= 1 and isinstance(node.args[0], ast.Constant) \
+                and node.args[0].value == "call":
+            raise AssertionError(
+                "__getattribute__(\"call\") reaches the outbound seam while "
+                "hiding it from this scan: " + ast.dump(node))
+        elif isinstance(node, ast.Call) \
+                and getattr(node.func, "id", "") == "getattr" \
+                and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) \
+                and node.args[1].value == "call":
+            raise AssertionError(
+                "getattr(..., \"call\") reaches the outbound seam while hiding "
+                "it from this scan: " + ast.dump(node))
     return methods
 
 
 def _assert_only_agent_focus(source: str) -> None:
-    """The tightened guard: `agent.focus` is the ONLY method handed to `call`."""
+    """The tightened guard: `agent.focus` is the ONLY method handed to `call`.
+
+    Refuses outright if the seam is aliased, fetched by string, or called with a
+    method name that is not a literal (see `_herdr_call_methods`).
+    """
     methods = _herdr_call_methods(source)
     assert methods, "expected the view to make its one outbound focus call"
     assert set(methods) == {"agent.focus"}, methods
@@ -861,22 +910,87 @@ def test_source_only_makes_read_only_calls():
     _assert_only_agent_focus(source)
 
 
-def test_the_ast_guard_catches_a_planted_second_outbound_call():
+def test_the_ast_guard_catches_every_planted_bypass():
     """The guard must be able to FAIL — a guard that cannot is decoration.
 
-    Appending one more `HerdrClient.call(...)` to the real source stands in for
-    the future edit the guard exists to stop; the tightened assertion has to
-    reject it. Without this, "the guard passes" would prove only that it never
-    fires.
+    Each entry appends one evasion to the real source, standing in for the future
+    edit the guard exists to stop, and the tightened assertion must reject every
+    one. The first is the obvious spelling; the rest hide a `.call(...)` from a
+    bare attribute walk:
+
+      * direct — a second `client.call("workspace.focus", …)`, the spelling the
+        old test planted;
+      * aliased — `send = client.call; send(...)`: the method is bound to a name,
+        so the call site is a plain `Name` call the walk never sees. The scan
+        refuses the ALIAS itself (a `call` attribute used as a value) rather than
+        trying to follow it, which is exactly why this is caught;
+      * non-literal method — a variable, an f-string, a `+` concatenation, and
+        `.format`: the name cannot be read, so the scan refuses instead of
+        assuming;
+      * indirect client — `getattr(client, "call")(…)` and
+        `client.__getattribute__("call")(…)`: the seam is fetched by string,
+        bypassing the `.call` spelling entirely.
+
+    WHAT THE GUARD DOES NOT PROMISE. It is a static scan, not a dataflow
+    analysis. A seam name that is itself DATA — `getattr(client, some_var)`, a
+    method pulled out of a dict, `exec` — is NOT caught: no attribute node names
+    `call` and no string literal does either, so there is nothing for the scan to
+    recognise. The promise is bounded to the spellings above. It fails closed on
+    everything it can SEE — every literal `.call(…)`, every `.call` used as a
+    value, and every literal-string `getattr`/`__getattribute__` — and an honest
+    boundary beats a false one. A spelling outside that set needs this test's
+    contract changed, not the guard quietly widened.
     """
     source = Path(a.__file__).read_text()
-    planted = source + (
-        '\n\ndef _planted(client):\n'
-        '    return client.call("workspace.focus", {"workspace_id": "w1"})\n'
-    )
-
-    with pytest.raises(AssertionError):
-        _assert_only_agent_focus(planted)
+    evasions = {
+        "direct": (
+            '\n\ndef _planted(client):\n'
+            '    return client.call("workspace.focus", {"workspace_id": "w1"})\n'
+        ),
+        "aliased-method": (
+            '\n\ndef _planted(client):\n'
+            '    send = client.call\n'
+            '    return send("workspace.focus", {"workspace_id": "w1"})\n'
+        ),
+        "non-literal-name": (
+            '\n\ndef _planted(client, method):\n'
+            '    return client.call(method, {"workspace_id": "w1"})\n'
+        ),
+        "f-string-name": (
+            '\n\ndef _planted(client, which):\n'
+            '    return client.call(f"workspace.{which}", {})\n'
+        ),
+        "concatenated-name": (
+            '\n\ndef _planted(client):\n'
+            '    return client.call("workspace." + "focus", {})\n'
+        ),
+        "format-name": (
+            '\n\ndef _planted(client, which):\n'
+            '    return client.call("workspace.{}".format(which), {})\n'
+        ),
+        "indirect-client-getattr": (
+            '\n\ndef _planted(client):\n'
+            '    send = getattr(client, "call")\n'
+            '    return send("workspace.focus", {"workspace_id": "w1"})\n'
+        ),
+        "indirect-client-dunder": (
+            '\n\ndef _planted(client):\n'
+            '    return client.__getattribute__("call")("workspace.focus", {})\n'
+        ),
+        "client-from-elsewhere": (
+            '\n\ndef _planted():\n'
+            '    c = _make_client()\n'
+            '    return c.call("workspace.focus", {"workspace_id": "w1"})\n'
+        ),
+    }
+    missed = []
+    for label, planted in evasions.items():
+        try:
+            _assert_only_agent_focus(source + planted)
+        except AssertionError:
+            continue
+        missed.append(label)
+    assert not missed, f"the guard failed to reject: {missed}"
 
 
 # ---------------------------------------------------------------------------
@@ -1642,19 +1756,32 @@ def test_the_footer_names_the_focus_and_expand_bindings():
     assert "a access" in a.FOOTER, "the existing bindings must survive"
 
 
+def _cjk_width(text: str) -> int:
+    """Display columns if AMBIGUOUS is two — the CJK-locale rule.
+
+    A footer form must fit under BOTH this and the Latin rule; the only way to
+    guarantee that is for the form to contain no Ambiguous glyph, which is what
+    `test_the_footer_is_measured_the_same_in_a_cjk_locale` pins.
+    """
+    import unicodedata
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 1
+               for ch in text)
+
+
 def test_the_footer_names_every_key_at_every_width():
     # The regression this pins: the full footer is 64 columns and the agents pane
     # is a ~46-column split, so a FIXED footer was clipped mid-word — "space
     # expand" and "a access" fell off the end, leaving the operator without the
     # two keys they most needed (Space, which had just inherited expand from
-    # Enter). At every width the footer must FIT the pane and still name q, r,
-    # the arrows, enter, space and a.
+    # Enter). At every width the footer must FIT the pane UNDER BOTH LOCALE RULES
+    # and still name q, r, the move keys, enter, space and a.
     for width in (46, 52, 64, 80):
         footer = a.render(a.Frame(), width=width)[-1]
         assert a._display_width(footer) <= width, (width, footer)
+        assert _cjk_width(footer) <= width, (width, footer)
         for letter in ("q", "r", "a"):
             assert letter in footer, (width, letter, footer)
-        assert "↑" in footer and "↓" in footer, (width, footer)
+        assert ("^/v" in footer or "^v" in footer), (width, footer)
         # Enter and Space are words at full width and glyphs when compact, but a
         # key must be named EITHER way.
         assert ("enter" in footer or "⏎" in footer), (width, footer)
@@ -1670,17 +1797,37 @@ def test_the_footer_chooses_a_form_by_measured_width():
     assert a._footer(45) == a.FOOTER_COMPACT, "the compact form fits 46"
     assert a._footer(44) == a.FOOTER_KEYS
     assert a._display_width(a.FOOTER) == 64
-    assert a._display_width(a.FOOTER_COMPACT) <= 46
+    assert a._display_width(a.FOOTER_COMPACT) == 45
     # Only labels degrade: every form names every key.
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
         assert "q" in form and "r" in form and "a" in form, form
-        assert "↑" in form and "↓" in form, form
+        assert ("^/v" in form or "^v" in form), form
 
 
-def test_the_footer_glyphs_are_narrow():
-    # A Wide/Fullwidth glyph in the footer would be painted two columns wide
-    # after `_footer` judged it to fit, spilling past the pane in a CJK locale —
-    # the same bug in a different costume. Every introduced glyph must be Narrow.
+def test_the_footer_is_measured_the_same_in_a_cjk_locale():
+    # The regression this pins, in the locale that re-created it: ↑ (U+2191) and
+    # ↓ (U+2193) are East Asian AMBIGUOUS — one column in a Latin locale, TWO in a
+    # CJK one. While they were in the footer, `_footer` measured the full form as
+    # 64 and chose it for a 64-column pane, but a CJK terminal painted 66 and
+    # `_clip` cut "a access" off. The footer now carries no Ambiguous or Wide
+    # glyph, so its measured width is identical under both rules and no form can
+    # overflow in either.
     import unicodedata
+
+    for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
+        for ch in form:
+            assert unicodedata.east_asian_width(ch) not in ("W", "F", "A"), (ch, form)
+        # One honest width rule: no glyph's width depends on the locale.
+        assert a._display_width(form) == _cjk_width(form) == len(form), form
+
+    # ⏎ and ␣ stay Narrow, and the wider keys still fit under the CJK rule.
     for glyph in ("⏎", "␣"):
         assert unicodedata.east_asian_width(glyph) == "N", glyph
+    assert _cjk_width(a.FOOTER) == 64
+    assert _cjk_width(a.FOOTER_COMPACT) <= 46
+
+    # Every form `_footer` picks for a pane at least as wide as the KEYS floor
+    # fits that pane under the CJK rule too.
+    floor = _cjk_width(a.FOOTER_KEYS)
+    for width in range(floor, 90):
+        assert _cjk_width(a._footer(width)) <= width, width
