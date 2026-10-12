@@ -698,7 +698,8 @@ class SessionWatcher:
             body = resp.read()
         return json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
 
-    def fetch_listing(self, kind: str = "any") -> tuple[list, bool]:
+    def fetch_listing(self, kind: str = "any",
+                      include_archived: bool = False) -> tuple[list, bool]:
         """Walk the listing to its end -> (rows, truncated). PUBLIC.
 
         Returns `(rows, truncated)`, and `truncated` means the walk stopped with
@@ -707,6 +708,12 @@ class SessionWatcher:
         of a session into evidence it is gone. `list_sessions` drops the flag
         because it wants only the rows; a caller that decides anything from an
         absence (poll_once, og_agents) needs both halves and calls this.
+
+        `include_archived` is the server's own `include_archived` query param,
+        which defaults to FALSE: an archived session is invisible to this walk
+        unless the caller asks for it. Off by default here so no existing caller
+        changes what it sees; `og sessions` turns it on because it has to be
+        able to see an archived session in order to unarchive it.
 
         `truncated` is set when the page cap ran out, the row cap cut the tail
         off, the envelope promised more but gave no cursor to ask for, or the
@@ -720,6 +727,8 @@ class SessionWatcher:
         rows: list = []
         truncated = False
         params = {"kind": kind, "limit": SESSION_PAGE_LIMIT}
+        if include_archived:
+            params["include_archived"] = "true"
         seen_cursors: set = set()
         cursor: Optional[str] = None
 
@@ -753,12 +762,14 @@ class SessionWatcher:
 
         return rows, truncated
 
-    def list_sessions(self, kind: str = "any") -> list:
+    def list_sessions(self, kind: str = "any",
+                      include_archived: bool = False) -> list:
         """Every listed session, walked across pages. Unfiltered — narrowing is
         `should_project`'s job, so this stays a faithful read of the API.
 
         kind defaults to "any" on purpose — see the module docstring: the
-        server's own default hides every sub-agent worker.
+        server's own default hides every sub-agent worker. `include_archived`
+        is forwarded to `fetch_listing`, which documents what it costs.
 
         The listing is paginated and newest-first, so one page is not the
         listing: on a machine with more than a page of sessions, reading only
@@ -775,7 +786,7 @@ class SessionWatcher:
         stop being evidence of deletion: `fetch_listing` reports when the walk
         stopped short, and poll_once acts on it.
         """
-        rows, _truncated = self.fetch_listing(kind)
+        rows, _truncated = self.fetch_listing(kind, include_archived)
         return rows
 
     def poll_once(self) -> list:

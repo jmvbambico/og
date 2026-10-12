@@ -423,6 +423,7 @@ og chat             open an orchestrator session in this terminal
 og url              print the URL (pipe-friendly)
 og logs [-f]        tail the server log
 og audit [id]       what happened in the latest run — per worker: tools, stalls, report
+og sessions         list sessions; --archive <id> hides one, --delete <id> destroys it
 og login            store server credentials (Keychain / keyring / 0600 file), once
 og update           pull the checkout and re-apply the install
 og version          print the installed version

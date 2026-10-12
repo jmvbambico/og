@@ -21,6 +21,7 @@
 #   og audit [id]       what happened in the latest run: per-worker tools, stalls, reports
 #   og stats            per-agent quota/capacity: remaining, reset, tier, source
 #   og agents [options] the live session tree in this terminal (not herdr-specific)
+#   og sessions [opts] list sessions; --archive <id> hides one, --delete <id> destroys it
 #   og herdr [options]  project live omnigent sessions into herdr panes
 #   og update           pull the checkout and re-apply the install
 #   og version          print the installed version
@@ -2024,6 +2025,24 @@ cmd_agents() {
   exec python3 "$viewer" "$@"
 }
 
+# `og sessions` — the terminal's answer to the web UI's session "..." menu.
+# Its own verb, never a flag on `og chat`: `og chat` starts and resumes
+# conversations, and a mistyped `og chat` must not be able to destroy one. The
+# herdr per-space command has a clean thing to call here.
+cmd_sessions() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_sessions.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  local cli="$repo/installer/og_sessions.py"
+  [[ -f "$cli" ]] || {
+    printf '\033[0;31merror:\033[0m og sessions is not installed (missing %s); re-run og setup\n' "$cli" >&2
+    exit 2
+  }
+  # --server so an install whose og.env moved the server off 6767 still talks
+  # to its own server, exactly as the herdr bridge is launched.
+  exec python3 "$cli" --server "http://127.0.0.1:$PORT" "$@"
+}
+
 # The herdr bridge ships on its own branch, so an install that predates it has
 # the checkout but not the script. A missing file must read as "reinstall", not
 # as python's cryptic "can't open file ... [Errno 2]" traceback — hence the
@@ -2360,17 +2379,18 @@ case "${1:-}" in
   audit)  shift; cmd_audit "$@" ;;
   stats)  shift; cmd_stats "$@" ;;
   agents) shift; cmd_agents "$@" ;;
+  sessions) shift; cmd_sessions "$@" ;;
   herdr)  shift; cmd_herdr "$@" ;;
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
     # The usage block is the comment header, so the RANGE has to track it: every
     # command added above without widening this quietly drops off the end of
-    # `og help`, which is how `og version` went missing once already. 2,26 is the
+    # `og help`, which is how `og version` went missing once already. 2,27 is the
     # last line of the command list (the prose below it is not help).
     # tests/test_og_start_mux.py::test_help_block_lists_every_dispatched_command
     # is the guard that cannot rot the way a number does.
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac
