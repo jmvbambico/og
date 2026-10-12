@@ -1219,3 +1219,106 @@ def test_access_info_never_modifies_or_deletes_the_tunnel_cache(
         after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
         assert after == before, f"the cache was touched for {provider!r}"
         assert (tmp_path / "og-tunnel.url").exists()
+
+
+# ---------------------------------------------------------------------------
+# 14. the curses painter: full-width writes and a single footer
+# ---------------------------------------------------------------------------
+#
+# Both defects lived BELOW the pure renderer — in the paint loop, at the seam
+# between a composed `Pane` and `addnstr` — so no pure-`render` test could see
+# them. These drive the real `_run_tui` loop with a fake window that records
+# every `addnstr`, which is the smallest seam that reaches the painter.
+
+class _FakeStdscr:
+    """A curses window that records what the painter hands it.
+
+    `getch` answers `q` at once, so the loop paints exactly one frame and
+    returns; `erase` clears `writes` the way it clears the screen, so what is
+    left is one frame's worth of writes.
+    """
+
+    def __init__(self, height, width):
+        self.height, self.width = height, width
+        self.writes: list[tuple[int, str, int]] = []
+
+    def keypad(self, flag): pass
+    def getmaxyx(self): return (self.height, self.width)
+    def erase(self): self.writes.clear()
+    def refresh(self): pass
+    def timeout(self, ms): pass
+    def getch(self): return ord("q")
+
+    def addnstr(self, row, col, text, n, attr):
+        self.writes.append((row, text[:n], n))
+
+
+class _StubModel:
+    """A model whose refresh always returns the same frame."""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    def refresh(self, selected_id=None, expanded_ids=(), force=False):
+        return self._frame
+
+
+def _paint(frame, width, height, monkeypatch):
+    """Run one real paint of `frame` and return the `addnstr` writes."""
+    import curses
+
+    scr = _FakeStdscr(height, width)
+    monkeypatch.setattr(curses, "curs_set", lambda *_: None)
+    monkeypatch.setattr(curses, "wrapper", lambda fn, *a, **k: fn(scr))
+    a._run_tui(_StubModel(frame), 3.0, "http://x")
+    return scr.writes
+
+
+def test_the_painter_writes_a_boxes_full_width_so_its_border_survives(
+        monkeypatch):
+    """A box closes in the pane's last column; `width - 1` clipped it off.
+
+    The old writer passed `width - 1` to `addnstr`, so every row lost its last
+    column — exactly the `┐`, `│` and `┘` — and every box rendered open on the
+    right. This asserts on the recorded writes, which is where the truncation
+    happened and where a pure `render` test cannot look.
+    """
+    frame = a.Frame(rows=[worker("w1", "working")], selected=0)
+    writes = _paint(frame, 60, 20, monkeypatch)
+
+    box = [text for _row, text, _n in writes[:4]]
+    assert all(len(line) == 60 for line in box), "each box row is the pane width"
+    assert box[0].endswith("┐"), "the top rule closes on the right"
+    assert box[-1].endswith("┘"), "the bottom rule closes on the right"
+    assert all(n == 60 for _row, _text, n in writes), \
+        "no row is written one column short"
+
+
+def test_a_short_list_paints_its_footer_once(monkeypatch):
+    """With the list shorter than the window the footer was painted twice.
+
+    The window ran over the whole of `items`, tail included, and landed on the
+    footer just above where the pinned tail drew it again — two footers, one
+    under the last box and one at the pane bottom.
+    """
+    frame = a.Frame(rows=[header(), worker("w1", "working")], selected=1)
+    writes = _paint(frame, 60, 24, monkeypatch)
+
+    footers = [row for row, text, _n in writes if text == a.FOOTER]
+    assert len(footers) == 1, "the footer is painted exactly once, not twice"
+    assert footers[0] == 23, "and once means pinned to the pane's bottom row"
+
+
+def test_a_long_list_keeps_one_footer_pinned_at_the_bottom(monkeypatch):
+    """A list that overflows the window still shows exactly one footer.
+
+    Here the window stops before the tail, so the pinned one is the only one —
+    the regression guard that the short-list fix did not drop the tail.
+    """
+    rows = [header()] + [worker(f"w{i}", "working") for i in range(16)]
+    frame = a.Frame(rows=rows, selected=1)
+    writes = _paint(frame, 60, 12, monkeypatch)
+
+    footers = [row for row, text, _n in writes if text == a.FOOTER]
+    assert len(footers) == 1, "the footer is painted exactly once"
+    assert footers[0] == 11, "and stays pinned to the bottom while the list scrolls"
