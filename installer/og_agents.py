@@ -14,11 +14,15 @@ The listing is cheap and drives the live view; the detail row is 121 KB and is
 fetched as little as possible. See `AgentModel.refresh` for the budget and why a
 per-row-per-poll fetch is a defect rather than a slow path.
 
-The shape of the view: one plain header per root (the harness label), then a
-full box per worker — `├─`/`└─` down a tree spine, a `▸` caret on the selected
-box, one ASCII glyph per state, a 6-dot braille spinner for anything working, a
-boxed access panel sized to its own content, and a one-line footer. `render` is
-a pure function from state to a list of lines and curses only paints them; that
+The shape of the view is the operator's chosen C2 template (rendered three ways
+in docs/proto/tui_chosen.py, C2 approved): a heavy `━` title bar per root with the
+root's name inlaid, a `█/░` done-gauge under it, then the root's workers GROUPED
+BY STATE under a label row, each worker a rounded box whose own left edge is the
+group rail — so one unbroken `│` runs down a group at no extra column cost. The
+caret `▸` on a box's first row is the selection marker; a per-state glyph and the
+harness brand mark sit in fixed columns left of the title. A boxed access panel
+sized to its own content and a one-line footer pin to the bottom. `render` is a
+pure function from state to a list of lines and curses only paints them; that
 separation is what lets the view be tested with `--once`, with no tty in sight.
 
 This module is deliberately NOT herdr-specific: it reads Omnigent's HTTP API and
@@ -60,26 +64,69 @@ from og_herdr_watch import (
 
 DEFAULT_INTERVAL = 3.0
 
-# The status glyph shown beside a worker. ASCII on purpose: a pane that renders
-# this view's box-drawing characters correctly is not guaranteed to have the
-# geometric shapes, and a `?` where a tick should be reads as "I do not know
-# this state" when the state is merely idle. `working` has no glyph here — it
-# gets the spinner (`state_glyph`), because a moving dot is the one glyph that
-# says "this is live" without a legend.
+# The per-state glyph shown beside a worker, the operator's chosen TUI
+# vocabulary: ● working, ⏸ blocked, ✗ failed, ○ finished. This REPLACES the ASCII
+# `+ ! x ?` this view used to draw and the 6-dot braille spinner it used for
+# working: the operator picked these four glyphs for the whole `og agents` design
+# (docs/proto/tui_beauty.py: the TUI "keeps its OWN state vocabulary - ● ⏸ ✗ ○"),
+# so a state never changes meaning between layouts and the pane no longer needs a
+# clock to animate. `?` stays the one honest glyph for a status `display_state`
+# could not name (-> "unknown"); it is not in the design's four because the design
+# never draws an unnameable state.
+#
+# ● ⏸ ○ are East Asian AMBIGUOUS. They are composed as ONE layout column, which is
+# what a western terminal paints — the same Ambiguous-charged-one rule the boxes
+# use (see ROUND_CORNERS). Only the MARK SLOT charges Ambiguous two, on purpose.
 STATE_GLYPH = {
-    "idle": "+",
-    "blocked": "!",
-    "failed": "x",
+    "working": "\u25cf",   # ●
+    "blocked": "\u23f8",   # ⏸
+    "failed": "\u2717",    # ✗
     "unknown": "?",
+    "idle": "\u25cb",      # ○
 }
 
-# The spinner: SIX braille dots, and only the top two rows of each cell (dots
-# 1-6, never the 7/8 descenders). That restriction is the whole reason for the
-# choice — the 7/8 forms hang below the baseline, so a spinner that used them
-# would change the glyph's height every frame and make the row it sits in jitter
-# as the box is redrawn. Six frames at SPIN_TICK is one ~0.7s cycle.
-SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴"
-SPIN_TICK = 0.12
+# --- the C2 pane geometry (docs/proto/tui_chosen.py, variant C2) ---------------
+#
+# The rail IS the box's own left edge. The breathing and label rows carry a `│`
+# at the box's left column too, so one unbroken vertical line runs down a group
+# and the hierarchy needs no extra column — that shared column is what makes this
+# C2 and not C1 (a rail beside the box, which spends two columns on a doubled
+# border) or C3 (no rail at all, structure read from the labels alone).
+#
+# WIDTH IS COMPOSED WITH ONE RULER: the len-based one (`_clip`/`_pad`, the
+# `_visible_width` notion). Every box-drawing glyph here is East Asian AMBIGUOUS,
+# so a whole box line measured with `_display_width` (Ambiguous charged two) would
+# double its borders and overflow the pane — exactly why the two rulers exist.
+# The len ruler charges Ambiguous one, which is what a western terminal paints,
+# and it matches the approved prototype line for line. `_display_width` (Ambiguous
+# two) is used in exactly ONE place, the MARK SLOT, because the slot's whole job
+# is to survive a font that draws an Ambiguous mark wide; see `_mark_slot`.
+ROUND_CORNERS = ("\u256d", "\u2500", "\u256e", "\u2502", "\u2570", "\u256f")
+RAIL = "\u2502"          # U+2502, the group rail, shared with the box's left edge
+TITLE_RULE = "\u2501"    # U+2501 heavy horizontal: the root's title bar
+GAUGE_FULL = "\u2588"    # █
+GAUGE_EMPTY = "\u2591"   # ░
+GAUGE_CELLS = 10         # the done-gauge is a fixed ten-cell bar
+CARET = "\u25b8"         # ▸ the selection marker; the caret row is the SELECTED one
+
+# The eight columns a box's first row spends before the title: leading space,
+# caret, space, state glyph, space, the two-column mark slot, space. The slot is
+# two WHATEVER it draws as, so the glyph and the mark line up down the list — the
+# point of the slot — and the title starts in the same place on every row.
+ROW_PREFIX = 8
+
+# The state groups, in the order they are DRAWN: what needs attention first.
+# `unknown` (a status `display_state` could not name) is its own group rather than
+# folded into `failed`, so its row keeps its own `?` glyph. A state outside this
+# tuple still gets a group, sorted last (see `_grouped`), so no worker is dropped.
+GROUP_ORDER = ("working", "blocked", "failed", "unknown", "idle")
+GROUP_WORD = {
+    "working": "working",
+    "blocked": "blocked - waiting on you",
+    "failed": "failed",
+    "unknown": "unknown",
+    "idle": "finished",
+}
 
 # The DISPLAY state `herdr_state` does not have. See `display_state` for why it
 # is derived here instead of being added to the shared vocabulary.
@@ -161,8 +208,10 @@ TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
 # testable; the curses attributes that go with them live in `_run_tui`.
 # SELECTED belongs to the CARET ROW of the selected worker and no other line:
 # the rest of its box is NORMAL, so selecting a worker marks it with the caret
-# instead of reverse-videoing the whole four-row block.
-NORMAL, SELECTED, DIM = "normal", "selected", "dim"
+# instead of reverse-videoing the whole block. TITLE is the ONE place the design
+# spends A_REVERSE — the root's heavy title bar; everything else earns its look
+# from glyphs and layout, and the pane carries no colour or background fill.
+NORMAL, SELECTED, DIM, TITLE = "normal", "selected", "dim", "title"
 
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
 # is `http://127.0.0.1:6767`.
@@ -249,15 +298,13 @@ def display_state(session: Any) -> str:
     return state
 
 
-def state_glyph(state: str, spin: int) -> str:
-    """The glyph for a display state: the spinner for `working`, else ASCII.
+def state_glyph(state: str) -> str:
+    """The glyph for a display state, from the chosen vocabulary. Pure.
 
-    Pure in `spin`: the caller owns the frame counter, so render stays a
-    function of its arguments and `--once` (which passes 0) has no animation to
-    be inconsistent about.
+    No `spin`: the C2 pane does not animate, so render is a function of the state
+    alone and `--once` has no frame counter to be inconsistent about. A state the
+    vocabulary does not name draws `?` rather than nothing.
     """
-    if state == "working":
-        return SPIN_FRAMES[spin % len(SPIN_FRAMES)]
     return STATE_GLYPH.get(state, "?")
 
 
@@ -457,47 +504,57 @@ def _index(sessions: Iterable[dict]):
 
 
 def _preorder(by_id: dict, children: dict, root_ids: Iterable[str]):
-    """`[(session_id, depth, spine, last)]` for the selected roots' trees.
+    """`[(session_id, depth)]` for the selected roots' trees, in pre-order.
 
-    Pre-order, and `spine` is the tree columns ABOVE this row: one two-column
-    entry per ancestor level, `│ ` while something follows at that level and `  `
-    once nothing does. `last` says the same thing for this row's own level, and
-    is what picks `└─` over `├─`. A root carries no spine and is always `last`:
-    it is drawn as a plain header, so its workers start in the first column and
-    nothing can hang off an edge that was never drawn.
+    Pre-order, and `depth` is how far below its root a row sits. C2 FLATTENS the
+    tree into state groups (`build_rows`), so the spine columns the old renderer
+    drew are gone; `depth` is kept because it is the row's nesting level and
+    nothing may crash on a listing that nests deeper than one level.
 
-    A `seen` set makes a malformed listing — a cycle, or a session that is its
-    own parent — terminate rather than recurse forever.
+    The `seen` set is the reason this walk still exists as its own function: a
+    malformed listing — a cycle, or a session that is its own parent — has to
+    terminate rather than recurse forever.
     """
-    out: list[tuple[str, int, tuple[str, ...], bool]] = []
+    out: list[tuple[str, int]] = []
     seen: set[str] = set()
 
-    def walk(sid: str, depth: int, spine: tuple[str, ...], last: bool) -> None:
+    def walk(sid: str, depth: int) -> None:
         if sid in seen or sid not in by_id:
             return
         seen.add(sid)
-        out.append((sid, depth, spine, last))
-        kids = children.get(sid, [])
-        # A root is a header: it draws no edge, so its workers start in the
-        # first column and there is nothing above them to continue. A worker's
-        # children inherit its column, closed once nothing follows at that level.
-        kid_spine = spine if depth == 0 else spine + ("  " if last else "│ ",)
-        for position, child in enumerate(kids):
-            walk(child, depth + 1, kid_spine, position == len(kids) - 1)
+        out.append((sid, depth))
+        for child in children.get(sid, []):
+            walk(child, depth + 1)
 
     for rid in root_ids:
-        walk(rid, 0, (), True)
+        walk(rid, 0)
     return out
 
 
 @dataclass
 class Row:
-    """One row of the tree, before it is turned into text.
+    """One row of the view, before it is turned into text.
 
-    A ROOT row is a header: `text` is the harness label and nothing else is
-    drawn. A WORKER row is a box: `text` is the task (the title with its
-    `<role>_<agent>:` prefix removed), `agent` and `meta` are the second line,
-    and `last`/`spine` place it in the tree.
+    FOUR kinds, told apart by a flag, because C2 draws each differently:
+
+      * a ROOT row (`is_root`): the heavy title bar and its done-gauge. `text` is
+        the root's name, `harness` the label right of the gauge, and `done`/`total`
+        the gauge's numerator and denominator.
+      * a GROUP row (`group`): the state label heading a group of workers. `state`
+        names the group and `text` is its word, and the row carries the very state
+        it was grouped by, so a label can never disagree with the boxes under it.
+      * a RAIL row (`rail`): the blank breathing row above a group, drawn as the
+        rail alone so the vertical line is unbroken between boxes.
+      * a WORKER row (none of the above): a rounded box. `text` is the task (the
+        title with its `<role>_<agent>:` prefix removed); `agent`, `meta` and
+        `harness` are its identity; `depth` is how far below the root it sits.
+
+    `harness` holds a HARNESS ID for a root and for a worker alike (both go
+    through `harness_label`/`harness_mark`), and is "" when the row does not know
+    one — the honest blank, never a guessed vendor.
+
+    Only a WORKER row is selectable (see `_is_box`): the caret belongs to a box,
+    so the rails, the labels and the roots are stepped over by the selection.
     """
 
     session_id: str
@@ -505,12 +562,15 @@ class Row:
     state: str
     depth: int
     is_root: bool = False
+    group: bool = False
+    rail: bool = False
     snippet: Optional[str] = None
     expanded: bool = False
     agent: Optional[str] = None
     meta: str = ""
-    last: bool = True
-    spine: tuple[str, ...] = ()
+    harness: str = ""
+    done: int = 0
+    total: int = 0
 
 
 @dataclass
@@ -532,9 +592,10 @@ class Access:
 class Frame:
     """The whole view at one instant: the rows, plus anything to say about it.
 
-    `selected` is an index into `rows` and `spin` is the spinner frame counter.
-    Both live on the frame rather than being read from a clock so `render` stays
-    pure: the same frame rendered twice is the same two screens.
+    `selected` is an index into `rows`, and both live on the frame rather than
+    being read from a clock so `render` stays pure: the same frame rendered twice
+    is the same two screens. There is no spinner counter — C2's state glyphs are
+    static (`state_glyph`), so nothing on the pane animates.
     """
 
     rows: list[Row] = field(default_factory=list)
@@ -542,7 +603,6 @@ class Frame:
     notice: Optional[str] = None
     access: Optional[Access] = None
     selected: int = 0
-    spin: int = 0
 
 
 @dataclass
@@ -663,14 +723,30 @@ def build_rows(
     expanded_ids: Iterable[str] = (),
     now: Optional[float] = None,
 ) -> list[Row]:
-    """The display rows for the selected roots' trees, in listing order.
+    """The display rows for the selected roots' trees, in DISPLAY order (C2).
 
-    A root row is labelled by its harness (the product name), matching the
-    orchestrator header the operator's web UI shows, and carries no glyph: it is
-    a header, not a worker. A worker row is labelled by its task and carries the
-    agent name, a glyph and a meta line. `snippets` is consulted per row, and a
-    row is marked expanded only when its id is in `expanded_ids` AND it has a
-    snippet to show.
+    The order built here IS the order on screen, and it is what the caret indexes
+    into: per root a title-bar row, then for each state group a breathing rail
+    row, the group's label row, and the group's worker boxes. So the whole view
+    reads top to bottom the way it is painted.
+
+    THE GROUPING HAPPENS HERE, not in `_pane`, and that is load-bearing. If the
+    view grouped the workers while `Frame.rows` stayed in tree order, the arrow
+    keys — `move_selection`, `snap_selection`, `_run_tui`'s scroll — would walk
+    the rows in tree order while the eye read state order, and the caret would
+    appear to jump around at random. Sorting the ROWS themselves keeps every
+    index-based helper correct without a change.
+
+    The sort is STABLE (`_grouped`), so two polls that brought the same set of
+    workers produce byte-identical rows; an unstable order would make otherwise
+    identical frames differ and defeat `paint_needed` forever.
+
+    A worker can have children, and the tree is FLATTENED: a descendant is
+    grouped by its OWN state like any other worker, and the spine columns are not
+    drawn. Grouping by state and drawing a tree spine are mutually exclusive —
+    a child placed under its parent's group label would sit under a label that
+    disagrees with its own state — so the parent link is dropped rather than
+    lied about. `depth` is still carried, and nothing crashes on nesting.
 
     `now` is the clock the meta lines are measured against; it defaults to the
     wall clock so a caller that only wants a tree need not supply one. Every
@@ -683,24 +759,57 @@ def build_rows(
     sessions = list(sessions)
     by_id, children = _index(sessions)
     rows: list[Row] = []
-    for sid, depth, spine, last in _preorder(by_id, children, root_ids):
+    for root_id in root_ids:
+        if root_id not in by_id:
+            continue
+        workers = _worker_rows(by_id, children, root_id, snippets, expanded, clock)
+        rows.append(_root_row(by_id[root_id], root_id, workers))
+        for state, group in _grouped(workers):
+            word = GROUP_WORD.get(state, state)
+            # The rail row and the label row carry the SAME state as the boxes
+            # under them, and the word is derived from that state, so the label
+            # cannot disagree with the group it heads.
+            rows.append(Row(session_id="", text="", state=state, depth=1, rail=True))
+            rows.append(Row(session_id="", text=word, state=state, depth=1,
+                            group=True))
+            rows.extend(group)
+    return rows
+
+
+def _root_row(session: dict, root_id: str, workers: list[Row]) -> Row:
+    """The title-bar row for one root: its name, harness label and done-gauge.
+
+    `done` counts the workers in the `idle` group — the design's `finished` — and
+    `total` is every worker under the root, so a root with no workers draws an
+    empty `0/0` bar rather than a broken one (`_gauge` guards the divide).
+    """
+    harness = session.get("harness")
+    title = (session.get("title") or "").strip() or root_id
+    return Row(
+        session_id=root_id,
+        text=title,
+        state=display_state(session),
+        depth=0,
+        is_root=True,
+        harness=harness if isinstance(harness, str) else "",
+        done=sum(1 for row in workers if row.state == "idle"),
+        total=len(workers),
+    )
+
+
+def _worker_rows(by_id: dict, children: dict, root_id: str,
+                 snippets: dict, expanded: set, clock: float) -> list[Row]:
+    """The worker Rows under one root, in pre-order (nesting flattened)."""
+    out: list[Row] = []
+    for sid, depth in _preorder(by_id, children, [root_id]):
+        if depth == 0 or sid not in by_id:
+            continue
         session = by_id[sid]
         state = display_state(session)
-        if depth == 0:
-            harness = session.get("harness")
-            label = harness_label(harness) if isinstance(harness, str) \
-                and harness else None
-            rows.append(Row(
-                session_id=sid,
-                text=label or session.get("title") or sid,
-                state=state,
-                depth=depth,
-                is_root=True,
-            ))
-            continue
         agent, task = split_title(session.get("title"))
         snippet = snippets.get(sid)
-        rows.append(Row(
+        harness = session.get("harness")
+        out.append(Row(
             session_id=sid,
             text=task,
             state=state,
@@ -709,10 +818,27 @@ def build_rows(
             expanded=sid in expanded and snippet is not None,
             agent=agent,
             meta=worker_meta(session, state, clock),
-            last=last,
-            spine=spine,
+            harness=harness if isinstance(harness, str) else "",
         ))
-    return rows
+    return out
+
+
+def _grouped(workers: list[Row]) -> list[tuple[str, list[Row]]]:
+    """`workers` bucketed by state, groups in `GROUP_ORDER`, STABLE within a group.
+
+    Stable is a requirement, not a nicety: two frames built from the same workers
+    must compose to identical lines, or `paint_needed` sees a difference that is
+    not one and the pane repaints forever. `sorted` is stable, so the pre-order
+    the walk produced is preserved inside each bucket. A state outside
+    `GROUP_ORDER` still gets its own group rather than being dropped, so an
+    unheard-of status can never silently lose a worker.
+    """
+    buckets: dict[str, list[Row]] = {}
+    for row in workers:
+        buckets.setdefault(row.state, []).append(row)
+    order = sorted(buckets, key=lambda st: GROUP_ORDER.index(st)
+                   if st in GROUP_ORDER else len(GROUP_ORDER))
+    return [(state, buckets[state]) for state in order]
 
 
 # ---------------------------------------------------------------------------
@@ -847,59 +973,126 @@ def access_lines(access: Access, width: int) -> list[str]:
     return _boxed(content, width)
 
 
-def row_block(row: Row, width: int, spin: int = 0,
-              selected: bool = False) -> list[str]:
-    """One worker as a full box: four rows, or five with its report expanded.
+def _rule_label(label: str, width: int) -> str:
+    """A heavy rule with `label` inlaid near the left: the root's title bar.
 
-    The tree spine is BAKED INTO the returned rows rather than added by the
-    caller, so the tree reads top to bottom whatever a box costs in rows — the
-    `├─` on the top row, `│ ` beside the middle rows while something follows,
-    and spaces once this is the last row.
-
-    The caret goes on the FIRST row only. Repeating it down the box would read
-    as four selected things.
+    `━━ name ━━━…` — two heavy horizontals, the name, then heavy fill to the pane
+    edge. When the label leaves no room for the leading rule the whole thing
+    degrades to the bare label, clipped, rather than an unreadable stub.
     """
-    inner = max(4, width - 6 - 2 * len(row.spine))
-    prefix = "".join(row.spine)
-    elbow = "└─" if row.last else "├─"
-    side = "  " if row.last else "│ "
-    caret = "▸" if selected else " "
-    info = f"{row.agent} · {row.meta}" if row.agent else row.meta
+    lab = f" {label} "
+    if len(lab) + 2 >= width:
+        return _clip(lab, width)
+    return _clip(TITLE_RULE * 2 + lab + TITLE_RULE * (width - 2 - len(lab)), width)
 
-    def body(content: str) -> str:
-        return f"{prefix}{side}  │" + _pad(content, inner) + "│"
 
-    lines = [
-        f"{prefix}{elbow} {caret}┌" + "─" * inner + "┐",
-        body(f" {state_glyph(row.state, spin)} {row.text}"),
-        body(f"   {info}"),
-    ]
+def _two_col(left: str, right: str, width: int) -> str:
+    """`left` flush left, `right` flush right, exactly `width` columns.
+
+    The right part never loses its last column to the left part: when `left` has
+    more to say than there is room for, the RIGHT part is what is drawn (it is the
+    clock or the harness label — the part being waited on), clipped if need be.
+    """
+    if width <= 0:
+        return ""
+    right = _clip(right, width)
+    room = width - len(right)
+    if room <= 0:
+        return _clip(right, width)
+    return _pad(left, room) + right
+
+
+def _gauge(done: int, total: int, cells: int) -> str:
+    """A `cells`-wide done bar: `█` for the fraction done, `░` for the rest.
+
+    A root with no workers has nothing to be a fraction OF, so `0/0` draws an
+    empty bar rather than dividing by zero.
+    """
+    filled = 0 if not total else int(round(done / total * cells))
+    return GAUGE_FULL * filled + GAUGE_EMPTY * (cells - filled)
+
+
+def _root_lines(row: Row, width: int) -> list[tuple[str, str]]:
+    """A root as its two header lines: the heavy title bar, then the done-gauge.
+
+    This REPLACES the bare one-line root header the pane used to draw — the thing
+    the operator complained was "not boxed". The bar is the ONE line the design
+    spends A_REVERSE on; the gauge right-aligns the harness label.
+    """
+    bar = _rule_label(row.text, width)
+    gauge = _two_col(
+        f"{_gauge(row.done, row.total, GAUGE_CELLS)}  {row.done}/{row.total} done",
+        harness_label(row.harness), width)
+    return [(bar, TITLE), (gauge, NORMAL)]
+
+
+def _round_box(inner_lines: list[str], width: int) -> list[str]:
+    """`inner_lines` in a rounded box EXACTLY `width` columns wide (len ruler).
+
+    The corners are the operator's one addition against the heavy title bar:
+    light `─` under curved `╭╮╰╯`, and the weight contrast is the interest.
+    """
+    width = max(4, width)
+    tl, hz, tr, vt, bl, br = ROUND_CORNERS
+    out = [tl + hz * (width - 2) + tr]
+    out += [vt + _pad(line, width - 2) + vt for line in inner_lines]
+    out.append(bl + hz * (width - 2) + br)
+    return out
+
+
+def worker_box(row: Row, width: int, selected: bool) -> tuple[list[str], int]:
+    """One worker as a rounded box, and the index of its caret row.
+
+    Line 1 (the row AFTER the top border) carries the caret, the state glyph and
+    the harness mark in its fixed two-column slot, then the title; line 2 the
+    agent name flush left and the clock flush right. An expanded report is a
+    third row INSIDE the box — never a loose line that would break the rectangle.
+
+    The caret goes on that ONE row, and the returned index is where the caller
+    must hang the SELECTED role: hanging it on row 0 (the top border) would bold
+    the wrong line and scroll the pane to a rule instead of to the caret. The
+    index is 1 because `_round_box` puts the top border at 0.
+    """
+    inner = max(0, width - 2)
+    caret = CARET if selected else " "
+    line1 = (" " + caret + " " + state_glyph(row.state) + " "
+             + harness_mark(row.harness) + " "
+             + _clip(row.text, inner - ROW_PREFIX))
+    lines = [line1, _two_col(" " + (row.agent or "role"), row.meta, inner)]
     if row.expanded and row.snippet:
-        lines.append(body(f"   {_clip(_oneline(row.snippet), inner - 3)}"))
-    lines.append(f"{prefix}{side}  └" + "─" * inner + "┘")
-    return lines
+        lines.append("  " + _clip(_oneline(row.snippet), inner - 2))
+    return _round_box(lines, width), 1
 
 
-def frame_working(frame: Frame) -> bool:
-    """Whether any WORKER is working — the only thing that animates.
+def _rail_label(text: str, width: int) -> str:
+    """A group label row: the rail, a space, then the state word.
 
-    A root is a plain header and carries no glyph, so a working root changes
-    nothing on screen and must not schedule a repaint; see `paint_needed`.
+    The rail glyph sits at the box's own left column, so the label row continues
+    the unbroken vertical line the group's boxes draw down their left edge.
     """
-    return any(not row.is_root and row.state == "working" for row in frame.rows)
+    return RAIL + " " + _clip(text, max(0, width - 2))
+
+
+def _is_box(row: Row) -> bool:
+    """Whether a row is a worker box — the only rows the caret can land on.
+
+    The roots, the group labels and the breathing rails draw no box and so no
+    caret; the selection steps over them (`_workers`, `move_selection`).
+    """
+    return not (row.is_root or row.group or row.rail)
 
 
 def _workers(rows: list[Row]) -> list[int]:
-    """The indexes of the rows that draw a box — everything but the headers."""
-    return [i for i, row in enumerate(rows) if not row.is_root]
+    """The indexes of the rows that draw a box — the selectable worker rows."""
+    return [i for i, row in enumerate(rows) if _is_box(row)]
 
 
 def snap_selection(rows: list[Row], selected: int) -> int:
     """`selected` if it still names a worker row, else the first one.
 
     Run after every refresh, when the row list has just changed underneath the
-    caret. The fallback is the first worker rather than row 0 because row 0 is
-    the group header, which draws no box and therefore no caret: a view that
+    caret. The fallback is the first WORKER rather than row 0 because row 0 is
+    the root's title bar, which draws no box and therefore no caret: a view that
     opened on it would look like it had no selection at all.
     """
     workers = _workers(rows)
@@ -911,8 +1104,10 @@ def snap_selection(rows: list[Row], selected: int) -> int:
 def move_selection(rows: list[Row], selected: int, delta: int) -> int:
     """The selection after a keypress: the next or previous WORKER.
 
-    Headers are stepped over instead of landed on, for the same reason
-    `snap_selection` prefers a worker: the caret belongs to a box.
+    Roots, group labels and rails are stepped over instead of landed on, for the
+    same reason `snap_selection` prefers a worker: the caret belongs to a box.
+    Because `Frame.rows` is in DISPLAY order (`build_rows`), this walks the
+    workers in the order the eye reads them.
     """
     workers = _workers(rows)
     if not workers:
@@ -943,6 +1138,50 @@ def _footer(width: int) -> str:
     return FOOTER_KEYS
 
 
+def _blocks(frame: Frame, width: int) -> list[list[tuple[str, str]]]:
+    """The frame's rows as atomic BLOCKS, in display order, composed to text.
+
+    A block is one ROOT (its title bar and gauge) or one GROUP (its breathing
+    rail, its label and all of the group's boxes). Grouping into blocks is what
+    keeps `_pane`'s height trimming honest: the trimmer keeps or drops a whole
+    block, so a box can never be cut in half and a label can never be left
+    without the group it heads — a label with no box under it is noise.
+
+    A new block starts at a root row or a rail row (a rail row is emitted by
+    `build_rows` at the head of every group, so it is the group's opening brace).
+    """
+    blocks: list[list[tuple[str, str]]] = []
+    unit: Optional[list[tuple[str, str]]] = None
+    for index, row in enumerate(frame.rows):
+        if (row.is_root or row.rail) and unit is not None:
+            blocks.append(unit)
+            unit = None
+        if unit is None:
+            unit = []
+        if row.is_root:
+            unit.extend(_root_lines(row, width))
+        elif row.rail:
+            unit.append((RAIL, NORMAL))
+        elif row.group:
+            unit.append((_rail_label(row.text, width), NORMAL))
+        else:
+            on_caret = index == frame.selected
+            lines, caret_row = worker_box(row, width, on_caret)
+            for position, line in enumerate(lines):
+                # Only the CARET row carries SELECTED; the body below it stays
+                # NORMAL. Tagging the whole block, as this once did, made the TUI
+                # reverse-video every row — the operator read that as several
+                # selected things and asked for the caret to be the marker. The
+                # role is kept on that one line rather than dropped because it is
+                # what the live view scrolls to keep visible (`_run_tui`), and it
+                # is painted bold there so the caret row stays findable.
+                role = SELECTED if (on_caret and position == caret_row) else NORMAL
+                unit.append((line, role))
+    if unit is not None:
+        blocks.append(unit)
+    return blocks
+
+
 def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
           height: Optional[int] = None) -> Pane:
     """The frame composed into lines with their paint roles. Pure.
@@ -951,11 +1190,13 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     and the TUI paints these same lines with the attributes their roles name.
     `height`, when given, is the pane's content height — the tail (panel and
     footer) is kept whole and the list above it is trimmed to fit, never below
-    ACCESS_LIST_FLOOR rows and never by cutting a box in half.
+    ACCESS_LIST_FLOOR rows, never by cutting a box in half, and never by dropping
+    a group label away from its group (the trimmer works in whole blocks; see
+    `_blocks`).
 
     A selected worker's block is NORMAL except its first line, the caret row,
     which carries SELECTED: the caret is the selection marker, not a reverse
-    block over all four rows.
+    block over the whole box.
     """
     items: list[tuple[str, str]] = []
     if frame.notice:
@@ -963,25 +1204,7 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     elif frame.truncated:
         items.append((_clip(TRUNCATED_NOTICE, width), NORMAL))
 
-    blocks: list[list[tuple[str, str]]] = []
-    for index, row in enumerate(frame.rows):
-        if row.is_root:
-            blocks.append([(_clip(row.text, width), NORMAL)])
-            continue
-        on_caret = index == frame.selected
-        block = [(line, NORMAL)
-                 for line in row_block(row, width, frame.spin, on_caret)]
-        if on_caret:
-            # Only the caret row carries SELECTED; the body below it stays
-            # NORMAL. Tagging the whole block, as this once did, made the TUI
-            # reverse-video all four rows — the operator read that as four
-            # selected things and asked for the caret to be the marker. The
-            # role is kept on that one line rather than dropped because it is
-            # what the live view scrolls to keep visible (`_run_tui`), and it
-            # is painted bold there so the caret row stays findable when the
-            # glyph itself is easy to miss.
-            block[0] = (block[0][0], SELECTED)
-        blocks.append(block)
+    blocks = _blocks(frame, width)
 
     tail: list[tuple[str, str]] = [("", NORMAL)]
     if frame.access is not None:
@@ -1024,27 +1247,24 @@ def paint_needed(items: list[tuple[str, str]],
     """Whether these lines have to be written to the screen.
 
     Nothing is repainted unless the composed view actually changed: a new data
-    poll that brought something new, a keypress that moved the caret, a resize,
-    or a spinner frame while something is working. That is the difference
-    between an `og agents` pane an operator leaves open all day and one that
-    redraws itself forever — with nothing working there is no spinner to
-    advance, the render is identical, and this is False, so `erase`/`refresh`
-    never run and the loop blocks on the keyboard instead.
+    poll that brought something new, a keypress that moved the caret, or a
+    resize. That is the difference between an `og agents` pane an operator leaves
+    open all day and one that redraws itself forever — C2 has no animation, so a
+    frame built twice from the same data is identical, this is False, and the loop
+    blocks on the keyboard instead of repainting.
     """
     return painted is None or items != painted
 
 
-def next_wait(now: float, poll_due: float, working: bool,
-              tick: float = SPIN_TICK) -> float:
+def next_wait(now: float, poll_due: float) -> float:
     """Seconds to block on the keyboard before anything could change on screen.
 
-    Nothing working: only the next data poll can change the view, so block until
-    then — the pane wakes once per poll rather than eight times a second.
-    Something working: the spinner advances on its own tick, so wake then,
-    unless the poll comes first.
+    The C2 pane does not animate — a working worker is a static `●`, not a
+    spinner — so the next data poll is the ONLY thing that can change the view.
+    The loop blocks on the keyboard until then, which is what makes a pane left
+    open all day cost one wakeup per poll and nothing in between.
     """
-    wake = min(now + tick, poll_due) if working else poll_due
-    return max(0.0, wake - now)
+    return max(0.0, poll_due - now)
 
 
 # ---------------------------------------------------------------------------
@@ -1253,7 +1473,7 @@ class AgentModel:
 
         # The lazy fetches. An idle worker is read once and kept; a selected row
         # is read once on selection, and re-read only on a forced refresh.
-        for sid, _depth, _spine, _last in order:
+        for sid, _depth in order:
             if sid not in by_id:
                 continue
             if display_state(by_id[sid]) == "idle":
@@ -1586,18 +1806,13 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     nothing to a session and changes no session state: `agent.focus` is the ONE
     outbound call it makes, and it moves the operator's own terminal alone.
 
-    TWO CLOCKS, deliberately. The data poll (`interval`, 3s) asks the server for
-    new rows; the spinner tick (SPIN_TICK, 120ms) only advances a counter that
-    render turns into a glyph. Driving the spinner off the poll would make a
-    three-second-wide animation, and driving the poll off the tick would ask the
-    server for the listing eight times a second.
-
-    And nothing is painted unless the composed lines actually CHANGE
-    (`paint_needed`). With nothing working there is no spinner to advance, the
-    render is byte-identical to the last one, and the loop skips `erase` and
-    `refresh` entirely — it blocks on the keyboard until the next poll
-    (`next_wait`) instead. An `og agents` pane an operator leaves open all day
-    then costs one wakeup per poll, not eight repaints a second forever.
+    ONE CLOCK. The data poll (`interval`, 3s) asks the server for new rows; C2
+    does not animate, so there is no spinner tick beside it. And nothing is
+    painted unless the composed lines actually CHANGE (`paint_needed`): a frame
+    built twice from the same data is byte-identical, the loop skips `erase` and
+    `refresh` entirely, and it blocks on the keyboard until the next poll
+    (`next_wait`). An `og agents` pane an operator leaves open all day then costs
+    one wakeup per poll and nothing in between.
     """
     import curses
 
@@ -1635,8 +1850,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # Resolved once, on the toggle: the address does not change while the
         # view runs, and probing for it every poll would shell out on a timer.
         access: Optional[Access] = access_info(server) if show_access else None
-        spin = 0
-        next_spin = 0.0
         next_poll = 0.0
         painted: Optional[list[tuple[str, str]]] = None
 
@@ -1653,9 +1866,10 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             # SELECTED is bold, not reverse: it lands on the caret row alone,
             # so reverse-videoing it would still light a full row of the box.
             # Bold keeps that one row findable without re-reading the old
-            # whole-block highlight the operator asked to be rid of.
+            # whole-block highlight the operator asked to be rid of. TITLE is
+            # the one line the design spends A_REVERSE on — the root's bar.
             attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_BOLD,
-                    DIM: curses.A_DIM}[role]
+                    DIM: curses.A_DIM, TITLE: curses.A_REVERSE}[role]
             try:
                 stdscr.addnstr(row, 0, text, width - 1, attr)
             except curses.error:
@@ -1681,12 +1895,7 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             # next poll.
             frame.access = access if show_access else None
             frame.selected = selected
-            frame.spin = spin
             frame.notice = notice
-            working = frame_working(frame)
-            if working and now >= next_spin:
-                spin += 1
-                next_spin = now + SPIN_TICK
 
             pane = _pane(frame, width)
             items = pane.items
@@ -1715,12 +1924,11 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                     put(tail_top + i, text, role)
                 stdscr.refresh()
 
-            # Two clocks, and the wait is whichever comes first: the next data
-            # poll, or the next spinner frame when something is working. With
-            # nothing working this is a single blocking `getch` per poll, so the
-            # loop costs nothing at all between polls.
+            # One clock: the next data poll is the only thing that can change the
+            # view, so this is a single blocking `getch` per poll and the loop
+            # costs nothing at all between polls.
             stdscr.timeout(max(1, math.ceil(next_wait(time.monotonic(),
-                                                     next_poll, working) * 1000)))
+                                                      next_poll) * 1000)))
             key = stdscr.getch()
             if key == -1:
                 continue
@@ -1820,9 +2028,8 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
         frame = model.refresh()
         if args.access:
             frame.access = access_info(args.server)
-        # No animation headless: one frame, at spinner frame 0, with the caret
-        # where the live view opens it — on the first worker.
-        frame.spin = 0
+        # No animation headless and no spinner: one frame, with the caret where
+        # the live view opens it — on the first worker.
         frame.selected = snap_selection(frame.rows, frame.selected)
         # The real pane width drives the QR fit; off a tty there is none, so
         # fall back to the classic 80 columns.
