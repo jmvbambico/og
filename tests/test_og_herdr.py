@@ -339,6 +339,159 @@ def test_the_bridge_makes_no_http_call_of_its_own():
 
 
 # ---------------------------------------------------------------------------
+# filing a root session into the install's project folder
+#
+# The bridge holds the TRIGGER and the POLICY (roots only, once, warned once on
+# failure); the HTTP is the injected `og_projects.ProjectFiler`'s. These tests
+# drive that real filer through a fake transport (the same opener seam the
+# watcher uses), so the merge and the "leave it alone" rules are exercised, and
+# no test touches a server.
+# ---------------------------------------------------------------------------
+
+class _FilerResponse:
+    """Minimal stand-in for an http.client.HTTPResponse: read() + context mgr."""
+
+    def __init__(self, body):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+class FilerOpener:
+    """Fake transport for `og_projects.ProjectFiler`.
+
+    Answers the labels GET with `labels` and records every PATCH body, so a test
+    can see exactly what was merged and written. `fail` (an exception instance)
+    is raised on the PATCH to pin the warn path.
+    """
+
+    def __init__(self, labels=None, fail=None):
+        self.labels = dict(labels or {})
+        self.fail = fail
+        self.gets = []
+        self.patches = []
+
+    def __call__(self, request):
+        if request.get_method() == "PATCH":
+            if self.fail is not None:
+                raise self.fail
+            self.patches.append(json.loads(request.data.decode("utf-8")))
+            return _FilerResponse(json.dumps({"id": "s1"}))
+        self.gets.append(request.full_url)
+        return _FilerResponse(json.dumps({"id": "s1", "labels": self.labels}))
+
+
+def _plan(home, name="hivemind"):
+    """Write the install plan whose `agent_name` the bridge must read."""
+    (Path(home) / "og-install.json").write_text(json.dumps({"agent_name": name}))
+
+
+def _filer(opener):
+    from og_projects import ProjectFiler
+    return ProjectFiler("http://127.0.0.1:6767", opener=opener)
+
+
+def test_a_new_root_is_filed_under_the_plans_agent_name(
+        seams, isolated_omnigent_home):
+    # The project name comes from the PLAN, not a constant: this install's
+    # agent_name is "hivemind", so that is the folder the session lands in.
+    _plan(isolated_omnigent_home, "hivemind")
+    opener = FilerOpener()
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, filer=_filer(opener))
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert opener.patches == [{"labels": {"omni_project": "hivemind"}}]
+    assert any("filed s1" in ln and "hivemind" in ln for ln in lines), lines
+    # Filing is beside the pane, never instead of it.
+    assert "workspace_create" in _names(client)
+
+
+def test_existing_labels_survive_the_filing(seams, isolated_omnigent_home):
+    # `labels` is a WHOLE map, so the write has to be a read-merge-write. A
+    # blind PATCH would strip the user's own labels off the session.
+    _plan(isolated_omnigent_home)
+    opener = FilerOpener(labels={"topic": "perf", "env": "local"})
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient(), filer=_filer(opener))
+
+    bridge.reconcile([Ev("added", "s1", root_session("T"))])
+
+    assert opener.patches == [
+        {"labels": {"topic": "perf", "env": "local", "omni_project": "hivemind"}}]
+
+
+def test_a_session_already_in_a_project_is_not_refiled(
+        seams, isolated_omnigent_home):
+    # Filed under a DIFFERENT project by the user: not ours to re-file. No PATCH,
+    # and no line claiming one happened.
+    _plan(isolated_omnigent_home)
+    opener = FilerOpener(labels={"omni_project": "someone-elses"})
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient(), filer=_filer(opener))
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session("T"))])
+
+    assert opener.patches == []
+    assert not any("filed s1" in ln for ln in lines), lines
+
+
+def test_a_sub_agent_session_is_not_filed(seams, isolated_omnigent_home):
+    # A worker nests under its root already; filing it would sprout a folder per
+    # worker. Only the root's labels are ever read or written.
+    _plan(isolated_omnigent_home)
+    opener = FilerOpener()
+    bridge = m.Bridge(FakeWatcher([]), RecordingClient(), filer=_filer(opener))
+
+    bridge.reconcile([
+        Ev("added", "root", root_session("T")),
+        Ev("added", "w1", sub_session("root")),
+    ])
+
+    assert opener.gets == ["http://127.0.0.1:6767/v1/sessions/root/labels"]
+    assert opener.patches == [{"labels": {"omni_project": "hivemind"}}]
+
+
+def test_a_failing_filing_warns_once_and_still_opens_the_pane(
+        seams, isolated_omnigent_home):
+    # Filing is a convenience, not the job: a dead server warns ONE line, never
+    # raises, and never keeps a session from getting its pane. The second failing
+    # session adds no second warning.
+    import urllib.error
+
+    _plan(isolated_omnigent_home)
+    opener = FilerOpener(fail=urllib.error.URLError("down"))
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, filer=_filer(opener))
+
+    lines = bridge.reconcile([
+        Ev("added", "s1", root_session("A")),
+        Ev("added", "s2", root_session("B")),
+    ])
+
+    warns = [ln for ln in lines if ln.startswith("warn:")]
+    assert len(warns) == 1, lines
+    assert _names(client).count("workspace_create") == 2
+
+
+def test_a_dry_run_files_nothing(seams, isolated_omnigent_home):
+    # A dry run makes zero calls, filing included: no labels read, no PATCH.
+    _plan(isolated_omnigent_home)
+    opener = FilerOpener()
+    bridge = m.Bridge(FakeWatcher([]), None, dry_run=True, filer=_filer(opener))
+
+    bridge.reconcile([Ev("added", "s1", root_session("T"))])
+
+    assert opener.gets == [] and opener.patches == []
+
+
+# ---------------------------------------------------------------------------
 # the pane's command: `omnigent attach --server <url> <session_id>`
 #
 # Measured in a real pane on a live server:
