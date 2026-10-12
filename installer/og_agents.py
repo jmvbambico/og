@@ -45,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -118,7 +119,22 @@ DEFAULT_WIDTH = 80
 # The footer. Its own constant so the tests can assert the binding is listed
 # without driving a tty. Enter FOCUSES the selected worker in herdr (see
 # `focus_in_herdr`); snippet expand/collapse moved to SPACE when Enter was taken.
+#
+# THREE forms, chosen by width in `_footer`. The agents pane is a SPLIT of the
+# chat and is often only ~46 columns, while this full sentence is 64, so a single
+# fixed footer gets clipped by `_clip` — which is exactly how "space expand" and
+# "a access" used to fall off the end, leaving the operator without the key that
+# had just inherited expand from Enter. FOOTER_COMPACT swaps the Enter and Space
+# words for their key glyphs and drops the doubled spacing; FOOTER_KEYS is the
+# floor, naming every key with no labels at all. Only LABELS ever degrade, never
+# a key: a key with no label is still findable by pressing it, a key clipped off
+# the end is gone. Every glyph here but the pre-existing ↑/↓ is Narrow (checked
+# with east_asian_width — ⏎ U+23CE and ␣ U+2423 are not the Wide traps they
+# could be); a Wide one would spill past the pane even after `_footer` said it
+# fit, so a future label must be measured before it is trusted.
 FOOTER = "q quit  r refresh  ↑/↓ move  enter focus  space expand  a access"
+FOOTER_COMPACT = "q quit r refresh ↑↓ ⏎ focus ␣ expand a access"
+FOOTER_KEYS = "q r ↑↓ ⏎ ␣ a"
 
 # The caveats shown under the address, mirroring bin/og's `show_access`: the
 # operator must know whether the address is scannable only on the same wifi or
@@ -663,6 +679,23 @@ def _visible_width(line: str) -> int:
     return len(_ANSI_SGR.sub("", line))
 
 
+def _display_width(text: str) -> int:
+    """The display columns of plain `text`: a Wide glyph costs two, the rest one.
+
+    `_clip` and `_visible_width` count with `len`, which is right for every
+    character in this view EXCEPT a Wide/Fullwidth one: counting that as a single
+    column judges a string narrower than the terminal paints it, so it is passed
+    as fitting and then spills past the pane — the CJK-locale form of the very
+    bug the footer keeps re-learning. Only the footer is measured here, and it
+    names its glyphs Narrow for exactly this reason.
+
+    No ANSI stripping: the footer is plain text. A line that may carry escapes is
+    measured through `_visible_width` instead.
+    """
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in text)
+
+
 def _boxed(lines: Iterable[str], width: int) -> list[str]:
     """`lines` in a box as wide as their widest row, never wider than `width`.
 
@@ -786,6 +819,28 @@ def move_selection(rows: list[Row], selected: int, delta: int) -> int:
     return workers[min(max(at + (1 if delta > 0 else -1), 0), len(workers) - 1)]
 
 
+def _footer(width: int) -> str:
+    """The footer form that fits `width` columns, widest readable first.
+
+    The same shape the rest of the pane already uses for an element that will not
+    fit: `_pane` trims the list to `height` and `access_lines` drops the QR when
+    the box is too narrow for it. Each picks a SMALLER representation rather than
+    being clipped, and the footer does too — full, then FOOTER_COMPACT, then the
+    bare FOOTER_KEYS. The widths compared are the forms' own measured widths, so
+    there is no hard-coded threshold to drift out of step with the strings.
+
+    Below the KEYS width there is nothing left to drop but keys themselves; the
+    agents pane is never that narrow (it is a ~46-column split, and `access_lines`
+    has already given up its QR by 31), so `_pane`'s `_clip` guard is the only
+    thing that could cut here, and it would cut a key list, not mid-sentence.
+    """
+    if width >= _display_width(FOOTER):
+        return FOOTER
+    if width >= _display_width(FOOTER_COMPACT):
+        return FOOTER_COMPACT
+    return FOOTER_KEYS
+
+
 def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
           height: Optional[int] = None) -> Pane:
     """The frame composed into lines with their paint roles. Pure.
@@ -830,7 +885,7 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     if frame.access is not None:
         tail.extend((line, DIM) for line in access_lines(frame.access, width))
         tail.append(("", NORMAL))
-    tail.append((_clip(FOOTER, width), DIM))
+    tail.append((_clip(_footer(width), width), DIM))
 
     room = None if height is None else max(ACCESS_LIST_FLOOR, height - len(tail))
     kept: list[list[tuple[str, str]]] = []

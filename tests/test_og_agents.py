@@ -1034,7 +1034,10 @@ def test_access_panel_drops_the_qr_when_the_pane_is_too_narrow():
     # has and says where it stopped.
     assert any(line.strip("│ ").startswith("http://192.168.100.17")
                for line in lines)
-    assert lines[0] == "" and lines[-1] == a._clip(a.FOOTER, 26)
+    # 26 columns is far below any footer form: it falls to the bare key list
+    # rather than being clipped mid-word (see `_footer`).
+    assert lines[0] == "" and lines[-1] == a._footer(26)
+    assert a._display_width(lines[-1]) <= 26
     assert len(a.access_lines(acc, 26)) == 4, "borders, address, caveat, borders"
 
 
@@ -1637,3 +1640,47 @@ def test_the_footer_names_the_focus_and_expand_bindings():
     assert "enter focus" in a.FOOTER, "the footer must name the Enter binding"
     assert "space expand" in a.FOOTER, "the footer must name the Space binding"
     assert "a access" in a.FOOTER, "the existing bindings must survive"
+
+
+def test_the_footer_names_every_key_at_every_width():
+    # The regression this pins: the full footer is 64 columns and the agents pane
+    # is a ~46-column split, so a FIXED footer was clipped mid-word — "space
+    # expand" and "a access" fell off the end, leaving the operator without the
+    # two keys they most needed (Space, which had just inherited expand from
+    # Enter). At every width the footer must FIT the pane and still name q, r,
+    # the arrows, enter, space and a.
+    for width in (46, 52, 64, 80):
+        footer = a.render(a.Frame(), width=width)[-1]
+        assert a._display_width(footer) <= width, (width, footer)
+        for letter in ("q", "r", "a"):
+            assert letter in footer, (width, letter, footer)
+        assert "↑" in footer and "↓" in footer, (width, footer)
+        # Enter and Space are words at full width and glyphs when compact, but a
+        # key must be named EITHER way.
+        assert ("enter" in footer or "⏎" in footer), (width, footer)
+        assert ("space" in footer or "␣" in footer), (width, footer)
+
+
+def test_the_footer_chooses_a_form_by_measured_width():
+    # The threshold is each form's own width, measured — not a magic number
+    # that can drift out of step with the strings.
+    assert a._footer(80) == a.FOOTER
+    assert a._footer(64) == a.FOOTER, "the full form fits a 64-column pane"
+    assert a._footer(63) == a.FOOTER_COMPACT
+    assert a._footer(45) == a.FOOTER_COMPACT, "the compact form fits 46"
+    assert a._footer(44) == a.FOOTER_KEYS
+    assert a._display_width(a.FOOTER) == 64
+    assert a._display_width(a.FOOTER_COMPACT) <= 46
+    # Only labels degrade: every form names every key.
+    for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
+        assert "q" in form and "r" in form and "a" in form, form
+        assert "↑" in form and "↓" in form, form
+
+
+def test_the_footer_glyphs_are_narrow():
+    # A Wide/Fullwidth glyph in the footer would be painted two columns wide
+    # after `_footer` judged it to fit, spilling past the pane in a CJK locale —
+    # the same bug in a different costume. Every introduced glyph must be Narrow.
+    import unicodedata
+    for glyph in ("⏎", "␣"):
+        assert unicodedata.east_asian_width(glyph) == "N", glyph
