@@ -12,6 +12,7 @@ import ast
 import io
 import json
 import os
+import sys
 import types
 import urllib.parse
 import urllib.request
@@ -1219,3 +1220,120 @@ def test_access_info_never_modifies_or_deletes_the_tunnel_cache(
         after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
         assert after == before, f"the cache was touched for {provider!r}"
         assert (tmp_path / "og-tunnel.url").exists()
+
+
+# ---------------------------------------------------------------------------
+# 15. the pane has no background of its own
+# ---------------------------------------------------------------------------
+#
+# `_run_tui` imports curses into the function, so a stub in sys.modules IS the
+# curses it sees — no tty, and no real screen buffer to assert on. The stub
+# hands back one frame's worth of keys (`q`), which is the first key the view
+# reads, so the loop paints once and exits: what is asserted is the call it
+# makes at startup and that it survives that call failing.
+
+class FakeCurses(types.ModuleType):
+    """A curses stand-in that records `use_default_colors`, and can refuse it.
+
+    `refuse=True` makes `use_default_colors` raise the way a terminal with no
+    colour support does — the call has to stay survivable, because a view that
+    cannot start colour still has to paint.
+    """
+
+    def __init__(self, refuse=False):
+        super().__init__("curses")
+        self.refuse = refuse
+        self.use_default_colors_calls = 0
+        # `curses.error` is a real exception class the view catches by name, so
+        # it must be a class here too, not an instance or a sentinel.
+        self.error = type("error", (Exception,), {})
+        self.A_NORMAL, self.A_REVERSE, self.A_DIM = 0, 1 << 18, 1 << 19
+        self.KEY_UP, self.KEY_DOWN, self.KEY_ENTER = 259, 258, 343
+        self.curs_set = lambda n: None
+        self.timeout = lambda n: None
+
+    def use_default_colors(self):
+        self.use_default_colors_calls += 1
+        if self.refuse:
+            raise self.error("use_default_colors: ERR")
+
+    def wrapper(self, loop):
+        loop(FakeScreen())
+
+
+class FakeScreen:
+    """A stdscr that answers one paint and then hands back `q`.
+
+    Written as a plain class rather than a stub with attribute records: the
+    view's only contract with the window is the method set below, and a screen
+    that records its own calls would assert less about the fix than the call it
+    exists to make possible.
+    """
+
+    def __init__(self, height=24, width=80):
+        self.height, self.width = height, width
+        self.painted: list[str] = []
+        self.keys = [ord("q")]
+
+    def keypad(self, flag):
+        pass
+
+    def getmaxyx(self):
+        return self.height, self.width
+
+    def erase(self):
+        pass
+
+    def addnstr(self, row, col, text, n, attr):
+        self.painted.append(text)
+
+    def refresh(self):
+        pass
+
+    def timeout(self, ms):
+        pass
+
+    def getch(self):
+        return self.keys.pop(0) if self.keys else -1
+
+
+def _fake_curses(monkeypatch, refuse=False):
+    fake = FakeCurses(refuse=refuse)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    return fake
+
+
+def _tui_model():
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+    return _model(opener)
+
+
+def test_the_view_takes_the_terminals_own_colours_so_the_pane_is_transparent(
+        monkeypatch):
+    # `curses.wrapper` calls start_color() before `loop` runs, and that is what
+    # made every cell this view paints opaque black: pair 0 is the curses
+    # default, not the terminal's. Nothing here sets a colour pair, so taking
+    # the default for pair 0 is the whole fix.
+    fake = _fake_curses(monkeypatch)
+
+    assert a._run_tui(_tui_model(), a.DEFAULT_INTERVAL, "http://x") == 0
+
+    assert fake.use_default_colors_calls == 1, \
+        "pair 0 must be the terminal's own colours, once, at startup"
+
+
+def test_the_view_still_paints_when_use_default_colors_raises(monkeypatch):
+    # A terminal that cannot take the default colours is not a reason to leave
+    # the operator with no view: the pane runs uncoloured instead.
+    fake = _fake_curses(monkeypatch, refuse=True)
+    screens: list[FakeScreen] = []
+
+    def wrapper(loop):
+        screens.append(FakeScreen())
+        loop(screens[-1])
+    fake.wrapper = wrapper
+
+    assert a._run_tui(_tui_model(), a.DEFAULT_INTERVAL, "http://x") == 0
+
+    assert fake.use_default_colors_calls == 1
+    assert screens and screens[0].painted, "the frame was painted, not skipped"
