@@ -628,6 +628,280 @@ def test_the_cwd_probe_is_skipped_entirely_under_all_roots():
 
 
 # ---------------------------------------------------------------------------
+# 6b. bug: two roots in the same directory — the STALE one is the live one
+# ---------------------------------------------------------------------------
+#
+# `test_a_quiet_workerless_root_in_the_cwd_narrows_the_view_to_its_tree` (above)
+# covers the case where NO root in the cwd was live. It cannot see this one, and
+# neither could any other test here, because every fixture until now had at most
+# one root in `$PWD` — which is why the wrong-session bug shipped: with a single
+# candidate, "first live match" and "root in this directory" are the same answer,
+# so the defect is invisible until a repo has a history of sessions in it.
+
+def _two_roots_in_one_repo():
+    """A repo with two root sessions in it: yesterday's run and today's.
+
+    `stale` is the trap. It is IDLE and has a finished worker, so `_is_live_root`
+    calls it live forever — which is correct for "worth showing" and useless for
+    "which directory am I in". `fresh` is the operator's session: brand new,
+    idle, nothing dispatched, so it is not in the live set at all.
+
+    Listing order is newest-first (og_herdr_watch's measured fact), which here is
+    ALSO the recency order — so on this fixture alone, "first row that matches"
+    would score the same as "most recent match". The tests below that put the two
+    in disagreement are what actually pin the rule; these pin the failure.
+    """
+    return [
+        listed("fresh", status="idle", title="og chat",
+               created_at=NOW - 60, updated_at=NOW - 60),
+        listed("stale", status="idle", title="yesterday's run",
+               created_at=NOW - 90000, updated_at=NOW - 90000),
+        listed("s1", parent="stale", status="idle", title="coder_zen:old work"),
+    ]
+
+
+_TWO_ROOTS_DETAILS = {
+    "fresh": detail("fresh", workspace="/repo/og", harness="claude-native"),
+    "stale": detail("stale", workspace="/repo/og", harness="claude-native"),
+    "s1": detail("s1", items=[ASSISTANT_MESSAGE]),
+}
+
+
+def test_the_newer_root_wins_when_a_stale_sibling_in_the_same_repo_is_live():
+    """`og agents` showed ~16 workers finished 22-41h ago. It was the wrong one.
+
+    A brand-new idle session in this repo, nothing dispatched from it, showed the
+    worker tree of the PREVIOUS root session in the same directory. `stale` won
+    for one reason only: it still has workers, so it is "live", so it matched
+    `$PWD` in the pass that checked live roots first and returned immediately —
+    and `fresh`, which was never asked at all.
+
+    The cwd question is about recency, not activity: the root in this directory
+    is the most recently active one, and a stale sibling with workers on screen
+    must not outrank the session the operator is standing in.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()] * 3,
+                           details=dict(_TWO_ROOTS_DETAILS))
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["fresh"], frame.rows
+    assert frame.rows[0].is_root, "it narrowed to the operator's own tree"
+    # The stale tree is not merely unshown behind the new one — it is absent,
+    # including the finished worker whose report is the tempting thing on screen.
+    assert not any("old work" in row.text for row in frame.rows), frame.rows
+
+
+def test_all_still_forces_the_wide_view_with_two_roots_in_one_repo():
+    """`--all` is the operator overriding the cwd rule, so it must still do that.
+
+    The fix moved the cwd decision off liveness and onto recency. `--all` is the
+    escape hatch for "I know there are other sessions, show me the live ones",
+    and a recency rule that leaked into it would turn it back into "this
+    directory's root". It shows every LIVE root — which here is `stale`, because
+    it has workers — and it pays nothing for the quiet root it declines to show.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()] * 2,
+                           details=dict(_TWO_ROOTS_DETAILS))
+    model = _model(opener, cwd="/repo/og", all_roots=True)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["stale", "s1"], frame.rows
+    # The quiet root was never even asked: `--all` is a liveness decision, and
+    # liveness is free (the listing row already says idle-with-no-workers). What
+    # IS fetched is `stale`'s own label and `s1`'s report — both pre-existing,
+    # both for the worker the lazy "first idle" snippet exists to read.
+    assert [r.full_url for r in opener.detail_requests] == [
+        "http://x/v1/sessions/stale",
+        "http://x/v1/sessions/s1",
+    ], [r.full_url for r in opener.detail_requests]
+
+
+def test_the_stale_live_root_is_still_fetched_and_cached_not_reshown():
+    """The fix narrows the SCOPE; it must not stop `stale` being shown elsewhere.
+
+    A narrowing that dropped the root from the view would hide a real session
+    from an operator sitting in a different directory. So it is still fetched
+    (that is what its `harness` label and `workspace` cost) and still cached,
+    and it is still in scope the moment the operator is somewhere that has no
+    root of its own.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()] * 2,
+                           details=dict(_TWO_ROOTS_DETAILS))
+    elsewhere = _model(opener, cwd="/no/root/here", all_roots=False)
+
+    frame = elsewhere.refresh()
+
+    # No root lives in `/no/root/here`, so the wide live set stands — and
+    # `stale` is in it, because it has workers.
+    assert [row.session_id for row in frame.rows] == ["stale", "s1"], frame.rows
+    assert "old work" in frame.rows[1].text
+
+
+def test_the_cwd_probe_stops_at_the_newest_match_and_costs_one_fetch_per_root():
+    """The budget, asserted on the seam: no fetch per root, per poll.
+
+    The recency walk replaces "live roots first, then the rest". That could have
+    cost a fetch per root on every poll, so it is pinned here: the walk fetches
+    each root at most once, ever, and stops at the first match — so the roots
+    BELOW the answer are never asked at all, and later polls add nothing.
+
+    The timestamps are arranged so the walk has real work to do in both
+    directions: two roots more recent than the match (which must be fetched and
+    rejected, and are the cost the ordering is buying) and one less recent (which
+    must never be touched at all).
+    """
+    listing = _two_roots_in_one_repo() + [
+        # More recent than `fresh`, in other directories: the walk cannot stop at
+        # the first row, it has to check them and reject them.
+        listed("newest_other", status="idle", title="yet another repo",
+               created_at=NOW - 10, updated_at=NOW - 10),
+        listed("recent_other", status="idle", title="another repo",
+               created_at=NOW - 30, updated_at=NOW - 30),
+        # LESS recent than the match and in another directory: the walk stops at
+        # `fresh`, so this one is never put to the question.
+        listed("older_other", status="idle", title="an older repo",
+               created_at=NOW - 120, updated_at=NOW - 120),
+    ]
+    opener = RoutingOpener([listing] * 4, details={
+        **_TWO_ROOTS_DETAILS,
+        "newest_other": detail("newest_other", workspace="/a/fourth/place"),
+        "recent_other": detail("recent_other", workspace="/a/third/place"),
+        "older_other": detail("older_other", workspace="/a/second/place"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    model.refresh()
+    after_first = [r.full_url for r in opener.detail_requests]
+
+    # `stale` is read for its harness label regardless (it is live); the walk
+    # then reads the two roots more recent than the answer and rejects them, and
+    # matches `fresh`. Four fetches, and `older_other` is not one of them.
+    assert after_first == [
+        "http://x/v1/sessions/stale",
+        "http://x/v1/sessions/newest_other",
+        "http://x/v1/sessions/recent_other",
+        "http://x/v1/sessions/fresh",
+    ], [r.full_url for r in opener.detail_requests]
+
+    # One fetch per root, ONCE. Four polls of a stable listing cost exactly what
+    # the first did — the regression this rule exists to prevent is a walk that
+    # refetches 121 KB per root every three seconds.
+    for _ in range(3):
+        model.refresh()
+    assert [r.full_url for r in opener.detail_requests] == after_first
+
+
+def test_two_roots_in_the_cwd_do_not_widen_the_view_to_both():
+    """Most-recent wins outright: it is one root's tree, not two.
+
+    The bug showed the WRONG tree. The obvious wrong fix would show both, which
+    is no better — the operator still cannot tell which session they are looking
+    at. A match is the whole scope, exactly as before.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()],
+                           details=dict(_TWO_ROOTS_DETAILS))
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["fresh"]
+    assert len([row for row in frame.rows if row.is_root]) == 1
+
+
+def test_a_root_with_no_usable_timestamp_is_not_treated_as_the_newest():
+    """Unknown age sorts LAST, so a row missing `updated_at` cannot win by luck.
+
+    The listing carries `created_at` and `updated_at` and nothing newer (see
+    og_herdr_watch's measured key list), so recency comes off the row itself and
+    costs no fetch. A root whose row carries neither is not evidence of recency;
+    treating it as newest would hand the operator whichever unknown-age root
+    happened to sort first, which is the bug being fixed, wearing a different hat.
+    """
+    listing = [
+        listed("dateless", status="idle", title="no timestamps at all"),
+        listed("stale", status="idle", title="yesterday's run",
+               updated_at=NOW - 90000),
+        listed("s1", parent="stale", status="idle", title="coder_zen:old work"),
+    ]
+    opener = RoutingOpener([listing], details={
+        "dateless": detail("dateless", workspace="/repo/og"),
+        "stale": detail("stale", workspace="/repo/og"),
+        "s1": detail("s1"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["stale", "s1"], frame.rows
+
+
+def test_recency_breaks_a_tie_by_created_at_when_updated_at_is_absent():
+    """`updated_at` is the answer; `created_at` is what is left when it is not.
+
+    Both come off the free LISTING row. Without this, two roots in one repo with
+    neither an `updated_at` would tie and fall back to listing order — which is
+    newest-first by the server's sort, but is a coincidence rather than a rule.
+    """
+    listing = [
+        listed("dateless", status="idle", title="older, no updated_at",
+               created_at=NOW - 90000),
+        listed("fresh", status="idle", title="newer, no updated_at",
+               created_at=NOW - 60),
+        listed("stale", status="idle", title="yesterday's run",
+               updated_at=NOW - 120000),
+        listed("s1", parent="stale", status="idle", title="coder_zen:old work"),
+    ]
+    opener = RoutingOpener([listing], details={
+        "dateless": detail("dateless", workspace="/repo/og"),
+        "fresh": detail("fresh", workspace="/repo/og"),
+        "stale": detail("stale", workspace="/repo/og"),
+        "s1": detail("s1"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["fresh"], frame.rows
+
+
+def test_a_live_root_in_the_cwd_still_wins_over_a_more_recent_root_elsewhere():
+    """The ordinary case must not regress: one live root in `$PWD`, and its tree.
+
+    Every other test in this file puts the answer in a quiet root. The common
+    real shape is the opposite — the operator's own session is running, has
+    workers, and is the only root in the repo — and that is the case where the
+    recency walk must agree with the live-root heuristic rather than fight it.
+    """
+    listing = [
+        listed("mine", status="running", title="this project",
+               created_at=NOW - 600, updated_at=NOW - 2),
+        listed("m1", parent="mine", status="running", title="coder_zen:work"),
+        listed("other", status="running", title="other project",
+               created_at=NOW - 300, updated_at=NOW - 1),
+        listed("o1", parent="other", status="running", title="coder_zen:elsewhere"),
+    ]
+    opener = RoutingOpener([listing] * 2, details={
+        "mine": detail("mine", workspace="/repo/og", harness="claude-native"),
+        "m1": detail("m1"),
+        "other": detail("other", workspace="/somewhere/else",
+                        harness="claude-native"),
+        "o1": detail("o1"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["mine", "m1"], frame.rows
+    assert frame.rows[0].text == "Claude Code"
+    # `other` is MORE recently active than `mine` and is still not the answer:
+    # recency breaks a tie between roots in `$PWD`, it does not outrank the cwd.
+    assert opener.detail_requests, "both live roots were read"
+
+
+# ---------------------------------------------------------------------------
 # 7. a detail fetch that fails still renders the row
 # ---------------------------------------------------------------------------
 
