@@ -137,7 +137,8 @@ def detail(sid, workspace=None, harness=None, items=None, parent=None, **extra):
 NOW = 1_700_000_000.0
 
 
-def worker(sid, state, *, text="t", snippet=None, expanded=False):
+def worker(sid, state, *, text="t", snippet=None, expanded=False,
+           agent=None, meta="", harness=""):
     """A worker Row assembled directly, for the renderer tests.
 
     Deliberately NOT built through `build_rows`: these tests are about the box
@@ -145,20 +146,40 @@ def worker(sid, state, *, text="t", snippet=None, expanded=False):
     filled in by hand. That also keeps each of them failing for its OWN reason
     when run against a build that lacks one piece — a glyph test that failed
     because the title parser was missing would be passing for the wrong reason.
+
+    `harness` is a HARNESS ID (the mark's input); `meta`/`agent` are the second
+    line.
     """
     return a.Row(session_id=sid, text=text, state=state, depth=1,
-                 snippet=snippet, expanded=expanded)
+                 snippet=snippet, expanded=expanded, agent=agent, meta=meta,
+                 harness=harness)
 
 
-def header(text="Claude Code", sid="root"):
-    return a.Row(sid, text, "working", 0, is_root=True)
+def header(text="conversation", harness="claude-native", *, sid="root",
+           done=0, total=0, state="working"):
+    """A ROOT row: the heavy title bar and its done-gauge."""
+    return a.Row(sid, text, state, 0, is_root=True, harness=harness,
+                 done=done, total=total)
+
+
+def group(state, word=None):
+    """A group LABEL row, as `build_rows` emits it (`state` is a display state)."""
+    return a.Row("", word or a.GROUP_WORD.get(state, state), state, 1, group=True)
+
+
+def rail():
+    """A breathing rail row, as `build_rows` emits it."""
+    return a.Row("", "", "working", 1, rail=True)
 
 
 # ---------------------------------------------------------------------------
 # 1. the renderer, as a pure function
 # ---------------------------------------------------------------------------
 
-def test_renderer_shows_a_root_and_its_workers_in_listing_order():
+def test_renderer_shows_a_root_title_bar_and_gauge_not_a_bare_line():
+    """The operator's complaint ("the root is not boxed") is what this fixes:
+    the root is now a heavy `━` title bar with its name inlaid, then a done-gauge
+    with the harness label right-aligned — not the old one-line header."""
     root = dict(listed("root", title="Omnigent Herdr Integration", status="running"),
                 harness="claude-native")
     sessions = [
@@ -172,26 +193,49 @@ def test_renderer_shows_a_root_and_its_workers_in_listing_order():
     rows = a.build_rows(sessions, ["root"], now=NOW)
     lines = a.render(a.Frame(rows=rows))
 
-    assert lines[0] == "Claude Code", "the root is a plain header, not a box"
+    assert lines[0].startswith("━━ Omnigent Herdr Integration ")
+    assert set(lines[0]) == {"━", " "} | set("Omnigent Herdr Integration")
+    assert "1/3 done" in lines[1], "w2 is the one idle (finished) worker"
+    assert lines[1].rstrip().endswith("Claude Code"), "the harness label is right"
+
+
+def test_workers_are_grouped_by_state_with_a_label_row_each():
+    """Workers appear grouped by state, each group under its own label — the
+    order on screen is the group order (working, blocked, failed, finished), not
+    listing order."""
+    sessions = [
+        dict(listed("root", title="conv", status="running"), harness="claude-native"),
+        listed("w1", parent="root", status="idle", title="coder_zen:done-already"),
+        listed("w2", parent="root", status="running", title="coder_claude:busy"),
+        listed("w3", parent="root", status="failed", title="coder_freebuff:broke"),
+    ]
+    rows = a.build_rows(sessions, ["root"], now=NOW)
+
+    # The rows themselves are in display order, which is what the caret indexes.
+    boxes = [row.text for row in rows if not row.is_root
+             and not row.group and not row.rail]
+    assert boxes == ["busy", "broke", "done-already"]
+
+    lines = a.render(a.Frame(rows=rows))
     joined = "\n".join(lines)
-    # Every worker is present, in listing order, each in its own box.
-    assert [row.text for row in rows[1:]] == \
-        ["space-per-root", "fix-stale-comments", "waiting-on-you"]
-    assert joined.index("space-per-root") < joined.index("fix-stale-comments") \
-        < joined.index("waiting-on-you")
-    assert [r.state for r in rows] == ["working", "working", "idle", "blocked"]
-    # ...and each box is closed: one top rule per worker, and only the last one
-    # is an elbow's end.
-    assert sum(1 for line in lines if line.startswith("├─")) == 2
-    assert sum(1 for line in lines if line.startswith("└─")) == 1
+    assert "│ working" in lines
+    assert "│ failed" in lines
+    assert "│ finished" in lines
+    # Each label sits above the box it heads, never apart from it.
+    for label, task in (("working", "busy"), ("failed", "broke"),
+                        ("finished", "done-already")):
+        assert joined.index(label) < joined.index(task)
 
 
-def test_renderer_nests_a_grandchild_and_shows_an_expanded_snippet():
+def test_renderer_flattens_a_nested_worker_and_shows_an_expanded_snippet():
+    """A grandchild is grouped by its OWN state like any other worker, and the
+    expanded report is a row INSIDE the rounded box, not a loose line. Grouping
+    by state and drawing a spine are mutually exclusive, so the tree is
+    flattened."""
     root = dict(listed("root", status="running"), harness="claude-native")
     sessions = [
         root,
         listed("w1", parent="root", status="running", title="coder_zen:worker"),
-        listed("w2", parent="root", status="running", title="coder_zen:sibling"),
         listed("g1", parent="w1", status="running", title="coder_zen:grandchild"),
     ]
     rows = a.build_rows(
@@ -199,17 +243,16 @@ def test_renderer_nests_a_grandchild_and_shows_an_expanded_snippet():
         snippets={"g1": "a child report"}, expanded_ids={"g1"}, now=NOW)
     lines = a.render(a.Frame(rows=rows))
 
-    assert lines[0] == "Claude Code"
-    # w1 has a sibling after it, so its column stays open down past its box...
-    assert lines[1].startswith("├─"), lines[1]
-    # ...and its grandchild hangs inside that column, two narrower.
-    grandchild = lines[5]
-    assert grandchild.startswith("│ └─  ┌"), grandchild
-    assert len(grandchild) == a.DEFAULT_WIDTH, "two columns narrower than w1"
-    # The report, expanded, is a row INSIDE the box rather than a loose line
-    # that would break the spine.
-    assert any("a child report" in line for line in lines[5:10])
-    assert all(line.startswith("│ ") for line in lines[5:10])
+    assert lines[0].startswith("━━ ")
+    # The grandchild is a box of its own, in the same (working) group...
+    assert any("grandchild" in line and "╭" not in line for line in lines)
+    # ...and the report is drawn inside a box: the row that carries it is a body
+    # row (`│…│`), never a loose line.
+    report = [line for line in lines if "a child report" in line]
+    assert report and report[0].startswith("│") and report[0].endswith("│")
+    # No tree spine columns survive: every box starts at column 0.
+    tops = [line for line in lines if line.startswith("╭")]
+    assert tops and all(len(line) == a.DEFAULT_WIDTH for line in tops)
 
 
 def test_renderer_notes_a_truncated_listing():
@@ -218,151 +261,176 @@ def test_renderer_notes_a_truncated_listing():
 
 
 # ---------------------------------------------------------------------------
-# 2. the B1 shape, verbatim
+# 2. the C2 shape, verbatim
 # ---------------------------------------------------------------------------
 
-B1_WIDTH = 64
+C2_WIDTH = 46
 
 
-def test_b1_shape_is_verbatim_tree_caret_and_aligned_boxes():
-    """The approved design, line for line: `├─`/`└─`, one caret, aligned boxes.
-
-    Built through `build_rows` from a listing rather than hand-assembled rows,
-    so the names, agents and elapsed figures under test are the ones the model
-    actually produces. Spinner frame 2 is `⠹`.
-    """
+def test_c2_shape_is_verbatim_title_gauge_groups_and_rounded_boxes():
+    """The approved C2 template, line for line: the heavy title bar, the gauge,
+    a state label per group, and a ROUNDED box per worker whose left edge is the
+    group rail. Built through `build_rows` from a listing, so the names, agents
+    and glyphs are the ones the model produces at width 46."""
     sessions = [
-        dict(listed("root", status="running", title="conversation"),
+        dict(listed("root", title="Project Status Review", status="running"),
              harness="claude-native"),
-        listed("w1", parent="root", status="running",
-               title="coder_zen:stock-concurrency-lock", created_at=NOW - 134),
-        listed("w2", parent="root", status="running", elicit=1,
-               title="cmdcode:fleet-accident-reports"),
-        listed("w3", parent="root", status="failed",
-               title="coder_freebuff:kg-base-unit-read-auth"),
+        dict(listed("w1", parent="root", status="running",
+                    title="coder_zen:coders", created_at=NOW - 134),
+             harness="opencode-native"),
+        dict(listed("w2", parent="root", status="running", elicit=1,
+                    title="cmdcode:reviewers"),
+             harness="acp:command-code"),
+        dict(listed("w3", parent="root", status="failed",
+                    title="coder_freebuff:scouts"),
+             harness="acp:freebuff"),
+        dict(listed("w4", parent="root", status="idle", title="cmdcode:docs",
+                    updated_at=NOW - 360),
+             harness="acp:command-code"),
     ]
     rows = a.build_rows(sessions, ["root"], now=NOW)
 
-    lines = a.render(a.Frame(rows=rows, selected=1, spin=2), width=B1_WIDTH)
-
-    rule = "─" * (B1_WIDTH - 6)
-
-    def mid(side, text):
-        return f"{side}  │" + (" " + text).ljust(B1_WIDTH - 6) + "│"
+    lines = a.render(a.Frame(rows=rows, selected=3), width=C2_WIDTH)
 
     assert lines == [
-        "Claude Code",
-        f"├─ ▸┌{rule}┐",
-        mid("│ ", "⠹ stock-concurrency-lock"),
-        mid("│ ", "  zen · 2m14s"),
-        f"│   └{rule}┘",
-        f"├─  ┌{rule}┐",
-        mid("│ ", "! fleet-accident-reports"),
-        mid("│ ", "  cmdcode · waiting on you"),
-        f"│   └{rule}┘",
-        f"└─  ┌{rule}┐",
-        mid("  ", "x kg-base-unit-read-auth"),
-        mid("  ", "  freebuff · failed"),
-        f"    └{rule}┘",
+        "━━ Project Status Review ━━━━━━━━━━━━━━━━━━━━━",
+        "██░░░░░░░░  1/4 done               Claude Code",
+        "│",
+        "│ working",
+        "╭────────────────────────────────────────────╮",
+        "│ ▸ ● ▯  coders                              │",
+        "│ zen                                   2m14s│",
+        "╰────────────────────────────────────────────╯",
+        "│",
+        "│ blocked - waiting on you",
+        "╭────────────────────────────────────────────╮",
+        "│   ⏸ ⌘  reviewers                           │",
+        "│ cmdcode                      waiting on you│",
+        "╰────────────────────────────────────────────╯",
+        "│",
+        "│ failed",
+        "╭────────────────────────────────────────────╮",
+        "│   ✗ ╔ scouts                               │",
+        "│ freebuff                             failed│",
+        "╰────────────────────────────────────────────╯",
+        "│",
+        "│ finished",
+        "╭────────────────────────────────────────────╮",
+        "│   ○ ⌘  docs                                │",
+        "│ cmdcode                         done 6m ago│",
+        "╰────────────────────────────────────────────╯",
         "",
-        a.FOOTER,
+        a.FOOTER_COMPACT,
     ]
-    # Every row of every box is exactly one pane wide, and the caret is on the
-    # FIRST row of its box only — repeated down the box it would read as four
-    # selected things.
-    assert all(len(line) == B1_WIDTH for line in lines[1:13])
+    # Every BOX row is exactly the pane width (the rail/label rows are short by
+    # design — the rail is one glyph), and the caret is on the FIRST content row
+    # of its box only.
+    box_rows = [line for line in lines
+                if line.startswith(("╭", "╰"))
+                or (line.startswith("│") and line.endswith("│") and len(line) > 2)]
+    assert box_rows and all(len(line) == C2_WIDTH for line in box_rows)
     assert sum(1 for line in lines if "▸" in line) == 1
+    assert lines[5].index("▸") == 2, "the caret sits in its own column"
 
 
-def test_every_glyph_and_the_spinner_for_working():
-    # The ASCII glyphs, one per state the viewer draws...
-    for state, glyph in (("idle", "+"), ("blocked", "!"), ("failed", "x"),
-                         ("unknown", "?")):
+def test_the_done_gauge_is_right_at_0_of_n_n_of_n_and_no_workers():
+    def gauge_line(done, total):
+        return a.render(a.Frame(rows=[header(done=done, total=total)]),
+                         width=C2_WIDTH)[1]
+
+    zero = gauge_line(0, 4)
+    assert zero.startswith("░░░░░░░░░░  0/4 done")
+    assert zero.endswith("Claude Code")
+    assert len(zero) == C2_WIDTH
+
+    full = gauge_line(4, 4)
+    assert full.startswith("██████████  4/4 done")
+    assert len(full) == C2_WIDTH
+
+    # A root with no workers has nothing to be a fraction of: an empty bar, no
+    # divide-by-zero.
+    assert gauge_line(0, 0).startswith("░░░░░░░░░░  0/0 done")
+    # Two of five fills four of ten cells, as the prototype draws it.
+    assert gauge_line(2, 5).startswith("████░░░░░░  2/5 done")
+
+
+def test_the_rail_runs_down_the_group_at_the_box_left_column():
+    """This is the C2-vs-C3 distinction: the breathing and label rows carry a `│`
+    at the box's OWN left column, so the rail is unbroken and spends no extra
+    column. C3 drew no rail; C1 put it in a gutter of its own."""
+    rows = [header(),
+            rail(), group("working"),
+            worker("w1", "working", text="one"),
+            worker("w2", "working", text="two")]
+    lines = a.render(a.Frame(rows=rows), width=C2_WIDTH)
+
+    assert lines[0].startswith("━━ ")
+    assert lines[2] == "│", "the breathing row is the rail alone"
+    assert lines[3].startswith("│ ")
+    # The rail column is column 0 on EVERY group row — the breathing row, the
+    # label, the box top/middle/bottom — so one line runs down the group.
+    box = [i for i, line in enumerate(lines) if line.startswith(("╭", "╰"))]
+    for index in range(2, box[-1] + 1):
+        assert lines[index][0] == "│" or lines[index][0] == "╭" \
+            or lines[index][0] == "╰", (index, lines[index])
+
+
+def test_every_state_glyph_comes_from_the_chosen_vocabulary():
+    # The operator's four glyphs, one per state the viewer draws...
+    assert a.STATE_GLYPH == {"working": "●", "blocked": "⏸", "failed": "✗",
+                             "unknown": "?", "idle": "○"}
+    for state, glyph in (("idle", "○"), ("blocked", "⏸"), ("failed", "✗"),
+                         ("unknown", "?"), ("working", "●")):
         frame = a.Frame(rows=[header(), worker("w", state)])
         assert glyph in "\n".join(a.render(frame, width=48)), state
-    # ...and working gets the spinner instead of a glyph.
-    assert a.state_glyph("working", 0) == a.SPIN_FRAMES[0]
-    working = a.Frame(rows=[header(), worker("w", "working")], spin=0)
-    assert "⠋" in "\n".join(a.render(working, width=48))
-    # Nothing else can leak a multi-cell or coloured glyph onto the line.
-    assert all(ord(ch) < 0x2800 or ch in "⠋⠙⠹⠸⠼⠴▸" for ch in "".join(a.STATE_GLYPH.values()) + a.SPIN_FRAMES + "▸")
-
-
-def test_the_spinner_uses_six_dots_so_the_row_never_jitters():
-    # Braille encodes dot N as bit N-1 of the cell's offset from U+2800, and
-    # dots 7 and 8 are the two low bits (0x40, 0x80) — the descenders that hang
-    # below the baseline. A spinner using them changes the glyph's height every
-    # frame, so the row it sits in jumps as the box is redrawn.
-    assert len(a.SPIN_FRAMES) == 6
-    for frame in a.SPIN_FRAMES:
-        assert ord(frame) - 0x2800 < 0x40, f"{frame} uses a 7/8 descender"
-
-
-def test_the_spinner_advances_with_the_frame_counter_and_is_pure():
-    def lines(spin):
-        frame = a.Frame(rows=[header(), worker("w", "working")], spin=spin)
-        return a.render(frame, width=48)
-
-    assert lines(0) != lines(1), "the spinner has to move"
-    assert lines(3) == lines(3), "same counter, same screen — render is pure"
-    assert lines(9) == lines(3), "the cycle is six frames long"
-    seen = [lines(n)[2].split("│")[1].strip()[0] for n in range(6)]
-    assert seen == list(a.SPIN_FRAMES)
-    # The counter is the ONLY thing that moved: every other column is identical.
-    assert [l[:4] for l in lines(0)] == [l[:4] for l in lines(1)]
+    # ...and there is no spinner left: the glyph is a pure function of the state.
+    assert a.state_glyph("working") == "●"
 
 
 def test_a_quiet_pane_renders_the_same_lines_and_schedules_no_repaint():
-    """An `og agents` pane with nothing running must not repaint at all.
+    """An `og agents` pane with nothing changing must not repaint at all.
 
-    The operator leaves these open in a pane for a whole day. Repainting on a
-    timer whether or not anything changed is a CPU burner for a screen that
-    never differs, so the loop compares the composed lines and skips
-    `erase`/`refresh` when they are identical — and blocks on the keyboard until
-    the next poll instead of waking eight times a second.
+    The operator leaves these open in a pane for a whole day. C2 does not
+    animate, so the render is byte-identical between polls and the loop skips
+    `erase`/`refresh` — and blocks on the keyboard until the next poll.
     """
-    quiet = a.Frame(rows=[header(),
-                          worker("w1", "idle"),
-                          worker("w2", "failed")])
-    assert a.frame_working(quiet) is False
+    quiet = a.Frame(rows=[header(), rail(), group("idle"),
+                          worker("w1", "idle"), worker("w2", "failed")])
 
-    first = a._pane(quiet, B1_WIDTH).items
+    first = a._pane(quiet, C2_WIDTH).items
     assert a.paint_needed(first, None) is True, "the first frame is painted"
     painted = first
-    for spin in range(12):
-        quiet.spin = spin
-        items = a._pane(quiet, B1_WIDTH).items
+    for _ in range(12):
+        items = a._pane(quiet, C2_WIDTH).items
         assert items == painted, "nothing changed, so nothing moved"
         assert a.paint_needed(items, painted) is False
 
-    # ...and it sleeps until the next data poll, not until the next spinner tick.
-    assert a.next_wait(now=100.0, poll_due=103.0, working=False) == 3.0
-
-    busy = a.Frame(rows=[header(), worker("w", "working")])
-    assert a.frame_working(busy) is True
-    painted = a._pane(busy, B1_WIDTH).items
-    busy.spin = 1
-    assert a.paint_needed(a._pane(busy, B1_WIDTH).items, painted) is True
-    assert a.next_wait(now=100.0, poll_due=103.0, working=True) == pytest.approx(
-        a.SPIN_TICK)
-    # A poll that comes first wins the race.
-    assert a.next_wait(now=100.0, poll_due=100.01, working=True) == pytest.approx(
-        0.01)
+    # ...and it sleeps until the next data poll, with no spinner tick beside it.
+    assert a.next_wait(now=100.0, poll_due=103.0) == 3.0
 
 
-def test_the_caret_moves_between_workers_and_never_onto_a_header():
+def test_the_caret_moves_between_workers_in_the_order_they_are_displayed():
+    """THE HAZARD: grouping by state reorders the rows, so the caret must walk
+    them in the order the eye reads — not in tree order. `Frame.rows` is itself
+    in display order, which is what makes `move_selection` correct unchanged."""
     rows = [header(),
-            worker("w1", "idle", text="one"),
-            worker("w2", "idle", text="two")]
-    assert a.snap_selection(rows, 0) == 1, \
-        "the view opens on the first worker, not a header"
+            rail(), group("working"),
+            worker("w1", "working", text="one"),
+            rail(), group("idle"),
+            worker("w2", "idle", text="two"),
+            worker("w3", "idle", text="three")]
+    assert a.snap_selection(rows, 0) == 3, \
+        "the view opens on the first WORKER, not the title bar or a label"
     frame = a.Frame(rows=rows, selected=a.snap_selection(rows, 0))
+    worker_text = {i: row.text for i, row in enumerate(rows) if a._is_box(row)}
 
-    for step, expected in ((1, 2), (1, 2), (-1, 1), (-1, 1)):
+    seen = []
+    for step in (1, 1, -1, -1):
         frame.selected = a.move_selection(rows, frame.selected, step)
-        assert frame.selected == expected
+        seen.append(worker_text[frame.selected])
         lines = a.render(frame, width=48)
         assert sum(1 for line in lines if "▸" in line) == 1
+    assert seen == ["two", "three", "two", "one"], "display order, not tree order"
 
     # No workers at all: the caret has nowhere to go and must not crash.
     assert a.move_selection([header()], 0, 1) == 0
@@ -372,43 +440,49 @@ def test_the_caret_moves_between_workers_and_never_onto_a_header():
 def test_only_the_caret_row_of_the_selected_box_carries_the_selected_role():
     """Selecting a worker marks it with the caret, not a reverse-video block.
 
-    `_pane` once tagged every line of the four-row box SELECTED and `_run_tui`
-    painted SELECTED reverse, so one selected worker lit four rows. The role
-    now belongs to the caret row alone; the rest of the block is NORMAL.
+    `_pane` once tagged every line of the box SELECTED and `_run_tui` painted
+    SELECTED reverse, so one selected worker lit a whole box. The role now
+    belongs to the caret row alone; the rest of the block is NORMAL.
     """
     rows = [header(),
+            rail(), group("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    frame = a.Frame(rows=rows, selected=1)
+    frame = a.Frame(rows=rows, selected=3)   # w1
 
     items = a._pane(frame, 48).items
 
+    # bar, gauge, rail, label, box-top, caret row, agent row, box-bottom, ...
     caret_rows = [i for i, (text, _role) in enumerate(items) if "▸" in text]
-    assert caret_rows == [1], "the caret is on the first line of the box"
-    assert items[1][1] == a.SELECTED, "the caret row carries SELECTED"
-    # The three rows under the caret are the box's body and its bottom rule;
-    # none of them may be SELECTED or the whole block reads as highlighted.
-    assert [role for _text, role in items[2:5]] == [a.NORMAL] * 3
+    assert caret_rows == [5], "the caret is on the box's content row, not a rule"
+    assert items[5][1] == a.SELECTED, "the caret row carries SELECTED"
+    # The rows around the caret — the box top, the agent row, the bottom rule —
+    # are NORMAL, or the whole box would read as highlighted.
+    assert [role for _text, role in items[4:5]] == [a.NORMAL]
+    assert [role for _text, role in items[6:8]] == [a.NORMAL] * 2
     assert sum(1 for _text, role in items if role == a.SELECTED) == 1
+    # ...and it is the TITLE bar, not SELECTED, that spends REVERSE.
+    assert items[0][1] == a.TITLE
 
 
 def test_the_caret_is_the_only_marker_and_moves_with_the_selection():
     """The caret is the sole selection signal, and it is really drawn.
 
     With the reverse block gone the caret character is all that distinguishes
-    the selected worker, so it has to be present in the rendered text and
-    absent from the unselected box. Comparing the two selections proves
-    nothing ELSE marks the row: only the caret column differs.
+    the selected worker, so it has to be present in the rendered text and absent
+    from the unselected box. Comparing the two selections proves nothing ELSE
+    marks the row: only the caret column differs.
     """
     rows = [header(),
+            rail(), group("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
 
-    on_w1 = a.render(a.Frame(rows=rows, selected=1), width=48)
-    on_w2 = a.render(a.Frame(rows=rows, selected=2), width=48)
+    on_w1 = a.render(a.Frame(rows=rows, selected=3), width=48)   # caret row 5
+    on_w2 = a.render(a.Frame(rows=rows, selected=4), width=48)   # caret row 9
 
-    assert "▸" in on_w1[1] and "▸" not in on_w1[5]
-    assert "▸" in on_w2[5] and "▸" not in on_w2[1]
+    assert "▸" in on_w1[5] and "▸" not in on_w1[9]
+    assert "▸" in on_w2[9] and "▸" not in on_w2[5]
     # The two frames differ ONLY in where the caret sits.
     blanked = [[line.replace("▸", " ") for line in frame] for frame in (on_w1, on_w2)]
     assert blanked[0] == blanked[1]
@@ -417,24 +491,102 @@ def test_the_caret_is_the_only_marker_and_moves_with_the_selection():
 def test_a_selection_move_still_repaints_the_pane():
     """Moving the caret must still schedule a repaint.
 
-    Every block is NORMAL now, so if the caret were not part of the composed
-    text a selection move would change nothing and `paint_needed` would say
-    False — the caret would appear stuck until an unrelated repaint. That is
-    the regression removing the whole-block highlight could have introduced.
+    Every block is NORMAL except the caret row, so if the caret were not part of
+    the composed text a selection move would change nothing and `paint_needed`
+    would say False — the caret would appear stuck until an unrelated repaint.
     """
     rows = [header(),
+            rail(), group("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, 0))
+    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, 0))   # w1
     before = a._pane(frame, 48).items
 
-    frame.selected = a.move_selection(rows, frame.selected, 1)
+    frame.selected = a.move_selection(rows, frame.selected, 1)       # w2
     after = a._pane(frame, 48).items
 
     assert after != before, "the caret moved, so the composed lines changed"
     assert a.paint_needed(after, before) is True
     # The caret really did move to the other worker's box.
-    assert "▸" in after[5][0] and "▸" not in after[1][0]
+    assert "▸" in after[9][0] and "▸" not in after[5][0]
+
+
+def test_every_harness_mark_fills_the_slot_and_narrow_marks_align_the_title():
+    """Row 1 carries the harness mark, and every mark spends the SAME two display
+    columns, so the glyph and the title line up down the list."""
+    harnesses = ("claude-native", "acp:cline", "acp:command-code",
+                 "opencode-native", "acp:freebuff", "totally-unknown", "")
+    title_col = {}
+    for harness in harnesses:
+        slot = a.harness_mark(harness)
+        assert a._display_width(slot) == 2, (harness, slot)
+        line = a.render(a.Frame(rows=[worker("w", "working", text="ZX",
+                                             harness=harness)]), 48)[1]
+        assert "ZX" in line, (harness, line)
+        title_col[harness] = line.index("ZX")
+
+    # A blank slot and a NARROW mark both spend two LAYOUT columns, so the title
+    # starts in one column for all of them. (An Ambiguous mark is charged two for
+    # the slot but one for the layout, so it lands one column early — deliberate,
+    # see `_mark_slot`.)
+    two = [h for h in harnesses if len(a.harness_mark(h)) == 2]
+    assert len(two) >= 5, "the narrow/blank marks must dominate the table"
+    assert len(set(title_col[h] for h in two)) == 1
+
+
+def test_a_rendered_group_label_and_its_box_line_up_in_the_same_columns():
+    rows = [header(), rail(), group("working"),
+            worker("w1", "working", text="one")]
+    lines = a.render(a.Frame(rows=rows), width=C2_WIDTH)
+    # rail, label and box top all start at column 0; the rail glyph is column 0.
+    assert lines[2] == "│"
+    assert lines[3][0] == "│" and lines[3][1] == " "
+    assert lines[4][0] == "╭"
+
+
+def test_multiple_roots_each_get_their_own_title_bar_and_gauge():
+    sessions = [
+        dict(listed("r1", title="first conv", status="running"),
+             harness="claude-native"),
+        listed("a1", parent="r1", status="idle", title="coder_zen:alpha"),
+        dict(listed("r2", title="second conv", status="running"),
+             harness="acp:cline"),
+        listed("b1", parent="r2", status="running", title="coder_cline:beta"),
+    ]
+    rows = a.build_rows(sessions, ["r1", "r2"], now=NOW)
+    lines = a.render(a.Frame(rows=rows), width=C2_WIDTH)
+    joined = "\n".join(lines)
+
+    bars = [line for line in lines if line.startswith("━━ ")]
+    assert len(bars) == 2, "each root gets its own heavy title bar"
+    assert bars[0].startswith("━━ first conv ")
+    assert bars[1].startswith("━━ second conv ")
+    assert "1/1 done" in joined, "the first root's own gauge"
+    assert "0/1 done" in joined, "the second root's own gauge"
+    assert "Claude Code" in joined and "Cline" in joined
+
+
+def test_height_trimming_never_orphans_a_label_or_splits_a_box():
+    """The trimmer works in whole blocks, so a group label can never be left
+    without its box and a box can never be cut in half."""
+    rows = [header(), rail(), group("working"),
+            worker("w1", "working", text="one"),
+            rail(), group("idle"),
+            worker("w2", "idle", text="two")]
+    full = a.render(a.Frame(rows=rows), width=C2_WIDTH)
+    joined = "\n".join(full)
+    assert joined.count("╭") == 2 and joined.count("╰") == 2
+    assert "working" in joined and "finished" in joined
+
+    # Room for the root block (2 rows) and the first group (rail + label + box =
+    # 6 rows) but not the second group: the second group is dropped WHOLE — its
+    # rail and its label go with its box, so no orphan label is left behind.
+    short = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=10)
+    short_joined = "\n".join(short)
+    assert "working" in short_joined and "one" in short_joined
+    assert "finished" not in short_joined, "an orphaned label would be noise"
+    assert "two" not in short_joined, "a box must not be cut in half"
+    assert short_joined.count("╭") == short_joined.count("╰") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +766,7 @@ def test_an_idle_root_with_a_finished_worker_still_shows():
 
     lines = a.render(model.refresh(expanded_ids={"w1"}))
 
-    assert lines[0] == "Claude Code"
+    assert lines[0].startswith("━━ conversation ")
     assert any("done-worker" in line for line in lines)
     assert any("The work was already committed" in line for line in lines)
 
@@ -711,7 +863,7 @@ def test_a_failed_snippet_fetch_still_renders_the_row():
     frame = model.refresh(selected_id="w1", expanded_ids={"w1"})
     lines = a.render(frame)
 
-    assert any("⠋ w1" in line for line in lines), lines
+    assert any("●" in line and "w1" in line for line in lines), lines
     assert not any("The work" in line for line in lines)
 
 
@@ -723,8 +875,9 @@ def test_a_failed_root_detail_still_renders_the_tree():
 
     # The root does not vanish: with no harness to label it by, it falls back to
     # its title, and the tree beneath it still renders.
-    assert lines[0] == "conversation"
-    assert any("⠋ w1" in line for line in lines)
+    assert lines[0].startswith("━━ conversation ")
+    assert any("●" in line and "w1" in line for line in lines), \
+        "the worker box survives, under its glyph"
 
 
 # ---------------------------------------------------------------------------
@@ -1231,15 +1384,16 @@ def test_build_parser_overrides():
 
 
 def test_main_once_prints_exactly_what_render_returns(monkeypatch, tmp_path, capsys):
-    # `--once` has no animation and no curses: it prints the lines render hands
-    # the painter, at spinner frame 0, and nothing else.
+    # `--once` has no curses: it prints the lines render hands the painter and
+    # nothing else.
     monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
     # The listing fixture carries no timestamps, so the meta lines are clock
     # free and the two frames below are the same frame.
     expected_frame = _model(opener).refresh()
-    # Row 1 is the first worker: row 0 is the group header, which draws no box.
-    expected_frame.selected = 1
+    # The caret opens on the first WORKER: rows 0-2 are the title bar, the rail
+    # and the group label, which draw no box.
+    expected_frame.selected = a.snap_selection(expected_frame.rows, 0)
     expected = a.render(expected_frame)
 
     rc = a.main(["--once", "--all", "--server", "http://x"], opener=opener)
@@ -1247,10 +1401,11 @@ def test_main_once_prints_exactly_what_render_returns(monkeypatch, tmp_path, cap
     out = capsys.readouterr().out.splitlines()
     assert rc == 0
     assert out == expected
-    assert out[0] == "Claude Code"
-    assert out[1].startswith("├─ ▸┌"), "the B1 box, with the caret on the first row"
+    assert out[0].startswith("━━ conversation "), "the root's title bar"
+    assert out[1].endswith("Claude Code"), "the gauge, with the harness label"
+    assert "│ working" in out, "the workers are grouped under a label"
+    assert any("╭" in line for line in out), "each worker is a rounded box"
     assert out[-1] == a.FOOTER
-    assert "⠋" in out[2], "spinner frame 0"
 
 
 def test_main_once_reports_the_missing_tty(monkeypatch, tmp_path, capsys):
@@ -1285,7 +1440,7 @@ def test_access_panel_is_off_by_default_and_the_footer_lists_the_binding():
 
     lines = a.render(a.Frame(rows=rows))
 
-    assert lines[0] == "conversation"
+    assert lines[0].startswith("━━ conversation ")
     assert "┌─ access" not in "\n".join(lines), "the panel starts closed"
     assert a.Frame().access is None, "the toggle starts off"
     assert lines[-1] == a.FOOTER
@@ -1298,9 +1453,10 @@ def test_the_access_box_is_content_sized_flush_left_and_drops_a_narrow_qr():
     note_width = len("same wifi only — not reachable outside")
 
     wide = a.render(a.Frame(rows=[header()], access=acc), width=80)
-    assert "┌─ access " in wide[2], wide[2]
     box = a.access_lines(acc, 80)
-    assert wide[2] == box[0], "flush left: column 0, not under the tree spine"
+    # The root block is two rows, then a blank, then the panel.
+    assert "┌─ access " in wide[3], wide[3]
+    assert wide[3] == box[0], "flush left: column 0, not under the rail"
     assert box[0].startswith("┌─ access ") and box[0].endswith("┐")
     assert len(box[0]) == note_width + a.BOX_PADDING, "sized to its content"
     assert all(len(line) == note_width + a.BOX_PADDING for line in box), \
@@ -1415,30 +1571,32 @@ def test_access_panel_height_is_content_sized():
     lines = a.render(a.Frame(rows=rows, access=acc), width=80)
     panel = a.access_lines(acc, 80)
 
-    # Exactly the list rows, then the panel, then the footer. Not a fraction of
-    # the pane, not a padded block.
-    assert lines[0] == "conversation"
-    assert lines[1] == "", "a blank row separates the tree from the panel"
-    assert lines[2:2 + len(panel)] == panel
+    # The root block (bar + gauge), then a blank row, then the panel, then the
+    # footer. Not a fraction of the pane, not a padded block.
+    assert lines[0].startswith("━━ conversation ")
+    assert "0/0 done" in lines[1], "the root is a title bar and a gauge"
+    assert lines[2] == "", "a blank row separates the list from the panel"
+    assert lines[3:3 + len(panel)] == panel
     assert len(panel) == 2 + 13 + 1 + 2, "2 borders + 13 QR + blank + URL + note"
     assert lines[-1] == a.FOOTER
 
 
-def test_agent_list_keeps_a_floor_of_rows_when_the_panel_is_open():
+def test_the_list_keeps_a_floor_of_rows_and_the_panel_is_never_squeezed():
     qr = [f"qr-row-{i}" for i in range(13)]   # a 19-row panel: 13 QR + blank + 2 info
     acc = _access(qr=qr)
-    rows = [a.Row(f"s{i}", f"row{i}", "working", 0, is_root=True)
-            for i in range(40)]
-    panel = a.access_lines(acc, 80)
+    # The root block (2 rows) plus one-row rail blocks, so the floor is visible.
+    rows = [header()] + [rail() for _ in range(6)]
 
-    short = a.render(a.Frame(rows=rows, access=acc), width=80, height=8)
-    assert sum(1 for line in short if line.startswith("row")) == a.ACCESS_LIST_FLOOR
-    assert any("qr-row-0" in line for line in short), \
-        "the panel is still shown on a short pane"
+    pane = a._pane(a.Frame(rows=rows, access=acc), width=80, height=8)
 
-    tall = a.render(a.Frame(rows=rows, access=acc), width=80, height=40)
-    assert sum(1 for line in tall if line.startswith("row")) == \
-        40 - (len(panel) + 3), "the tail is reserved whole: blank, panel, blank, footer"
+    # The tail (blank + panel + footer) is reserved whole and the list above it
+    # keeps at least ACCESS_LIST_FLOOR rows.
+    assert pane.list_rows == a.ACCESS_LIST_FLOOR
+    # ...and the panel is still shown whole rather than squeezed away.
+    assert any("qr-row-0" in text for text, _role in pane.items)
+    # A block is never cut: the kept list is the root's two rows and whole rails.
+    assert pane.items[2] == ("│", a.NORMAL)
+    assert all(text != "" or role == a.NORMAL for text, role in pane.items[:3])
 
 
 def test_qr_fit_measures_visible_columns_not_raw_length():
@@ -1500,8 +1658,8 @@ def test_no_line_handed_to_the_painter_contains_an_escape():
     # The plain path first: these are the lines `addnstr` is handed.
     frame = a.Frame(rows=rows, access=acc)
     assert not any("\x1b" in text for text in a.render(frame, width=80))
-    # A moved caret and an advanced spinner cannot change that.
-    frame.selected, frame.spin = 1, 3
+    # A moved caret cannot change that.
+    frame.selected = 1
     assert not any("\x1b" in text for text in a.render(frame, width=80))
     assert not any("\x1b" in text for text, _role in a._pane(frame, 80).items)
     # ...and the block characters survived, so the code still draws.
