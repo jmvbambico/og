@@ -106,6 +106,15 @@ class RecordingClient:
     def pane_run(self, pane_id, command):
         self._call("pane_run", pane_id, command)
 
+    def pane_send_text(self, pane_id, text):
+        """The unsubmitted sibling of `pane_run`: same wire method, no newline.
+
+        A history space's pane is given this — the resume line left as text, not
+        run — so no session is resurrected. Kept separate from `pane_run` here
+        so a test can tell the two apart by the recorded method name.
+        """
+        self._call("pane_send_text", pane_id, text)
+
     def pane_close(self, pane_id):
         self._call("pane_close", pane_id)
 
@@ -932,6 +941,221 @@ def test_a_nested_worker_lands_beside_its_own_parent(seams):
         Ev("added", "g1", sub_session("w1", "coder_zen:sub-task"))])
     tabs = [c for c in client.calls if c[0] == "tab_create"]
     assert [t[1] for t in tabs] == [("ws1",), ("ws1",)]
+
+
+# ---------------------------------------------------------------------------
+# PAST conversations: every non-archived ROOT gets a space, live or not.
+#
+# The web sidebar lists every conversation the operator has had; this is the
+# herdr half. A root whose runner is gone gets a space labelled with its title
+# and a pane holding the resume line UNSENT — visible and resumable, with
+# nothing running. A sub-agent is NOT extended this (a dead worker is noise),
+# and a live root is unchanged.
+# ---------------------------------------------------------------------------
+
+def test_a_dead_root_gets_a_space_labelled_with_its_title(seams, tmp_path):
+    # The title plumbing is the same one a live root uses: the space is labelled
+    # with the session's own title, so the operator sees the conversation's name
+    # exactly as Omnigent auto-named it.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
+
+    wc = _call(client, "workspace_create")
+    assert wc[1] == ("Fix issue 502",)
+    assert wc[2]["cwd"] == str(tmp_path)
+    assert wc[2]["focus"] is False
+    assert _names(client).count("workspace_create") == 1
+
+
+def test_a_dead_roots_pane_holds_the_resume_line_unsubmitted(seams, tmp_path):
+    # THE HARD CONSTRAINT. A space for a past conversation must not resurrect it.
+    # The pane is a plain shell — one `workspace.create` — holding the resume line
+    # as UNSENT text: `pane_send_text` with no trailing newline, and NOT
+    # `pane_run`, which would append the newline that starts it.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "New Alignment", runner_online=False, workspace=str(tmp_path)))])
+
+    assert "pane_run" not in _names(client)
+    _name, args, _kwargs = _call(client, "pane_send_text")
+    assert args == ("pane1", "og chat --resume dead1")
+    assert not args[1].endswith("\n"), "the resume line must not be submitted"
+
+
+def test_a_live_root_still_gets_todays_exact_treatment(seams):
+    # No regression, and the sharpest form of it: a root with a live runner takes
+    # the path it always did — a SUBMITTED attach, the agent marker, the title
+    # metadata — and never the unsubmitted resume line.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "Live", runner_online=True, workspace="/repo/og"))])
+
+    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
+                              "report_metadata"]
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
+    assert "pane_send_text" not in _names(client)
+
+
+def test_a_root_with_no_runner_key_is_treated_as_live(seams):
+    # Backwards compatibility, and the direction that matters: only an explicit
+    # `runner_online: False` means "past conversation". A session dict from any
+    # other source — an old event, a detail fetch that failed — has no such key
+    # and must keep taking today's path rather than becoming a history space.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "s1", root_session("Live"))])
+
+    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
+                              "report_metadata"]
+
+
+def test_a_dead_root_whose_workspace_is_gone_gets_no_space(seams, tmp_path):
+    # A space is a shell in a directory, and a shell whose cwd does not exist is
+    # broken. A past conversation whose checkout was a temporary worktree — which
+    # is deleted when it finishes — names a directory that is simply not there,
+    # so it gets nothing rather than a dead shell.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    gone = tmp_path / "deleted-worktree"
+    lines = bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(gone)))])
+
+    assert client.calls == []
+    assert any("dead1" in ln and "gone" in ln for ln in lines), lines
+
+
+def test_a_sub_agent_is_never_given_a_history_space(seams):
+    # Sub-agent behaviour is unchanged: a dead worker is not a conversation, and
+    # the watcher does not even emit one. If one reaches the bridge anyway (a
+    # `runner_online: False` on a session that has a parent), the parent check
+    # keeps the history path to roots.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    session = sub_session("root", "coder_zen:fix", runner_online=False,
+                          workspace="/repo/og")
+    bridge.reconcile([Ev("added", "w1", session)])
+
+    # It is NOT a history space (no unsubmitted resume line); it falls to the
+    # ordinary sub-agent path, which opens a space when the parent has none.
+    assert "pane_send_text" not in _names(client)
+    assert _names(client).count("workspace_create") == 1
+
+
+def test_every_non_archived_root_gets_a_space_by_default(seams, tmp_path):
+    # NO CAP BY DEFAULT: the operator wants the web sidebar's contents, all of
+    # it, and prunes by hand. So a Bridge built with no explicit cap (the
+    # shipping default, 0) opens a space for every root it is handed.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    assert bridge.space_cap == 0
+    events = [Ev("added", f"d{i}", root_session(
+        f"past-{i}", runner_online=False, workspace=str(tmp_path)))
+        for i in range(5)]
+
+    bridge.reconcile(events)
+
+    titles = [c[1][0] for c in client.calls if c[0] == "workspace_create"]
+    assert titles == [f"past-{i}" for i in range(5)]
+
+
+def test_the_history_space_cap_is_honoured_when_one_is_set(seams, tmp_path):
+    # A cap that IS set is still honoured: the listing is NEWEST-FIRST, so the
+    # roots arrive newest-first and the cap keeps the ones that arrive FIRST —
+    # the recent conversations — and leaves the rest alone, with a line saying why.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=2)
+    events = [Ev("added", f"d{i}", root_session(
+        f"past-{i}", runner_online=False, workspace=str(tmp_path)))
+        for i in range(3)]
+
+    lines = bridge.reconcile(events)
+
+    titles = [c[1][0] for c in client.calls if c[0] == "workspace_create"]
+    assert titles == ["past-0", "past-1"]
+    assert any("past-2" in ln and "cap" in ln for ln in lines), lines
+
+
+def test_a_live_root_is_never_subject_to_the_history_cap(seams, tmp_path):
+    # The cap is on PAST conversations only: a live session always gets its
+    # space, even when the cap is already full — otherwise a machine at its cap
+    # would stop showing the conversation someone is actually driving.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=1)
+    bridge.reconcile([Ev("added", "d0", root_session(
+        "past-0", runner_online=False, workspace=str(tmp_path)))])
+    bridge.reconcile([Ev("added", "live1", root_session(
+        "Live", runner_online=True, workspace=str(tmp_path)))])
+
+    assert _names(client).count("workspace_create") == 2
+    assert "pane_run" in _names(client)
+
+
+def test_a_dead_root_does_not_get_a_second_space_on_a_later_pass(seams,
+                                                                 tmp_path):
+    # "One pane per session" holds for history spaces too: a redelivered `added`
+    # for a root that already has one is a no-op, not a second space.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    session = root_session("New Alignment", runner_online=False,
+                           workspace=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", session)])
+    bridge.reconcile([Ev("added", "dead1", session)])
+
+    assert _names(client).count("workspace_create") == 1
+
+
+def test_a_dead_root_adopts_its_recorded_space_after_a_restart(seams, tmp_path):
+    # The other half of "no second space": a NEW process (empty `_recs`, same
+    # state file and same herdr) adopts the recorded space instead of opening
+    # another. This is also what keeps the cap stable across a restart — the
+    # adopted spaces are counted, not re-created.
+    session = root_session("New Alignment", runner_online=False,
+                           workspace=str(tmp_path))
+    client = RecordingClient()
+    m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path)).reconcile(
+        [Ev("added", "dead1", session)])
+    client.calls.clear()
+
+    m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path)).reconcile(
+        [Ev("added", "dead1", session)])
+
+    assert "workspace_create" not in _names(client)
+
+
+def test_a_repaired_history_space_still_leaves_its_resume_line_unsubmitted(
+        seams, tmp_path):
+    # The REPAIR path must not quietly undo the constraint. A dead root whose
+    # space the operator closed is re-projected — and re-projected as a HISTORY
+    # space, with the resume line UNSENT — not as a live one that submits an
+    # attach on a session nobody is watching.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "New Alignment", state="idle", runner_online=False,
+        workspace=str(tmp_path)))])
+    client.operator_closed("ws1")
+    client.calls.clear()
+    # Only the pane is reported gone; the space is gone too, so the repair has to
+    # open a fresh one (the `_reproject` create branch, not the `_add_tab` one).
+    client.fail = {"report_agent": FakeHerdrError(
+        "pane_not_found", "pane ws1:p1 not found")}
+
+    bridge.reconcile([Ev("changed", "dead1", root_session(
+        "New Alignment", state="idle"), previous=root_session(
+            "New Alignment", state="idle"))])
+
+    assert "pane_run" not in _names(client), (
+        "a repaired history space must never submit a runner")
+    _name, args, _kwargs = _call(client, "pane_send_text")
+    assert args == ("pane2", "og chat --resume dead1")
+    assert not args[1].endswith("\n")
+    # ...and it is still recorded as a history space the cap counts.
+    assert bridge._recs["dead1"]["owns_space"] is True
 
 
 # ---------------------------------------------------------------------------

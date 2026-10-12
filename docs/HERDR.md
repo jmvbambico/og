@@ -234,8 +234,19 @@ Projecting every live session would mean ~100 tabs, nearly all dead. So:
 - a **root** session is projected while it is listed and not archived — it
   reads `idle` the whole time it waits for the human to type, so retiring it on
   idle would close the pane they are typing into;
+- a **dead root** — one whose detail row reports `runner_online: false` — is
+  projected too, but as a **history space**: a plain shell (one
+  `workspace.create`, which makes the space and its first tab together) holding
+  `og chat --resume <id>` as UNSENT text, so a past conversation is visible and
+  resumable without resurrecting it. There is NO cap by default — every
+  non-archived root is listed and the operator prunes by hand — though a positive
+  `herdr_session_space_cap` in the install caps them, newest-first so the recent
+  conversations survive. A root whose workspace directory is gone is skipped
+  entirely (a shell whose cwd does not exist is broken), and a live root is never
+  subject to the cap;
 - a **sub-agent** is projected only while `running` or holding a pending
-  elicitation, and its pane retires when it goes idle or fails.
+  elicitation AND with a live runner, and its pane retires when it goes idle or
+  fails. A dead worker is noise, so the runner refusal stays in force for it.
 
 ### One consequence worth generalising
 

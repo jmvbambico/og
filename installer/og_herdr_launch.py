@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from og_herdr import (
+    DEFAULT_SPACE_CAP,
     OWNER_LAUNCHER,
     SPACE_LIVE,
     _id_of,
@@ -98,10 +99,11 @@ AGENTS_PANE_RATIO = 0.7
 # or runner-offline session must not block a fresh start.
 LIVE_STATUSES = frozenset({"running", "idle"})
 
-# og-install.json keys. Both have a default, so an install that predates them
+# og-install.json keys. All have a default, so an install that predates one
 # still launches.
 AGENT_NAME_KEY = "agent_name"
 AGENTS_PANE_KEY = "herdr_agents_pane"
+SESSION_SPACE_CAP_KEY = "herdr_session_space_cap"
 DEFAULT_AGENT_NAME = "dev-lead"
 
 # How long to wait for `herdr server` to answer a ping before giving up. Bounded
@@ -163,6 +165,30 @@ def agents_pane_enabled(config: dict) -> bool:
     """
     value = config.get(AGENTS_PANE_KEY, True)
     return True if value is None else bool(value)
+
+
+def session_space_cap(config: dict) -> int:
+    """How many past-conversation spaces the bridge may keep open.
+
+    0 MEANS NO LIMIT and 0 is the default, so an install that never answered (and
+    one that predates the key) lists every non-archived root — the parity with
+    the web sidebar that is the point of the feature. A POSITIVE value is a cap
+    the bridge honours, trimming the oldest first (see og_herdr.DEFAULT_SPACE_CAP).
+    Same shape as `agents_pane_enabled`: one key in `~/.omnigent/og-install.json`
+    read through one function with a default.
+
+    The reader is here, beside the other config readers, but the CONSUMER is the
+    bridge (og_herdr), which counts the history spaces it already has and refuses
+    new ones past this. Only a real, non-negative `int` is honoured; anything
+    else — a missing key, a null, a string, a float, a negative — falls back to
+    the default (no limit) rather than raising, because this feeds a background
+    daemon that must not die over a hand-edited number. A bool is refused on
+    purpose: `True` is an `int` in Python and would otherwise read as a cap of 1.
+    """
+    value = config.get(SESSION_SPACE_CAP_KEY, DEFAULT_SPACE_CAP)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return DEFAULT_SPACE_CAP
+    return value
 
 
 # ---------------------------------------------------------------------------

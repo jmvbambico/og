@@ -898,6 +898,27 @@ def test_pane_run_never_emits_the_cli_only_method(fake):
     run.close()
 
 
+def test_pane_send_text_leaves_the_line_unsubmitted(fake):
+    """`pane_send_text` is `pane_run` WITHOUT the submitting newline.
+
+    It is what a space for a PAST conversation is given: the pane must hold
+    `og chat --resume <id>` as an un-executed line, so the session is not
+    resurrected until the operator presses Enter. The absence of the trailing
+    newline IS the behaviour — it is the only thing that distinguishes this call
+    from `pane_run` — so it is asserted exactly rather than by containment.
+    """
+    server = fake()
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    client.pane_send_text("w1:pQ", "og chat --resume s_abc123")
+    assert server.requests[0] == {
+        "id": "req_1",
+        "method": "pane.send_text",
+        "params": {"pane_id": "w1:pQ", "text": "og chat --resume s_abc123"},
+    }
+    assert not server.requests[0]["params"]["text"].endswith("\n")
+    client.close()
+
+
 def test_tab_create_sends_workspace_id_and_never_workspace(fake):
     """`tab.create` takes `workspace_id`; `workspace` is dropped, not rejected.
 
@@ -1464,7 +1485,7 @@ def test_the_conformance_guard_covers_every_requesting_wrapper(fake):
     assert names == {
         "ping", "workspace_list", "workspace_create", "workspace_close",
         "workspace_rename",
-        "tab_create", "tab_close", "pane_run",
+        "tab_create", "tab_close", "pane_run", "pane_send_text",
         "pane_close", "pane_rename", "pane_read", "report_agent",
         "release_agent", "report_metadata", "agent_list", "agent_get",
         "events_subscribe",
