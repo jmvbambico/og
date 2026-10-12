@@ -1538,6 +1538,28 @@ def test_a_dead_root_is_projected_as_a_history_space():
     assert set(watcher._seen) == {"dead"}
 
 
+def test_poll_once_still_emits_a_dead_root_for_the_launcher_to_reject():
+    """THE BOUNDARY CONTRACT WITH `og_herdr_launch.live_session`.
+
+    A dead root must keep flowing OUT of poll_once, because the BRIDGE turns it
+    into a history space — the spaces feature. The launcher is the one that has to
+    REJECT it (it re-applies `runner_is_offline` itself; the event is not a session
+    to attach to). So a future reader must not "fix" the launcher-attaches-to-a-
+    dead-root regression by narrowing `_projectable` back to kind-blind: that would
+    empty the history spaces this feature exists to show. This test fails the
+    moment someone tries, and it pins the PREDICATE, not just the outcome."""
+    dead = detail("dead", workspace="/repo/og", runner_online=False)
+    opener = RoutingOpener([envelope([session("dead")])], details={"dead": dead})
+    watcher = w.SessionWatcher(opener=opener)
+
+    # The predicate itself keeps a dead root...
+    assert w.SessionWatcher._projectable(session("dead"), dead) is True
+    # ...and that is what poll_once acts on, so the event reaches the consumer.
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("added", "dead")]
+    assert events[0].session["runner_online"] is False
+
+
 def test_a_session_with_an_online_runner_is_still_projected():
     # The other side of the same pair. Without it, a rule that dropped everything
     # would satisfy the test above, and a workspace that empties itself looks
