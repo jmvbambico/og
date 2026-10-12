@@ -1430,12 +1430,28 @@ def render_roster_skill(plan: dict) -> str:
         "failed this run. Every worker pins its own model in its spec — never pass",
         "`args.model`.", "",
         "## Preflight (FIRST turn, before any dispatch)", "",
-        "Run ONE `sys_session_get_info({})` and read `configured_harnesses`. Each",
-        "worker maps to exactly one harness id:", "",
+        "Run ONE `sys_session_get_info({})` and read `configured_harnesses`. Look",
+        "up the KEY this table names for each worker:", "",
         render_preflight_map(plan), "",
-        "A worker is available ONLY when its value is exactly `true`. Route only to",
-        "the available set. Do not announce a clean result; a MISSING worker is the",
-        "only fact worth words. Do this in the same turn you start planning.", "",
+        "A worker is available ONLY when its key's value there is exactly `true`.",
+        "An `acp:<slug>` harness has no key of its own — the map carries ONE shared",
+        "`acp` entry for the whole ACP transport, so those workers are keyed `acp`;",
+        "every other worker is keyed by its own harness id. That `acp` key is HONEST",
+        "BUT SHALLOW: it proves the transport is up, NOT that this agent's CLI is",
+        "installed or authenticated. Confirm those separately — the installer's PATH",
+        "scan and login reminder, and each worker's caveat below — because a worker",
+        "can pass this preflight and still fail at `ACP session/new` with no auth",
+        "token. Route only to the available set. Do not announce a clean result;",
+        "a MISSING worker is the only fact worth words.",
+        "Do this in the same turn you start planning.", "",
+        "## Dispatch shape", "",
+        "`sys_session_send` REQUIRES `agent` (the worker name) and `args.input` (the",
+        "task text). Also pass `title` (names the WORK, never the vendor) and",
+        "`args.purpose` (`implement` / `review` / `explore`). A call missing `agent`",
+        "or `args.input` returns an error AND still counts against",
+        "`max_dispatches_per_turn` — a schema typo can burn a whole turn's budget:", "",
+        "    sys_session_send({agent: \"coder_kilo\", title: \"fix-sse-retry\",",
+        "        args: {input: \"<the task text>\", purpose: \"implement\"}})", "",
         *zen,
         "## Capacity", "",
         "Run `og stats --json` (og is on PATH) before the FIRST dispatch of this run,",
@@ -1737,17 +1753,43 @@ def _wrap(text: str, width: int) -> list:
     return out
 
 
-def render_preflight_map(plan: dict) -> str:
-    """The worker -> harness-id table the roster skill's preflight uses.
+def preflight_key(harness: str) -> str:
+    """The `configured_harnesses` key that actually answers for a harness.
 
-    Generated from the plan rather than frozen into the prompt: the mapping
-    must match the roster the user actually chose, and a hardcoded table
-    silently drifts the moment a coder is added, dropped or renamed.
+    An `acp:<slug>` harness (every acp-user registry row) has NO key of its own
+    in `configured_harnesses`: that map carries one shared `acp` entry for the
+    whole ACP transport, plus native-looking harness ids. A lookup of
+    `acp:kilo-code` therefore always misses — which reads as "the worker is
+    missing" and silently deletes it from the roster, leaving the orchestrator
+    short a coder. Every other harness keeps its own id as the key.
+    Derived from the harness string rather than a hardcoded list of ids, so a
+    new vendor stays a registry row and no code change (AGENTS.md).
+    """
+    return "acp" if harness.startswith("acp:") else harness
+
+
+def render_preflight_map(plan: dict) -> str:
+    """The worker -> `configured_harnesses` KEY table the preflight uses.
+
+    Generated from the plan and the registry rather than frozen into the
+    prompt: the mapping must match the roster the user actually chose, and a
+    hardcoded table silently drifts the moment a coder is added, dropped or
+    renamed. The key comes from the row's harness via `preflight_key`, so an
+    ACP worker points at the shared `acp` entry AND names the phantom
+    `acp:<slug>` key it must not search for — text that cannot be misread as
+    "look up `acp:kilo-code`".
     """
     reg = agents_by_id()
-    rows = [f"    `{name}` -> `{reg[e['id']]['harness']}`"
-            for r in SPEC_ROLES
-            for name, e in zip(role_names(plan, r.key), chain(plan, r.key))]
+    rows = []
+    for r in SPEC_ROLES:
+        for name, e in zip(role_names(plan, r.key), chain(plan, r.key)):
+            harness = reg[e["id"]]["harness"]
+            key = preflight_key(harness)
+            if key == harness:
+                rows.append(f"    `{name}` -> `{key}`")
+            else:
+                rows.append(f"    `{name}` -> `{key}`   (shared ACP key; the map "
+                            f"has no `{harness}`)")
     return "\n".join(rows)
 
 
