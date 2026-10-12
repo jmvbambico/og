@@ -379,6 +379,14 @@ def select_scope(
     be read simply has no match and does not narrow anything — the view falls
     back to the wide set rather than hiding the session the user is in because
     one optional fetch failed.
+
+    ONE narrower's worth of caution, because this is where the wrong-session bug
+    lived: narrowed within the live roots, this rule can only ever return a LIVE
+    root, and a stale root in a repo with a history of sessions is live for as
+    long as it still has workers. `AgentModel._match_cwd_root` is what decides
+    which root is `$PWD` among ALL of them, newest first; this function supplies
+    the wide fallback and the `--all` path. The two agreeing is the common case,
+    and when they disagree the caller uses the probe's answer.
     """
     ids = [sid for sid in (_session_id(s) for s in roots) if sid]
     if all_roots or not cwd:
@@ -396,6 +404,29 @@ def _is_root(session: dict) -> bool:
     """A session with no parent is a root: the conversation the human drives."""
     parent = session.get("parent_session_id")
     return not (isinstance(parent, str) and parent)
+
+
+def _recency(session: dict) -> float:
+    """A root's recency, as epoch seconds, for "which of these is THIS one".
+
+    `updated_at` — the listing row's LAST ACTIVITY — first, because the root the
+    operator is standing in is the one that was used most recently. That is the
+    same field `worker_meta` reads and the reason it is the right one here: an
+    old root whose workers kept a long job alive can have been updated after a
+    newer conversation was opened, and neither field can see the difference, but
+    that is the truth of the data rather than a guess this function could avoid.
+
+    `created_at` is the fallback for a row the server sent without an
+    `updated_at`, and a row with neither sorts last rather than first: an unknown
+    age is not evidence of recency. There is no `last_activity_at` on a listing
+    row — see og_herdr_watch's measured key list — so this is the same free
+    LISTING field the rest of the view reads, not a detail-fetch one.
+    """
+    updated = _epoch(session.get("updated_at"))
+    if updated is not None:
+        return updated
+    created = _epoch(session.get("created_at"))
+    return created if created is not None else 0.0
 
 
 def _index(sessions: Iterable[dict]):
@@ -879,9 +910,12 @@ class AgentModel:
       1. once per LIVE ROOT, to learn its `workspace` (the cwd rule needs it)
          and its `harness` (the header label). Roots come and go, so this is
          "once per root, on its first sighting", not "once per poll".
-      2. once per root the cwd rule probes past the live set, and only until one
-         matches (see `_match_cwd_root`). Also once per root, because the result
-         is cached under the same session id.
+      2. once per root the cwd rule puts to the question, walking every root
+         newest-first and stopping at the first one whose `workspace` is `$PWD`
+         (see `_match_cwd_root`). That stop IS the "most recent match" — the walk
+         is ordered by recency — so the rule costs the roots more recent than the
+         answer, and none of the ones after it. Also once per root, because the
+         result is cached under the same session id.
       3. once per worker that has gone IDLE, to capture the report it just
          produced. An idle report stops changing, so it is fetched once and kept.
       4. once for a row the user SELECTED, so its snippet can be read on demand
@@ -965,34 +999,45 @@ class AgentModel:
 
     # -- refresh ------------------------------------------------------------
 
-    def _match_cwd_root(self, by_id: dict, live_root_ids: list[str],
-                        asked: set[str]) -> Optional[str]:
-        """The root session whose `workspace` is `$PWD`, or None.
+    def _match_cwd_root(self, by_id: dict, asked: set[str]) -> Optional[str]:
+        """The MOST RECENTLY ACTIVE root whose `workspace` is `$PWD`, or None.
 
-        Checked against the live roots first (their details are already in hand,
-        so this costs nothing), and only then against the roots the live
-        heuristic EXCLUDED. That second pass is the fix for the wrong-directory
-        bug: "live" means working, blocked, or the parent of a worker, so a
-        brand-new `og chat` in this directory — idle, nothing dispatched yet —
-        is not live, its `workspace` was never fetched, nothing matched `$PWD`,
-        and the view fell back to every root on the machine. The cwd question is
-        not a question about activity, so it is answered independently of it.
+        Asked of EVERY root, live or not, in ONE pass newest-first, stopping at
+        the first match — so the stop IS the recency rule rather than something
+        that has to be checked for afterwards.
 
-        The probe stops at the first match and every result is cached per session
-        id (`_root_detail`), so this is one fetch per root ONCE, not one per
-        poll; `asked` records which roots were put to the question this refresh
-        so the prune keeps exactly their cache entries.
+        The failure this replaces: there were two passes, and pass 1 walked the
+        LIVE roots and returned on the first hit. In a repo with a history of
+        sessions that made the implemented rule "the first LIVE root in this
+        directory", and the live root there is the STALE one — it stays live
+        forever precisely because it still has workers (see `_is_live_root`),
+        while the session the operator is actually standing in is a brand-new
+        idle one that nothing dispatched from yet. Measured on a fresh `og chat`
+        in this repo: ~16 finished workers, done 22-41h earlier, belonging to the
+        previous root session in the same directory. A stale sibling with workers
+        beat the live session with none, every time, and the pass that would have
+        found the right one never ran.
+
+        So liveness is not a filter here at all. `workspace` is a DETAIL-row
+        field (see og_herdr_watch's measured key list), and the budget is kept by
+        the two things that were always keeping it: every root is fetched at most
+        ONCE per process (`_root_detail`, bounded by MAX_ROOT_DETAILS — the same
+        dict, the same eviction, so the walk is still capped), and the walk stops
+        at the first match. A root already fetched this refresh costs nothing,
+        which is every live root and every root behind an earlier match.
+
+        `asked` is how "asked, and therefore worth keeping in the cache" is
+        recorded, so the prune in `refresh` cannot turn this into a per-poll
+        refetch.
         """
         target = _norm_path(self.cwd)
-        for sid in live_root_ids:
-            workspace = self._root_info.get(sid, {}).get("workspace")
-            if isinstance(workspace, str) and workspace and \
-                    _norm_path(workspace) == target:
-                return sid
-        for sid, session in by_id.items():
-            if sid in asked or not _is_root(session):
-                continue
-            asked.add(sid)
+        newest_first = sorted(
+            (sid for sid, session in by_id.items() if _is_root(session)),
+            key=lambda sid: -_recency(by_id[sid]),
+        )
+        for sid in newest_first:
+            if sid not in asked:
+                asked.add(sid)
             workspace = self._root_detail(sid).get("workspace")
             if isinstance(workspace, str) and workspace and \
                     _norm_path(workspace) == target:
@@ -1031,16 +1076,26 @@ class AgentModel:
         for sid in live_root_ids:
             self._root_detail(sid)
 
+        # The wide view is every LIVE root; `select_scope` narrows it to `$PWD`
+        # and forces the wide view under `--all`. The narrowing only ever looks
+        # WITHIN the live roots, which is what made it unsafe to treat as final:
+        # a stale sibling root in the same repo stays live precisely because it
+        # still has workers (`_is_live_root`), so it answers `$PWD` on its own and
+        # the probe below — the only thing that can find the session the operator
+        # is actually standing in — gets skipped as unnecessary.
         scope = select_scope(
             [by_id[sid] for sid in live_root_ids if sid in by_id],
             self.cwd,
             self.all_roots,
         )
-        # `select_scope` reports "nothing matched `$PWD`" by handing back exactly
-        # what it was given, so the equality IS the no-match signal — the rule
-        # itself stays defined in one place.
-        if self.cwd and not self.all_roots and scope == live_root_ids:
-            match = self._match_cwd_root(by_id, live_root_ids, asked)
+        # So while the cwd rule is in force it is asked unconditionally, and its
+        # answer REPLACES the narrowing rather than only applying when that
+        # narrowing found nothing. `select_scope` keeps its own contract — it
+        # reports "nothing matched" by handing back exactly what it was given —
+        # because it is still what supplies the wide fallback below and the
+        # `--all` path, both of which are decisions about LIVENESS.
+        if self.cwd and not self.all_roots:
+            match = self._match_cwd_root(by_id, asked)
             if match is not None:
                 # A match IS the scope: one root's tree, not the live set plus
                 # this one.
@@ -1104,6 +1159,13 @@ class AgentModel:
         This decides what is WORTH SHOWING, never which directory the operator is
         in: a quiet root in `$PWD` is still the answer to that question, and
         `_match_cwd_root` asks it of every root regardless.
+
+        What this heuristic MUST NOT do is decide that question on its own. A
+        stale root is live for as long as its workers are on screen, so in a repo
+        with a history of sessions "the live root in this directory" is usually
+        the PREVIOUS session, not the one the operator is in. That is exactly how
+        a fresh `og chat` came to show ~16 workers finished 22-41h earlier.
+        Liveness is what gets shown when nothing else decides it, nothing more.
         """
         if herdr_state(root) in ("working", "blocked"):
             return True
