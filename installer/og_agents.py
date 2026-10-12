@@ -128,6 +128,9 @@ TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
 
 # The paint role of a line. Plain strings so the composer stays pure and
 # testable; the curses attributes that go with them live in `_run_tui`.
+# SELECTED belongs to the CARET ROW of the selected worker and no other line:
+# the rest of its box is NORMAL, so selecting a worker marks it with the caret
+# instead of reverse-videoing the whole four-row block.
 NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
@@ -785,6 +788,10 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     `height`, when given, is the pane's content height — the tail (panel and
     footer) is kept whole and the list above it is trimmed to fit, never below
     ACCESS_LIST_FLOOR rows and never by cutting a box in half.
+
+    A selected worker's block is NORMAL except its first line, the caret row,
+    which carries SELECTED: the caret is the selection marker, not a reverse
+    block over all four rows.
     """
     items: list[tuple[str, str]] = []
     if frame.notice:
@@ -797,10 +804,20 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
         if row.is_root:
             blocks.append([(_clip(row.text, width), NORMAL)])
             continue
-        role = SELECTED if index == frame.selected else NORMAL
-        blocks.append([(line, role)
-                       for line in row_block(row, width, frame.spin,
-                                             index == frame.selected)])
+        on_caret = index == frame.selected
+        block = [(line, NORMAL)
+                 for line in row_block(row, width, frame.spin, on_caret)]
+        if on_caret:
+            # Only the caret row carries SELECTED; the body below it stays
+            # NORMAL. Tagging the whole block, as this once did, made the TUI
+            # reverse-video all four rows — the operator read that as four
+            # selected things and asked for the caret to be the marker. The
+            # role is kept on that one line rather than dropped because it is
+            # what the live view scrolls to keep visible (`_run_tui`), and it
+            # is painted bold there so the caret row stays findable when the
+            # glyph itself is easy to miss.
+            block[0] = (block[0][0], SELECTED)
+        blocks.append(block)
 
     tail: list[tuple[str, str]] = [("", NORMAL)]
     if frame.access is not None:
@@ -1395,7 +1412,11 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             """
             if not 0 <= row < height or width < 1:
                 return
-            attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_REVERSE,
+            # SELECTED is bold, not reverse: it lands on the caret row alone,
+            # so reverse-videoing it would still light a full row of the box.
+            # Bold keeps that one row findable without re-reading the old
+            # whole-block highlight the operator asked to be rid of.
+            attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_BOLD,
                     DIM: curses.A_DIM}[role]
             try:
                 stdscr.addnstr(row, 0, text, width - 1, attr)

@@ -367,6 +367,74 @@ def test_the_caret_moves_between_workers_and_never_onto_a_header():
     assert a.snap_selection([header()], 3) == 0
 
 
+def test_only_the_caret_row_of_the_selected_box_carries_the_selected_role():
+    """Selecting a worker marks it with the caret, not a reverse-video block.
+
+    `_pane` once tagged every line of the four-row box SELECTED and `_run_tui`
+    painted SELECTED reverse, so one selected worker lit four rows. The role
+    now belongs to the caret row alone; the rest of the block is NORMAL.
+    """
+    rows = [header(),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+    frame = a.Frame(rows=rows, selected=1)
+
+    items = a._pane(frame, 48).items
+
+    caret_rows = [i for i, (text, _role) in enumerate(items) if "▸" in text]
+    assert caret_rows == [1], "the caret is on the first line of the box"
+    assert items[1][1] == a.SELECTED, "the caret row carries SELECTED"
+    # The three rows under the caret are the box's body and its bottom rule;
+    # none of them may be SELECTED or the whole block reads as highlighted.
+    assert [role for _text, role in items[2:5]] == [a.NORMAL] * 3
+    assert sum(1 for _text, role in items if role == a.SELECTED) == 1
+
+
+def test_the_caret_is_the_only_marker_and_moves_with_the_selection():
+    """The caret is the sole selection signal, and it is really drawn.
+
+    With the reverse block gone the caret character is all that distinguishes
+    the selected worker, so it has to be present in the rendered text and
+    absent from the unselected box. Comparing the two selections proves
+    nothing ELSE marks the row: only the caret column differs.
+    """
+    rows = [header(),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+
+    on_w1 = a.render(a.Frame(rows=rows, selected=1), width=48)
+    on_w2 = a.render(a.Frame(rows=rows, selected=2), width=48)
+
+    assert "▸" in on_w1[1] and "▸" not in on_w1[5]
+    assert "▸" in on_w2[5] and "▸" not in on_w2[1]
+    # The two frames differ ONLY in where the caret sits.
+    blanked = [[line.replace("▸", " ") for line in frame] for frame in (on_w1, on_w2)]
+    assert blanked[0] == blanked[1]
+
+
+def test_a_selection_move_still_repaints_the_pane():
+    """Moving the caret must still schedule a repaint.
+
+    Every block is NORMAL now, so if the caret were not part of the composed
+    text a selection move would change nothing and `paint_needed` would say
+    False — the caret would appear stuck until an unrelated repaint. That is
+    the regression removing the whole-block highlight could have introduced.
+    """
+    rows = [header(),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, 0))
+    before = a._pane(frame, 48).items
+
+    frame.selected = a.move_selection(rows, frame.selected, 1)
+    after = a._pane(frame, 48).items
+
+    assert after != before, "the caret moved, so the composed lines changed"
+    assert a.paint_needed(after, before) is True
+    # The caret really did move to the other worker's box.
+    assert "▸" in after[5][0] and "▸" not in after[1][0]
+
+
 # ---------------------------------------------------------------------------
 # 3. the cwd rule
 # ---------------------------------------------------------------------------
@@ -1247,7 +1315,8 @@ class FakeCurses(types.ModuleType):
         # `curses.error` is a real exception class the view catches by name, so
         # it must be a class here too, not an instance or a sentinel.
         self.error = type("error", (Exception,), {})
-        self.A_NORMAL, self.A_REVERSE, self.A_DIM = 0, 1 << 18, 1 << 19
+        self.A_NORMAL, self.A_REVERSE, self.A_BOLD, self.A_DIM = \
+            0, 1 << 18, 1 << 20, 1 << 19
         self.KEY_UP, self.KEY_DOWN, self.KEY_ENTER = 259, 258, 343
         self.curs_set = lambda n: None
         self.timeout = lambda n: None
