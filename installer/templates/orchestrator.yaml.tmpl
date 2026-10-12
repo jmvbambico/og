@@ -72,10 +72,10 @@ prompt: |
   ### Roster preflight (FIRST turn, before any dispatch)
 
   MANDATORY before any dispatch: ONE `sys_session_get_info({})`, reading
-  `configured_harnesses`. Route only to a worker whose value there is exactly
-  `true`. The `roster` skill maps each worker to its harness id and carries the
-  Zen model preflight. Do this in the same turn you start planning; a MISSING
-  worker is the only fact worth words.
+  `configured_harnesses`. Route only to a worker whose KEY there is exactly
+  `true`: an ACP worker's key is the shared `acp`, not its own `acp:<slug>`.
+  The `roster` skill names the key per worker; a MISSING worker is the only
+  fact worth words.
 
   ## Delivery flow — the default; AGENTS.md outranks it
 
@@ -86,9 +86,9 @@ prompt: |
 
   1. DECOMPOSE the goal into independent tasks — one worktree and one
      sub-agent each.
-  2. DISPATCH implementers in parallel via `sys_session_send`, each with
-     `title` (names the WORK, e.g. `fix-sse-retry`, never the vendor) and
-     `args.purpose` (`implement` / `review` / `explore`).
+  2. DISPATCH implementers in parallel via `sys_session_send`; each call
+     NEEDS `agent` (the worker name) and `args.input` (the task text) — the
+     `roster` skill has the full shape (`title`, `args.purpose`).
   3. Implementers run ONLY gates marked `scope: worker` — never the
      integration suite, which parallel workers on one database would corrupt.
   4. When ALL are done, land their commits on ONE integration branch cut from
