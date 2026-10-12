@@ -512,6 +512,72 @@ def test_an_idle_session_with_an_attached_runner_is_still_deletable():
     assert len(opener.deletes) == 1
 
 
+def test_the_current_session_guard_is_inert_when_no_marker_is_set():
+    """What the guard does when it cannot know which session this terminal is
+    inside: nothing at all. Pinned rather than left implicit, because the
+    absence is a property of the guard and not an accident — the alternative
+    (guessing from the cwd) would refuse deletions in any directory that merely
+    hosts another live session. What still stands between the operator and a
+    delete is the typed confirmation."""
+    sid = "1234567890abcdef1234567890abcdef"
+    opener = RecordingOpener(
+        listing=[{"data": [listed(sid, title="ours, unmarked")],
+                  "has_more": False}],
+        details={sid: detail_of(runner_online=False)},
+    )
+
+    rc, out, err = run(["--delete", sid], opener, stdin=ScriptedStdin("DELETE\n"))
+
+    assert rc == 0
+    assert len(opener.deletes) == 1
+    assert "this terminal is inside" not in err
+    assert "ours, unmarked" in out           # and the delete was an informed one
+
+
+def test_a_stale_session_marker_does_not_refuse_the_delete():
+    """A marker naming a session that is no longer this one must not refuse: the
+    guard compares for EQUALITY, so a stale value is inert — the operator is
+    not inside `0000…`, and refusing here would be the guard costing a delete
+    for a string left over in a wrapper's environment."""
+    sid = "1234567890abcdef1234567890abcdef"
+    stale = "0" * 32
+    opener = RecordingOpener(
+        listing=[{"data": [listed(sid, title="a different session")],
+                  "has_more": False}],
+        details={sid: detail_of(runner_online=False)},
+    )
+
+    rc, _out, err = run(["--delete", sid, "--yes"], opener,
+                        stdin=ScriptedStdin(tty=False),
+                        env={"OG_SESSION_ID": stale,
+                             "OMNIGENT_SESSION_ID": stale})
+
+    assert rc == 0
+    assert len(opener.deletes) == 1
+    assert "this terminal is inside" not in err
+
+
+def test_a_blank_session_marker_counts_as_absent():
+    """A wrapper that exports an empty string is not a session. `current_session_id`
+    skips blanks and falls through to the next name, and with both blank the guard
+    stands down — so a blank must not accidentally match anything either."""
+    sid = "1234567890abcdef1234567890abcdef"
+    opener = RecordingOpener(
+        listing=[{"data": [listed(sid, title="blank markers")],
+                  "has_more": False}],
+        details={sid: detail_of(runner_online=False)},
+    )
+
+    rc, _out, err = run(["--delete", sid, "--yes"], opener,
+                        stdin=ScriptedStdin(tty=False),
+                        env={"OG_SESSION_ID": "   ",
+                             "OMNIGENT_SESSION_ID": ""})
+
+    assert rc == 0
+    assert len(opener.deletes) == 1
+    assert "this terminal is inside" not in err
+
+
 # ---------------------------------------------------------------------------
 # archiving is a PATCH
 # ---------------------------------------------------------------------------
@@ -610,6 +676,154 @@ def test_a_full_id_the_listing_does_not_have_still_reaches_the_server():
 
     assert rc == 0
     assert len(opener.deletes) == 1
+
+
+# ---------------------------------------------------------------------------
+# a truncated listing cannot resolve a prefix
+# ---------------------------------------------------------------------------
+
+def truncated_walk(rows):
+    """The pages of a listing the walk cannot finish: page one carries `rows`,
+    page two promises more and hands back no cursor to continue with. That is the
+    exact shape that sets `fetch_listing`'s `truncated` — and it yields `rows`
+    and NOTHING after them, which is the point: the walk stopped, so any further
+    match the operator has in mind is a row nobody here can see."""
+    return [{"data": list(rows), "has_more": True},
+            {"data": [], "has_more": True}]
+
+
+def test_a_truncated_listing_refuses_a_prefix_and_sends_no_delete():
+    """THE regression. `has_more` with no cursor means rows were never fetched,
+    and those rows are indistinguishable from the rows of a smaller server. So
+    "exactly one match" here means only "exactly one match AMONG THE ROWS WE
+    GOT" — and a delete built on that destroys a session the operator never
+    named. Nothing may be sent."""
+    fetched = "abcdef0123456789abcdef0123456789"
+    opener = RecordingOpener(
+        listing=truncated_walk([listed(fetched, title="the one we saw")]),
+        details={fetched: detail_of()},
+    )
+
+    rc, _out, err = run(["--delete", "abcdef01", "--yes"], opener,
+                        stdin=ScriptedStdin(tty=False))
+
+    assert rc == 1
+    assert opener.deletes == []
+    # The walk really did stop early — it asked for a second page — so this is
+    # the truncated branch and not a stale fixture that merely looks like it.
+    assert len(opener.by_method("GET")) == 2
+    assert "TRUNCATED" in err
+    # …and it says what to do instead, because a refusal without a way forward
+    # is just a wall.
+    assert "full session id" in err
+
+
+def test_force_does_not_buy_a_pass_on_a_truncated_listing():
+    """`--force` covers the live runner and the session you are inside — two
+    facts about the session. It is not a statement about the listing being
+    complete, and letting it through here reopens the hole exactly."""
+    sid = "abcdef0123456789abcdef0123456789"
+    opener = RecordingOpener(
+        listing=truncated_walk([listed(sid, title="busy", status="running")]),
+        details={sid: detail_of(status="running", runner_online=True)},
+    )
+
+    rc, _out, _err = run(["--delete", "abcdef01", "--yes", "--force"], opener,
+                         stdin=ScriptedStdin(tty=False))
+
+    assert rc == 1
+    assert opener.deletes == []
+
+
+def test_an_exact_id_still_resolves_on_a_truncated_listing():
+    """Ids are unique, so a full id cannot be shadowed by a row that was never
+    fetched — and that is the escape hatch the refusal points at."""
+    sid = "abcdef0123456789abcdef0123456789"
+    opener = RecordingOpener(
+        listing=truncated_walk([listed(sid, title="on page one")]),
+        details={sid: detail_of()},
+    )
+
+    rc, _out, _err = run(["--delete", sid, "--yes"], opener,
+                         stdin=ScriptedStdin(tty=False))
+
+    assert rc == 0
+    assert opener.deletes[0].full_url == f"{SERVER}/v1/sessions/{sid}"
+    # No caveat is owed here: the session's own listing row came back, and the
+    # id matched itself rather than a prefix.
+
+
+def test_a_full_id_the_truncated_walk_never_fetched_still_reaches_the_server():
+    """The second half of the escape hatch: the id is sent verbatim, so a
+    session beyond the cap is reachable without ever proving anything about the
+    rows behind it."""
+    sid = "1234567890abcdef1234567890abcdef"
+    opener = RecordingOpener(
+        listing=truncated_walk([listed("a" * 32, title="page one")]),
+        details={sid: detail_of()},
+    )
+
+    rc, _out, err = run(["--delete", sid, "--yes"], opener,
+                        stdin=ScriptedStdin(tty=False))
+
+    assert rc == 0
+    assert opener.deletes[0].full_url == f"{SERVER}/v1/sessions/{sid}"
+    assert "truncated" in err
+
+
+def test_a_truncated_listing_still_refuses_a_prefix_it_can_see_is_ambiguous():
+    """Two fetched matches are a fact, not a guess: that refusal must survive,
+    or the truncation branch would hide the sharper one behind a vaguer line."""
+    first = "abc111111111111111111111111111111"
+    second = "abc222222222222222222222222222222"
+    opener = RecordingOpener(
+        listing=truncated_walk([listed(first), listed(second)]),
+        details={first: detail_of(), second: detail_of()},
+    )
+
+    rc, _out, err = run(["--delete", "abc", "--yes"], opener,
+                        stdin=ScriptedStdin(tty=False))
+
+    assert rc == 1
+    assert opener.deletes == []
+    assert "matches 2 sessions" in err
+
+
+def test_archive_on_a_truncated_listing_warns_and_still_patches():
+    """The proportionate half. A PATCH flips one boolean and the server keeps
+    every byte, and `--archive` undoes it by name — so refusing would be
+    protecting a verb whose worst outcome is a re-run. It warns instead, naming
+    the id it acted on and the fact that the walk could not see everything."""
+    sid = "abcdef0123456789abcdef0123456789"
+    opener = RecordingOpener(
+        listing=truncated_walk([listed(sid, title="hide me")]),
+        details={sid: detail_of()},
+    )
+
+    rc, _out, err = run(["--archive", "abcdef01"], opener)
+
+    assert rc == 0
+    assert opener.deletes == []
+    assert len(opener.patches) == 1
+    assert opener.patches[0].full_url == f"{SERVER}/v1/sessions/{sid}"
+    assert "truncated" in err
+    assert sid[:8] in err
+    assert "--unarchive" in err            # and how to put it back
+
+
+def test_unarchive_on_a_truncated_listing_names_archive_as_the_way_back():
+    """The warning's undo flag has to follow the direction that was used."""
+    sid = "abcdef0123456789abcdef0123456789"
+    opener = RecordingOpener(
+        listing=truncated_walk([listed(sid, archived=True, title="back")]),
+        details={sid: detail_of()},
+    )
+
+    rc, _out, err = run(["--unarchive", "abcdef01"], opener)
+
+    assert rc == 0
+    assert len(opener.patches) == 1
+    assert "--archive" in err
 
 
 # ---------------------------------------------------------------------------

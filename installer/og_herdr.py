@@ -969,6 +969,13 @@ class Bridge:
 
         `owner == OWNER_HISTORY` is what marks a record as one of these; see the
         constant for why the marker lives in that field.
+
+        A LOWERED cap governs new spaces only: it does not retroactively close
+        the ones already open. The count above decides what opens next, and
+        nothing here reaches for a live herdr space to enforce the number — a
+        space the operator may be reading a past conversation in is not ours to
+        close behind their back, and lowering a cap in og-install.json is a
+        statement about the future.
         """
         return sum(1 for rec in self._spaces.values()
                    if rec.get("owner") == OWNER_HISTORY)
@@ -993,7 +1000,9 @@ class Bridge:
         * the CAP: `space_cap` 0 (the default) means NO cap — every non-archived
           root gets a space, as the operator asked. When a positive cap is set,
           the listing is newest-first, so the roots that arrive FIRST are the
-          most recent and the ones past the cap are left alone.
+          most recent and the ones past the cap are left alone. The cap governs
+          what opens from here on; it never closes a space already open, however
+          low it is set afterwards (see `_history_space_count`).
         """
         if self.dry_run:
             self._recs[sid] = {

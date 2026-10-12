@@ -36,6 +36,13 @@ API facts, read from a live server's own /openapi.json:
   applies field-wise (`model_fields_set`) — so `{"archived": true}` touches
   nothing else. Archiving is OWNER-gated. `delete_worktree` is a field on the
   same request; this module never sends it.
+* the listing walk is TRUNCATABLE — the page cap ran out, the row cap cut the
+  tail, the envelope promised more with no cursor, the server repeated a cursor
+  — and the rows of a truncated walk are indistinguishable from the rows of a
+  smaller server. So a PREFIX (the eight characters the listing prints) is only
+  ever matched against a walk that finished; otherwise "unique" means only
+  "unique among the rows we fetched". `--delete` REFUSES such a match; `--archive`
+  / `--unarchive` warn and proceed, because a PATCH is undone by one more flag.
 * `GET /v1/sessions?kind=any` excludes ARCHIVED rows unless
   `include_archived=true`, and carries NEITHER `workspace` NOR `runner_online` —
   both are detail-only fields (measured: an idle root's detail row says
@@ -347,7 +354,8 @@ def current_session_id(env: Any = None) -> Optional[str]:
     return None
 
 
-def resolve_session(rows: Iterable[Any], needle: str) -> str:
+def resolve_session(rows: Iterable[Any], needle: str, *, truncated: bool = False,
+                    incomplete_is_fatal: bool = True) -> str:
     """Turn what the human typed into one session id, or raise.
 
     An exact id resolves to itself. A PREFIX resolves when it is unique, which
@@ -359,6 +367,24 @@ def resolve_session(rows: Iterable[Any], needle: str) -> str:
     A long needle that matches nothing is passed through: the id is sent
     verbatim and the server answers 404 if it is wrong, so this stays safe while
     still reaching a session the listing has already dropped.
+
+    `truncated` is `fetch_listing`'s own flag, and it is the one thing that can
+    turn the uniqueness proved here into a lie. This function can only see the
+    rows it was handed; a truncated walk stopped before some of them existed, and
+    nothing in the rows it DID get says which. So a prefix that matches exactly
+    one FETCHED row may just as well match one that was never fetched — which is
+    how a delete reaches the wrong session after the operator typed `delete` at a
+    correct prompt. Uniqueness cannot be established from here: the caps belong
+    to the shared watcher, and a destructive action must not depend on the walk
+    finishing. So with `incomplete_is_fatal` this REFUSES, and the refusal names
+    the missing rows and points at the full id, which skips prefix matching
+    entirely and is sent verbatim.
+
+    `incomplete_is_fatal=False` is for the reversible verbs, which resolve as
+    best they can and say so. It is deliberately NOT wired to `--force`: that
+    flag is scoped to the live-runner and current-session refusals, and letting
+    it wave through a target this function cannot verify would reopen the exact
+    hole the refusal closes.
     """
     matches = []
     for row in rows:
@@ -366,6 +392,14 @@ def resolve_session(rows: Iterable[Any], needle: str) -> str:
         if sid and sid.startswith(needle):
             matches.append(sid)
     if len(matches) == 1:
+        if truncated and incomplete_is_fatal and matches[0] != needle:
+            raise SessionAdminError(
+                f"cannot resolve {needle!r}: the session listing was TRUNCATED, "
+                "so the rows this walk never fetched may hold another session "
+                "with the same prefix — the one match here cannot be shown to "
+                "be the only one. Pass the full session id instead: it skips "
+                "prefix matching and is sent verbatim, so it can only ever name "
+                "the session you meant (--force does not apply here)")
         return matches[0]
     if len(matches) > 1:
         shown = ", ".join(sorted(matches)[:4])
@@ -532,9 +566,10 @@ def main(argv: Optional[Iterable[str]] = None, *,
 
     try:
         if args.delete is not None:
-            return _delete(admin, args, stdin=stdin, env=env, now=now, out=out)
+            return _delete(admin, args, stdin=stdin, env=env, now=now, out=out,
+                           err=err)
         if args.archive is not None or args.unarchive is not None:
-            return _archive(admin, args, out=out)
+            return _archive(admin, args, out=out, err=err)
         _require_delete_only(args)
         return _list(admin, args, env=env, now=now, out=out, err=err)
     except SessionAdminError as exc:
@@ -592,11 +627,26 @@ def _list(admin: SessionAdmin, args: argparse.Namespace, *, env: Any,
     return 0
 
 
-def _archive(admin: SessionAdmin, args: argparse.Namespace, *, out: Any) -> int:
+def _archive(admin: SessionAdmin, args: argparse.Namespace, *, out: Any,
+             err: Any) -> int:
     archived = args.archive is not None
     needle = args.archive if archived else args.unarchive
-    rows, _truncated = admin.listing()
-    session_id = resolve_session(rows, needle)
+    rows, truncated = admin.listing()
+    # `incomplete_is_fatal=False`, deliberately and only here. A PATCH flips one
+    # boolean, the server keeps every byte, and `--archive`/`--unarchive` undo
+    # each other by name — so the cost of resolving against a listing the walk
+    # did not finish is a keystroke, not a conversation. What that does NOT get
+    # to cost is silence, hence the warning below, written BEFORE the PATCH so it
+    # is on screen while the operator can still stop it.
+    session_id = resolve_session(rows, needle, truncated=truncated,
+                                 incomplete_is_fatal=False)
+    if truncated:
+        back = "unarchive" if archived else "archive"
+        err.write(f"og sessions: the listing was truncated, so "
+                  f"{session_id[:8]} is the only session this walk could see "
+                  f"for {needle!r}; another with the same prefix may exist "
+                  f"beyond the rows it fetched. Undo with --{back} "
+                  f"{session_id}\n")
     view = describe(session_id, _row_for(rows, session_id), admin.detail(session_id))
     admin.set_archived(session_id, archived)
     verb = "archived" if archived else "unarchived"
@@ -609,12 +659,24 @@ def _archive(admin: SessionAdmin, args: argparse.Namespace, *, out: Any) -> int:
 
 
 def _delete(admin: SessionAdmin, args: argparse.Namespace, *, stdin: Any,
-            env: Any, now: Optional[float], out: Any) -> int:
-    rows, _truncated = admin.listing()
-    session_id = resolve_session(rows, args.delete)
+            env: Any, now: Optional[float], out: Any, err: Any) -> int:
+    rows, truncated = admin.listing()
+    # The flag is passed, not defaulted away: dropping it is what let a prefix
+    # resolve against rows the walk never fetched, and there is no override for
+    # this one (`--force` is scoped to the runner and current-session refusals).
+    session_id = resolve_session(rows, args.delete, truncated=truncated)
     row = _row_for(rows, session_id)
     detail = admin.detail(session_id)
     view = describe(session_id, row, detail)
+    if truncated and not row:
+        # The session resolved on its own id, so it is still the right one — but
+        # its LISTING row is among the ones never fetched, so the confirmation
+        # below is being drawn from the detail row alone and should not look
+        # like a complete picture of the listing.
+        err.write("og sessions: the listing was truncated, so this session was "
+                  "resolved from the id you gave — its listing row was not "
+                  "among the rows fetched, and the details below are the "
+                  "detail row's\n")
 
     if not args.force:
         current = current_session_id(env)
