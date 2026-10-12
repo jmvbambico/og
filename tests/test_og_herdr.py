@@ -132,6 +132,17 @@ class RecordingClient:
         """
         self._live.pop(workspace_id, None)
 
+    def operator_renamed(self, workspace_id, label):
+        """The operator renames a space by hand, in their own herdr window.
+
+        No call is recorded — the bridge did not do it — but the new label is
+        what `workspace.list` reports from here on, which is exactly what the
+        bridge compares against when Omnigent's session title changes. Like
+        `operator_closed`, this is a first-class way to set up the operator's
+        own action rather than a test reaching into `_live` directly.
+        """
+        self._live[workspace_id]["label"] = label
+
     def report_agent(self, pane_id, source, agent, state, message=None,
                      seq=None, agent_session_id=None):
         self._call("report_agent", pane_id, source, agent=agent, state=state)
@@ -686,13 +697,19 @@ def test_changed_sequence_reports_state_and_title(seams):
         Ev("changed", "s1", root_session("New", state="working"),
            previous=root_session("Old", state="idle"))])
 
-    assert _names(client) == ["report_agent", "report_metadata"]
+    # The title change also renames the SPACE, not just the pane's metadata — a
+    # space opened before the conversation had a name would otherwise keep its
+    # `sid[:8]` label for good (see `_rename_own_space`). The label to compare
+    # against comes from the per-pass listing, hence the one `workspace_list`.
+    assert _names(client) == ["report_agent", "report_metadata",
+                              "workspace_list", "workspace_rename"]
     assert _call(client, "report_agent")[2]["state"] == "working"
     # The STORED label, not one re-derived from this event: a `changed` carries
     # the listing row, which has no `harness` to derive from, and reporting a
     # different agent string would make herdr show two markers for one pane.
     assert _call(client, "report_agent")[2]["agent"] == "Claude Code"
     assert _call(client, "report_metadata")[2]["title"] == "New"
+    assert _call(client, "workspace_rename")[1] == ("ws1", "New")
     assert "update s1" in lines[0]
 
 
@@ -2338,6 +2355,147 @@ def test_the_workspace_rename_frame_matches_herdrs_schema(seams):
     # The negative control: a param herdr does not have must be caught by the
     # comparison above, or every assertion here could pass for a typo'd key.
     assert set(allowed["properties"]) != {"workspace_id", "name"}
+
+
+# ---------------------------------------------------------------------------
+# the space label follows the title when it ARRIVES, not only at adoption
+#
+# A fresh `og chat` conversation has no title until its first message, so a
+# space opened for it is labelled `sid[:8]` — the "hash id" the operator saw —
+# and, before this, kept that string for the life of the session. The title
+# arrives on the `changed` event after that first message, and THAT is where the
+# space has to be renamed. Not a race, and not the adoption path: the ordinary
+# path for every new session.
+# ---------------------------------------------------------------------------
+
+def test_a_titleless_space_is_renamed_when_the_session_title_arrives(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    # No title yet: the space is opened as the first eight characters of the id.
+    bridge.reconcile([Ev("added", "abcd1234efgh", root_session(
+        None, state="idle"))])
+    assert _call(client, "workspace_create")[1] == ("abcd1234",)
+    client.calls.clear()
+
+    # The first message gives the conversation a name; the space follows it.
+    bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+
+    assert _call(client, "workspace_rename")[1] == ("ws1", "First question")
+
+
+def test_a_second_title_change_renames_the_space_again(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "abcd1234efgh", root_session(
+        None, state="idle"))])
+    bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "A better name", state="working"), previous=root_session(
+            "First question", state="working"))])
+
+    assert [c[1] for c in client.calls if c[0] == "workspace_rename"] == \
+        [("ws1", "A better name")]
+
+
+def test_a_batch_of_title_changes_lists_the_workspaces_once(seams):
+    # The listing is a per-PASS cost, not a per-event one: `workspace.list` is
+    # fetched once and reused for every title change in the batch, which is the
+    # constraint `_workspace_index` exists to hold. Two title changes in one
+    # pass must not mean two listings.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "aaaa1111bb", root_session(None, state="idle")),
+        Ev("added", "cccc2222dd", root_session(None, state="idle")),
+    ])
+    client.calls.clear()
+
+    bridge.reconcile([
+        Ev("changed", "aaaa1111bb", root_session("First", state="working"),
+           previous=root_session(None, state="idle")),
+        Ev("changed", "cccc2222dd", root_session("Second", state="working"),
+           previous=root_session(None, state="idle")),
+    ])
+
+    assert _names(client).count("workspace_list") == 1, _names(client)
+    assert [c[1] for c in client.calls if c[0] == "workspace_rename"] == \
+        [("ws1", "First"), ("ws2", "Second")]
+
+
+def test_a_workers_title_change_never_renames_the_space_it_sits_in(seams):
+    # A sub-agent gets a TAB in its parent's space, and its record names the
+    # PARENT's workspace. Renaming that to the worker's title would rename the
+    # operator's whole conversation to `fix-space-rename` every time a worker
+    # spawned. The positive control — the ROOT's own title DOES rename the
+    # space — is in the same test, because the negative alone is satisfied by a
+    # module that renames nothing at all.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("Old name"))])
+    bridge.reconcile([Ev("added", "w1", sub_session("root", "coder_zen:fix"))])
+
+    # The ROOT's title arriving renames its own space...
+    bridge.reconcile([Ev("changed", "root", root_session("New name"),
+                         previous=root_session("Old name"))])
+    assert _call(client, "workspace_rename")[1] == ("ws1", "New name")
+
+    # ...but the WORKER's never touches that space.
+    client.calls.clear()
+    bridge.reconcile([Ev("changed", "w1", sub_session("root", "coder_zen:v2"),
+                         previous=sub_session("root", "coder_zen:fix"))])
+    assert "workspace_rename" not in _names(client), _names(client)
+
+
+def test_a_failed_space_rename_leaves_the_pass_intact_and_the_metadata_reported(
+        seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session(None, state="idle"))])
+    client.calls.clear()
+    client.fail = {"workspace_rename": FakeHerdrError(
+        "invalid_label", "label must not be empty")}
+
+    lines = bridge.reconcile([
+        Ev("changed", "s1", root_session("First question", state="working"),
+           previous=root_session(None, state="idle")),
+        Ev("added", "s2", root_session("Second", state="idle")),
+    ])
+
+    # The metadata report is made BEFORE the rename, so a rename that fails
+    # cannot lose it.
+    assert _call(client, "report_metadata")[2]["title"] == "First question"
+    # The failure is recorded as an ordinary error line, and the batch carries
+    # on — one bad space rename does not abort the rest of the pass.
+    assert any("error s1" in ln and "invalid_label" in ln for ln in lines), lines
+    assert any("add s2" in ln for ln in lines), lines
+
+
+def test_a_hand_renamed_space_is_renamed_back_to_the_session_title(seams):
+    # The judgement call, pinned. The operator renames a space BY HAND; Omnigent
+    # then names the conversation, and the TITLE wins — the same rule the
+    # adoption path already applies to a manual label. The space is a projection
+    # of the conversation and the conversation's name is authoritative, and
+    # across a restart the bridge cannot tell a hand-set label from its own
+    # stale one, so honouring it would make the space's name depend on the order
+    # events happened to arrive in.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "abcd1234ef", root_session(
+        None, state="idle"))])
+    client.operator_renamed("ws1", "My Own Name")
+    client.calls.clear()
+
+    bridge.reconcile([Ev("changed", "abcd1234ef", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+
+    assert _call(client, "workspace_rename")[1] == ("ws1", "First question")
 
 
 # --- 6. pending records are pruned by EXISTENCE, not by a clock ----------------

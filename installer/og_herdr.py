@@ -1217,19 +1217,63 @@ class Bridge:
         self._spaces[sid] = record
         return record
 
+    def _rename_own_space(self, sid: str, rec: dict, title: str) -> None:
+        """Rename the space a session is NAMED FOR when its title arrives.
+
+        The gap `_rename_space`'s old docstring denied. A space this bridge
+        CREATES is labelled `title or sid[:8]` (`_add_space`), and Omnigent
+        titles a conversation only once it has a first message — so a space
+        opened for a brand-new session is created with the first eight
+        characters of the session id, and, before this, kept that string for the
+        life of the session. The title arrives on the `changed` event that
+        follows, and this brings the space's label up to it then. It is not a
+        race and not an adoption-only concern: it is the ordinary path for every
+        new session.
+
+        Only a space this session is the SUBJECT of is renamed — never the space
+        a worker's tab lives in. The test is the same one `_removed` uses for
+        whose space a record names: `spaces[sid]` has to point at this record's
+        workspace. A sub-agent's record names its PARENT's workspace (`_add_tab`)
+        and has no `spaces` entry of its own, so without that test a worker's
+        title arriving would rename the operator's whole conversation to
+        `fix-space-rename`.
+
+        The label to compare against comes from the per-PASS workspace listing
+        (`_workspace_index`, cached for the whole pass), never a fresh listing
+        per event. When that listing could not be read there is no label to
+        compare against, and the rename is attempted anyway rather than skipped:
+        the title does not arrive twice (`title_changed` is a one-shot on the
+        event that carries it), so a skipped rename here is exactly the `sid[:8]`
+        label surviving — the bug this exists to fix.
+        """
+        ws_id = rec.get("workspace_id")
+        own = self._spaces.get(sid)
+        if not own or own.get("workspace_id") != ws_id:
+            return
+        index = self._workspace_index()
+        info = index.get(ws_id) if index is not None else None
+        self._rename_space(ws_id, title, info or {})
+
     def _rename_space(self, ws_id: str, title, info: dict) -> None:
-        """Rename a taken-over space to the session title, when it differs.
+        """Rename a space to the session title, when the label differs.
 
-        The launcher's whole reason for labelling a space from the DIRECTORY is
-        that no session existed when it made one — there was no title to use.
-        Once the conversation has a name, the space is renamed to it, and that
-        rename IS the handoff. Skipped when the label already matches (the
-        common case for a bridge-created space, so a `workspace.rename` on
-        every adoption would be noise) and when there is no title yet.
+        The launcher labels a space from the DIRECTORY because no session
+        existed when it made one — there was no title to use — and the rename IS
+        that handoff. A space this bridge CREATES is labelled `title or sid[:8]`
+        (`_add_space`) for the same reason: a conversation is titled only once
+        it has a message, so a space opened for a brand-new session starts as
+        the id prefix and wants the identical rename the moment Omnigent names
+        the conversation. So this is called for a taken-over space AND for one
+        this process opened — see `_rename_own_space`, which is how.
 
-        Only ever called for a space being taken over, never for one this
-        process created — a bridge-created space is labelled with the title at
-        creation and never needs it back.
+        Skipped when the label already matches (so a re-delivered title is not a
+        `workspace.rename` of pure noise) and when there is no title yet. A
+        label that DIFFERS is replaced, including one the operator set by hand:
+        the space is a projection of the conversation and the conversation's
+        name is authoritative, which is already the rule on the adoption path —
+        and across a restart the bridge cannot tell a hand-set label from its
+        own stale one, so honouring it would make the space's name depend on the
+        order events happened to arrive in.
         """
         if not title or info.get("label") == title:
             return
@@ -1727,6 +1771,12 @@ class Bridge:
             if title:
                 self.client.report_metadata(rec["pane_id"], self.source,
                                            title=title)
+                # ...and the SPACE's label follows the title too, not just the
+                # pane's metadata: a space opened before the conversation had a
+                # name is labelled with `sid[:8]` and was left that way for the
+                # life of the session (see `_rename_own_space`). Reported AFTER
+                # the metadata above, so a rename that fails cannot lose it.
+                self._rename_own_space(sid, rec, title)
         rec["title"] = title
         return [f"update {sid} → state={state}" + (" (title)" if title_changed
                                                    else "")]
