@@ -43,11 +43,19 @@ class RecordingClient:
     def __init__(self, fail=None, create_results=None, spaces=None):
         self.calls = []
         self.fail = fail or {}
+        # Failures that do NOT fire once: a herdr that is still broken when the
+        # bridge retries, which is the case a one-shot `fail` cannot express.
+        self.fail_always = {}
         # Queued create returns, so a test can hand back a malformed reply
         # (missing ids) that the default well-formed shape never produces.
         self.create_results = list(create_results) if create_results else []
         # What workspace_list reports, for the operator's own workspaces.
         self.spaces = list(spaces) if spaces else []
+        # Workspaces THIS fake created and has not closed, which herdr would
+        # also list. Without this the fake answers "no workspaces" about a space
+        # it just made, and the bridge's re-validation would — correctly — read
+        # that as "your space is gone" and re-project into a second one.
+        self._live: dict[str, dict] = {}
         self._seq = 0
 
     def _call(self, name, *args, **kwargs):
@@ -56,6 +64,8 @@ class RecordingClient:
         # same method succeeds — which is exactly what "does not abort the loop"
         # is meant to demonstrate.
         exc = self.fail.pop(name, None)
+        if exc is None:
+            exc = self.fail_always.get(name)
         if exc is not None:
             raise exc
 
@@ -70,6 +80,8 @@ class RecordingClient:
         if self.create_results:
             return self.create_results.pop(0)
         n = self._next()
+        self._live[f"ws{n}"] = {"workspace_id": f"ws{n}", "label": label,
+                                "pane_count": 1, "tab_count": 1}
         return {"type": "workspace_created",
                 "workspace": {"workspace_id": f"ws{n}", "label": label},
                 "tab": {"tab_id": f"tab{n}", "workspace_id": f"ws{n}"},
@@ -77,6 +89,7 @@ class RecordingClient:
 
     def workspace_close(self, workspace_id):
         self._call("workspace_close", workspace_id)
+        self._live.pop(workspace_id, None)
 
     def tab_create(self, workspace_id, cwd, label, focus=False):
         self._call("tab_create", workspace_id, cwd=cwd, label=label)
@@ -98,7 +111,17 @@ class RecordingClient:
 
     def workspace_list(self):
         self._call("workspace_list")
-        return self.spaces
+        return list(self.spaces) + list(self._live.values())
+
+    def operator_closed(self, workspace_id):
+        """The operator closes a space by hand, in their own herdr window.
+
+        The space leaves the listing and NO call is recorded — the bridge did
+        not do it and must not be credited with it. This is the event the whole
+        re-validation rule exists for, so it is a first-class way to set one up
+        rather than something a test reaches into `_live` to do.
+        """
+        self._live.pop(workspace_id, None)
 
     def report_agent(self, pane_id, source, agent, state, message=None,
                      seq=None, agent_session_id=None):
@@ -2214,3 +2237,313 @@ def test_an_adopted_record_without_a_pane_id_becomes_a_tab_in_that_space(seams):
     # pane this call created instead of falling back again.
     assert bridge._spaces["s1"]["pane_id"] == "pane1"
     assert bridge._spaces["s1"]["tab_id"] == "tab1"
+
+
+# ---------------------------------------------------------------------------
+# a recorded workspace is a CACHE, and herdr's listing is the only truth
+#
+# THE BUG, from the live bridge log during a real fan-out of three workers:
+#
+#     error ab222b88…: invalid_metadata_request: missing metadata field to set or clear
+#     error ab222b88…: pane_not_found: pane wV:p1 not found      (x9, the ROOT)
+#     error f193205d…: workspace_not_found: workspace wV not found  (worker 1)
+#     error 5b011e8e…: workspace_not_found: workspace wV not found  (worker 2)
+#     error 3f3a1c0a…: workspace_not_found: workspace wV not found  (worker 3)
+#
+# and `workspace_list` answering with exactly one space, `wT`. wV had been
+# recorded once, at `workspace.create`, and never checked again: a ROOT's record
+# is validated when it adopts a space (`_existing_space`) but a sub-agent's is a
+# lookup in `_recs`, so every worker was handed an id herdr had never heard of —
+# and the root's own pane reported against the same dead space on every poll,
+# forever, with nothing repairing the record and nothing said to the operator.
+#
+# `og_herdr_launch` had this rule already and states it once, in `space_status`;
+# the tests below are the bridge's half of it.
+# ---------------------------------------------------------------------------
+
+def test_a_worker_whose_roots_space_is_gone_lands_in_a_fresh_space(seams):
+    # THE FIX, on the failing case. The root's space was closed by the operator
+    # (or, just as easily, by `og start <mux>` case (C) closing the pane that
+    # happened to be the last one in it — closing a workspace's last pane removes
+    # the workspace, measured). The next worker must NOT be created in `wV`.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.operator_closed("ws1")
+    client.calls.clear()
+
+    lines = bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:fix"))])
+
+    assert _names(client).count("workspace_create") == 1, (
+        "the dead root's space was trusted instead of re-validated")
+    assert _names(client).count("tab_create") == 1
+    assert _call(client, "tab_create")[1] == ("ws2",), (
+        "the worker did not land in the re-projected space")
+    assert ("ws1",) not in [c[1] for c in client.calls if c[0] == "tab_create"]
+    assert any("ws1" in ln and "no workspace ws1" in ln for ln in lines), lines
+    # The whole crew is together again: the worker is a tab of the root's CURRENT
+    # space, which is the layout this bridge exists to produce.
+    assert bridge._recs["w1"]["workspace_id"] == \
+        bridge._recs["root"]["workspace_id"] == "ws2"
+    # The dead id is nowhere in memory or in the file, so the next restart does
+    # not make the same decision against it.
+    assert "ws1" not in json.dumps(bridge._spaces)
+    assert "ws1" not in Path(bridge.state_path).read_text()
+
+
+def test_a_space_created_in_a_pass_is_visible_to_the_rest_of_that_pass(seams):
+    # The re-validation reads a per-PASS snapshot, and a space created during
+    # the pass is not in it — the next worker's `_space_of` would read the
+    # fresh space as gone and re-project the root AGAIN. That is the
+    # duplicate-space bug with one more step to reach it, and it is reachable in
+    # ordinary use: any pass that opens a space and then files a worker in it.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+
+    bridge.reconcile([
+        Ev("added", "root", root_session("New Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix")),
+        Ev("added", "w2", sub_session("root", "coder_cmdcode:stale-comments")),
+    ])
+
+    assert _names(client).count("workspace_create") == 1
+    assert [c[1] for c in client.calls if c[0] == "tab_create"] == \
+        [("ws1",), ("ws1",)]
+
+
+def test_a_worker_in_a_live_roots_space_opens_no_second_space(seams):
+    # The control for the test above, and the direction that must not regress:
+    # when the listing DOES carry the recorded id, that id is used and nothing is
+    # created. `workspace.list` really is asked every time — that is the price
+    # of the guard, and a bridge that never asked would satisfy this half for
+    # the wrong reason.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:fix"))])
+
+    assert "workspace_list" in _names(client)
+    assert _names(client).count("workspace_create") == 0
+    assert _call(client, "tab_create")[1] == ("ws1",)
+
+
+def test_an_unreadable_workspace_list_does_not_split_a_conversation_in_two(
+        seams):
+    # "Cannot tell" is not "absent", and here it has a price: a worker whose
+    # parent's space cannot be confirmed would be given a space OF ITS OWN, so
+    # one hiccup in the listing would scatter the operator's conversation across
+    # two spaces — for a space that is sitting there perfectly well.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+    client.fail = {"workspace_list": FakeHerdrError("boom", "cannot list")}
+
+    lines = bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:fix"))])
+
+    # An ERROR, not an empty answer: it is in the pass's lines…
+    assert any("cannot list workspaces" in ln for ln in lines), lines
+    # …the recorded id is used unchanged, and nothing is adopted over it.
+    assert _names(client).count("workspace_create") == 0
+    assert _call(client, "tab_create")[1] == ("ws1",)
+    assert bridge._recs["root"]["workspace_id"] == "ws1"
+    # The record is also untouched on disk, so the NEXT pass tries again.
+    assert json.loads(Path(bridge.state_path).read_text())["spaces"]["root"] \
+        ["workspace_id"] == "ws1"
+
+
+def test_a_workspace_not_found_repairs_the_record_instead_of_repeating(seams):
+    # The guard consults the listing, but a record can still go stale BETWEEN two
+    # events — herdr re-mints ids on restart, the operator closes one tab out of
+    # a space that stays. Then the error arrives from herdr rather than from the
+    # listing, and before this fix it was logged and nothing else: the record
+    # survived, so the next poll repeated it forever.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+    client.fail = {"tab_create": FakeHerdrError(
+        "workspace_not_found", "workspace ws1 not found")}
+
+    first = bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:fix"))])
+
+    assert sum("workspace_not_found" in ln for ln in first) == 1, first
+    # Repaired ONCE: the retry went through the ordinary create path, and the
+    # worker is now tracked in a space herdr has.
+    assert any("could not be projected" in ln and "w1" in ln for ln in first), \
+        first
+    assert "w1" in bridge._recs
+    client.calls.clear()
+
+    # And the session is projected rather than re-failing: a second poll for the
+    # same worker finds a ready record and does nothing, and no workspace id is
+    # ever used that herdr has not confirmed this pass.
+    second = bridge.reconcile([Ev("added", "w1", sub_session(
+        "root", "coder_zen:fix"))])
+    assert second == []
+    assert client.calls == []
+
+
+def test_a_pane_not_found_on_an_update_reprojects_once_rather_than_forever(
+        seams):
+    # The other half of the log: NINE identical `pane_not_found` lines for one
+    # root, one per poll, with no repair and nothing said to the operator. The
+    # root's space is still listed here — only its tab is gone — so the repair is
+    # a new TAB in the same space, never a second space for one conversation.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.calls.clear()
+    client.fail = {"report_agent": FakeHerdrError(
+        "pane_not_found", "pane ws1:p1 not found")}
+
+    first = bridge.reconcile([Ev("changed", "root", root_session(
+        "New Alignment", state="working"), previous=root_session(
+            "New Alignment", state="idle"))])
+
+    assert sum("pane_not_found" in ln for ln in first) == 1, first
+    assert _names(client).count("workspace_create") == 0, (
+        "one conversation must never get two spaces, however stale the pane is")
+    assert _names(client).count("tab_create") == 1
+    assert bridge._recs["root"]["pane_id"] != "pane1"
+    # Still owns the space: it is the root's own space and its removal must
+    # close it, not just the tab that was re-made.
+    assert bridge._recs["root"]["owns_space"] is True
+
+    # The next poll reports against the new pane and says nothing about the old.
+    client.calls.clear()
+    client.fail = {}
+    again = bridge.reconcile([Ev("changed", "root", root_session(
+        "New Alignment", state="idle"), previous=root_session(
+            "New Alignment", state="working"))])
+    assert again == ["update root → state=idle"]
+    assert _call(client, "report_agent")[1][0] == bridge._recs["root"]["pane_id"]
+
+
+def test_a_repair_that_fails_again_is_said_once_and_stops(seams):
+    # Bounded on purpose: the re-projection goes through the ordinary create
+    # path, so a herdr that is still broken fails it too. That must be ONE more
+    # line and a dropped record — never a retry loop inside one event, and never
+    # a record left behind still naming a pane herdr does not have.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
+    client.operator_closed("ws1")
+    client.calls.clear()
+    # The pane is gone AND the space is gone, so the repair has to create one.
+    client.fail_always = {
+        "report_agent": FakeHerdrError("pane_not_found", "pane ws1:p1 not found"),
+        "workspace_create": FakeHerdrError("connect", "herdr is unreachable"),
+    }
+
+    lines = bridge.reconcile([Ev("changed", "root", root_session(
+        "New Alignment", state="working"), previous=root_session(
+            "New Alignment", state="idle"))])
+
+    assert sum("could not re-project" in ln for ln in lines) == 1, lines
+    # Exactly one attempt: the failing call is made once inside the repair and
+    # once in the update it belongs to — never in a loop.
+    assert _names(client).count("workspace_create") == 1, lines
+    assert "root" not in bridge._recs
+    # ...and with no record there is nothing left to report against: the session
+    # is ignored from here rather than failing on every poll.
+    client.calls.clear()
+    client.fail_always = {}
+    assert bridge.reconcile([Ev("changed", "root", root_session(
+        "New Alignment", state="idle"))]) == []
+    assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# pane metadata: a report with nothing to set is refused by herdr
+#
+#     invalid_metadata_request: missing metadata field to set or clear
+#
+# `pane_id` and `source` are the only params herdr REQUIRES, so the bare frame
+# og sent for a session with no title yet is schema-valid and still refused.
+# ---------------------------------------------------------------------------
+
+def test_no_metadata_frame_is_sent_for_a_session_with_no_title(seams):
+    # A fresh `og chat` conversation has `title: None` until its first message,
+    # and `_drop_none` then strips the only field that was going to be set.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        None, state="idle"))])
+
+    assert "report_metadata" not in _names(client), (
+        "a metadata report with no title to set is refused by herdr")
+    # Setup still COMPLETES, so a redelivered `added` does not send it later
+    # either, and the pane is not left half-configured.
+    assert bridge._recs["s1"]["ready"] is True and bridge._recs["s1"]["step"] == 3
+    assert any("add s1" in ln for ln in lines), lines
+
+
+def test_a_title_arriving_later_is_still_reported_as_metadata(seams):
+    # The reason the call is skipped rather than sent empty: the title is not
+    # lost, it is reported by the next event that carries one.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session(None, state="idle"))])
+
+    lines = bridge.reconcile([Ev("changed", "s1", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+
+    assert _call(client, "report_metadata")[2]["title"] == "First question"
+    assert lines == ["update s1 → state=working (title)"]
+
+
+def test_a_title_going_away_does_not_send_an_empty_report(seams):
+    # The other direction, which the live log also shows: `title_changed` is
+    # true for None -> "x" and for "x" -> None alike, and only the second one
+    # has nothing to say.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("changed", "s1", root_session(
+        None, state="working"), previous=root_session("T", state="idle"))])
+
+    assert "report_metadata" not in _names(client)
+
+
+def test_a_failed_repair_leaves_no_stale_record_behind(seams):
+    # The ORDER inside a repair, which is the contract and not a detail: forget
+    # the stale record BEFORE anything that can fail. Forgetting it afterwards
+    # leaves the dead record in place whenever the re-projection itself fails —
+    # and then the next poll reports against the same pane herdr has never
+    # heard of, and says so again, which is the whole failure being repaired.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([
+        Ev("added", "root", root_session("New Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix"))])
+    client.operator_closed("ws1")
+    client.calls.clear()
+    # A worker whose pane is gone, whose ROOT's space is gone, and a herdr that
+    # keeps refusing the reports — so both re-projections die part-way.
+    client.fail_always = {"report_agent": FakeHerdrError(
+        "pane_not_found", "pane pane2 not found")}
+
+    lines = bridge.reconcile([Ev("changed", "w1", sub_session(
+        "root", "coder_zen:fix"), previous={})])
+
+    assert sum("could not re-project" in ln for ln in lines) == 1, lines
+    assert "w1" not in bridge._recs, \
+        "the stale worker record survived a repair that failed"
+    # The root did move — its own re-projection got as far as creating the space,
+    # and its record says so rather than naming the closed one.
+    assert bridge._recs["root"]["workspace_id"] != "ws1"
+    client.fail_always = {}
+    client.calls.clear()
+    assert bridge.reconcile([Ev("changed", "w1", sub_session(
+        "root", "coder_zen:fix"), previous={})]) == []
+    assert client.calls == [], "the same failure was repeated on the next poll"
