@@ -128,13 +128,21 @@ DEFAULT_WIDTH = 80
 # words for their key glyphs and drops the doubled spacing; FOOTER_KEYS is the
 # floor, naming every key with no labels at all. Only LABELS ever degrade, never
 # a key: a key with no label is still findable by pressing it, a key clipped off
-# the end is gone. Every glyph here but the pre-existing ↑/↓ is Narrow (checked
-# with east_asian_width — ⏎ U+23CE and ␣ U+2423 are not the Wide traps they
-# could be); a Wide one would spill past the pane even after `_footer` said it
-# fit, so a future label must be measured before it is trusted.
-FOOTER = "q quit  r refresh  ↑/↓ move  enter focus  space expand  a access"
-FOOTER_COMPACT = "q quit r refresh ↑↓ ⏎ focus ␣ expand a access"
-FOOTER_KEYS = "q r ↑↓ ⏎ ␣ a"
+# the end is gone.
+#
+# NO LOCALE-DEPENDENT GLYPH HERE. The move keys were once ↑/↓ (U+2191/U+2193),
+# which are East Asian AMBIGUOUS: one column in a Latin locale, TWO in a CJK one.
+# `_display_width` charged them one, so the full form measured exactly 64 and was
+# chosen for a 64-column pane — but a CJK terminal painted 66 and `_clip` cut the
+# trailing keys off. That is the very bug the three forms exist to end, merely
+# relocated to another locale. They are ASCII now (`^/v`), so every footer glyph
+# measures one column under BOTH rules and the question cannot arise. ⏎ (U+23CE)
+# and ␣ (U+2423) are Narrow — checked, not assumed — and `_display_width` charges
+# Ambiguous two as a backstop for anything a future edit adds. See
+# `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
+FOOTER = "q quit  r refresh  ^/v move  enter focus  space expand  a access"
+FOOTER_COMPACT = "q quit r refresh ^v ⏎ focus ␣ expand a access"
+FOOTER_KEYS = "q r ^v ⏎ ␣ a"
 
 # The caveats shown under the address, mirroring bin/og's `show_access`: the
 # operator must know whether the address is scannable only on the same wifi or
@@ -644,6 +652,15 @@ def _clip(text: str, width: int) -> str:
     An ellipsis rather than a hard cut because a silently truncated row reads as
     the whole name, and the operator goes looking for a session that does not
     exist under the name they were shown.
+
+    KNOWN INCONSISTENCY: this cuts by `len`, i.e. code point, while
+    `_display_width` counts DISPLAY columns (a Wide/Ambiguous glyph as two). The
+    two agree on everything the footer — the only line `_display_width` guards —
+    now contains, since it is ASCII-plus-Narrow. They disagree on a wide glyph,
+    which a session snippet could still carry: such a row could be clipped a
+    column short or long. Reconciling them means width-aware clipping throughout
+    the renderer (grapheme clusters included), a larger change than it looks and
+    deliberately not made here.
     """
     if width <= 0:
         return ""
@@ -680,19 +697,26 @@ def _visible_width(line: str) -> int:
 
 
 def _display_width(text: str) -> int:
-    """The display columns of plain `text`: a Wide glyph costs two, the rest one.
+    """The display columns of plain `text`: a Wide, Fullwidth, or AMBIGUOUS glyph
+    costs two, the rest one.
 
     `_clip` and `_visible_width` count with `len`, which is right for every
-    character in this view EXCEPT a Wide/Fullwidth one: counting that as a single
-    column judges a string narrower than the terminal paints it, so it is passed
-    as fitting and then spills past the pane — the CJK-locale form of the very
-    bug the footer keeps re-learning. Only the footer is measured here, and it
-    names its glyphs Narrow for exactly this reason.
+    character in this view EXCEPT a wide one: counting that as a single column
+    judges a string narrower than the terminal paints it, so it is passed as
+    fitting and then spills past the pane — the CJK-locale form of the very bug
+    the footer keeps re-learning.
+
+    AMBIGUOUS (East Asian "A") is charged two as well, deliberately. Its width is
+    locale-dependent — one column in a Latin locale, two in a CJK one — so the
+    only rule correct in BOTH is the pessimistic one; charging it one is how the
+    footer's old ↑/↓ cost 64 measured but 66 painted. The footer now names no
+    Ambiguous glyph, so this backstop does not move any current threshold: it only
+    bites a future edit that adds one. See the footer comment.
 
     No ANSI stripping: the footer is plain text. A line that may carry escapes is
     measured through `_visible_width` instead.
     """
-    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 1
                for ch in text)
 
 
@@ -1443,9 +1467,15 @@ def focus_in_herdr(session_id: str,
     env = os.environ if environ is None else environ
     try:
         from og_herdr_launch import is_inside
+        # The probe is INSIDE the guard, not after it. This function promises
+        # "NEVER raises", and `is_inside` reads the environment for a live pane an
+        # operator leaves open all day: an unexpected error in the probe must
+        # become a notice like every other failure, not a traceback that kills the
+        # TUI loop on a keypress.
+        inside = is_inside(env)
     except Exception:
         return NOTICE_FOCUS_UNAVAILABLE
-    if not is_inside(env):
+    if not inside:
         return NOTICE_FOCUS_OUTSIDE_HERDR
     try:
         from og_herdr_client import HerdrClient
