@@ -1217,7 +1217,7 @@ class Bridge:
         self._spaces[sid] = record
         return record
 
-    def _rename_own_space(self, sid: str, rec: dict, title: str) -> None:
+    def _rename_own_space(self, sid: str, rec: dict, title: str) -> list:
         """Rename the space a session is NAMED FOR when its title arrives.
 
         The gap `_rename_space`'s old docstring denied. A space this bridge
@@ -1245,14 +1245,40 @@ class Bridge:
         the title does not arrive twice (`title_changed` is a one-shot on the
         event that carries it), so a skipped rename here is exactly the `sid[:8]`
         label surviving — the bug this exists to fix.
+
+        Returns the lines to ADD to the event's own — empty unless the rename
+        failed, and the failure is RECORDED here rather than raised, as
+        `_reject_partial_create` does for its cleanup. The rename is an ADDITION
+        to `_changed`'s work: `report_agent` and `report_metadata` ARE that work
+        and are allowed to fail the event, but a cosmetic space label is not, so
+        an addition failing must not discard the bookkeeping of the work that
+        already succeeded. That bookkeeping is `rec["title"]` — persisted and
+        read back across a restart, so leaving it stale makes the record
+        disagree with the session it names, past the life of the process — and
+        the event's own `update …` line, this bridge's audit trail.
+
+        ONE attempt, never a retry, and that is by construction rather than
+        oversight: `title_changed` is derived from the watcher's `previous`, not
+        from `rec`, so once the watcher has seen the new title the event does
+        not recur and a failed rename is not re-attempted — the space keeps its
+        `sid[:8]` label for the life of the session. Repeating a failing call on
+        every poll is the shape the dead-workspace repair already had to stop
+        (see `_reproject`), and a label is not worth re-earning that lesson for.
+        Absorbing it hides nothing about a dead space either: a workspace that
+        is gone took its panes with it, so `report_agent` above — which runs
+        first and DOES propagate — is what reports it and drives the repair.
         """
         ws_id = rec.get("workspace_id")
         own = self._spaces.get(sid)
         if not own or own.get("workspace_id") != ws_id:
-            return
+            return []
         index = self._workspace_index()
         info = index.get(ws_id) if index is not None else None
-        self._rename_space(ws_id, title, info or {})
+        try:
+            self._rename_space(ws_id, title, info or {})
+        except _error_cls() as exc:
+            return [_error_line(sid, exc)]
+        return []
 
     def _rename_space(self, ws_id: str, title, info: dict) -> None:
         """Rename a space to the session title, when the label differs.
@@ -1762,6 +1788,7 @@ class Bridge:
         # herdr show two markers for one pane.
         self.client.report_agent(rec["pane_id"], self.source,
                                  agent=rec["agent"], state=state)
+        renamed: list[str] = []
         if title_changed:
             # A title that is None is a title that cannot be reported: see
             # `_setup_pane` for the measured refusal herdr answers with a frame
@@ -1774,12 +1801,13 @@ class Bridge:
                 # ...and the SPACE's label follows the title too, not just the
                 # pane's metadata: a space opened before the conversation had a
                 # name is labelled with `sid[:8]` and was left that way for the
-                # life of the session (see `_rename_own_space`). Reported AFTER
-                # the metadata above, so a rename that fails cannot lose it.
-                self._rename_own_space(sid, rec, title)
+                # life of the session. The rename is absorbed rather than
+                # raised (see `_rename_own_space`), so neither the metadata call
+                # above nor the bookkeeping below depends on it succeeding.
+                renamed = self._rename_own_space(sid, rec, title)
         rec["title"] = title
         return [f"update {sid} → state={state}" + (" (title)" if title_changed
-                                                   else "")]
+                                                   else "")] + renamed
 
     def _drop_children(self, sid: str, lines: list[str]) -> None:
         """Forget the records of sessions whose pane just went with the space.
