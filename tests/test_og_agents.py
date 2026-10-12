@@ -250,9 +250,11 @@ def test_renderer_flattens_a_nested_worker_and_shows_an_expanded_snippet():
     # row (`│…│`), never a loose line.
     report = [line for line in lines if "a child report" in line]
     assert report and report[0].startswith("│") and report[0].endswith("│")
-    # No tree spine columns survive: every box starts at column 0.
-    tops = [line for line in lines if line.startswith("╭")]
-    assert tops and all(len(line) == a.DEFAULT_WIDTH for line in tops)
+    # Every box sits in the gutter: the rail at column 0, the rounded corner at
+    # column 4, and the whole line as wide as the pane.
+    tops = [line for line in lines if "╭" in line]
+    assert tops and all(line.index("╭") == 4 for line in tops)
+    assert all(len(line) == a.DEFAULT_WIDTH for line in tops)
 
 
 def test_renderer_notes_a_truncated_listing():
@@ -269,9 +271,9 @@ C2_WIDTH = 46
 
 def test_c2_shape_is_verbatim_title_gauge_groups_and_rounded_boxes():
     """The approved C2 template, line for line: the heavy title bar, the gauge,
-    a state label per group, and a ROUNDED box per worker whose left edge is the
-    group rail. Built through `build_rows` from a listing, so the names, agents
-    and glyphs are the ones the model produces at width 46."""
+    a state label per group, and a ROUNDED box per worker BEHIND a rail+caret
+    gutter. Built through `build_rows` from a listing, so the names, agents and
+    glyphs are the ones the model produces at width 46."""
     sessions = [
         dict(listed("root", title="Project Status Review", status="running"),
              harness="claude-native"),
@@ -297,40 +299,41 @@ def test_c2_shape_is_verbatim_title_gauge_groups_and_rounded_boxes():
         "██░░░░░░░░  1/4 done               Claude Code",
         "│",
         "│ working",
-        "╭────────────────────────────────────────────╮",
-        "│ ▸ ● ▯  coders                              │",
-        "│ zen                                   2m14s│",
-        "╰────────────────────────────────────────────╯",
+        "│ ▸ ╭────────────────────────────────────────╮",
+        "│   │ ● ▯  coders                            │",
+        "│   │ zen                               2m14s│",
+        "│   ╰────────────────────────────────────────╯",
         "│",
         "│ blocked - waiting on you",
-        "╭────────────────────────────────────────────╮",
-        "│   ⏸ ⌘  reviewers                           │",
-        "│ cmdcode                      waiting on you│",
-        "╰────────────────────────────────────────────╯",
+        "│   ╭────────────────────────────────────────╮",
+        "│   │ ⏸ ⌘  reviewers                         │",
+        "│   │ cmdcode                  waiting on you│",
+        "│   ╰────────────────────────────────────────╯",
         "│",
         "│ failed",
-        "╭────────────────────────────────────────────╮",
-        "│   ✗ ╔ scouts                               │",
-        "│ freebuff                             failed│",
-        "╰────────────────────────────────────────────╯",
+        "│   ╭────────────────────────────────────────╮",
+        "│   │ ✗ ╔ scouts                             │",
+        "│   │ freebuff                         failed│",
+        "│   ╰────────────────────────────────────────╯",
         "│",
         "│ finished",
-        "╭────────────────────────────────────────────╮",
-        "│   ○ ⌘  docs                                │",
-        "│ cmdcode                         done 6m ago│",
-        "╰────────────────────────────────────────────╯",
+        "│   ╭────────────────────────────────────────╮",
+        "│   │ ○ ⌘  docs                              │",
+        "│   │ cmdcode                     done 6m ago│",
+        "│   ╰────────────────────────────────────────╯",
         "",
         a.FOOTER_COMPACT,
     ]
-    # Every BOX row is exactly the pane width (the rail/label rows are short by
-    # design — the rail is one glyph), and the caret is on the FIRST content row
-    # of its box only.
+    # Every BOX row is exactly the pane width (the label rows are short by
+    # design — the rail is one glyph and the word follows it), and the caret is on
+    # the FIRST row of its box — the `╭` border — and nowhere else.
     box_rows = [line for line in lines
-                if line.startswith(("╭", "╰"))
-                or (line.startswith("│") and line.endswith("│") and len(line) > 2)]
+                if (line.startswith("│") and line.endswith("│") and len(line) > 1)]
     assert box_rows and all(len(line) == C2_WIDTH for line in box_rows)
     assert sum(1 for line in lines if "▸" in line) == 1
-    assert lines[5].index("▸") == 2, "the caret sits in its own column"
+    assert lines[4].startswith("│ ▸ ╭"), "the caret points at the box from outside"
+    assert lines[4].index("▸") == 2, "the caret sits in its own column, after the rail"
+    assert lines[4].index("╭") == 4, "the box starts after the gutter"
 
 
 def test_the_done_gauge_is_right_at_0_of_n_n_of_n_and_no_workers():
@@ -354,10 +357,12 @@ def test_the_done_gauge_is_right_at_0_of_n_n_of_n_and_no_workers():
     assert gauge_line(2, 5).startswith("████░░░░░░  2/5 done")
 
 
-def test_the_rail_runs_down_the_group_at_the_box_left_column():
-    """This is the C2-vs-C3 distinction: the breathing and label rows carry a `│`
-    at the box's OWN left column, so the rail is unbroken and spends no extra
-    column. C3 drew no rail; C1 put it in a gutter of its own."""
+def test_the_rail_runs_down_the_group_at_the_pane_left_column():
+    """The rail is a column of its OWN at the pane's left edge, on the breathing
+    rows, the label row and EVERY row of every box — one unbroken `│` down the
+    whole group. The box has moved right, behind the caret, so it no longer
+    carries that line itself; the PRE-C2 shape put the box edge in column 0 and
+    the caret inside, which is exactly what this replaces."""
     rows = [header(),
             rail(), group("working"),
             worker("w1", "working", text="one"),
@@ -366,13 +371,34 @@ def test_the_rail_runs_down_the_group_at_the_box_left_column():
 
     assert lines[0].startswith("━━ ")
     assert lines[2] == "│", "the breathing row is the rail alone"
-    assert lines[3].startswith("│ ")
-    # The rail column is column 0 on EVERY group row — the breathing row, the
-    # label, the box top/middle/bottom — so one line runs down the group.
-    box = [i for i, line in enumerate(lines) if line.startswith(("╭", "╰"))]
-    for index in range(2, box[-1] + 1):
-        assert lines[index][0] == "│" or lines[index][0] == "╭" \
-            or lines[index][0] == "╰", (index, lines[index])
+    assert lines[3].startswith("│ "), "the label keeps the rail in column 0"
+    # Every group row — breathing, label, and every line of both boxes — carries
+    # the rail at column 0. The blank above the footer and the footer are last.
+    for index, line in enumerate(lines[2:-2], start=2):
+        assert line[0] == "│", (index, line)
+    # The rounded corners sit AFTER the rail+caret gutter, at column 4.
+    corners = [line for line in lines if "╭" in line or "╰" in line]
+    assert corners and all(
+        line.index("╭" if "╭" in line else "╰") == a.GUTTER for line in corners)
+
+
+def test_the_caret_sits_between_the_rail_and_the_box_on_the_first_row_only():
+    """`▸` is drawn in the gutter's caret column — between the rail and the box's
+    `╭` — on the box's FIRST row alone. Blank on every other row of that box: a
+    caret repeated down the box reads as several selected things, the rule the
+    pre-C2 renderer already followed."""
+    rows = [header(),
+            rail(), group("working"),
+            worker("w1", "working", text="one"),
+            worker("w2", "working", text="two")]
+    lines = a.render(a.Frame(rows=rows, selected=3), width=C2_WIDTH)   # w1
+
+    # Row 0 is the group label; the box's four rows follow at 4..7.
+    assert lines[4][:4] == "│ ▸ ", "the caret leads the box's top border"
+    assert "▸" not in lines[5] and "▸" not in lines[6] and "▸" not in lines[7]
+    assert "▸" not in lines[8], "the unselected box draws no caret at all"
+    # The caret column (2) is strictly between the rail (0) and the box (4).
+    assert lines[4].index("▸") == 2 and lines[4].index("╭") == a.GUTTER
 
 
 def test_every_state_glyph_comes_from_the_chosen_vocabulary():
@@ -452,14 +478,14 @@ def test_only_the_caret_row_of_the_selected_box_carries_the_selected_role():
 
     items = a._pane(frame, 48).items
 
-    # bar, gauge, rail, label, box-top, caret row, agent row, box-bottom, ...
+    # bar, gauge, rail, label, box-top (caret), content, agent, box-bottom, ...
     caret_rows = [i for i, (text, _role) in enumerate(items) if "▸" in text]
-    assert caret_rows == [5], "the caret is on the box's content row, not a rule"
-    assert items[5][1] == a.SELECTED, "the caret row carries SELECTED"
-    # The rows around the caret — the box top, the agent row, the bottom rule —
-    # are NORMAL, or the whole box would read as highlighted.
-    assert [role for _text, role in items[4:5]] == [a.NORMAL]
-    assert [role for _text, role in items[6:8]] == [a.NORMAL] * 2
+    assert caret_rows == [4], "the caret is on the box's top border"
+    assert items[4][1] == a.SELECTED, "the caret row carries SELECTED"
+    # The rows around the caret — the label above, and the box's content, agent
+    # and bottom rows — are NORMAL, or the whole box would read as highlighted.
+    assert [role for _text, role in items[3:4]] == [a.NORMAL]
+    assert [role for _text, role in items[5:8]] == [a.NORMAL] * 3
     assert sum(1 for _text, role in items if role == a.SELECTED) == 1
     # ...and it is the TITLE bar, not SELECTED, that spends REVERSE.
     assert items[0][1] == a.TITLE
@@ -478,11 +504,11 @@ def test_the_caret_is_the_only_marker_and_moves_with_the_selection():
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
 
-    on_w1 = a.render(a.Frame(rows=rows, selected=3), width=48)   # caret row 5
-    on_w2 = a.render(a.Frame(rows=rows, selected=4), width=48)   # caret row 9
+    on_w1 = a.render(a.Frame(rows=rows, selected=3), width=48)   # caret row 4
+    on_w2 = a.render(a.Frame(rows=rows, selected=4), width=48)   # caret row 8
 
-    assert "▸" in on_w1[5] and "▸" not in on_w1[9]
-    assert "▸" in on_w2[9] and "▸" not in on_w2[5]
+    assert "▸" in on_w1[4] and "▸" not in on_w1[8]
+    assert "▸" in on_w2[8] and "▸" not in on_w2[4]
     # The two frames differ ONLY in where the caret sits.
     blanked = [[line.replace("▸", " ") for line in frame] for frame in (on_w1, on_w2)]
     assert blanked[0] == blanked[1]
@@ -508,12 +534,12 @@ def test_a_selection_move_still_repaints_the_pane():
     assert after != before, "the caret moved, so the composed lines changed"
     assert a.paint_needed(after, before) is True
     # The caret really did move to the other worker's box.
-    assert "▸" in after[9][0] and "▸" not in after[5][0]
+    assert "▸" in after[8][0] and "▸" not in after[4][0]
 
 
 def test_every_harness_mark_fills_the_slot_and_narrow_marks_align_the_title():
-    """Row 1 carries the harness mark, and every mark spends the SAME two display
-    columns, so the glyph and the title line up down the list."""
+    """The box's content row carries the harness mark, and every mark spends the
+    SAME two display columns, so the glyph and the title line up down the list."""
     harnesses = ("claude-native", "acp:cline", "acp:command-code",
                  "opencode-native", "acp:freebuff", "totally-unknown", "")
     title_col = {}
@@ -538,10 +564,11 @@ def test_a_rendered_group_label_and_its_box_line_up_in_the_same_columns():
     rows = [header(), rail(), group("working"),
             worker("w1", "working", text="one")]
     lines = a.render(a.Frame(rows=rows), width=C2_WIDTH)
-    # rail, label and box top all start at column 0; the rail glyph is column 0.
+    # The rail is column 0 on the breathing row, the label and the box top alike;
+    # the label's word and the box's rounded corner both follow the rail.
     assert lines[2] == "│"
     assert lines[3][0] == "│" and lines[3][1] == " "
-    assert lines[4][0] == "╭"
+    assert lines[4][0] == "│" and lines[4].index("╭") == a.GUTTER
 
 
 def test_multiple_roots_each_get_their_own_title_bar_and_gauge():
@@ -980,50 +1007,130 @@ def test_ambiguous_marks_are_not_padded_but_narrow_ones_are():
 
 
 def test_the_blank_slot_is_exactly_two_spaces():
+    # A row that names NO agent identity draws the blank slot — a mark there would
+    # be meaningless. This is the path the atom must never take.
     assert a.harness_mark(None) == "  "
+    assert a.harness_mark("") == "  "
+    assert a.harness_mark("   ") == "  "
+    assert a.agent_mark(None) == "  "
+    assert a.agent_mark("") == "  "
     assert a._display_width(a.harness_mark(None)) == 2
 
 
 def test_every_return_is_exactly_two_columns_including_the_blank():
     for row in _catalog()["agents"]:
         assert a._display_width(a.harness_mark(row["harness"])) == 2, row["id"]
+        assert a._display_width(a.agent_mark(row["id"])) == 2, row["id"]
     for degenerate in ("brand-new-native", "", None, 7, "  "):
         assert a._display_width(a.harness_mark(degenerate)) == 2, degenerate
+        assert a._display_width(a.agent_mark(degenerate)) == 2, degenerate
 
 
-def test_the_mark_degrades_to_a_blank_slot_never_a_raise():
-    # An unknown harness, and a non-string harness, must not raise and must not
-    # guess a vendor: both are the blank slot, exactly as harness_label degrades
-    # to a raw id. A pane has to render with no marks rather than not render.
-    assert a.harness_mark("brand-new-native") == "  "
-    assert a.harness_mark(None) == "  "
-    assert a.harness_mark("") == "  "
+def test_an_unresolvable_agent_gets_the_atom_never_a_blank():
+    # A harness that NAMES an agent whose vendor we cannot resolve draws the atom
+    # — "an agent whose vendor I could not identify" — rather than a silent blank.
+    # It must not raise: a pane has to render with no marks rather than not render.
+    assert a.harness_mark("brand-new-native") == a.ATOM + " "
+    assert a.agent_mark("reviewer") == a.ATOM + " "
+    # A non-string is NO identity, not an unresolvable one: blank.
     assert a.harness_mark(7) == "  "
+    assert a.agent_mark(7) == "  "
 
 
-def test_an_unknown_vendor_gets_the_blank_slot(monkeypatch):
+def test_the_atom_is_east_asian_narrow_like_the_other_marks():
+    # The slot charges it one trailing space; the whole point is that every mark
+    # spends the same two display columns.
+    assert unicodedata.east_asian_width(a.ATOM) == "N"
+    assert a._mark_slot(a.ATOM) == a.ATOM + " "
+
+
+def test_an_unknown_vendor_gets_the_atom(monkeypatch):
     # A registry row naming a vendor the mark table does not carry (a catalog
-    # edited before the table) is a cosmetic failure, not a crash.
+    # edited before the table) still names an agent, so it earns the atom, not a
+    # blank — the failure is a missing mark, not a missing agent.
     monkeypatch.setattr(a, "harness_vendors",
                         lambda: {"mystery-native": "unknown-vendor"})
-    assert a.harness_mark("mystery-native") == "  "
+    assert a.harness_mark("mystery-native") == a.ATOM + " "
 
 
-def test_a_broken_registry_degrades_every_mark_to_blank(monkeypatch, tmp_path):
+def test_a_broken_registry_blanks_no_harness_but_atoms_a_named_one(
+        monkeypatch, tmp_path):
     # Mirrors the label test in tests/test_og_herdr.py: a missing, malformed or
-    # wrong-shaped catalog yields an empty vendor table, and every mark falls
-    # back to the blank slot. Never a raise.
+    # wrong-shaped catalog yields an empty vendor table. A row that names NO
+    # harness still draws the blank; a row that names one we can no longer look up
+    # draws the atom. Never a raise.
     for name, content in (("missing.json", None),
                           ("broken.json", "{ not json"),
                           ("wrong-shape.json", '{"agents": "nope"}'),
                           ("a-list.json", "[]")):
         monkeypatch.setattr(h, "_REGISTRY_VENDORS", None)
+        monkeypatch.setattr(h, "_REGISTRY_AGENT_VENDORS", None)
         path = tmp_path / name
         if content is not None:
             path.write_text(content)
         monkeypatch.setattr(h, "REGISTRY_PATH", path)
         assert h.harness_vendors() == {}, name
-        assert a.harness_mark("claude-native") == "  ", name
+        assert h.agent_vendors() == {}, name
+        assert a.harness_mark("") == "  ", name
+        assert a.harness_mark("claude-native") == a.ATOM + " ", name
+        assert a.agent_mark("zen") == a.ATOM + " ", name
+
+
+# ---------------------------------------------------------------------------
+# 8c. the agent NAME -> vendor hop (the fix for the blank worker marks)
+# ---------------------------------------------------------------------------
+
+def test_the_agent_name_resolves_through_the_registry():
+    # A worker's LISTING row carries no `harness`; its mark comes from the agent
+    # name the title gave. The name -> vendor hop is a registry fact, read through
+    # the same catalog the labels and harness vendors come from.
+    assert h.agent_vendor("cmdcode") == "moonshotai"
+    assert h.agent_vendor("freebuff") == "z-ai"
+    assert h.agent_vendor("kilo") == "kilo"
+    assert h.agent_vendor("codex") == "openai"
+    assert h.agent_vendor("claude") == "anthropic"
+
+
+def test_the_agent_name_resolution_tolerates_case_and_the_coder_prefix():
+    # The names arrive as `coder_zen` in a worker title (split_title strips the
+    # prefix) and may arrive in any case; both are absorbed.
+    for name in ("zen", "coder_zen", "Coder_Zen", "ZEN", "Coder_Zen"):
+        assert h.agent_vendor(name) == "opencode-zen", name
+    assert h.agent_vendor("coder_cmdcode") == "moonshotai"
+    for nothing in (None, "", "   ", 7):
+        assert h.agent_vendor(nothing) is None, nothing
+
+
+def test_the_zen_alias_comes_from_the_registry_worker_field():
+    # `zen` is not an `id`; it is the opencode row's `worker: "coder_zen"` with the
+    # prefix stripped, so the alias is derivable from the catalog alone and NO
+    # hardcoded alias map was needed.
+    rows = _catalog()["agents"]
+    opencode = next(r for r in rows if r["id"] == "opencode")
+    assert opencode["worker"] == "coder_zen"
+    assert "zen" not in {r["id"] for r in rows}
+    assert h.agent_vendors()["zen"] == "opencode-zen"
+
+
+def test_a_worker_box_marks_by_agent_name_because_the_row_has_no_harness():
+    """The fix for the blank worker marks: a worker's LISTING row carries no
+    `harness`, so the box resolves its mark from the agent name the title gave."""
+    def content_line(**row_kwargs):
+        return a.render(a.Frame(rows=[worker("w", "working", text="ZX",
+                                             **row_kwargs)]), 48)[1]
+
+    # `zen` (the opencode alias) and `cmdcode` resolve to their vendor's mark...
+    assert a.agent_mark("zen") == a._HARNESS_MARKS["opencode-zen"] + " "
+    assert a._HARNESS_MARKS["opencode-zen"] in content_line(agent="zen")
+    assert a._HARNESS_MARKS["moonshotai"] in content_line(agent="cmdcode")
+    # ...an unresolvable agent shows the atom, NOT a blank...
+    assert a.ATOM in content_line(agent="reviewer")
+    # ...and a row naming no agent at all is the genuinely-blank case.
+    assert a.agent_mark(None) == "  "
+    assert a.ATOM not in content_line(agent=None)
+    # A real `harness` on the row still wins over the agent name.
+    assert a._HARNESS_MARKS["anthropic"] in content_line(
+        agent="cmdcode", harness="claude-native")
 
 
 def test_harness_vendors_reads_this_repos_catalog():
