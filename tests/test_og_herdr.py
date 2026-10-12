@@ -2470,10 +2470,45 @@ def test_a_failed_space_rename_leaves_the_pass_intact_and_the_metadata_reported(
     # The metadata report is made BEFORE the rename, so a rename that fails
     # cannot lose it.
     assert _call(client, "report_metadata")[2]["title"] == "First question"
-    # The failure is recorded as an ordinary error line, and the batch carries
-    # on — one bad space rename does not abort the rest of the pass.
+    # The failure is absorbed LOCALLY as an ordinary `error:` line: the rename is
+    # an addition to `_changed`'s work, so it must not discard the bookkeeping of
+    # the work that already succeeded. That bookkeeping is `rec["title"]` —
+    # persisted and read back across a restart — and the event's own audit line.
     assert any("error s1" in ln and "invalid_label" in ln for ln in lines), lines
+    assert bridge._recs["s1"]["title"] == "First question"
+    assert "update s1 → state=working (title)" in lines, lines
+    # ...and the batch carries on: one bad space rename aborts nothing.
     assert any("add s2" in ln for ln in lines), lines
+
+
+def test_a_failed_space_rename_is_not_retried_on_a_later_poll(seams):
+    # ONE attempt, never a retry — and this is the test a reader needs, because
+    # the property is easy to misread. `title_changed` comes from the watcher's
+    # `previous`, not from `rec`, so once the watcher has seen the new title the
+    # event does not recur: a failed rename is reported once and then the space
+    # simply keeps its `sid[:8]` label for the life of the session, rather than
+    # the bridge repeating the same failing `workspace.rename` on every poll
+    # forever (the lesson the dead-workspace repair already learned).
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "abcd1234efgh", root_session(
+        None, state="idle"))])
+    client.calls.clear()
+    client.fail_always = {"workspace_rename": FakeHerdrError(
+        "invalid_label", "nope")}
+
+    first = bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+    assert sum("invalid_label" in ln for ln in first) == 1, first
+
+    # The next poll carries no title change, so the rename is not re-attempted.
+    client.calls.clear()
+    second = bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            "First question", state="working"))])
+    assert "workspace_rename" not in _names(client), _names(client)
+    assert not any("invalid_label" in ln for ln in second), second
 
 
 def test_a_hand_renamed_space_is_renamed_back_to_the_session_title(seams):
