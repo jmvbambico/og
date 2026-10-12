@@ -20,6 +20,7 @@ multiplexers** as a catalog, the way supported agents already are.
 
 ```
 og start [<mux>] [local|tunneled] [domain] [--use ngrok|tunnl]
+        [--once] [--socket PATH] [--bin PATH]
 ```
 
 `<mux>` is a multiplexer id from the registry (today: `herdr`). It is
@@ -30,8 +31,30 @@ composes:
 og start herdr
 og start herdr tunneled
 og start herdr tunneled --use tunnl
+og start herdr --once
 og start tunneled                     # unchanged
 ```
+
+### The launcher's flags, forwarded
+
+`--once`, `--socket` and `--bin` are the **launcher's** flags
+(`og_herdr_launch.build_parser`), and they reach it only from `cmd_start`'s
+exec — which is a separate process with its own parser. They were originally
+unreachable: the exec carried a fixed argv, so `og start herdr --once` died in
+`parse_start_args` as an unknown option on its way to a parser that has had the
+flag all along. `parse_start_args` now collects them into `OG_START_MUX_ARGS`
+and the exec appends them after `--mux`/`--server`, so they can never displace
+the two that command derives.
+
+`--mux` and `--server` are deliberately NOT forwarded: `cmd_start` computes them
+from the mux id and `$PORT`, and an override would point a pane at another space
+or another server with nothing else to show for it. They stay unknown options
+here.
+
+Everything the launcher's parser does not have is still an unknown option, and
+a launcher flag with no multiplexer is refused rather than accepted and dropped
+— a flag the operator typed that nothing acts on is the same failure this whole
+change is about.
 
 ### The parsing collision — this one bites
 
@@ -119,6 +142,40 @@ The space is labelled from the directory at this point because **no session
 exists yet** — `og chat` is what mints one. The bridge renames the space to the
 conversation title once it appears (`workspace.rename`).
 
+### A degradation the operator can find out about
+
+Step 6 is best effort, and correctly so: the chat pane is the session, and a
+cosmetic second pane must never take it down. What it was *not* correctly doing
+was failing silently — `pane.split` raising, herdr reporting no new pane id and
+`pane_run` raising all `warn()`ed and then handed the terminal to `exec herdr`,
+whose TUI enters the alternate screen within milliseconds. Every one of those
+warnings was wiped before a human could read it, and the launcher wrote no log,
+so "the agents pane never appeared" arrived as a report with no cause — from
+another machine, where nobody could see what had been printed a moment earlier.
+
+The trade is unchanged (a failed split is never fatal). What changed is that a
+degradation now goes three places:
+
+- **`~/.omnigent/logs/herdr-launch.log`**, one timestamped line per failure. A
+  sibling of `herdr-server.log`, never that file: that one is herdr's own stdout
+  and stderr, and og's sentence written there would read as the multiplexer's.
+  This is the channel that answers "what happened?" afterwards.
+- **A bounded hold before the exec** (6s, only when stdout is a terminal and
+  something actually degraded). The log is what an operator finds tomorrow; the
+  hold is what tells them today. Neither alone is enough — a log nobody knows to
+  open is the same void with a file in it. It is skipped entirely under `--once`,
+  which returns before the exec and so already leaves the text on screen.
+- **The terminal**, as before, and re-surfaced at the hold: `info("opened space
+  …")` is printed *after* the split, so the first copy has already scrolled off
+  the top by exec time.
+
+stdout is flushed explicitly before `execvp` as well: exec does not flush, so on
+a pipe the warnings would be discarded by the exec rather than by the TUI — the
+same loss by a different mechanism.
+
+The same reasoning says what a degradation must never be: a non-zero exit, or any
+exception out of `_split_agents`. Both are pinned by tests.
+
 **(B) Not inside, session already in $PWD.**
 
 The session is live somewhere; put the operator on it instead of starting a
@@ -126,6 +183,16 @@ second one.
 
 - If that session has a space: `workspace.focus(ws)`, then `exec herdr`.
 - If it does not: adopt it (§4), then focus and attach.
+
+**Known gap, unfixed.** Only `_open_space` opens the `og agents` pane, so this
+case never splits — and says nothing when the space it attaches to has no agents
+pane (closed by hand, or created before the feature). At the keyboard that is
+indistinguishable from case (A)'s split failing. It is not a small fix: the
+split needs a tab id and a root pane, and an existing space's layout cannot be
+trusted to match what the state file recorded, so "add the pane if it is missing"
+is a design decision rather than a line of code. Splitting unconditionally is
+the safe half, and has to be idempotent besides — the operator may have closed
+the pane on purpose. Until then `og start herdr --once` is the diagnostic.
 
 **(C) Inside the mux, session already in $PWD.**
 
