@@ -1629,3 +1629,65 @@ def test_the_conformance_guard_reads_a_fixture_with_all_herdrs_methods(api_schem
     assert len(_request_params_by_method(api_schema)) == 102
     assert "pane.send_text" in _request_params_by_method(api_schema)
     assert "pane.run" not in _request_params_by_method(api_schema)
+
+
+# ---------------------------------------------------------------------------
+# pane metadata: the one call herdr accepts nothing about
+# ---------------------------------------------------------------------------
+
+def test_a_metadata_report_with_nothing_to_set_is_valid_schema_and_wrong_wire(
+        api_schema):
+    """Why `pane.report_metadata` is the one frame the guard above cannot judge.
+
+    Measured in the live bridge log:
+
+        error ab222b88…: invalid_metadata_request: missing metadata field to set or clear
+
+    sent for a session whose `title` was still None — `_drop_none` then strips
+    the only field that was going to be set, and what goes out is `pane_id` and
+    `source` and nothing else.
+
+    herdr REFUSES that frame, and its schema cannot say so: `pane_id` and
+    `source` are the only params `PaneReportMetadataParams` requires, and every
+    field that would make the call mean something is optional. So the frame
+    passes `_frame_violations` — which is exactly why this defect lived through
+    a guard that has caught four others — and the requirement has to be pinned
+    here instead, where it is read off the schema rather than inferred from a
+    passing frame.
+    """
+    variants = _request_params_by_method(api_schema)
+    assert "pane.report_metadata" in variants
+    params_schema = variants["pane.report_metadata"]
+    assert set(params_schema["required"]) == {"pane_id", "source"}
+
+    # The frame the bridge used to send for a titleless session. The guard has
+    # nothing to say about it — which is the point of this test.
+    bare = {"id": "req_1", "method": "pane.report_metadata",
+            "params": {"pane_id": "w1:p1", "source": "og-bridge"}}
+    assert _frame_violations(api_schema, bare) == []
+
+    # The fields that would have made it a request rather than a shrug. Any
+    # caller that has one of them must send it — herdr's error message is
+    # literally about having none.
+    settable = {"title", "display_agent", "agent", "state_labels", "tokens",
+                "clear_title", "clear_display_agent", "clear_state_labels"}
+    assert settable <= set(params_schema["properties"])
+    assert not (set(bare["params"]) & settable)
+
+
+def test_a_titled_metadata_report_carries_its_title(fake, api_schema):
+    """The frame the bridge sends when it has something to say, checked whole.
+
+    The other end of the defect above: a titled report must actually name the
+    title, since the fix for a titleless one is to send nothing rather than to
+    send less.
+    """
+    server = fake()
+    client = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    client.report_metadata("w1:p1", "og-bridge", title="coder_zen:fix")
+    client.close()
+
+    frame = server.requests[0]
+    assert frame["method"] == "pane.report_metadata"
+    assert frame["params"]["title"] == "coder_zen:fix"
+    assert _frame_violations(api_schema, frame) == []

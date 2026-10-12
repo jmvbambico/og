@@ -52,11 +52,14 @@ from typing import Any, Callable, Optional
 
 from og_herdr import (
     OWNER_LAUNCHER,
+    SPACE_LIVE,
     _id_of,
     attach_command,
     default_state_path,
     load_state,
     save_state,
+    space_status,
+    workspace_index,
 )
 
 # The only multiplexer with a backend. A registry row buys detection and
@@ -512,27 +515,28 @@ def space_for(ctx: Launch, session: dict) -> tuple:
         raise LaunchError("the session in {0} has no id".format(ctx.cwd))
     record = _load(ctx)["spaces"].get(sid)
     ws_id = (record or {}).get("workspace_id")
-    live = live_workspaces(ctx)
-    if ws_id and ws_id in live:
+    if space_status(ws_id, live_workspaces(ctx)) == SPACE_LIVE:
         return record, False
     if ws_id:
         info("the recorded space {0} is gone; adopting again".format(ws_id))
     return _adopt(ctx, session), True
 
 
-def live_workspaces(ctx: Launch) -> set:
-    """Every workspace herdr currently lists, by id.
+def live_workspaces(ctx: Launch) -> dict:
+    """`{workspace_id: row}` for every workspace herdr currently lists.
 
     A listing that cannot be read is an error rather than an empty answer: an
     empty one would read as "your space is gone" and adopt a second space over
-    the first.
+    the first. The parse itself lives in og_herdr so this launcher and the
+    bridge cannot drift into reading the same reply two different ways, and the
+    verdict is `og_herdr.space_status`, which is also where that rule is
+    stated.
     """
     try:
         listing = ctx.client.workspace_list()
     except Exception as exc:
         raise LaunchError("could not list herdr workspaces: {0}".format(exc))
-    return {str(entry.get("workspace_id")) for entry in (listing or [])
-            if isinstance(entry, dict) and entry.get("workspace_id")}
+    return workspace_index(listing)
 
 
 def _adopt(ctx: Launch, session: dict) -> dict:
