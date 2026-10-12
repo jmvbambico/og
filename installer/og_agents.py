@@ -50,7 +50,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-from og_herdr import DEFAULT_AGENT_LABEL, harness_labels
+from og_herdr import DEFAULT_AGENT_LABEL, harness_labels, harness_vendors
 from og_herdr_watch import (
     DEFAULT_BASE_URL,
     SessionWatcher,
@@ -576,6 +576,84 @@ def harness_label(harness: Any) -> str:
     if not isinstance(harness, str) or not harness:
         return DEFAULT_AGENT_LABEL
     return harness_labels().get(harness, harness)
+
+
+# The operator's chosen one-cell brand mark per VENDOR, ported unchanged from
+# the approved tier-0 table in docs/proto/tui_marks.py. Keyed by vendor, not by
+# harness, because the registry puts two harnesses on one vendor (agy and gemini
+# are both `google`) and a per-harness table would hand one company two
+# different glyphs. The harness -> vendor hop is read from installer/registry.json
+# through `og_herdr.harness_vendors`, so renaming or re-vendoring a harness in
+# the catalog moves its mark without an edit here.
+#
+# Three picks (kilo, cognition, z-ai) are East Asian AMBIGUOUS; the rest are
+# Narrow. That split is the whole reason for the slot below — see `_mark_slot`.
+_HARNESS_MARKS = {
+    "anthropic": "\u2733",       # ✳ eight-spoked asterisk
+    "opencode-zen": "\u25AF",    # ▯ white vertical rectangle
+    "google": "\u2726",          # ✦ black four-pointed star
+    "openai": "\u2B21",          # ⬡ white hexagon
+    "deepseek": "\U0001319E",    # 𓆞 Egyptian hieroglyph
+    "kilo": "\U0001F13A",        # 🄺 squared letter (AMBIGUOUS)
+    "aws-kiro": "\U0001680C",    # 𖠌 Bamum letter
+    "cursor": "\u21D7",          # ⇗ north-east double arrow
+    "goose": "\U0001316F",       # 𓅯 Egyptian hieroglyph
+    "hermes": "\u2624",          # ☤ caduceus
+    "xai": "\U0001D54F",         # 𝕏 double-struck X
+    "cognition": "\u26EF",       # ⛯ lighthouse (AMBIGUOUS)
+    "z-ai": "\u2554",            # ╔ box-drawing corner (AMBIGUOUS)
+    "moonshotai": "\u2318",      # ⌘ place-of-interest sign
+}
+
+# A mark is padded into a FIXED two display columns, not left as-is. Without the
+# slot, a Narrow mark (one cell) and an Ambiguous one (two cells in a CJK-locale
+# terminal) on consecutive rows start the column after them at two different
+# offsets, and every box edge, rule and right-aligned clock downstream shears by
+# that difference. Padding each mark to the same column removes it.
+MARK_SLOT = 2
+
+
+def _mark_slot(mark: str) -> str:
+    """`mark` padded to exactly `MARK_SLOT` display columns. THE slot.
+
+    A mark the terminal draws in two cells fills the slot on its own; a mark it
+    draws in one gets a single trailing space; no mark at all is two spaces.
+    Width is measured with `_display_width`, never `len`: every glyph in the
+    table is ONE python character whatever it draws as, so `len` is exactly the
+    ruler that cannot see the shear this exists to prevent.
+
+    AMBIGUOUS marks are charged TWO cells and so are NOT padded. Ambiguous has
+    no single true width — one cell in a western locale, two in a CJK one — and
+    the only assumption that holds in both is the pessimistic one: a slot one
+    column NARROW on the ambiguous row (visible, cosmetic, one row) beats a slot
+    one column WIDE under a CJK locale, which pushes the row past the pane's
+    right edge and is read as "the pane is broken". So the three Ambiguous marks
+    stand one column short of the slot in a western terminal, deliberately; the
+    other eleven are exact.
+    """
+    if not mark or mark == " ":
+        return " " * MARK_SLOT
+    return mark + " " * max(0, MARK_SLOT - _display_width(mark))
+
+
+def harness_mark(harness: Any) -> str:
+    """The brand mark for a harness id, in its fixed two-column slot.
+
+    `claude-native` -> "✳ " (vendor `anthropic`). Resolves harness id -> vendor
+    through `og_herdr.harness_vendors` (the same registry the labels come from,
+    so the two cannot disagree) and then vendor -> glyph through `_HARNESS_MARKS`.
+
+    NEVER raises and never loses a row over a cosmetic failure: an unknown
+    harness, a harness whose vendor the table does not name, a missing or corrupt
+    registry, or a harness that is None all return the BLANK slot (two spaces),
+    exactly as `harness_label` degrades to a raw id. A pane must be able to
+    render with no marks at all rather than not render — a blank is the honest
+    answer, never a guessed vendor.
+    """
+    if not isinstance(harness, str) or not harness:
+        return _mark_slot("")
+    vendor = harness_vendors().get(harness)
+    return _mark_slot(_HARNESS_MARKS.get(vendor, ""))
 
 
 def build_rows(
