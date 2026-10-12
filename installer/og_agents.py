@@ -1352,6 +1352,20 @@ def _run_tui(model: AgentModel, interval: float, server: str,
 
     def loop(stdscr) -> None:
         curses.curs_set(0)
+        # Take the terminal's own colours for pair 0. `curses.wrapper` calls
+        # `start_color()` before this point, and once colour is started pair 0
+        # is the curses implementation's default white-on-black rather than the
+        # terminal's: every cell the view touches — including the spaces
+        # `stdscr.erase()` writes — then paints an opaque black background over
+        # the operator's theme and transparency. Nothing here sets a colour
+        # pair, so with the default in place the pane has no background of its
+        # own and matches every other native CLI in the window. The call raises
+        # `curses.error` on a terminal that cannot do it; the view still has to
+        # paint there, so it runs uncoloured rather than dying at startup.
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
         stdscr.keypad(True)
         selected = 0
         offset = 0
