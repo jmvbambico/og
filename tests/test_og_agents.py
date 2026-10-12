@@ -367,6 +367,74 @@ def test_the_caret_moves_between_workers_and_never_onto_a_header():
     assert a.snap_selection([header()], 3) == 0
 
 
+def test_only_the_caret_row_of_the_selected_box_carries_the_selected_role():
+    """Selecting a worker marks it with the caret, not a reverse-video block.
+
+    `_pane` once tagged every line of the four-row box SELECTED and `_run_tui`
+    painted SELECTED reverse, so one selected worker lit four rows. The role
+    now belongs to the caret row alone; the rest of the block is NORMAL.
+    """
+    rows = [header(),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+    frame = a.Frame(rows=rows, selected=1)
+
+    items = a._pane(frame, 48).items
+
+    caret_rows = [i for i, (text, _role) in enumerate(items) if "▸" in text]
+    assert caret_rows == [1], "the caret is on the first line of the box"
+    assert items[1][1] == a.SELECTED, "the caret row carries SELECTED"
+    # The three rows under the caret are the box's body and its bottom rule;
+    # none of them may be SELECTED or the whole block reads as highlighted.
+    assert [role for _text, role in items[2:5]] == [a.NORMAL] * 3
+    assert sum(1 for _text, role in items if role == a.SELECTED) == 1
+
+
+def test_the_caret_is_the_only_marker_and_moves_with_the_selection():
+    """The caret is the sole selection signal, and it is really drawn.
+
+    With the reverse block gone the caret character is all that distinguishes
+    the selected worker, so it has to be present in the rendered text and
+    absent from the unselected box. Comparing the two selections proves
+    nothing ELSE marks the row: only the caret column differs.
+    """
+    rows = [header(),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+
+    on_w1 = a.render(a.Frame(rows=rows, selected=1), width=48)
+    on_w2 = a.render(a.Frame(rows=rows, selected=2), width=48)
+
+    assert "▸" in on_w1[1] and "▸" not in on_w1[5]
+    assert "▸" in on_w2[5] and "▸" not in on_w2[1]
+    # The two frames differ ONLY in where the caret sits.
+    blanked = [[line.replace("▸", " ") for line in frame] for frame in (on_w1, on_w2)]
+    assert blanked[0] == blanked[1]
+
+
+def test_a_selection_move_still_repaints_the_pane():
+    """Moving the caret must still schedule a repaint.
+
+    Every block is NORMAL now, so if the caret were not part of the composed
+    text a selection move would change nothing and `paint_needed` would say
+    False — the caret would appear stuck until an unrelated repaint. That is
+    the regression removing the whole-block highlight could have introduced.
+    """
+    rows = [header(),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, 0))
+    before = a._pane(frame, 48).items
+
+    frame.selected = a.move_selection(rows, frame.selected, 1)
+    after = a._pane(frame, 48).items
+
+    assert after != before, "the caret moved, so the composed lines changed"
+    assert a.paint_needed(after, before) is True
+    # The caret really did move to the other worker's box.
+    assert "▸" in after[5][0] and "▸" not in after[1][0]
+
+
 # ---------------------------------------------------------------------------
 # 3. the cwd rule
 # ---------------------------------------------------------------------------
@@ -729,14 +797,8 @@ def test_the_meta_line_says_what_the_timestamps_can_support():
 # 10. read-only: the module never calls anything that could write to a session
 # ---------------------------------------------------------------------------
 
-def test_source_only_makes_read_only_calls():
-    """AST scan: no CALLED identifier looks like a writer to a session.
-
-    Prose and docstrings are allowed to discuss prompting and elicitations (the
-    rationale lives in them); only called names are inspected. A viewer must
-    never send a prompt, answer an elicitation, or POST anything.
-    """
-    source = Path(a.__file__).read_text()
+def _called_names(source: str) -> set:
+    """Every identifier name that is CALLED in `source`, lower-cased."""
     called = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Call):
@@ -744,11 +806,77 @@ def test_source_only_makes_read_only_calls():
             name = func.attr if isinstance(func, ast.Attribute) \
                 else getattr(func, "id", "")
             called.add(name.lower())
+    return called
+
+
+def _herdr_call_methods(source: str) -> list:
+    """The string method names `source` hands to a `HerdrClient.call(...)`.
+
+    `HerdrClient.call` is the view's only outbound seam, so the set of literal
+    first arguments IS the set of requests it can send. A `.call(...)` whose
+    method is not spelled as a string literal cannot be checked and is rejected
+    rather than skipped — "we cannot tell what it sends" must fail closed.
+    """
+    methods = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "call":
+            args = node.args
+            assert args and isinstance(args[0], ast.Constant) \
+                and isinstance(args[0].value, str), \
+                "a .call(...) must spell its method as a literal: " + ast.dump(node)
+            methods.append(args[0].value)
+    return methods
+
+
+def _assert_only_agent_focus(source: str) -> None:
+    """The tightened guard: `agent.focus` is the ONLY method handed to `call`."""
+    methods = _herdr_call_methods(source)
+    assert methods, "expected the view to make its one outbound focus call"
+    assert set(methods) == {"agent.focus"}, methods
+
+
+def test_source_only_makes_read_only_calls():
+    """AST scan: no CALLED identifier looks like a writer to a session, AND the
+    only herdr method this module hands to `call` is `agent.focus`.
+
+    Prose and docstrings are allowed to discuss prompting and elicitations (the
+    rationale lives in them); only called names are inspected. A viewer must
+    never send a prompt, answer an elicitation, or POST anything.
+
+    The second assertion is the TIGHTENING. The view gained exactly one outbound
+    call when Enter was made to focus a worker in herdr, so the guard no longer
+    stops at "nothing looks like a writer": it now reads the method name out of
+    every `.call(...)` and refuses anything but `agent.focus`. A future edit that
+    adds a second outbound request fails HERE, at review time, rather than at the
+    operator's terminal.
+    """
+    source = Path(a.__file__).read_text()
+    called = _called_names(source)
     assert called, "expected to find call expressions in the module"
     offenders = [c for c in called
                  if any(bad in c for bad in ("send", "prompt", "resolve",
                                              "elicit", "post"))]
     assert not offenders, offenders
+    _assert_only_agent_focus(source)
+
+
+def test_the_ast_guard_catches_a_planted_second_outbound_call():
+    """The guard must be able to FAIL — a guard that cannot is decoration.
+
+    Appending one more `HerdrClient.call(...)` to the real source stands in for
+    the future edit the guard exists to stop; the tightened assertion has to
+    reject it. Without this, "the guard passes" would prove only that it never
+    fires.
+    """
+    source = Path(a.__file__).read_text()
+    planted = source + (
+        '\n\ndef _planted(client):\n'
+        '    return client.call("workspace.focus", {"workspace_id": "w1"})\n'
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_only_agent_focus(planted)
 
 
 # ---------------------------------------------------------------------------
@@ -1247,7 +1375,8 @@ class FakeCurses(types.ModuleType):
         # `curses.error` is a real exception class the view catches by name, so
         # it must be a class here too, not an instance or a sentinel.
         self.error = type("error", (Exception,), {})
-        self.A_NORMAL, self.A_REVERSE, self.A_DIM = 0, 1 << 18, 1 << 19
+        self.A_NORMAL, self.A_REVERSE, self.A_BOLD, self.A_DIM = \
+            0, 1 << 18, 1 << 20, 1 << 19
         self.KEY_UP, self.KEY_DOWN, self.KEY_ENTER = 259, 258, 343
         self.curs_set = lambda n: None
         self.timeout = lambda n: None
@@ -1337,3 +1466,174 @@ def test_the_view_still_paints_when_use_default_colors_raises(monkeypatch):
 
     assert fake.use_default_colors_calls == 1
     assert screens and screens[0].painted, "the frame was painted, not skipped"
+
+
+# ---------------------------------------------------------------------------
+# 16. Enter focuses the selected worker in herdr; Space expands its snippet
+# ---------------------------------------------------------------------------
+#
+# `focus_in_herdr` imports `og_herdr_client` LAZILY, so a fake module dropped
+# into sys.modules IS the client it reaches — the same trick the curses stub
+# above uses, and here it is what keeps every test off a real socket. HERDR_ENV
+# is set or deleted per test so the "inside herdr" question is never answered by
+# whatever environment the suite happens to run in (an operator running pytest
+# from inside a herdr pane has HERDR_ENV=1 for real).
+
+ENTER = 13          # what the view treats as Enter (curses.KEY_ENTER, 10 or 13)
+SPACE = 32
+QUIT = ord("q")
+
+
+class _KeyScreen(FakeScreen):
+    """`FakeScreen` with a settable key sequence and per-frame paint capture.
+
+    `painted` (inherited) is every line ever written; `frames` is the same lines
+    grouped into one list per `erase()`, which is what lets a test ask what the
+    LAST frame looked like after a key changed the view.
+    """
+
+    def __init__(self, keys, height=24, width=80):
+        super().__init__(height, width)
+        self.keys = list(keys)
+        self.frames: list[list[str]] = []
+
+    def erase(self):
+        self.frames.append([])
+
+    def addnstr(self, row, col, text, n, attr):
+        self.painted.append(text)
+        if self.frames:
+            self.frames[-1].append(text)
+
+
+def _fake_herdr_client(monkeypatch, error=None):
+    """Install a fake `og_herdr_client`; return the list it records calls into."""
+    calls = []
+
+    class HerdrClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def call(self, method, params=None):
+            calls.append((method, params))
+            if error is not None:
+                raise error
+            return {}
+
+    module = types.ModuleType("og_herdr_client")
+    module.HerdrClient = HerdrClient
+    monkeypatch.setitem(sys.modules, "og_herdr_client", module)
+    return calls
+
+
+def _run_tui_capture(monkeypatch, keys, model=None):
+    """Run the live view with a faked curses; return the screen it painted.
+
+    Every Enter/Space test needs the frame the loop actually wrote, which the
+    stock `FakeScreen` stub does not expose. `model` defaults to the shared
+    `_tui_model()` (root + three running workers, `w1` selected).
+    """
+    fake = _fake_curses(monkeypatch)
+    screens: list[_KeyScreen] = []
+
+    def wrapper(loop):
+        screen = _KeyScreen(keys)
+        screens.append(screen)
+        loop(screen)
+    fake.wrapper = wrapper
+
+    a._run_tui(model if model is not None else _tui_model(),
+               a.DEFAULT_INTERVAL, "http://x")
+    return screens[0]
+
+
+def test_enter_focuses_the_selected_worker_with_that_rows_session_id(monkeypatch):
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = _fake_herdr_client(monkeypatch)
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+    model = _model(opener)
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=model)
+
+    # Row 1 is the first worker (row 0 is the group header), so w1 was selected
+    # and its session id is what went on the wire.
+    assert calls == [("agent.focus", {"target": "w1"})], calls
+    # Focus is not a reason to refetch: exactly the one listing walk for the
+    # first paint, and none from the keypress.
+    assert len(opener.listing_requests) == 1, "Enter must not trigger a refetch"
+    # A successful focus leaves no notice behind.
+    assert screen.painted, "the pane was painted"
+    assert not any("focus:" in text for text in screen.painted)
+
+
+def test_enter_outside_herdr_makes_no_call_and_shows_a_notice(monkeypatch):
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    calls = _fake_herdr_client(monkeypatch)
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT])
+
+    assert calls == [], "no herdr pane, no call"
+    assert any(a.NOTICE_FOCUS_OUTSIDE_HERDR in text for text in screen.painted), \
+        screen.painted
+
+
+def test_focus_degrades_when_the_herdr_client_cannot_be_imported(monkeypatch):
+    # `None` in sys.modules makes `from og_herdr_client import ...` raise
+    # ImportError: a client present in name only. The view still has to run.
+    monkeypatch.setenv("HERDR_ENV", "1")
+    monkeypatch.setitem(sys.modules, "og_herdr_client", None)
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT])
+
+    assert any(a.NOTICE_FOCUS_UNAVAILABLE in text for text in screen.painted), \
+        screen.painted
+
+
+def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(
+        monkeypatch):
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = _fake_herdr_client(monkeypatch,
+                               error=RuntimeError("connect: no such socket"))
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, ENTER, QUIT])
+
+    # One Enter per press: the failure neither swallows the key nor retries, and
+    # the loop is still taking keys after the first failure.
+    assert [method for method, _params in calls] == ["agent.focus", "agent.focus"]
+    assert any("focus: " in text for text in screen.painted), screen.painted
+
+
+def test_space_expands_and_collapses_the_selected_snippet(monkeypatch):
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+
+    def model():
+        return _model(RoutingOpener(
+            [_live_listing()],
+            details={"root": ROOT_DETAIL,
+                     "w1": detail("w1", items=[ASSISTANT_MESSAGE])}))
+
+    report = "The work was already committed"
+
+    expanded = _run_tui_capture(monkeypatch, [SPACE, QUIT], model=model())
+    assert any(report in text for text in expanded.frames[-1]), \
+        "space expanded the selected snippet"
+
+    # A second space collapses it: the report is in the frame the first space
+    # produced and gone from the last one.
+    collapsed = _run_tui_capture(monkeypatch, [SPACE, SPACE, QUIT], model=model())
+    assert any(report in text for text in collapsed.frames[1]), \
+        "the first space expanded the snippet"
+    assert not any(report in text for text in collapsed.frames[-1]), \
+        "the second space collapsed it"
+
+
+def test_the_footer_names_the_focus_and_expand_bindings():
+    assert "enter focus" in a.FOOTER, "the footer must name the Enter binding"
+    assert "space expand" in a.FOOTER, "the footer must name the Space binding"
+    assert "a access" in a.FOOTER, "the existing bindings must survive"
