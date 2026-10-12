@@ -73,10 +73,15 @@ class RecordingClient:
         self._seq += 1
         return self._seq
 
-    def workspace_create(self, label, cwd, focus=False):
+    def workspace_create(self, label, cwd, focus=False, env=None):
         """The MEASURED workspace.create reply: workspace, tab AND root_pane, all
-        three in one call — the schema's own result listing is lossy."""
-        self._call("workspace_create", label, cwd=cwd, focus=focus)
+        three in one call — the schema's own result listing is lossy.
+
+        `env` is recorded, not sent: it is the pane-shell environment map
+        `og_herdr_client.HerdrClient.workspace_create` takes, so a test can see
+        what the bridge installed in the pane it just asked for.
+        """
+        self._call("workspace_create", label, cwd=cwd, focus=focus, env=env)
         if self.create_results:
             return self.create_results.pop(0)
         n = self._next()
@@ -91,8 +96,8 @@ class RecordingClient:
         self._call("workspace_close", workspace_id)
         self._live.pop(workspace_id, None)
 
-    def tab_create(self, workspace_id, cwd, label, focus=False):
-        self._call("tab_create", workspace_id, cwd=cwd, label=label)
+    def tab_create(self, workspace_id, cwd, label, focus=False, env=None):
+        self._call("tab_create", workspace_id, cwd=cwd, label=label, env=env)
         if self.create_results:
             return self.create_results.pop(0)
         n = self._next()
@@ -1203,6 +1208,138 @@ def test_a_repaired_history_space_still_leaves_its_resume_line_unsubmitted(
     assert not args[1].endswith("\n")
     # ...and it is still recorded as a history space the cap counts.
     assert bridge._recs["dead1"]["owns_space"] is True
+
+
+# ---------------------------------------------------------------------------
+# the pane's environment: how a BRIDGE pane keeps the browser shut
+# ---------------------------------------------------------------------------
+# The same rule og_herdr_launch applies, and now stated ONCE in this module so
+# the two cannot drift: a pane og opens under a multiplexer runs an omnigent
+# command that can open the live conversation in a browser, and the only place
+# the suppression can be installed is the pane's own shell. herdr takes an env
+# map on the CREATING calls (`workspace.create`, `tab.create`, `pane.split`)
+# and not on `pane.send_text` — see pane_env_for.
+#
+# The bridge had none of it, so every space and tab it created started with
+# $BROWSER unset. The launcher threaded `ctx.pane_env` through all three of its
+# own creates and the bridge threaded nothing through any of its three, which is
+# how a `og start herdr` could leave a pane that opens a browser.
+
+def test_a_space_the_bridge_opens_carries_the_browser_suppression(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws",
+                      pane_env={"BROWSER": "true"})
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {"BROWSER": "true"}
+
+
+def test_a_sub_agents_tab_carries_the_browser_suppression(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws",
+                      pane_env={"BROWSER": "true"})
+
+    bridge.reconcile([Ev("added", "root", root_session("Fix bug")),
+                      Ev("added", "w1", sub_session("root", "coder:task"))])
+
+    assert _call(client, "tab_create")[2]["env"] == {"BROWSER": "true"}
+
+
+def test_a_history_space_carries_the_browser_suppression(seams, tmp_path):
+    """The one case where the bug is INVISIBLE until a human acts.
+
+    A history space's pane holds `og chat --resume <id>` as unsubmitted text:
+    nothing runs, so nothing opens a browser, and the pane looks identical to a
+    suppressed one. The moment the operator presses Enter — which is the entire
+    point of the space — an unsuppressed pane runs it and a browser opens. So
+    the create is asserted here rather than inferred from the live cases.
+    """
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      pane_env={"BROWSER": "true"})
+
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {"BROWSER": "true"}
+    assert _call(client, "pane_send_text")[1] == ("pane1",
+                                                  "og chat --resume dead1")
+
+
+def test_the_bridge_defaults_an_unset_browser_rather_than_opening_one(
+        seams, monkeypatch):
+    """`pane_env` left out means "derive it from this process", NOT "send none".
+
+    The bug being fixed was a path that FORGOT the map, so the default has to be
+    the safe one: a Bridge built by anything — `og herdr`, `--once`, a caller
+    that never heard of pane_env — suppresses unless it is told otherwise.
+    """
+    monkeypatch.delenv("BROWSER", raising=False)
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {"BROWSER": "true"}
+
+
+def test_an_operator_browser_setting_reaches_a_bridge_pane(seams, monkeypatch):
+    """`$BROWSER` is a PREFERENCE, so the bridge passes it through, not over it.
+
+    Measured rather than assumed: bin/og starts the bridge as
+    `nohup env PYTHONUNBUFFERED=1 python3 og_herdr.py ...`, and `env` without
+    `-i` passes the caller's environment through with one variable added. So the
+    daemon does inherit an exported `$BROWSER` — and must honour it, exactly as
+    the launcher does, rather than silently replacing it with `true`.
+    """
+    monkeypatch.setenv("BROWSER", "/usr/bin/firefox")
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {
+        "BROWSER": "/usr/bin/firefox"}
+
+
+def test_the_suppression_is_installed_at_creation_and_never_typed_after(
+        seams, tmp_path):
+    """herdr has no per-send env, so creation is the ONLY place it can go.
+
+    `pane.send_text` carries `pane_id` and `text` and nothing else (herdr's
+    published PaneSendTextParams), so a line typed into an existing pane cannot
+    carry an environment: it runs in the shell herdr started when the pane was
+    created. That is why every create is covered above and nothing is done about
+    `pane_run`/`pane_send_text` — asserted here so the next reader does not go
+    looking for an env to add to a send.
+    """
+    monkeypatched = {"env": {"BROWSER": "true"}}
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      pane_env=monkeypatched["env"])
+
+    bridge.reconcile([Ev("added", "s1", root_session("Live"))])
+
+    # The fake client accepts only what the real one does: `pane_run` and
+    # `pane_send_text` take (pane_id, command) — a third argument would be a
+    # TypeError, which is the assertion.
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
+    assert "env" not in _call(client, "pane_run")[2]
+
+
+def test_the_launcher_and_the_bridge_share_one_pane_env_rule():
+    """One statement of the rule, one implementation, no second copy.
+
+    `og_herdr_launch` imports `pane_env_for` from here; it must be the SAME
+    object, not a re-spelling that happens to agree today. Two copies of a
+    suppression rule is how this bug comes back: the bridge's panes opened
+    browsers for exactly as long as nobody checked the other module.
+    """
+    import og_herdr_launch
+
+    assert og_herdr_launch.pane_env_for is m.pane_env_for
 
 
 # ---------------------------------------------------------------------------

@@ -784,7 +784,7 @@ def test_workspace_create_carries_the_pane_env(fake):
     """`env` is the map herdr installs in the new pane's shell — the only way to
     reach the process the pane spawns, since the pane runs a fresh shell. og
     passes BROWSER in it so a pane's `og chat` cannot open a browser (see
-    og_herdr_launch.pane_env_for). Pinned on the exact frame: a dropped or
+    og_herdr.pane_env_for). Pinned on the exact frame: a dropped or
     misspelled `env` key is silently discarded by serde, so the pane would just
     start with the operator's ambient environment and open the browser again.
     """

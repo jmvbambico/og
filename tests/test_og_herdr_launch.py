@@ -576,9 +576,12 @@ def test_the_split_leaves_the_agents_pane_room_for_its_footer(tmp_path):
 # the pane environment — how a mux launch keeps the browser shut
 # ---------------------------------------------------------------------------
 # The chat pane runs `og chat` in a FRESH shell, so the only way to reach it is
-# herdr's per-create env map. pane_env_for builds the map; these pin that it is
-# threaded onto every pane a launch creates, that an operator's own $BROWSER is
-# respected, and that a launch with no map sends no `env` key at all.
+# herdr's per-create env map. `pane_env_for` builds the map and LIVES IN
+# og_herdr now — this module imports it, which is why importing it from
+# `og_herdr_launch` below still works and is itself part of what these pin: the
+# lift must not change what a launch sends. These assert that it is threaded
+# onto every pane a launch creates, that an operator's own $BROWSER is respected,
+# and that a launch with no map sends no `env` key at all.
 
 def test_a_mux_launch_passes_browser_true_into_every_pane_it_creates(tmp_path):
     """Asserted as the EXACT env map, so a dropped or renamed `env` key fails

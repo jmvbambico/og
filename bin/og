@@ -1410,9 +1410,14 @@ mux_homepage() {
 #   2. `og chat` -> `omnigent run` opens the live conversation in the browser for
 #      an interactive launch (cli.py: auto_open_conversation defaults to
 #      `prompt is None`). This is the open that actually fired, and it is shut
-#      at the PANE, not here: the launcher passes BROWSER=true in herdr's pane
-#      env (og_herdr_launch.pane_env_for). An export from this shell would never
-#      reach it — the pane runs `og chat` in a fresh shell.
+#      at the PANE, not here: og_herdr.pane_env_for builds {BROWSER: true} and
+#      BOTH pane-creating modules — this launcher's own launcher AND the herdr
+#      bridge, which opens spaces and tabs of its own — pass it as herdr's pane
+#      env. An export from this shell would never reach it: the pane runs
+#      `og chat` in a fresh shell. Measured limit (omnigent 0.17.0
+#      conversation_browser.open_conversation_url): on macOS that open shells
+#      out to `open <url>` rather than going through `webbrowser`, so it ignores
+#      BROWSER there; og_herdr.pane_env_for says so in full.
 #   3. og's OWN opener: the needs_setup create-admin path in cmd_start. That one
 #      asks og_browser_suppressed below.
 #
