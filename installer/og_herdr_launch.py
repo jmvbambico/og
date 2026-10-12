@@ -58,6 +58,11 @@ from og_herdr import (
     attach_command,
     default_state_path,
     load_state,
+    # The pane environment is stated ONCE, in og_herdr, next to the pane
+    # commands it is about — the bridge opens panes too and had no copy of the
+    # rule at all, which is how `og start herdr` left panes that opened a
+    # browser. Imported here, not redefined: see og_herdr.pane_env_for.
+    pane_env_for,
     save_state,
     space_status,
     workspace_index,
@@ -419,30 +424,6 @@ def is_inside(env: dict) -> bool:
     value that a caller may legitimately not have.
     """
     return env.get("HERDR_ENV") == "1"
-
-
-def pane_env_for(environ: dict) -> dict:
-    """The environment every pane this launch creates is started with.
-
-    A mux launch asked for a TERMINAL interface, so the panes must not steal
-    focus with a browser. The panes run `og chat`, which is `omnigent run`, and
-    an interactive `omnigent run` opens the live conversation in the browser by
-    default (cli.py: `auto_open_conversation` defaults to `prompt is None`).
-    `omnigent run` has no --no-open and no env var for it, but `webbrowser` —
-    what it calls — honours `$BROWSER`, and pointing that at `true(1)` makes
-    `webbrowser.open()` run `/usr/bin/true <url>`: it succeeds and opens
-    nothing. So the suppression is this one variable.
-
-    It has to travel to the PANE, not to this process: an export here reaches
-    only the launcher, and the pane runs `og chat` in a fresh shell. herdr takes
-    an env map on every pane-creating call and installs it in that shell, which
-    is why `ctx.pane_env` is threaded through the creates rather than exported.
-
-    An operator who already set `$BROWSER` has expressed a preference — a real
-    browser — so it is passed through untouched; only an unset `$BROWSER` is
-    defaulted. Same rule the accounts auto-open guard in bin/og follows.
-    """
-    return {"BROWSER": environ["BROWSER"] if "BROWSER" in environ else "true"}
 
 
 def _attach_there(ctx: Launch, session: dict) -> str:

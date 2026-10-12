@@ -405,6 +405,38 @@ declines them with a "use the web UI" message (`repl/_repl.py:2631-2647`).
 Those specific approvals always need the browser. This is the one place where
 "purely herdr, no browser" is literally false.
 
+### Nobody asked for a browser
+
+A mux launch asked for a terminal, so every pane og opens carries
+`BROWSER=true` in herdr's pane environment (`og_herdr.pane_env_for` — one rule,
+one implementation; both `og_herdr_launch` and the bridge use it, because the
+bridge opens spaces and tabs of its own and once used no rule at all). It has to
+be the *pane* env rather than an `export`: a pane runs its command in a fresh
+shell, and herdr only takes an env map on the creating calls (`workspace.create`,
+`tab.create`, `pane.split` — never `pane.send_text`, so there is nowhere else it
+could go). An operator who has set `$BROWSER` keeps it; only an unset one is
+defaulted.
+
+**Measured limit.** In omnigent 0.17.0 the conversation open does not go through
+`webbrowser` on macOS at all: `conversation_browser.open_conversation_url`
+shells out to `subprocess.run(["open", url])`. So `BROWSER=true` silences the
+`webbrowser` openers (and is the whole answer off macOS), but on macOS it does
+**not** stop `og chat` or `og chat --resume` from opening a browser. Closing
+that gap needs either omnigent routing through `webbrowser`, or
+`auto_open_conversation: false` — and the only way to set that globally from og
+is the machine-wide config write that commit `ef2bdd9` deliberately removed. It
+is recorded here rather than worked around.
+
+Which panes can fire it, on omnigent 0.17.0:
+
+| Pane | Command | Opens a browser? |
+|---|---|---|
+| Launcher's space (case A/D) | `og chat` | **Yes**, at session creation — and `BROWSER` does not stop it on macOS |
+| Bridge's space for a live root (`_add_space`) | `omnigent attach …` | No — `attach` resolves `auto_open_conversation` to `False` unless the operator configured it |
+| Bridge's tab for a sub-agent (`_add_tab`) | `omnigent attach …` | Same as above |
+| Bridge's history space (`_add_history_space`) | `og chat --resume <id>`, **unsubmitted** | Nothing runs until the operator presses Enter; then **yes**, same as the launcher's pane |
+| The `og agents` split | `og agents` | No |
+
 ---
 
 ## Open items

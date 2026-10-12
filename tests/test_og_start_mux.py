@@ -676,7 +676,7 @@ def test_cmd_start_calls_the_helpers_it_is_meant_to():
 # the operator kept getting came from og's own openers. These pin that the mux
 # suppression (a) sets the flag og's own needs_setup path consults, and (b)
 # writes NOTHING to omnigent's config — the chat pane's browser is shut with
-# BROWSER in herdr's pane env instead (the launcher's pane_env_for), so omnigent
+# BROWSER in herdr's pane env instead (og_herdr.pane_env_for), so omnigent
 # must not be invoked at all. The `omnigent` CLI is STUBBED so that an invocation
 # would be observed.
 
@@ -730,7 +730,7 @@ def test_a_plain_start_leaves_og_own_browser_alone(tmp_path):
 
 def test_a_mux_launch_never_writes_global_omnigent_config(tmp_path):
     """The browser is suppressed PER PANE now (BROWSER in herdr's pane env, see
-    og_herdr_launch.pane_env_for), not by mutating the operator's omnigent
+    og_herdr.pane_env_for), not by mutating the operator's omnigent
     config. An earlier fix ran `omnigent config set --global
     auto_open_conversation=false`; that leaked one `og start herdr` into a
     persistent, machine-wide change. This pins the behaviour (the suppression

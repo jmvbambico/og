@@ -189,6 +189,73 @@ def resume_command(session_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# the pane's environment: how a pane og opens keeps the browser shut
+# ---------------------------------------------------------------------------
+#
+# ONE statement of the rule, shared by the two things that open panes. The
+# launcher had it first and got it right; the bridge never learned it, and a
+# `og start herdr` left panes on the operator's screen that would open a browser
+# the moment something in them ran. So the rule lives HERE, next to the pane
+# commands it is about, and `og_herdr_launch` imports it — one direction still,
+# as for `space_status`/`workspace_index`. A second copy is how this came back.
+
+def pane_env_for(environ: dict) -> dict:
+    """The environment every pane og opens is started with.
+
+    A mux launch asked for a TERMINAL interface, so the panes must not steal
+    focus with a browser. A pane runs an omnigent command that can open the live
+    conversation — `og chat` (-> `omnigent run`) opens it by default
+    (cli.py: `auto_open_conversation` defaults to `prompt is None`), and
+    `og chat --resume <id>` in a history space does the same the moment the
+    operator presses Enter. `omnigent run` has no --no-open and no env var for
+    it, but `webbrowser` — what it calls — honours `$BROWSER`, and pointing that
+    at `true(1)` makes `webbrowser.open()` run `/usr/bin/true <url>`: it succeeds
+    and opens nothing. Measured, not assumed: with `BROWSER=true`,
+    `webbrowser._tryorder` comes back `['true', 'MacOSX', 'chrome', 'firefox',
+    'safari']` and `open()` returns True, so `true` is tried first and the
+    platform openers never run. So the suppression is this one variable.
+
+    IT HAS TO TRAVEL TO THE PANE, not to the process that asks for the pane: a
+    pane runs its command in a fresh shell, so an export in the launcher or the
+    bridge reaches neither. herdr takes an env map on the CREATING calls and
+    installs it in that pane's shell — `workspace.create`, `tab.create`,
+    `pane.split`, and nothing else (see herdr's own request schema:
+    `PaneSendTextParams` is `pane_id` + `text` and has no `env`). That is why
+    every create in both modules threads this map and nothing is done about
+    `pane_run`/`pane_send_text`: a line typed into an existing pane runs in the
+    shell herdr started when the pane was created, so it inherits what that
+    create installed. Creation is the only place the value can go.
+
+    An operator who already set `$BROWSER` has expressed a preference — a real
+    browser — so it is passed through untouched; only an unset `$BROWSER` is
+    defaulted. Same rule the accounts auto-open guard in bin/og follows.
+
+    The bridge is a DAEMON, so `environ` here is whatever environment it was
+    started in — not the operator's shell as it is now. Measured, not assumed:
+    bin/og starts it `nohup env PYTHONUNBUFFERED=1 python3 og_herdr.py ...`, and
+    `env` without `-i` passes the caller's environment through with one variable
+    added, so an exported `$BROWSER` does reach the bridge — the same answer the
+    launcher gets, because both are children of the same `og start`. The one
+    honest limit is that a bridge already running keeps the value it started
+    with: `og start herdr` is idempotent about the daemon (a live pidfile
+    means it is not restarted), so a `$BROWSER` the operator changes afterwards
+    reaches a fresh launcher's panes and not the running bridge's. That is a
+    staleness, not a divergence — same rule, read once, per process.
+
+    KNOWN LIMIT, measured in omnigent 0.17.0 (conversation_browser.py:
+    `open_conversation_url`): on macOS that helper does NOT go through
+    `webbrowser` — it runs `subprocess.run(["open", url])` directly, so a
+    `BROWSER=true` pane does not shut THAT open. So this map does what it can do
+    from here (it silences the `webbrowser` openers, and on every non-darwin
+    platform it is the whole answer), but on macOS the conversation open needs
+    omnigent to route through `webbrowser`, or `auto_open_conversation: false`.
+    Fixing that from og means the global config write this code deliberately
+    replaced (commit ef2bdd9) — so it is written down here rather than done.
+    """
+    return {"BROWSER": environ["BROWSER"] if "BROWSER" in environ else "true"}
+
+
+# ---------------------------------------------------------------------------
 # lazy seams to the sibling modules
 #
 # Nothing here imports og_herdr_client / og_herdr_watch at module load. Tests
@@ -448,7 +515,7 @@ class Bridge:
 
     def __init__(self, watcher, client, dry_run=False, source=DEFAULT_SOURCE,
                  cwd=None, server=DEFAULT_SERVER, state_path=None, filer=None,
-                 space_cap=DEFAULT_SPACE_CAP):
+                 space_cap=DEFAULT_SPACE_CAP, pane_env=None):
         self.watcher = watcher
         self.client = client
         self.dry_run = dry_run
@@ -467,6 +534,14 @@ class Bridge:
         # How many history spaces (past conversations) this bridge may keep on
         # screen; see DEFAULT_SPACE_CAP. A live session is never subject to it.
         self.space_cap = space_cap
+        # The pane-shell environment installed into every pane this bridge asks
+        # herdr to create, so none of them can open a browser (see
+        # `pane_env_for`). DERIVED from this process when not given, rather than
+        # defaulting to "send no env": the bug this fixes was a path that forgot
+        # the map, so the default has to be the safe one — a Bridge built by
+        # anything at all suppresses unless it is explicitly told otherwise.
+        self.pane_env = pane_env_for(dict(os.environ)) if pane_env is None \
+            else pane_env
         # The directory new panes open in when the session does not name one of
         # its own (see `_added`). It comes from THIS process, so with no
         # explicit --cwd it is the bridge's own cwd.
@@ -1047,9 +1122,16 @@ class Bridge:
         metadata — is the SAME as a live root's (see `_setup_pane`), so the space
         reads like a conversation in the list rather than a nameless shell, and
         a title change, an adoption or a removal all take the ordinary path.
+
+        `env` is `self.pane_env`, and this is the create that needs it most: the
+        space is silent until the operator presses Enter — which is the whole
+        design — so an unsuppressed pane here is indistinguishable from a
+        suppressed one until the one keystroke that is the point of the feature
+        runs `og chat --resume`, which opens a browser. Nothing about the day it
+        goes wrong looks like anything on screen; see `pane_env_for`.
         """
         result = self.client.workspace_create(
-            label=title or sid[:8], cwd=cwd, focus=False)
+            label=title or sid[:8], cwd=cwd, focus=False, env=self.pane_env)
         ws_id = _id_of(result.get("workspace"), "workspace_id")
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
@@ -1595,9 +1677,13 @@ class Bridge:
         in a single poll, and each of them asking for focus would rip the
         operator out of whatever they were typing, once per session, forever.
         The bridge reports; it does not take over the screen.
+
+        `env` is `self.pane_env` for the same reason `focus` is False: the pane
+        this creates is the operator's to work in, and a browser opening out of
+        it takes the screen away from them (see `pane_env_for`).
         """
         result = self.client.workspace_create(
-            label=title or sid[:8], cwd=cwd, focus=False)
+            label=title or sid[:8], cwd=cwd, focus=False, env=self.pane_env)
         ws_id = _id_of(result.get("workspace"), "workspace_id")
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
@@ -1636,9 +1722,17 @@ class Bridge:
         HISTORY root being repaired back into its own surviving space (see
         `_reproject`): it is carried onto the record so `_setup_pane` hands the
         pane the resume line unsubmitted rather than a submitted attach.
+
+        A sub-agent's worker pane is the operator's window onto that worker, and
+        it is opened exactly like a root's — so it carries `self.pane_env` too,
+        from the same `pane_env_for`. It used not to: the launcher threaded the
+        map through all three of its own creates and this one threaded nothing,
+        which is how a fan-out of workers put panes on the screen that would
+        open a browser.
         """
         result = self.client.tab_create(space, cwd=cwd,
-                                        label=title or sid[:8], focus=False)
+                                        label=title or sid[:8], focus=False,
+                                        env=self.pane_env)
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
         if tab_id is None or pane_id is None:
@@ -1677,6 +1771,11 @@ class Bridge:
         three steps are identical for both, and that is deliberate — they are
         what makes the agent column read "Claude Code" and the title beside it
         read which worker and which task, whichever kind of session this is.
+
+        NOTHING here carries a pane environment, and that is not an omission:
+        herdr's `pane.send_text` has no `env` to carry (see `pane_env_for`), and
+        the pane these type into was created with the map already installed, so
+        the command runs in a shell that already has it.
 
         The one other variation is step 0 for a HISTORY space: its pane is handed
         the resume line UNSUBMITTED rather than a submitted attach, so a past

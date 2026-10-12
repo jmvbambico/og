@@ -422,7 +422,7 @@ class HerdrClient:
         way to reach a process the pane spawns — the pane runs a fresh shell, so
         an `export` in the launcher never touches it. og passes `BROWSER` here
         so the pane's `og chat` (-> `omnigent run`) cannot open a browser (see
-        og_herdr_launch.pane_env_for). Omitted when unset, so a caller with
+        og_herdr.pane_env_for). Omitted when unset, so a caller with
         nothing to set sends exactly the frame it always did.
         """
         params = {"label": label, "cwd": cwd, "focus": focus}
