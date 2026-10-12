@@ -1264,6 +1264,11 @@ parse_start_args() {
         [[ -n "${2:-}" ]] || die "$1 needs a value"
         mux_args+=("$1" "$2"); shift 2 ;;
       --socket=*|--bin=*)
+        # Same guard, same words as the separate form above -- an empty
+        # --socket= is not a socket path, and two spellings of the same flag
+        # disagreeing about emptiness would hand the launcher an argument it
+        # cannot use while `--socket` alone is fatal here.
+        [[ -n "${1#*=}" ]] || die "${1%%=*} needs a value"
         mux_args+=("${1%%=*}" "${1#*=}"); shift ;;
       # NOT --mux / --server: bin/og derives both (from the mux id and $PORT)
       # and putting them on the command line is how a pane would be pointed at
