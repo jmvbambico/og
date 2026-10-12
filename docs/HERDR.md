@@ -427,6 +427,21 @@ that gap needs either omnigent routing through `webbrowser`, or
 is the machine-wide config write that commit `ef2bdd9` deliberately removed. It
 is recorded here rather than worked around.
 
+**What a macOS operator should do about it.** Set the key by hand, once:
+
+```yaml
+# ~/.omnigent/config.yaml
+auto_open_conversation: false
+```
+
+`omnigent run` resolves an explicit setting before falling back to its
+interactive default (`cli.py`, `_resolve_auto_open_conversation_setting` — the
+tri-state exists precisely so an opt-out is honoured), so this silences the
+pane. Note the scope: it is omnigent's global config, so plain `omnigent run`
+outside herdr stops opening a browser too. That is the trade, and it is the
+operator's to make — which is why og does not write this key for them. Remove
+the line to get the browser back.
+
 Which panes can fire it, on omnigent 0.17.0:
 
 | Pane | Command | Opens a browser? |
