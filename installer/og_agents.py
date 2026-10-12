@@ -898,6 +898,53 @@ def next_wait(now: float, poll_due: float, working: bool,
 
 
 # ---------------------------------------------------------------------------
+# the painter: which rows get which line, and the one write itself
+# ---------------------------------------------------------------------------
+
+def paint_plan(items: list[tuple[str, str]], list_rows: int, offset: int,
+               list_view: int, height: int) -> list[tuple[int, str, str]]:
+    """The `(row, text, role)` triples a paint writes, top to bottom. Pure.
+
+    The scrolling window covers the LIST only — `items[:list_rows]` — so it can
+    never reach into the tail. The tail (blank, optional access panel, footer)
+    is then pinned to the bottom in exactly one place. Windowing over ALL of
+    `items` as the old loop did painted the tail twice on a short list, because
+    a window taller than the list ran past `list_rows` into the very footer the
+    second loop was about to draw at the bottom.
+    """
+    plan: list[tuple[int, str, str]] = []
+    for i, (text, role) in enumerate(
+            items[offset:min(offset + list_view, list_rows)]):
+        plan.append((i, text, role))
+    tail_top = max(0, height - (len(items) - list_rows))
+    for i, (text, role) in enumerate(items[list_rows:]):
+        plan.append((tail_top + i, text, role))
+    return plan
+
+
+def paint_line(stdscr, row: int, text: str, width: int, height: int,
+               attr: int) -> None:
+    """One `addnstr` at the full `width`, tolerant of the window's last cell.
+
+    A box closes its border in the pane's rightmost column, so the write has to
+    be `width` wide or every box renders open on the right. The one cell curses
+    refuses is the window's bottom-right — the last line's last column — so the
+    exception is swallowed there instead of narrowing every other line to dodge
+    it. The old `width - 1` paid that cost on every row; the docstring it had
+    claimed the dropped column was "already on screen", which is false for a
+    border that lives in that column.
+    """
+    import curses
+
+    if not 0 <= row < height or width < 1:
+        return
+    try:
+        stdscr.addnstr(row, 0, text, width, attr)
+    except curses.error:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # the model: listing + lazy detail
 # ---------------------------------------------------------------------------
 
@@ -1434,21 +1481,10 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         painted: Optional[list[tuple[str, str]]] = None
 
         def put(row: int, text: str, role: str) -> None:
-            """One `addnstr`, tolerant of the edges.
-
-            curses raises when a write touches the last cell of the window, and
-            a line one column too long lands exactly there — the rest of the
-            line is already on screen, so swallowing it is a no-op rather than a
-            lost frame.
-            """
-            if not 0 <= row < height or width < 1:
-                return
+            """One `addnstr` at the pane's full width (see `paint_line`)."""
             attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_REVERSE,
                     DIM: curses.A_DIM}[role]
-            try:
-                stdscr.addnstr(row, 0, text, width - 1, attr)
-            except curses.error:
-                pass
+            paint_line(stdscr, row, text, width, height, attr)
 
         while True:
             height, width = stdscr.getmaxyx()
@@ -1495,12 +1531,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             if paint_needed(items, painted):
                 painted = items
                 stdscr.erase()
-                for row, (text, role) in enumerate(
-                        items[offset:offset + list_view]):
+                for row, text, role in paint_plan(items, pane.list_rows,
+                                                  offset, list_view, height):
                     put(row, text, role)
-                tail_top = max(0, height - tail_len)
-                for i, (text, role) in enumerate(items[pane.list_rows:]):
-                    put(tail_top + i, text, role)
                 stdscr.refresh()
 
             # Two clocks, and the wait is whichever comes first: the next data
