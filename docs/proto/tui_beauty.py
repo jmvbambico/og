@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""og agents - BEAUTY prototype: seven treatments for the root header and the
+"""og agents - BEAUTY prototype: eight treatments for the root header and the
 view at large, rendered on the SAME real data so they can be compared.
 
 The complaint this answers, in the operator's words: the ROOT is a naked line
@@ -21,6 +21,20 @@ separator rules, blank breathing rows and those three attributes - never from a
 background fill. V7 says out loud where A_REVERSE/A_DIM would be used, and the
 one place a variant would genuinely want colour is called out in its rationale
 rather than assumed.
+
+V8 (W1) is the exception and is drawn, not asserted: the operator sent a
+screenshot of the WEB view of this same pane and asked for the TUI to get as
+close to it as possible, and the web has a FILLED header bar. So this file now
+emits real SGR escapes - in V8's header bar and in the selection comparison
+below - which is why `clip`, `pad_clip` and `two_col` measure display columns
+with the escapes stripped and `unicodedata.east_asian_width` consulted instead
+of counting characters. V1-V7 contain neither an escape nor a non-BMP glyph, so
+they render identically under the old ruler and under the new one.
+
+Two of W1's details are decisions, not transcription, and both are argued where
+they are implemented: the harness mark gets its OWN aligned gutter (which is
+what makes a per-worker mark earn its column in this layout and only this one),
+and selection is the caret alone rather than a full-block A_REVERSE.
 
 Each variant is a COMPLETE view of the same root + the same worker selection
 (read from sessions.json), each carries a one-line rationale naming what it
@@ -188,14 +202,79 @@ def load(limit=5):
 
 
 # ------------------------------------------------------------ primitives
+# WIDTH IS MEASURED, NOT ASSUMED - the same rule tui_marks.py follows, for the
+# same reason. V8 (W1) is the first variant here that emits a real SGR escape
+# (the filled header bar) and the first to draw a non-BMP glyph (the harness
+# mark), so `len()` would now be wrong twice over on one line: it counts an
+# escape as thirteen visible characters, and it calls every glyph one column
+# whatever it draws as. `_visible_width` strips escapes and asks
+# `unicodedata.east_asian_width`. Nothing before V8 changed output under the
+# new ruler, because no earlier line contains either.
+import re
+import unicodedata
+
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+# East Asian Wide and Fullwidth are the two classes a terminal draws in TWO
+# cells. `A` (Ambiguous) is one cell in a western terminal and two in a
+# CJK-locale one; the mark column is charged pessimistically for it, in
+# `mark_slot` below, which is the same rule tui_marks.py applies.
+_WIDE = ("W", "F")
+_WIDE_SLOT = ("W", "F", "A")
+
+SLOT_COLS = 2
+
+
+def _visible_width(line):
+    """Display columns of one rendered line: escapes stripped, wide glyphs 2."""
+    total = 0
+    for ch in _ANSI_SGR.sub("", line):
+        if unicodedata.combining(ch):
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in _WIDE else 1
+    return total
+
+
+def _cells(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in _WIDE else 1
+
+
+def _tokens(s):
+    """(text, is_escape) runs. Escapes are carried whole and never cut in half."""
+    pos = 0
+    for m in _ANSI_SGR.finditer(s):
+        if m.start() > pos:
+            yield s[pos:m.start()], False
+        yield m.group(0), True
+        pos = m.end()
+    if pos < len(s):
+        yield s[pos:], False
+
+
 def clip(s, w):
     if w <= 0:
         return ""
-    return s if len(s) <= w else s[:max(0, w - 1)] + "\u2026"
+    if _visible_width(s) <= w:
+        return s
+    out, used = [], 0
+    for text, is_escape in _tokens(s):
+        if is_escape:
+            out.append(text)
+            continue
+        for ch in text:
+            cw = _cells(ch)
+            if used + cw > w - 1:
+                return "".join(out) + "\u2026"
+            out.append(ch)
+            used += cw
+    return "".join(out)
 
 
 def pad_clip(s, w):
-    return clip(s, w).ljust(w)
+    c = clip(s, w)
+    return c + " " * max(0, w - _visible_width(c))
 
 
 def rule(w, ch="\u2500"):
@@ -207,9 +286,10 @@ def wrap(text, width):
         return [text]
     out, cur = [], ""
     for word in text.split():
+        cw = _visible_width(word)
         if not cur:
             cur = word
-        elif len(cur) + 1 + len(word) <= width:
+        elif _visible_width(cur) + 1 + cw <= width:
             cur += " " + word
         else:
             out.append(cur)
@@ -224,12 +304,34 @@ def two_col(left, right, w):
     if w <= 0:
         return ""
     right = clip(right, w)
-    room = w - len(right)
+    room = w - _visible_width(right)
     if room <= 0:
-        return right[:w]
-    if len(left) > room:
-        left = clip(left, room)
-    return (left.ljust(room) + right)[:w]
+        return clip(right, w)
+    return pad_clip(left, room) + right
+
+
+def slot_cells(ch):
+    """Cells one character occupies inside the mark slot: Ambiguous counts 2.
+
+    A copy of `tui_marks.slot_cells`, kept here so this prototype stands alone
+    - it has no registry and no tier-0 table of its own - and kept honest by
+    that file's `check_marks()`, which renders W1 through both and compares.
+    """
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in _WIDE_SLOT else 1
+
+
+def mark_slot(mark):
+    """`mark` padded to exactly two columns under the pessimistic ruler.
+
+    Narrow gets one space, a blank vendor gets two, Ambiguous gets none -
+    it has already been charged two. A mark the font does not have draws in
+    the same two cells, which is what keeps a tofu box from shearing the row.
+    """
+    if not mark or mark == " ":
+        return " " * SLOT_COLS
+    return mark + " " * max(0, SLOT_COLS - slot_cells(mark[0]))
 
 
 def box(lines, bw, chars=LIGHT):
@@ -254,9 +356,9 @@ def wbox(k, w, indent=0, chars=LIGHT, caret=" ", extra=""):
 def rule_label(label, w, ch="\u2500"):
     """A rule with `label` inlaid near the left: `== blocked ==========`."""
     lab = " %s " % label
-    if len(lab) + 2 >= w:
+    if _visible_width(lab) + 2 >= w:
         return clip(lab, w)
-    return (ch * 2 + lab + ch * (w - 2 - len(lab)))[:w]
+    return clip(ch * 2 + lab + ch * (w - 2 - _visible_width(lab)), w)
 
 
 def state_counts(kids):
@@ -385,6 +487,176 @@ def v_weights(r, w):
     return out
 
 
+# ---- V8 W1 web-parity -----------------------------------------------------
+# The operator sent a screenshot of the web version of this view and asked for
+# the TUI to get as close to it as possible. What the web has, itemised:
+#   a FILLED header bar across the full pane, carrying a square avatar tile and
+#     the orchestrator name in bold, with clear space under it;
+#   NO BOXES AT ALL around workers - the list is flat;
+#   a LEFT TIMELINE RAIL: a small circled dot in a narrow gutter, joined down
+#     the list by a faint vertical line, drawn dim;
+#   a STATUS CHIP in a second narrow column;
+#   the HARNESS MARK in a third narrow column (the web's per-agent icon);
+#   TWO LINES per worker - the title, then a dim report snippet truncated with
+#     an ellipsis at the pane edge, ALWAYS shown rather than expanded;
+#   a blank row between workers.
+#
+# Two of those are decisions rather than decorations, and they are why W1 is
+# the one layout in the whole file where a per-worker mark earns its column:
+#
+#   THE MARK GETS ITS OWN GUTTER. In V1/V2/V5 the mark is jammed in front of
+#   the title, so it costs the title three columns a row and lands against
+#   whatever the row above happened to end with. Here it is a column of its own
+#   that lines up down the whole list, which is the difference between a mark
+#   and a logo glued to a ragged edge. That reverses the earlier "per-worker
+#   marks do not earn their column" verdict - FOR THIS VARIANT ONLY; the other
+#   seven still jam it in front, and the measurement behind that verdict is
+#   kept in tui_marks.py section A.
+#
+#   SELECTION IS THE CARET. The operator does not want the selected worker in
+#   full reverse video. A_REVERSE therefore survives here in exactly one place,
+#   the header bar, which is a different job from marking the cursor. The
+#   comparison section below shows what that replaces.
+#
+# The geometry is shared with tui_marks.py, which renders the same variant with
+# the operator's real tier-0 marks; that file's `check_marks()` renders W1
+# through both and fails if the two ever disagree.
+REV, NOREV = "\x1b[7m", "\x1b[27m"
+DIM, UNDIM = "\x1b[2m", "\x1b[22m"
+BOLD, UNBOLD = "\x1b[1m", "\x1b[22m"
+
+W1_CARET = "\u25b8"
+# U+2299 for the node, U+2502 for the rule joining them. Both are Ambiguous,
+# like every box-drawing glyph this pane already draws, so W1 introduces no new
+# class of width risk - it adds more of a class the pane has always had.
+W1_DOT = "\u2299"
+W1_RULE = "\u2502"
+# The avatar tile when no vendor mark is available: one cell under both rulers,
+# which matters in a bar filled to the full pane width.
+W1_TILE = "\u25a1"
+# Below this many columns for the title the three gutters are not worth their
+# columns and the form degrades. The title is the pane's content; the gutters
+# are aids to reading it.
+W1_MIN_TITLE = 18
+W1_MIN_TITLE_SMALL = 11
+
+# The web shows a green check for done and a red exclamation for failed. The
+# TUI keeps its OWN state vocabulary - \u25cf \u23f8 \u2717 \u25cb, the four glyphs every other
+# variant here uses - so a state never changes meaning between layouts, and
+# because the chip is one cell of monochrome text glyph it inherits the row
+# attribute exactly as the mark does. Colour is not available to it either way;
+# that divergence from the web shot is deliberate and it is the only one.
+#
+# The capture carries NO report text - a worker row has a title, a status, an
+# agent name, two timestamps and an elicitation count - so the snippet below is
+# SYNTHESISED from the fields that do exist, and the variant says so. What is
+# under test is the second LINE: always present, always dim, truncated with an
+# ellipsis at the pane edge, never expanded on demand. The words are
+# placeholders of the length needed to make that visible at width 46.
+SNIPPET = {
+    "working": "in progress, no report line yet",
+    "blocked": "holding an elicitation, needs a decision",
+    "failed": "stopped on an error, nothing reported",
+    "idle": "finished, report at the tail of the log",
+}
+
+# This prototype has no registry and no tier-0 table of its own, so the mark
+# column is filled from the three vendors that actually appear in the fallback
+# capture. The real table is tui_marks.py's; the parity check described above
+# is what keeps the two honest. An agent not in here draws the same honest
+# blank slot a role row draws there.
+DEMO_MARKS = {"cmdcode": "\u2318", "zen": "\u25af", "freebuff": "\u2554"}
+
+
+def snippet_for(k):
+    """The dim second line W1 shows under every worker. Synthesised; see above."""
+    who = k.get("agent") or "role"
+    return "%s \u00b7 %s \u00b7 %s" % (who, SNIPPET[k["state"]], k["meta"])
+
+
+def w1_cols(rail_on, mark_on):
+    """Columns the W1 gutter occupies: caret, [rail], chip, [mark] + spaces."""
+    return 4 + 2 * rail_on + 3 * mark_on
+
+
+def w1_layout(w):
+    """`(grade, rail_on, mark_on)` for W1 at pane width `w`.
+
+    The drop order is the design, not an accident: the timeline rail goes first
+    because it is decoration on top of a single cell; then the harness mark,
+    which the rest of tui_marks.py argues hardest for; then the chip, whose
+    information the state word in the title already carries. The title is the
+    last thing to go, and the grade is printed with every render, so a degraded
+    W1 always says so on the same screen.
+    """
+    for grade, rail, mk, need in (
+            ("full - timeline rail, status chip and harness mark",
+             True, True, W1_MIN_TITLE),
+            ("DEGRADED - the timeline rail is dropped", False, True,
+             W1_MIN_TITLE_SMALL),
+            ("DEGRADED - rail and mark dropped, chip kept", False, False,
+             W1_MIN_TITLE_SMALL)):
+        if w - w1_cols(rail, mk) >= need:
+            return grade, rail, mk
+    return "DEGRADED - caret only, no gutters", False, False
+
+
+def w1_prefix(caret, rail_char, rail_on, chip, mark, mark_on):
+    """The gutter in front of every W1 line. Identical in both prototypes.
+
+    The rail column is DIM here and nowhere else, which is what makes the rail
+    read as a rail: a full-brightness vertical rule beside a list is a border,
+    and the whole point of this layout is that it has none.
+    """
+    s = caret + " "
+    if rail_on:
+        s += DIM + rail_char + UNDIM + " "
+    s += chip + " "
+    if mark_on:
+        s += mark + " "
+    return s
+
+
+def w1_header(r, w, mark):
+    """The filled bar: A_REVERSE across the full pane, tile plus bold name.
+
+    THE ONE PLACE REVERSE VIDEO BELONGS. Selection is the caret, so the
+    attribute is not competing with selection for the same channel: one thing
+    is a filled bar at the top, the other is an arrow in the gutter, and the
+    operator can see both at once.
+    """
+    lead = " %s " % ((mark or "").strip() or W1_TILE)
+    name = clip(r["harness"], max(2, w - _visible_width(lead) - 1))
+    return REV + pad_clip(lead + BOLD + name + UNBOLD, w) + NOREV
+
+
+def v_web(r, w, mark_of=None, root_mark=None):
+    """V8: the web view's shape, in this pane. Flat, two lines a worker."""
+    grade, rail_on, mark_on = w1_layout(w)
+    mark_of = mark_of or (lambda k: DEMO_MARKS.get(k.get("agent"), " "))
+    cols = w1_cols(rail_on, mark_on)
+    room = max(0, w - cols)
+    out = [w1_header(r, w, root_mark), ""]
+    for i, k in enumerate(r["kids"]):
+        if i:
+            # The blank row is not blank: it carries the rail's vertical rule,
+            # which is what joins one node to the next.
+            out.append(w1_prefix(" ", W1_RULE, rail_on, " ", "  ", mark_on))
+        slot = mark_slot(mark_of(k) or " ")
+        title = BOLD + k["title"] + UNBOLD if i == 0 else k["title"]
+        out.append(w1_prefix(W1_CARET if i == 0 else " ", W1_DOT, rail_on,
+                             GLYPH[k["state"]], slot, mark_on)
+                   + clip(title, room))
+        out.append(w1_prefix(" ", W1_RULE, rail_on, " ", "  ", mark_on)
+                   + DIM + clip(snippet_for(k), room) + UNDIM)
+    # Wrapped, not clipped: a degraded W1 that cannot say which gutter it
+    # dropped has failed at the one job the degradation ladder has.
+    out += [" " + seg for seg in wrap(
+        "W1 at width %d: %s. %d columns of gutter, %d left for the title and "
+        "the snippet." % (w, grade, cols, room), max(1, w - 1))]
+    return out
+
+
 VARIANTS = [
     ("nested-container",
      "Root is a double-line container the worker boxes visibly sit inside, so the top "
@@ -418,11 +690,95 @@ VARIANTS = [
      v_gauge),
     ("weight-encoding",
      "State is told by box weight alone - rounded root, double for failed, heavy for "
-     "blocked, light for the rest - with no colour anywhere; it is the variant that turns "
-     "on A_REVERSE for the selected row and A_DIM for meta. "
+     "blocked, light for the rest - with no colour anywhere. "
      "Cost: +4 root rows and a trailing legend row.",
      v_weights),
+    ("W1 web-parity",
+     "The WEB view, in the pane: a filled A_REVERSE header bar, NO boxes, a DIM "
+     "timeline rail down the left, a status chip, the harness mark in its own "
+     "aligned gutter, two lines a worker with the report snippet always shown, and a "
+     "blank row between workers. Selection is the caret alone. "
+     "Cost: 3 header rows and 2 rows a worker; below %d columns the gutters are "
+     "dropped in order, rail first."
+     % W1_MIN_TITLE,
+     v_web),
 ]
+
+
+# ---------------------------------------------------------------- selection
+# The operator's words: "the arrow pointing to it is enough". W1 is drawn that
+# way, and this section puts the old treatment next to the new one so the
+# replacement is visible rather than asserted - including what is given up.
+def _sel_line(k, w, caret, reverse=False, bold=False):
+    """One flat worker row under each selection treatment, same geometry."""
+    body = k["title"] if not bold else BOLD + k["title"] + UNBOLD
+    line = pad_clip(caret + " " + GLYPH[k["state"]] + " " + body, w)
+    return REV + line + NOREV if reverse else line
+
+
+def selection_block(w, root):
+    """Full-block reverse (what the pane does today) against caret + bold.
+
+    Drawn on the SAME rows as every variant above, one per state, so the two
+    treatments can be compared like for like rather than described.
+    """
+    kids, seen = [], set()
+    for k in root["kids"]:
+        if k["state"] not in seen:
+            seen.add(k["state"])
+            kids.append(k)
+    kids = kids[:4] or FALLBACK[0]["kids"][:4]
+    out = ["", rule(w, "\u2500"),
+           clip("  SELECTION - the caret alone, and what it replaces", w)]
+    out += [" " + seg for seg in wrap(
+        "The operator does not want the selected worker drawn in full reverse "
+        "video: 'the arrow pointing to it is enough'. This section shows the "
+        "treatment being replaced and the one replacing it, on the same rows "
+        "and the same width, so the difference is a thing you look at. W1 "
+        "above uses the caret; A_REVERSE survives in exactly one place in that "
+        "layout, the filled header bar, which is a different thing from a "
+        "selection indicator and never has to be told apart from one.", w - 1)]
+    out.append(rule(w, "\u2500"))
+    out.append("")
+    out.append(clip("  REPLACED - A_REVERSE across the whole row, today:", w))
+    out.append("")
+    for i, k in enumerate(kids):
+        out.append("  " + _sel_line(k, w - 2, "\u25b8" if i == 0 else " ",
+                                    reverse=(i == 0)))
+    out.append("")
+    out.append(clip("  REPLACING - the caret alone, plus A_BOLD on the title:", w))
+    out.append("")
+    for i, k in enumerate(kids):
+        out.append("  " + _sel_line(k, w - 2, "\u25b8" if i == 0 else " ",
+                                    bold=(i == 0)))
+    out.append("")
+    out += [" " + seg for seg in wrap(
+        "WHAT THE OLD TREATMENT BOUGHT: a selected row is unmissable at any "
+        "glance, because it is the only block of inverted colour on the screen "
+        "and the eye finds inverted colour without being aimed at it. It also "
+        "survives a screenshot, a scrollback dump and a pane with no colour at "
+        "all, because reverse is an attribute rather than a hue.", w - 1)]
+    out += [" " + seg for seg in wrap(
+        "WHAT IT GIVES UP: everything else. The block covers the row's own "
+        "text, so a selected title in reverse reads as a label the pane is "
+        "holding rather than a title you can read; it fights the header bar if "
+        "one is added (two inverted regions on one screen, and only one of "
+        "them means 'you are here'); and it is the pane's loudest possible "
+        "signal for the least important fact in the list, which is where the "
+        "operator's cursor happens to be.", w - 1)]
+    out += [" " + seg for seg in wrap(
+        "WHAT THE CARET BUYS BACK: the title stays in normal weight and "
+        "normal colour, the inverted header bar is the only inverted thing on "
+        "screen, and the selection costs one column that no other row is "
+        "using. Its real cost is visibility: a caret is one character wide and "
+        "one character bright, so a long list scanned for a half-remembered "
+        "title can lose it. W1's answer is the blank row between workers - "
+        "each item is its own two-line block, so the caret has a row of its "
+        "own to live in rather than sharing a line with five other rows. A "
+        "pane that wants both can keep the caret and spend A_DIM on the "
+        "unselected rows instead, which is the same idea one step quieter.",
+        w - 1)]
+    return out
 
 
 def build_all(root, w):
@@ -440,9 +796,13 @@ def build_all(root, w):
         out.append(rule(w, "\u2500"))
         out += fn(root, w)
         out.append("")
+    out += selection_block(w, root)
+    out.append("")
     out.append(rule(w, "\u2550"))
-    out.append(clip("  %d variants \u00b7 no line exceeds %d cols \u00b7 no colour: "
-                    "A_NORMAL / A_REVERSE / A_DIM only" % (len(VARIANTS), w), w))
+    out.append(clip("  %d variants \u00b7 no line exceeds %d cols \u00b7 A_NORMAL / "
+                    "A_DIM / A_BOLD everywhere, and A_REVERSE in exactly two "
+                    "places: V8's header bar and the selection comparison"
+                    % (len(VARIANTS), w), w))
     out.append(rule(w, "\u2550"))
     return out
 
@@ -457,11 +817,18 @@ def main():
             w = 46
     root, _now = load()
     lines = build_all(root, w)
-    over = [ln for ln in lines if len(ln) > w]
+    # Escapes stripped, east-asian width consulted: `len()` would count V8's
+    # header bar's thirteen SGR bytes as thirteen columns of text.
+    over = [ln for ln in lines if _visible_width(ln) > w]
     for ln in lines:
-        print(ln[:w])
+        print(clip(ln, w))
     if over:
-        sys.stderr.write("tui_beauty: %d line(s) exceeded width %d\n" % (len(over), w))
+        for ln in over:
+            sys.stderr.write("tui_beauty: %d cols, width %d: %r\n"
+                             % (_visible_width(ln), w, ln))
+        sys.stderr.write("tui_beauty: %d line(s) exceeded width %d\n"
+                         % (len(over), w))
+        return 1
     return 0
 
 
