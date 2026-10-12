@@ -17,13 +17,16 @@ per-row-per-poll fetch is a defect rather than a slow path.
 The shape of the view is the operator's chosen C2 template (rendered three ways
 in docs/proto/tui_chosen.py, C2 approved): a heavy `━` title bar per root with the
 root's name inlaid, a `█/░` done-gauge under it, then the root's workers GROUPED
-BY STATE under a label row, each worker a rounded box whose own left edge is the
-group rail — so one unbroken `│` runs down a group at no extra column cost. The
-caret `▸` on a box's first row is the selection marker; a per-state glyph and the
-harness brand mark sit in fixed columns left of the title. A boxed access panel
-sized to its own content and a one-line footer pin to the bottom. `render` is a
-pure function from state to a list of lines and curses only paints them; that
-separation is what lets the view be tested with `--once`, with no tty in sight.
+BY STATE under a label row, each worker a rounded box. A GUTTER runs down the
+left of a group — its own `│` rail, then the caret column, then the box — so the
+rail is a column of its own at the pane's left edge, unbroken across the
+breathing rows, the label row and EVERY row of every box, and the caret `▸` sits
+between the rail and the box, on the box's first row alone, pointing AT it from
+outside. A per-state glyph and the harness brand mark sit in fixed columns left
+of the title inside the box. A boxed access panel sized to its own content and a
+one-line footer pin to the bottom. `render` is a pure function from state to a
+list of lines and curses only paints them; that separation is what lets the view
+be tested with `--once`, with no tty in sight.
 
 This module is deliberately NOT herdr-specific: it reads Omnigent's HTTP API and
 must run in any terminal. It sends NOTHING to a session — no prompting, no
@@ -54,7 +57,12 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-from og_herdr import DEFAULT_AGENT_LABEL, harness_labels, harness_vendors
+from og_herdr import (
+    DEFAULT_AGENT_LABEL,
+    agent_vendor,
+    harness_labels,
+    harness_vendors,
+)
 from og_herdr_watch import (
     DEFAULT_BASE_URL,
     SessionWatcher,
@@ -87,11 +95,11 @@ STATE_GLYPH = {
 
 # --- the C2 pane geometry (docs/proto/tui_chosen.py, variant C2) ---------------
 #
-# The rail IS the box's own left edge. The breathing and label rows carry a `│`
-# at the box's left column too, so one unbroken vertical line runs down a group
-# and the hierarchy needs no extra column — that shared column is what makes this
-# C2 and not C1 (a rail beside the box, which spends two columns on a doubled
-# border) or C3 (no rail at all, structure read from the labels alone).
+# A GUTTER runs down the pane's left edge: the rail `│` in its OWN column, a
+# space, the caret column, a space — and the worker's rounded box starts AFTER
+# it. So the rail carries the unbroken vertical line down a group alone (the box
+# no longer does that job, because the box has moved right), and the caret points
+# AT the box from OUTSIDE it rather than sitting inside.
 #
 # WIDTH IS COMPOSED WITH ONE RULER: the len-based one (`_clip`/`_pad`, the
 # `_visible_width` notion). Every box-drawing glyph here is East Asian AMBIGUOUS,
@@ -102,18 +110,27 @@ STATE_GLYPH = {
 # two) is used in exactly ONE place, the MARK SLOT, because the slot's whole job
 # is to survive a font that draws an Ambiguous mark wide; see `_mark_slot`.
 ROUND_CORNERS = ("\u256d", "\u2500", "\u256e", "\u2502", "\u2570", "\u256f")
-RAIL = "\u2502"          # U+2502, the group rail, shared with the box's left edge
+RAIL = "\u2502"          # U+2502, the group rail, its own column at the left edge
 TITLE_RULE = "\u2501"    # U+2501 heavy horizontal: the root's title bar
 GAUGE_FULL = "\u2588"    # █
 GAUGE_EMPTY = "\u2591"   # ░
 GAUGE_CELLS = 10         # the done-gauge is a fixed ten-cell bar
 CARET = "\u25b8"         # ▸ the selection marker; the caret row is the SELECTED one
 
-# The eight columns a box's first row spends before the title: leading space,
-# caret, space, state glyph, space, the two-column mark slot, space. The slot is
-# two WHATEVER it draws as, so the glyph and the mark line up down the list — the
-# point of the slot — and the title starts in the same place on every row.
-ROW_PREFIX = 8
+# The four columns a box spends BEFORE its rounded border: the rail, a space, the
+# caret column, a space. The caret is drawn on the box's first row only and blank
+# on every other row of the box (repeating it down the box reads as several
+# selected things — the rule the pre-C2 renderer already followed). The breathing
+# rails and the group label keep the rail in column 0 too, so one unbroken line
+# runs down the whole group.
+GUTTER = 4
+
+# The six columns a box's first CONTENT row spends before the title, now the caret
+# has left it: leading space, state glyph, space, the two-column mark slot, space.
+# The slot is two WHATEVER it draws as, so the glyph and the mark line up down the
+# list — the point of the slot — and the title starts in the same place on every
+# row.
+ROW_PREFIX = 6
 
 # The state groups, in the order they are DRAWN: what needs attention first.
 # `unknown` (a status `display_state` could not name) is its own group rather than
@@ -549,9 +566,11 @@ class Row:
         title with its `<role>_<agent>:` prefix removed); `agent`, `meta` and
         `harness` are its identity; `depth` is how far below the root it sits.
 
-    `harness` holds a HARNESS ID for a root and for a worker alike (both go
-    through `harness_label`/`harness_mark`), and is "" when the row does not know
-    one — the honest blank, never a guessed vendor.
+    `harness` holds a HARNESS ID when the row knows one — a root, whose detail
+    fetch supplies it — and is "" otherwise, which is every worker: a worker's
+    LISTING row carries no `harness`, so its mark is resolved from `agent`
+    instead (see `worker_box` and `agent_mark`). "" is the honest blank, never a
+    guessed vendor.
 
     Only a WORKER row is selectable (see `_is_box`): the caret belongs to a box,
     so the rails, the labels and the roots are stepped over by the selection.
@@ -672,6 +691,15 @@ _HARNESS_MARKS = {
 # that difference. Padding each mark to the same column removes it.
 MARK_SLOT = 2
 
+# The mark for an agent whose VENDOR could not be identified — U+269B ATOM SYMBOL.
+# It is East Asian NARROW (measured: `east_asian_width("\u269b") == "N"`), so its
+# slot is the glyph plus one trailing space, exactly two display columns like
+# every other Narrow mark. It means "an agent whose vendor I could not identify",
+# NOT "no agent here": a row that names no agent identity at all draws the blank
+# slot instead (see `harness_mark` / `agent_mark`), so the atom never appears on a
+# row that simply has nothing to mark.
+ATOM = "\u269b"
+
 
 def _mark_slot(mark: str) -> str:
     """`mark` padded to exactly `MARK_SLOT` display columns. THE slot.
@@ -696,24 +724,58 @@ def _mark_slot(mark: str) -> str:
     return mark + " " * max(0, MARK_SLOT - _display_width(mark))
 
 
+def _vendor_mark(vendor: Any) -> str:
+    """The mark slot for an already-resolved vendor, atom when it resolved to
+    nothing.
+
+    The atom is the honest answer for a row that NAMES an agent (`claude-native`,
+    `zen`) whose vendor the catalog does not carry: something is there, we just
+    cannot say what. It is reached both by a harness id whose registry row is
+    missing and by an agent name the registry does not list, which is why it lives
+    here rather than in either lookup.
+    """
+    return _mark_slot(_HARNESS_MARKS.get(vendor) or ATOM)
+
+
 def harness_mark(harness: Any) -> str:
-    """The brand mark for a harness id, in its fixed two-column slot.
+    """The brand mark for a HARNESS ID, in its fixed two-column slot.
 
     `claude-native` -> "✳ " (vendor `anthropic`). Resolves harness id -> vendor
-    through `og_herdr.harness_vendors` (the same registry the labels come from,
-    so the two cannot disagree) and then vendor -> glyph through `_HARNESS_MARKS`.
+    through `og_herdr.harness_vendors` (the same registry the labels come from, so
+    the two cannot disagree) and then vendor -> glyph through `_HARNESS_MARKS`.
 
-    NEVER raises and never loses a row over a cosmetic failure: an unknown
-    harness, a harness whose vendor the table does not name, a missing or corrupt
-    registry, or a harness that is None all return the BLANK slot (two spaces),
-    exactly as `harness_label` degrades to a raw id. A pane must be able to
-    render with no marks at all rather than not render — a blank is the honest
-    answer, never a guessed vendor.
+    A harness that is ABSENT — None, empty, whitespace — draws the BLANK slot
+    (two spaces): there is no agent to identify, and a mark would be meaningless.
+    A harness that is PRESENT but unresolvable — not in the registry, or on a
+    vendor the mark table does not carry, or a registry that could not be read —
+    draws the ATOM, because an agent IS named and only its vendor is unknown.
+
+    NEVER raises and never loses a row over a cosmetic failure, exactly as
+    `harness_label` degrades to a raw id. A pane must be able to render with no
+    marks at all rather than not render; the atom is the honest "unknown agent",
+    the blank the honest "no agent".
     """
-    if not isinstance(harness, str) or not harness:
+    if not isinstance(harness, str) or not harness.strip():
         return _mark_slot("")
-    vendor = harness_vendors().get(harness)
-    return _mark_slot(_HARNESS_MARKS.get(vendor, ""))
+    return _vendor_mark(harness_vendors().get(harness))
+
+
+def agent_mark(agent: Any) -> str:
+    """The brand mark for an agent NAME (a worker's title-derived identity).
+
+    The WORKER counterpart of `harness_mark`, and the fix for the blank marks on
+    every worker row: a worker's LISTING row carries no `harness`, so the mark has
+    to come from the name the title already gives — `zen`, `cmdcode`, `freebuff`.
+    Resolves name -> vendor through `og_herdr.agent_vendor` (registry `id`, or the
+    registry `worker` field with its `coder_` prefix stripped) and then vendor ->
+    glyph, sharing `_vendor_mark` with the harness path so the two agree.
+
+    Same blank/atom split as `harness_mark` and for the same reason: no name is
+    blank, a name the registry cannot resolve is the atom. Never raises.
+    """
+    if not isinstance(agent, str) or not agent.strip():
+        return _mark_slot("")
+    return _vendor_mark(agent_vendor(agent))
 
 
 def build_rows(
@@ -1041,34 +1103,48 @@ def _round_box(inner_lines: list[str], width: int) -> list[str]:
 
 
 def worker_box(row: Row, width: int, selected: bool) -> tuple[list[str], int]:
-    """One worker as a rounded box, and the index of its caret row.
+    """One worker as a guttered, rounded box, and the index of its caret row.
 
-    Line 1 (the row AFTER the top border) carries the caret, the state glyph and
-    the harness mark in its fixed two-column slot, then the title; line 2 the
-    agent name flush left and the clock flush right. An expanded report is a
+    The box starts AFTER the `GUTTER`-column gutter (`│`, space, caret, space), so
+    its own left edge sits at column 4 and one unbroken rail runs down the group
+    at column 0 — the shape the operator asked for. Every returned line is exactly
+    `width` columns: the four-column gutter plus a box `width - GUTTER` wide.
+
+    The caret `▸` is drawn on the box's FIRST row (the `╭` border) and blank on
+    every other row of the box, so it points AT the box from outside rather than
+    sitting inside it. The returned index is 0 — the caller hangs the SELECTED
+    role there, which is the row the live view scrolls to keep visible.
+
+    Inside the box, content line 1 carries the state glyph and the harness mark in
+    its fixed two-column slot, then the title (the caret has left this row); line 2
+    the agent name flush left and the clock flush right. An expanded report is a
     third row INSIDE the box — never a loose line that would break the rectangle.
-
-    The caret goes on that ONE row, and the returned index is where the caller
-    must hang the SELECTED role: hanging it on row 0 (the top border) would bold
-    the wrong line and scroll the pane to a rule instead of to the caret. The
-    index is 1 because `_round_box` puts the top border at 0.
     """
-    inner = max(0, width - 2)
-    caret = CARET if selected else " "
-    line1 = (" " + caret + " " + state_glyph(row.state) + " "
-             + harness_mark(row.harness) + " "
+    box_width = max(4, width - GUTTER)
+    inner = max(0, box_width - 2)
+    # A real harness on the row wins; a worker carries none, so its mark is
+    # resolved from the agent name the title gave — only when BOTH are absent is
+    # the slot blank (see `harness_mark` / `agent_mark`).
+    mark = harness_mark(row.harness) if row.harness else agent_mark(row.agent)
+    line1 = (" " + state_glyph(row.state) + " " + mark + " "
              + _clip(row.text, inner - ROW_PREFIX))
     lines = [line1, _two_col(" " + (row.agent or "role"), row.meta, inner)]
     if row.expanded and row.snippet:
         lines.append("  " + _clip(_oneline(row.snippet), inner - 2))
-    return _round_box(lines, width), 1
+    boxed = _round_box(lines, box_width)
+    caret = CARET if selected else " "
+    return [
+        RAIL + " " + (caret if index == 0 else " ") + " " + line
+        for index, line in enumerate(boxed)
+    ], 0
 
 
 def _rail_label(text: str, width: int) -> str:
     """A group label row: the rail, a space, then the state word.
 
-    The rail glyph sits at the box's own left column, so the label row continues
-    the unbroken vertical line the group's boxes draw down their left edge.
+    The rail glyph sits in its own column at the pane's left edge, so the label
+    row continues the unbroken vertical line the group's breathing rows and every
+    box row draw down column 0.
     """
     return RAIL + " " + _clip(text, max(0, width - 2))
 

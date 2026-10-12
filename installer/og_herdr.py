@@ -300,6 +300,88 @@ def harness_vendors() -> dict[str, str]:
     return vendors
 
 
+# The third view of the same catalog, and the one `og agents` needs: an agent
+# NAME (the `zen` / `cmdcode` a worker's title carries) to the vendor its brand
+# mark is keyed by. A worker's LISTING row has no `harness` — only a root's
+# detail fetch carries one — so a mark that resolved harness->vendor alone drew
+# a blank for every worker. The name is a registry fact (the `id`, or the
+# `worker` field the orchestrator dispatches under), so this reads it from the
+# catalog rather than keeping a second alias table that could drift.
+_REGISTRY_AGENT_VENDORS: dict[str, str] | None = None
+
+# The prefix the orchestrator puts on a worker name in a session title
+# (`coder_zen:task`). Stripped on BOTH the table keys and the lookup, because
+# the catalog spells the alias `coder_zen` while the view's `split_title` hands
+# over `zen`.
+_WORKER_PREFIX = "coder_"
+
+
+def agent_vendors() -> dict[str, str]:
+    """`{agent name: vendor}` from installer/registry.json, cached, lowercased.
+
+    The name is EITHER the row's `id` (the stable identity — `cmdcode`,
+    `freebuff`, `kilo`, `codex`) OR its `worker` field with the `coder_` prefix
+    stripped (the name the orchestrator actually dispatches under — the
+    opencode row's `worker: "coder_zen"` is where the alias `zen` comes from,
+    since `zen` is not an `id` at all). Reading the `worker` field rather than
+    hardcoding `zen -> opencode` is what keeps the alias derivable from the
+    catalog alone.
+
+    The same degradation contract as `harness_labels` and `harness_vendors`, and
+    for the same reason: never raises and never returns a half-read table. A
+    missing, unreadable or malformed catalog yields `{}`, and a name that is
+    absent resolves to no vendor — the caller then draws the unknown-agent mark
+    rather than guessing a vendor the registry does not name. A broken catalog
+    must cost a cosmetic detail, never a pane.
+    """
+    global _REGISTRY_AGENT_VENDORS
+    if _REGISTRY_AGENT_VENDORS is not None:
+        return _REGISTRY_AGENT_VENDORS
+    vendors: dict[str, str] = {}
+    try:
+        catalog = json.loads(REGISTRY_PATH.read_text())
+    except (OSError, ValueError):
+        catalog = None
+    rows = catalog.get("agents") if isinstance(catalog, dict) else None
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        vendor = row.get("vendor")
+        if not isinstance(vendor, str) or not vendor:
+            continue
+        for field in ("id", "worker"):
+            value = row.get(field)
+            if not isinstance(value, str) or not value:
+                continue
+            key = value.strip().lower()
+            if key.startswith(_WORKER_PREFIX):
+                key = key[len(_WORKER_PREFIX):]
+            if key:
+                # First row wins, matching `harness_vendors`: two rows sharing an
+                # alias would be an ambiguous catalog, and the first is the one
+                # `--questions` would offer.
+                vendors.setdefault(key, vendor)
+    _REGISTRY_AGENT_VENDORS = vendors
+    return vendors
+
+
+def agent_vendor(agent: object) -> str | None:
+    """The vendor for an agent NAME, or None.
+
+    Case-insensitive and `coder_`-tolerant, because that is the shape the names
+    arrive in: a title reads `Coder_Zen:task` as readily as `coder_zen:task`, and
+    `split_title` hands over the part after the prefix. Never raises: a non-string
+    or empty name resolves to None, exactly as a name the catalog does not list
+    does, and the caller renders the unknown-agent mark for it.
+    """
+    if not isinstance(agent, str) or not agent.strip():
+        return None
+    key = agent.strip().lower()
+    if key.startswith(_WORKER_PREFIX):
+        key = key[len(_WORKER_PREFIX):]
+    return agent_vendors().get(key)
+
+
 def agent_label(session: dict) -> str:
     """The name herdr shows in a pane's agent column for this session.
 
