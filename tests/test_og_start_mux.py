@@ -135,6 +135,124 @@ def test_a_non_mux_bare_argument_is_still_a_domain(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# the launcher's OWN flags — `og start herdr --once`
+# --------------------------------------------------------------------------
+# `--once` is the launcher's documented diagnostic (it does the work, prints it,
+# and returns instead of exec'ing the multiplexer), and until now it could not be
+# TYPED: cmd_start exec'd the launcher with a fixed argv and parse_start_args
+# refused every option but --use, so `og start herdr --once` died here as an
+# unknown option on its way to a parser that has it. It is the one mode in which
+# the launcher's warnings outlive the exec — which is exactly why the failure it
+# was meant to explain could not be reproduced with it.
+#
+# The flags collected here are the launcher's own (og_herdr_launch
+# .build_parser) MINUS the two cmd_start derives itself; see the parse loop for
+# why --mux/--server are excluded. Everything else still dies in this function:
+# a flag that is accepted and quietly discarded is the defect being fixed, one
+# layer up.
+
+_FORWARD_DRIVER = r'''
+src="$0"; args=("$@")
+set --
+source "$src" >/dev/null 2>&1
+parse_start_args ${args[@]+"${args[@]}"} || exit 1
+printf 'mux=%s\nforwarded=%s\n' "${OG_START_MUX-}" "${OG_START_MUX_ARGS[*]-}"
+'''
+
+
+def _forward(result):
+    got = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("mux", "forwarded"):
+            got[key] = value
+    return got
+
+
+# argv -> (mux, what the launcher is handed). The empty rows are the regression
+# guard: an `og start` with no launcher flag must forward NOTHING, or the exec
+# grows a stray argument on every start on the planet.
+FORWARD_CASES = [
+    (["herdr", "--once"], "herdr", ["--once"]),
+    (["--once", "herdr"], "herdr", ["--once"]),          # mux stripped anywhere
+    (["herdr", "tunneled", "--once"], "herdr", ["--once"]),
+    (["herdr", "--socket", "/tmp/h.sock"], "herdr",
+     ["--socket", "/tmp/h.sock"]),
+    (["herdr", "--socket=/tmp/h.sock"], "herdr", ["--socket", "/tmp/h.sock"]),
+    (["herdr", "--bin", "/opt/herdr"], "herdr", ["--bin", "/opt/herdr"]),
+    (["herdr"], "herdr", []),
+    ([], "", []),
+    (["local"], "", []),
+    (["tunneled", "mydomain"], "", []),
+]
+
+
+@pytest.mark.parametrize("argv,mux,forwarded", FORWARD_CASES,
+                         ids=[" ".join(c[0]) or "(empty)" for c in FORWARD_CASES])
+def test_a_launcher_flag_is_forwarded_and_everything_else_is_not(
+        tmp_path, argv, mux, forwarded):
+    result = _source_and_forward(tmp_path, argv)
+    assert result.returncode == 0, result.stderr
+    assert _forward(result) == {"mux": mux,
+                                "forwarded": " ".join(forwarded)}
+
+
+def _source_and_forward(home, argv):
+    return subprocess.run(
+        ["bash", "-c", _FORWARD_DRIVER, str(OG), *argv],
+        capture_output=True, text=True, timeout=30,
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin",
+             "OG_REPO": str(REPO)},
+    )
+
+
+def test_a_launcher_flag_with_no_multiplexer_is_refused_not_swallowed(tmp_path):
+    """There is nothing to forward it to, and accepting it anyway would leave the
+    operator believing `--once` did something. A multiplexer whose BINARY is
+    missing is a different question — that one is cmd_start's, and it is never
+    fatal (see `test_og_start_herdr_warns_and_degrades_without_herdr`)."""
+    result = _source_and_forward(tmp_path, ["--once"])
+    assert result.returncode != 0
+    assert "--once is a flag of 'og start <mux>'" in result.stderr
+    assert "og start herdr --once" in result.stderr
+
+
+def test_an_option_the_launcher_does_not_have_is_still_an_unknown_option(tmp_path):
+    """The refusal is not a hole everything falls through. `--mux` and `--server`
+    land here too, on purpose: cmd_start derives both, and a user override would
+    point the launcher at another space or another server with nothing to show
+    for it."""
+    for flag in ("--nope", "--mux", "--server"):
+        result = _source_and_forward(tmp_path, [flag])
+        assert result.returncode != 0, flag
+        assert "unknown option: {0}".format(flag) in result.stderr
+
+
+def test_a_forwarded_flag_missing_its_value_is_refused(tmp_path):
+    result = _source_and_forward(tmp_path, ["herdr", "--socket"])
+    assert result.returncode != 0
+    assert "--socket needs a value" in result.stderr
+
+
+def test_cmd_start_hands_the_forwarded_flags_to_the_launcher():
+    """Collection is not delivery: the exec is the only place the flags reach the
+    launcher, and a launcher exec'd without them is exactly the bug being fixed.
+    Pinned at the source because driving cmd_start as far as its exec would start
+    a real server — the same reason `parse_start_args` exists as a function."""
+    text = OG.read_text()
+    # The whole statement, backslash continuations included — a flag forwarded on
+    # the continuation line is exactly the thing that must not go missing.
+    statement = re.search(r'^(\s*exec python3 "\$launcher"(?:[^\n]*\\\n)*[^\n]*)',
+                          text, re.M)
+    assert statement, "cmd_start no longer execs the launcher"
+    argv = statement.group(1)
+    # After, not before: the flags must not be able to displace the --mux and
+    # --server this command derived from the mux id and $PORT.
+    assert argv.index('${mux_args[@]+"${mux_args[@]}"}') > argv.index("--server")
+    assert '--mux "$mux"' in argv and '--server "http://127.0.0.1:$PORT"' in argv
+
+
+# --------------------------------------------------------------------------
 # `og help` -- the usage block must list every command the dispatch handles
 # --------------------------------------------------------------------------
 # bin/og prints usage with `sed -n '2,26p'` over its own header comment. The

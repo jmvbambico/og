@@ -9,6 +9,7 @@ worse hazard than the bug it is looking for.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -21,12 +22,15 @@ from og_herdr_launch import (  # noqa: E402
     DEFAULT_AGENT_NAME,
     Launch,
     LaunchError,
+    _hold_for_problems,
     agents_pane_enabled,
     agent_name,
     install_config,
     is_inside,
     launch,
+    launch_log_path,
     live_session,
+    main,
     pane_env_for,
     session_space_cap,
 )
@@ -173,6 +177,16 @@ class FakeWatcher:
 class UnreadableWatcher(FakeWatcher):
     def poll_once(self):
         raise OSError("connection refused")
+
+
+class NoSplitClient(FakeClient):
+    """A multiplexer whose `pane.split` fails — the agents pane's own failure."""
+
+    def call(self, method, params=None):
+        if method == "pane.split":
+            self.calls.append((method, params or {}))
+            raise RuntimeError("no room")
+        return super().call(method, params)
 
 
 def root_session(sid="s1", cwd=CWD, status="idle", **extra):
@@ -386,6 +400,35 @@ def test_case_b_focuses_the_existing_space_and_attaches(tmp_path):
     assert launch(ctx) == "attach"
     assert client.methods == ["workspace.list", "workspace.focus"]
     assert client.params_of("workspace.focus")[0] == {"workspace_id": "w7"}
+
+
+def test_case_b_never_opens_an_agents_pane_and_says_nothing_when_it_cannot(
+        tmp_path, capsys):
+    """THE KNOWN GAP, pinned on purpose and deliberately NOT fixed here.
+
+    Attaching to an existing session's space never splits, so a space whose
+    agents pane was closed by hand — or that predates the feature — gives the
+    operator no pane and no explanation. At the keyboard that is
+    indistinguishable from case (A)'s split failing, for the same reason: the
+    launch says nothing either way.
+
+    The split needs a tab id and a root pane, and an existing space has neither
+    trustworthy (the layout may have changed since the record was written), so
+    "add the pane if it is missing" is a design decision, not a line of code —
+    see the note in `_attach_there`. Whoever closes the gap changes THIS test,
+    which is what makes it a to-do rather than an accident.
+    """
+    (tmp_path / "og-herdr.json").write_text(
+        '{"version": 2, "spaces": {"s1": {"workspace_id": "w7", '
+        '"tab_id": "w7:t1", "pane_id": "w7:p1", "owner": "launcher"}}, '
+        '"pending": {}}')
+    client = FakeClient(workspaces=[{"workspace_id": "w7", "pane_count": 1}])
+    ctx = make_ctx(tmp_path, client, FakeWatcher([root_session()]))
+
+    assert launch(ctx) == "attach"
+    assert "pane.split" not in client.methods
+    assert ctx.problems == [], "this case reports nothing today, by design"
+    assert capsys.readouterr().out.count("!") == 0
 
 
 def test_case_b_adopts_when_the_session_has_no_space(tmp_path):
@@ -659,6 +702,152 @@ def test_a_split_failure_never_fails_the_launch(tmp_path):
     client = HalfDead()
     launch(make_ctx(tmp_path, client, FakeWatcher()))
     assert client.text_typed() == ["og chat"]
+
+
+# ---------------------------------------------------------------------------
+# a degradation the operator can actually find out about
+# ---------------------------------------------------------------------------
+# THE DEFECT THIS PINS: `og start herdr` ends in `exec herdr`, and herdr's TUI
+# takes the terminal into the alternate screen within milliseconds. A warning
+# that reached only the terminal was therefore wiped before a human could read
+# it, so a missing agents pane produced no cause at all — reported from a second
+# machine, where nobody could see what og had said a moment earlier.
+#
+# Two channels, because they answer different questions:
+#   * the log answers "what happened?" afterwards, on any machine, forever;
+#   * the hold answers "did something go wrong?" in the moment, before the
+#     operator is inside the TUI and has forgotten they saw anything.
+# Neither alone closes the gap: a log nobody knows to open is the same void with
+# a file in it, and a countdown nobody sees is the same warning as before.
+
+
+def _launch_log(tmp_path):
+    return tmp_path / "logs" / "herdr-launch.log"
+
+
+def test_a_split_failure_is_written_to_the_launcher_log(tmp_path):
+    """The durable channel. Timestamp-prefixed so a log spanning two launches is
+    still readable, which is the only time anybody ever reads this file."""
+    client = NoSplitClient()
+    launch(make_ctx(tmp_path, client, FakeWatcher()))
+
+    lines = _launch_log(tmp_path).read_text().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith(time.strftime("%Y-%m-%d")), lines[0]
+    assert "could not open the og agents pane" in lines[0]
+    assert "no room" in lines[0]
+
+
+def test_the_launcher_log_is_not_the_file_herdr_writes_its_own_output_to(tmp_path):
+    """`log_path` is herdr's stdout and stderr (spawn_herdr_server appends to
+    it). An og warning written there reads as the multiplexer's, and an operator
+    tailing herdr's log to find out why herdr misbehaved would find og's
+    sentence and no answer."""
+    ctx = make_ctx(tmp_path, NoSplitClient(), FakeWatcher())
+    launch(ctx)
+
+    assert ctx.log_path.name == "herdr-server.log"
+    assert launch_log_path(ctx) != ctx.log_path
+    assert not ctx.log_path.exists(), "og wrote into herdr's own log"
+
+
+def test_a_launch_that_worked_writes_no_launch_log(tmp_path):
+    """The log means "something went wrong". A file written on every launch is a
+    file nobody opens."""
+    launch(make_ctx(tmp_path, FakeClient(), FakeWatcher()))
+    assert not _launch_log(tmp_path).exists()
+
+
+def test_a_launch_with_no_log_path_still_reports_without_raising(tmp_path):
+    """A caller that passes no `log_path` has no durable channel, which is the
+    old behaviour — not a reason for the launch to fail."""
+    ctx = make_ctx(tmp_path, NoSplitClient(), FakeWatcher())
+    ctx.log_path = None
+    assert launch(ctx) == "attach"
+    assert ctx.problems and "og agents" in ctx.problems[0]
+
+
+def test_a_degraded_launch_holds_the_terminal_before_the_tui_takes_it(
+        tmp_path, monkeypatch, capsys):
+    """Re-surfaced, not just printed once: `_open_space` prints `info("opened
+    space ...")` AFTER the split, so by exec time the first copy has scrolled off
+    the top. The hold waits — in whole seconds, counted by a bounded loop rather
+    than a wall-clock deadline, so it cannot overrun its own budget."""
+    monkeypatch.setattr("og_herdr_launch.operator_is_watching", lambda: True)
+    monkeypatch.setattr("og_herdr_launch.DEGRADE_HOLD_SECONDS", 3)
+    slept = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+
+    ctx = make_ctx(tmp_path, NoSplitClient(), FakeWatcher())
+    launch(ctx)
+    capsys.readouterr()          # discard the first copy, as a terminal would scroll it
+    _hold_for_problems(ctx)
+
+    out = capsys.readouterr().out
+    assert "1 thing about this launch did not work" in out
+    assert "could not open the og agents pane" in out
+    assert "the chat pane itself is unaffected" in out
+    assert slept == [1.0, 1.0, 1.0]
+
+
+def test_the_hold_is_skipped_when_nobody_is_watching(tmp_path, monkeypatch):
+    """`og start herdr > run.log` is a real invocation, and its stdout is a file.
+    Sitting there counting down for nobody would be a six-second start-up cost
+    added to every degraded launch in a script."""
+    monkeypatch.setattr("time.sleep", lambda _s: pytest.fail("held the terminal"))
+    ctx = make_ctx(tmp_path, NoSplitClient(), FakeWatcher())
+    launch(ctx)
+    _hold_for_problems(ctx)     # operator_is_watching is False under pytest
+
+
+def test_the_hold_is_skipped_when_nothing_degraded(tmp_path, monkeypatch):
+    """The ordinary launch costs exactly what it cost before."""
+    monkeypatch.setattr("og_herdr_launch.operator_is_watching", lambda: True)
+    monkeypatch.setattr("time.sleep", lambda _s: pytest.fail("held the terminal"))
+    ctx = make_ctx(tmp_path, FakeClient(), FakeWatcher())
+    launch(ctx)
+    assert ctx.problems == []
+    _hold_for_problems(ctx)
+
+
+def test_the_reason_outlives_the_exec(tmp_path, monkeypatch):
+    """THE WHOLE FIX, end to end: the agents pane fails, the chat still comes up,
+    the multiplexer is STILL attached, the reason is on the terminal, and it is
+    in the log afterwards. The exec is stubbed — which is the point, because the
+    real one is what was destroying the message."""
+    client = NoSplitClient()
+    ctx = make_ctx(tmp_path, client, FakeWatcher())
+    monkeypatch.setattr("og_herdr_launch.build_launch", lambda args: ctx)
+    monkeypatch.setattr("og_herdr_launch.operator_is_watching", lambda: True)
+    monkeypatch.setattr("og_herdr_launch.DEGRADE_HOLD_SECONDS", 2)
+    slept = []
+    monkeypatch.setattr(time, "sleep", slept.append)
+    execed = []
+    monkeypatch.setattr("os.execvp", lambda binary, argv: execed.append(binary))
+
+    assert main(["--mux", "herdr"]) == 0
+
+    # The launch did not fail: the chat is up and the TUI is attached anyway.
+    assert client.text_typed() == ["og chat"]
+    assert len(execed) == 1
+    # …and the operator was held long enough to read why, before it was attached.
+    assert slept == [1.0, 1.0]
+    # …and the same reason is readable afterwards.
+    assert "could not open the og agents pane" in _launch_log(tmp_path).read_text()
+
+
+def test_the_hold_is_skipped_by_once_which_keeps_the_terminal(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    """`--once` returns before the exec, so nothing takes the terminal and the
+    text is already on screen — waiting there would be pure delay. This is the
+    diagnostic the operator is told to run, so it must stay instant."""
+    monkeypatch.setattr("time.sleep", lambda _s: pytest.fail("held the terminal"))
+    ctx = make_ctx(tmp_path, NoSplitClient(), FakeWatcher())
+    monkeypatch.setattr("og_herdr_launch.build_launch", lambda args: ctx)
+    monkeypatch.setattr("os.execvp", lambda *a: pytest.fail("attached"))
+    assert main(["--mux", "herdr", "--once"]) == 0
+    assert "could not open the og agents pane" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
