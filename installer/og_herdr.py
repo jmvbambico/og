@@ -1130,8 +1130,9 @@ class Bridge:
         runs `og chat --resume`, which opens a browser. Nothing about the day it
         goes wrong looks like anything on screen; see `pane_env_for`.
         """
+        label = title or sid[:8]
         result = self.client.workspace_create(
-            label=title or sid[:8], cwd=cwd, focus=False, env=self.pane_env)
+            label=label, cwd=cwd, focus=False, env=self.pane_env)
         ws_id = _id_of(result.get("workspace"), "workspace_id")
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
@@ -1147,9 +1148,11 @@ class Bridge:
         # Same reason `_add_space` drops it: this pass's listing predates the
         # space, and a later lookup in the same batch must not read it as gone.
         self._ws_index = None
+        labelled = self._rename_first_tab(sid, tab_id, label)
         self._setup_pane(sid, rec, state)
         return [f"add {sid} → history space {ws_id} tab {tab_id} pane {pane_id} "
-                f"'{title}' '{resume_command(sid)}' (unsubmitted) [{state}]"]
+                f"'{title}' '{resume_command(sid)}' (unsubmitted) [{state}]"] \
+            + labelled
 
     # -- adopting a space that is already on screen --------------------------
     #
@@ -1233,6 +1236,17 @@ class Bridge:
             bool((info or {}).get("pane_count"))
         if info is not None:
             self._rename_space(ws_id, title, info)
+            # The space's first tab follows it onto the title too — but ONLY when
+            # the space itself was relabelled (the same `label != title` test
+            # `_rename_space` skips on), so an adoption of an already-correct
+            # space does not fire a redundant `tab.rename` every time. This is
+            # the adoption path for a space the launcher made: it labels the tab
+            # from the directory, and an already-titled session may never produce
+            # the `title_changed` that `_rename_own_space` needs, so the tab would
+            # otherwise keep the directory name for the life of the session.
+            if title and info.get("label") != title:
+                self._pass_notes.extend(
+                    self._rename_first_tab(sid, record.get("tab_id"), title))
         # NOT in a dry run, and that is the whole reason this save is guarded
         # rather than left to `_save_state`: a dry run that claimed and wrote
         # would consume the pending record and leave the NEXT REAL RUN with
@@ -1349,6 +1363,13 @@ class Bridge:
         Absorbing it hides nothing about a dead space either: a workspace that
         is gone took its panes with it, so `report_agent` above — which runs
         first and DOES propagate — is what reports it and drives the repair.
+
+        The space's first TAB is relabelled in the same breath and with the same
+        absorb-and-record shape (see `_rename_first_tab`): `workspace.create`
+        cannot label the tab it makes, so the root's tab carries the space's own
+        label from `_add_space`/the launcher and must move onto the title here
+        with the space. A tab rename that fails is a second line in the same
+        return, never a second failure mode.
         """
         ws_id = rec.get("workspace_id")
         own = self._spaces.get(sid)
@@ -1356,8 +1377,50 @@ class Bridge:
             return []
         index = self._workspace_index()
         info = index.get(ws_id) if index is not None else None
+        lines: list[str] = []
         try:
             self._rename_space(ws_id, title, info or {})
+        except _error_cls() as exc:
+            lines.append(_error_line(sid, exc))
+        # ...and the space's FIRST TAB follows it. `workspace.create` labels only
+        # the space, so the root's tab was opened unlabelled (herdr shows its tab
+        # number) and the launcher's own create labels it from the directory —
+        # either way it must converge onto the title here, or the operator is left
+        # with a correctly-named space holding a tab still called `1`.
+        lines.extend(self._rename_first_tab(sid, rec.get("tab_id"), title))
+        return lines
+
+    def _rename_first_tab(self, sid: str, tab_id, label) -> list:
+        """Give a space's first tab the space's own label, absorbing failure.
+
+        herdr's `workspace.create` labels the WORKSPACE only — its `label` is the
+        workspace's, and it has no field for the tab's — so the first tab a create
+        makes implicitly is UNLABELLED and herdr falls back to the tab number:
+        the bare `1` the operator sees. `tab.create` carries its own `label`,
+        which is why a worker's tab already reads a real name. This is the call
+        that closes the gap for the root tab.
+
+        Renamed by the id that came back from the create (`_add_space`,
+        `_add_history_space`, and the launcher's own record carried through
+        `_adopt`) or the id the record already carries (`_rename_own_space`) —
+        never by position. herdr tab ids are stable across a reorder, so the
+        session's own tab is relabelled wherever the operator has dragged it and
+        the WRONG tab is never touched. A tab the operator has since CLOSED
+        answers `tab_not_found`, which is ABSORBED here rather than raised: the
+        label is cosmetic, and `reconcile` treats a raised `*_not_found` as a
+        stale record and repairs the session — a repair driven by a tab label
+        would re-open a pane over a cosmetic failure, which is a far worse
+        outcome than a tab that keeps its number. The same absorb-and-record
+        shape `_rename_own_space` chose for the space label, kept consistent.
+
+        Returns the lines to add — empty on success. A missing `tab_id` (an
+        upgraded v1 record carries none) or a missing label is a no-op: there is
+        nothing named to rename.
+        """
+        if not tab_id or not label:
+            return []
+        try:
+            self.client.tab_rename(tab_id, label)
         except _error_cls() as exc:
             return [_error_line(sid, exc)]
         return []
@@ -1682,8 +1745,9 @@ class Bridge:
         this creates is the operator's to work in, and a browser opening out of
         it takes the screen away from them (see `pane_env_for`).
         """
+        label = title or sid[:8]
         result = self.client.workspace_create(
-            label=title or sid[:8], cwd=cwd, focus=False, env=self.pane_env)
+            label=label, cwd=cwd, focus=False, env=self.pane_env)
         ws_id = _id_of(result.get("workspace"), "workspace_id")
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
@@ -1704,9 +1768,10 @@ class Bridge:
         # here is unknown (`pane_count` decides whether an adopted record's pane
         # can be resumed on) and guessing it would be inventing a fact.
         self._ws_index = None
+        labelled = self._rename_first_tab(sid, tab_id, label)
         self._setup_pane(sid, rec, state)
         return [f"add {sid} → space {ws_id} tab {tab_id} pane {pane_id} "
-                f"'{title}' '{command}' [{state}]"]
+                f"'{title}' '{command}' [{state}]"] + labelled
 
     def _add_tab(self, sid: str, title, space: str, cwd: str, agent: str,
                  state: str, command: str, parent: str | None,

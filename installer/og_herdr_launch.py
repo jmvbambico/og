@@ -263,7 +263,6 @@ class Launch:
     watcher: Any                     # og_herdr_watch.SessionWatcher
     cwd: str
     server: str
-    agent: str
     agents_pane: bool
     env: dict
     state_path: Path
@@ -500,6 +499,14 @@ def _open_space(ctx: Launch, attach: bool) -> str:
     space to the conversation title once it appears. That rename is the whole
     reason the pending record is written at all.
 
+    The space's first tab is given that same label. `workspace.create` labels
+    only the WORKSPACE — it has no tab-label field — so the tab it makes
+    implicitly would otherwise be unlabelled and show herdr's tab number. The
+    operator asked for the tab to read the space's own name, so it does, and
+    og_herdr's title-arrival rename carries it onto the title with the space.
+    (`ctx.agent`, which this used to say, is the driving bundle's name; it read
+    as a second, different name beside a space labelled from the directory.)
+
     The pending record is written BEFORE `og chat` is typed, and that order is
     the contract, not a detail. The bridge is already running (bin/og starts it
     before exec'ing this) and polls every few seconds, while `og chat` mints the
@@ -536,7 +543,10 @@ def _open_space(ctx: Launch, attach: bool) -> str:
         raise LaunchError(
             "workspace.create returned no workspace id: {0!r}".format(created))
 
-    ctx.client.call("tab.rename", {"tab_id": tab_id, "label": ctx.agent})
+    # The first tab reads the space's own label, not the agent bundle's name:
+    # `workspace.create` cannot label the tab it makes, so without this it shows
+    # herdr's tab number. See the docstring.
+    ctx.client.tab_rename(tab_id, label)
     # A pending record, not a space record: the session this space is for does
     # not exist yet, so there is no id to key it by. og_herdr claims it by
     # directory when the session appears — and it must be on disk BEFORE the
@@ -706,6 +716,10 @@ def _adopt(ctx: Launch, session: dict) -> dict:
     `og chat` would mint a NEW conversation — the one thing adoption exists to
     avoid — so the pane gets `omnigent attach --server <url> <session id>`,
     built by og_herdr so there is one spelling of it.
+
+    The space's first tab is labelled with the same string as the space: the
+    session's title when it has one, else the directory's basename. Same reason
+    as `_open_space` — `workspace.create` cannot label the tab it makes.
     """
     sid = str(session.get("id") or "")
     label = session.get("title") or os.path.basename(ctx.cwd.rstrip(os.sep))
@@ -726,7 +740,7 @@ def _adopt(ctx: Launch, session: dict) -> dict:
         raise LaunchError(
             "workspace.create returned {0}; expected workspace, tab and "
             "root_pane".format(sorted(created) or "an empty result"))
-    ctx.client.call("tab.rename", {"tab_id": tab_id, "label": ctx.agent})
+    ctx.client.tab_rename(tab_id, str(label))
     ctx.client.pane_run(pane_id, attach_command(ctx.server, sid))
     record = {"workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
               "owner": OWNER_LAUNCHER, "cwd": str(cwd)}
@@ -870,7 +884,7 @@ def build_launch(args: argparse.Namespace) -> Launch:
                      or Path.home() / ".omnigent") / "logs"
                 / "herdr-server.log")
     return Launch(client=client, watcher=watcher, cwd=os.getcwd(),
-                  server=args.server, agent=agent_name(config),
+                  server=args.server,
                   agents_pane=agents_pane_enabled(config), env=dict(os.environ),
                   state_path=default_state_path(),
                   pane_env=pane_env_for(dict(os.environ)),

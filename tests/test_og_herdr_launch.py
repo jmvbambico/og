@@ -142,6 +142,11 @@ class FakeClient:
     def pane_close(self, pane_id):
         self.call("pane.close", {"pane_id": pane_id})
 
+    def tab_rename(self, tab_id, label):
+        # The real wrapper, mirrored so an assertion on the recorded frame sees
+        # the same method name and params herdr receives.
+        self.call("tab.rename", {"tab_id": tab_id, "label": label})
+
     def close(self):
         self.closed = True
 
@@ -198,13 +203,13 @@ def root_session(sid="s1", cwd=CWD, status="idle", **extra):
 
 
 def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
-             agents_pane=True, spawn=None, agent="hivemind", pane_env=None):
+             agents_pane=True, spawn=None, pane_env=None):
     environment = {"HOME": str(tmp_path)} if env is None else dict(env)
     if inside:
         environment.setdefault("HERDR_ENV", "1")
         environment.setdefault("HERDR_PANE_ID", "w0:p9")
     return Launch(client=client, watcher=watcher, cwd=CWD, server=SERVER,
-                  agent=agent, agents_pane=agents_pane, env=environment,
+                  agents_pane=agents_pane, env=environment,
                   state_path=tmp_path / "og-herdr.json",
                   pane_env={} if pane_env is None else pane_env,
                   spawn=spawn if spawn is not None else (lambda: None),
@@ -281,8 +286,11 @@ def test_case_a_creates_a_space_runs_chat_and_asks_to_attach(tmp_path):
     ]
     assert client.params_of("workspace.create")[0] == {
         "label": "og", "cwd": CWD, "focus": True}
+    # The tab is labelled with the SPACE's own label (the directory basename),
+    # not the agent bundle's name: `workspace.create` cannot label the tab it
+    # makes, so without this it would show herdr's tab number.
     assert client.params_of("tab.rename")[0] == {"tab_id": "w1:t1",
-                                                 "label": "hivemind"}
+                                                 "label": "og"}
     assert client.text_typed() == ["og chat", "og agents"]
     assert client.params_of("pane.send_text")[0]["pane_id"] == "w1:p1"
     assert client.params_of("pane.send_text")[1]["pane_id"] == "w1:p2"
@@ -446,6 +454,10 @@ def test_case_b_adopts_when_the_session_has_no_space(tmp_path):
     assert client.text_typed() == [
         "omnigent attach --server {0} s1".format(SERVER)]
     assert client.params_of("workspace.create")[0]["label"] == "the conversation"
+    # The adopted space's first tab is labelled with the SAME string as the
+    # space — the session's title — not the agent bundle's name.
+    assert client.params_of("tab.rename")[0] == {"tab_id": "w1:t1",
+                                                 "label": "the conversation"}
 
     state = load_state(ctx_path(tmp_path))
     assert state["spaces"]["s1"]["workspace_id"] == "w1"

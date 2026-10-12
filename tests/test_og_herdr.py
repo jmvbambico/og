@@ -166,6 +166,13 @@ class RecordingClient:
         tests/test_og_herdr_client.py rather than by the generic `call`."""
         self._call("workspace_rename", workspace_id, label)
 
+    def tab_rename(self, tab_id, label):
+        """The client's NAMED `tab.rename` wrapper, matching
+        `og_herdr_client.HerdrClient`. The bridge routes the first-tab label
+        through it, so the frame is covered by the introspection guard in
+        tests/test_og_herdr_client.py rather than by the generic `call`."""
+        self._call("tab_rename", tab_id, label)
+
 
 class FakeWatcher:
     def __init__(self, batches):
@@ -242,8 +249,8 @@ def test_added_sequence(seams):
 
     # A ROOT opens a workspace, and the one call brings the space, its first tab
     # and that tab's root pane back together.
-    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
-                              "report_metadata"]
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
     wc = _call(client, "workspace_create")
     assert wc[1] == ("Fix bug",)
     assert wc[2]["cwd"] == "/tmp/ws"
@@ -254,6 +261,10 @@ def test_added_sequence(seams):
     assert ra[1] == ("pane1", "og-bridge")
     assert ra[2] == {"agent": "Claude Code", "state": "working"}
     assert _call(client, "report_metadata")[2]["title"] == "Fix bug"
+    # The space's first tab is labelled with the space's own title:
+    # `workspace.create` cannot label the tab it makes, so without this it shows
+    # herdr's tab number.
+    assert _call(client, "tab_rename")[1] == ("tab1", "Fix bug")
     assert len(lines) == 1 and "add s1" in lines[0]
 
 
@@ -275,6 +286,10 @@ def test_added_defaults_cwd_to_process_cwd_and_label_to_session_id(seams):
     # wreck the one display they asked for.
     assert _call(client, "workspace_create")[1] == ("abcdef12",)
     assert len(lines) == 1
+    # ...and the space's first tab is labelled the SAME way, so a space opened
+    # before its title exists does not show herdr's bare tab number in the
+    # meantime — the `1` the operator was looking at.
+    assert _call(client, "tab_rename")[1] == ("tab1", "abcdef12")
 
 
 def test_realistic_listing_row_without_workspace_key_uses_bridge_cwd(seams):
@@ -707,7 +722,8 @@ def test_changed_sequence_reports_state_and_title(seams):
     # `sid[:8]` label for good (see `_rename_own_space`). The label to compare
     # against comes from the per-pass listing, hence the one `workspace_list`.
     assert _names(client) == ["report_agent", "report_metadata",
-                              "workspace_list", "workspace_rename"]
+                              "workspace_list", "workspace_rename",
+                              "tab_rename"]
     assert _call(client, "report_agent")[2]["state"] == "working"
     # The STORED label, not one re-derived from this event: a `changed` carries
     # the listing row, which has no `harness` to derive from, and reporting a
@@ -715,6 +731,10 @@ def test_changed_sequence_reports_state_and_title(seams):
     assert _call(client, "report_agent")[2]["agent"] == "Claude Code"
     assert _call(client, "report_metadata")[2]["title"] == "New"
     assert _call(client, "workspace_rename")[1] == ("ws1", "New")
+    # ...and the space's FIRST TAB follows the space. The root's tab was labelled
+    # `Old` at creation; it must converge onto `New` here, or the operator is left
+    # with a correctly-named space holding a tab still called by the old label.
+    assert _call(client, "tab_rename")[1] == ("tab1", "New")
     assert "update s1" in lines[0]
 
 
@@ -1007,6 +1027,19 @@ def test_a_dead_roots_pane_holds_the_resume_line_unsubmitted(seams, tmp_path):
     assert not args[1].endswith("\n"), "the resume line must not be submitted"
 
 
+def test_a_history_spaces_first_tab_is_labelled_too(seams, tmp_path):
+    # A history space is opened by the SAME `workspace.create` as a live one, so
+    # it starts with the same unlabelled first tab. It is given the space's label
+    # — the past conversation's title — for the same reason.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "New Alignment", runner_online=False, workspace=str(tmp_path)))])
+
+    assert _call(client, "workspace_create")[1] == ("New Alignment",)
+    assert _call(client, "tab_rename")[1] == ("tab1", "New Alignment")
+
+
 def test_a_live_root_still_gets_todays_exact_treatment(seams):
     # No regression, and the sharpest form of it: a root with a live runner takes
     # the path it always did — a SUBMITTED attach, the agent marker, the title
@@ -1016,8 +1049,8 @@ def test_a_live_root_still_gets_todays_exact_treatment(seams):
     bridge.reconcile([Ev("added", "s1", root_session(
         "Live", runner_online=True, workspace="/repo/og"))])
 
-    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
-                              "report_metadata"]
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
     assert _call(client, "pane_run")[1] == (
         "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
     assert "pane_send_text" not in _names(client)
@@ -1032,8 +1065,8 @@ def test_a_root_with_no_runner_key_is_treated_as_live(seams):
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
     bridge.reconcile([Ev("added", "s1", root_session("Live"))])
 
-    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
-                              "report_metadata"]
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
 
 
 def test_a_dead_root_whose_workspace_is_gone_gets_no_space(seams, tmp_path):
@@ -1808,8 +1841,8 @@ def test_blocked_is_reported_not_resolved(seams, monkeypatch):
     ra = _call(client, "report_agent")
     assert ra[2]["state"] == "blocked"
     # only reporting calls happened; nothing that could resolve an elicitation
-    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
-                              "report_metadata"]
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
 
 
 def test_source_never_calls_an_elicitation_resolver():
@@ -2565,28 +2598,35 @@ def test_a_batch_of_title_changes_lists_the_workspaces_once(seams):
         [("ws1", "First"), ("ws2", "Second")]
 
 
-def test_a_workers_title_change_never_renames_the_space_it_sits_in(seams):
+def test_a_workers_title_change_never_renames_the_space_or_tab_it_sits_in(seams):
     # A sub-agent gets a TAB in its parent's space, and its record names the
     # PARENT's workspace. Renaming that to the worker's title would rename the
     # operator's whole conversation to `fix-space-rename` every time a worker
-    # spawned. The positive control — the ROOT's own title DOES rename the
-    # space — is in the same test, because the negative alone is satisfied by a
-    # module that renames nothing at all.
+    # spawned — and relabelling the parent's FIRST TAB would be the same mistake
+    # one level down. The positive control — the ROOT's own title DOES rename the
+    # space AND its first tab — is in the same test, because the negative alone
+    # is satisfied by a module that renames nothing at all.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
     bridge.reconcile([Ev("added", "root", root_session("Old name"))])
     bridge.reconcile([Ev("added", "w1", sub_session("root", "coder_zen:fix"))])
 
-    # The ROOT's title arriving renames its own space...
+    # The worker's tab was created WITH its own title, and is never the root's.
+    assert _call(client, "tab_create")[2]["label"] == "coder_zen:fix"
+
+    # The ROOT's title arriving renames its own space AND its first tab...
     bridge.reconcile([Ev("changed", "root", root_session("New name"),
                          previous=root_session("Old name"))])
     assert _call(client, "workspace_rename")[1] == ("ws1", "New name")
+    assert [c[1] for c in client.calls if c[0] == "tab_rename"] == \
+        [("tab1", "Old name"), ("tab1", "New name")], client.calls
 
-    # ...but the WORKER's never touches that space.
+    # ...but the WORKER's never touches that space or that tab.
     client.calls.clear()
     bridge.reconcile([Ev("changed", "w1", sub_session("root", "coder_zen:v2"),
                          previous=sub_session("root", "coder_zen:fix"))])
     assert "workspace_rename" not in _names(client), _names(client)
+    assert "tab_rename" not in _names(client), _names(client)
 
 
 def test_a_failed_space_rename_leaves_the_pass_intact_and_the_metadata_reported(
@@ -2616,6 +2656,32 @@ def test_a_failed_space_rename_leaves_the_pass_intact_and_the_metadata_reported(
     assert "update s1 → state=working (title)" in lines, lines
     # ...and the batch carries on: one bad space rename aborts nothing.
     assert any("add s2" in ln for ln in lines), lines
+
+
+def test_a_failed_tab_rename_is_absorbed_like_the_space_rename(seams):
+    # A cosmetic label must not fail the event or drive a repair. The SPACE
+    # rename already absorbs this way (the test above); the tab rename keeps the
+    # SAME shape, so a `tab_not_found` — the failure mode when the operator has
+    # closed the space's first tab — is a recorded line, never a raised error that
+    # `reconcile` would read as a stale record and repair by re-opening a pane.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("Old", state="idle"))])
+    client.calls.clear()
+    client.fail["tab_rename"] = FakeHerdrError("tab_not_found", "gone")
+
+    lines = bridge.reconcile([
+        Ev("changed", "s1", root_session("New", state="working"),
+           previous=root_session("Old", state="idle"))])
+
+    # The space rename still went through and the title bookkeeping still landed.
+    assert _call(client, "workspace_rename")[1] == ("ws1", "New")
+    assert bridge._recs["s1"]["title"] == "New"
+    # The tab failure is an ordinary `error:` line, and no repair was driven by
+    # it — the record is untouched.
+    assert any("error s1" in ln and "tab_not_found" in ln for ln in lines), lines
+    assert _names(client).count("workspace_create") == 0, _names(client)
+    assert not any("re-project" in ln for ln in lines), lines
 
 
 def test_a_failed_space_rename_is_not_retried_on_a_later_poll(seams):

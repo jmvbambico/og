@@ -167,6 +167,11 @@ RESULTS = {
                                  "cwd": "/private/tmp", "agent_status": "unknown",
                                  "revision": 0}},
     "tab.close": {"closed": True},
+    # `tab.rename` requires both params and answers with the `tab_renamed`
+    # result; the wrapper ignores the body, but the fake must answer a real
+    # method rather than refuse it. This is what gives a space's first tab the
+    # space's own label instead of herdr's tab number.
+    "tab.rename": {"type": "tab_renamed"},
     # pane.run is absent because it is not a request variant: `herdr pane run` is
     # a CLI subcommand. pane.send_text is what a pane actually runs a command
     # with, and returns the void `ok` result.
@@ -759,6 +764,23 @@ def test_workspace_rename_sends_both_required_params(fake):
     assert server.requests[0] == {
         "id": "req_1", "method": "workspace.rename",
         "params": {"workspace_id": "wB", "label": "Fix the bridge"}}
+    renamed.close()
+
+
+def test_tab_rename_sends_both_required_params(fake):
+    """`TabRenameParams` requires both `tab_id` and `label`.
+
+    Pinned on the exact frame for the same reason `workspace_rename` is: this is
+    the call that gives a space's first tab its label. A dropped or misspelled
+    key is dropped by serde, so the tab would keep herdr's number and the rename
+    would look like it worked.
+    """
+    server = fake()
+    renamed = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    assert renamed.tab_rename("w1:t1", "Fix the bridge") is None
+    assert server.requests[0] == {
+        "id": "req_1", "method": "tab.rename",
+        "params": {"tab_id": "w1:t1", "label": "Fix the bridge"}}
     renamed.close()
 
 
@@ -1485,7 +1507,7 @@ def test_the_conformance_guard_covers_every_requesting_wrapper(fake):
     assert names == {
         "ping", "workspace_list", "workspace_create", "workspace_close",
         "workspace_rename",
-        "tab_create", "tab_close", "pane_run", "pane_send_text",
+        "tab_create", "tab_close", "tab_rename", "pane_run", "pane_send_text",
         "pane_close", "pane_rename", "pane_read", "report_agent",
         "release_agent", "report_metadata", "agent_list", "agent_get",
         "events_subscribe",
@@ -1539,6 +1561,23 @@ def test_the_conformance_guard_covers_the_workspace_wrappers(fake, api_schema):
         assert refusal is None, "{0}: the fake refused it too — {1}".format(
             name, refusal)
         assert _frame_violations(api_schema, frame) == []
+
+
+def test_the_conformance_guard_covers_the_tab_rename_wrapper(fake, api_schema):
+    """`tab.rename` is reached by the bridge AND the launcher, for the first tab.
+
+    Named rather than implied, as for the workspace wrappers: the systemic guard
+    validates it because it enumerates wrappers by introspection, so this makes
+    that a checked claim rather than an assumption. It is the call that replaces
+    the unlabelled first tab's herdr number with the space's own label, and it
+    used to go through the generic `call` — invisible to the guard — before this
+    wrapper existed.
+    """
+    frames = _captured_frames(fake)
+    frame, refusal = frames["tab_rename"]
+    assert frame["method"] == "tab.rename"
+    assert refusal is None, "the fake refused it too — {0}".format(refusal)
+    assert _frame_violations(api_schema, frame) == []
 
 
 def test_the_conformance_guard_covers_the_pane_env_parameter(fake, api_schema):
