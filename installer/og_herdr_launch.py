@@ -81,12 +81,13 @@ AGENTS_COMMAND = "og agents"
 # not the launcher's own.
 #
 # 0.7, not 0.8, because the agents pane must be able to show its OWN controls.
-# The `og agents` footer ("q quit  r refresh  ↑/↓ move  enter expand  a access")
-# is ~52 display columns — the widest fixed element the pane renders — and at
-# 0.8 on the operator's 215-column terminal the pane got ~43 and clipped it,
-# worse on a narrower terminal. 0.7 leaves ~30% (~64 columns there): the footer
-# fits with room to spare, and so does the 27-column QR. A pane that cannot
-# show its own controls is broken.
+# The `og agents` footer ("q quit  r refresh  ↑/↓ move  enter focus  space
+# expand  a access") is 64 display columns — the widest fixed element the pane
+# renders, now that Enter focuses and expand moved to Space — and at 0.8 on the
+# operator's 215-column terminal the pane got ~43 and clipped it, worse on a
+# narrower terminal. 0.7 leaves ~30% (~64 columns there): the whole 64-column
+# footer just fits on that terminal, and so does the 27-column QR. A pane that
+# cannot show its own controls is broken.
 AGENTS_PANE_RATIO = 0.7
 
 # Statuses that mean "this session is the one to come back to". `idle`

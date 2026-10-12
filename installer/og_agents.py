@@ -22,11 +22,17 @@ a pure function from state to a list of lines and curses only paints them; that
 separation is what lets the view be tested with `--once`, with no tty in sight.
 
 This module is deliberately NOT herdr-specific: it reads Omnigent's HTTP API and
-must run in any terminal. It never writes to a session — no prompting, no
-answering an elicitation, no dispatches. The only requests it makes are GETs,
-and they all go through `og_herdr_watch`, which owns the transport, pagination,
-`kind=any` default, truncation handling and per-server token matching. None of
-that is re-implemented here.
+must run in any terminal. It sends NOTHING to a session — no prompting, no
+answering an elicitation, no dispatches — and changes no session state. Its read
+path is GET-only and goes entirely through `og_herdr_watch`, which owns the
+transport, pagination, `kind=any` default, truncation handling and per-server
+token matching; none of that is re-implemented here. It makes exactly ONE
+outbound call of its own: `agent.focus` (see `focus_in_herdr`), which moves the
+operator's own herdr UI to a worker's session and touches no session state. That
+call is reached lazily — the herdr client is imported inside the handler, so `og
+agents` still runs with no herdr installed, outside a herdr pane, or with the
+socket down — and it is pinned by the AST guard in tests/test_og_agents.py, which
+asserts `agent.focus` is the ONLY method this module ever hands to `call`.
 """
 from __future__ import annotations
 
@@ -110,8 +116,9 @@ MAX_META = 28
 DEFAULT_WIDTH = 80
 
 # The footer. Its own constant so the tests can assert the binding is listed
-# without driving a tty.
-FOOTER = "q quit  r refresh  ↑/↓ move  enter expand  a access"
+# without driving a tty. Enter FOCUSES the selected worker in herdr (see
+# `focus_in_herdr`); snippet expand/collapse moved to SPACE when Enter was taken.
+FOOTER = "q quit  r refresh  ↑/↓ move  enter focus  space expand  a access"
 
 # The caveats shown under the address, mirroring bin/og's `show_access`: the
 # operator must know whether the address is scannable only on the same wifi or
@@ -1255,7 +1262,8 @@ def _cached_tunnel_url(home: str) -> Optional[str]:
     same-wifi address that visibly fails.
 
     Deliberately does NOT clear the cache on a stale entry, unlike bin/og: `og
-    agents` is a read-only viewer (the test AST guard pins that), and the
+    agents` sends nothing to a session and changes no session state (the test AST
+    guard pins that, and that its ONE outbound call is `agent.focus`), so the
     operator's state files are `og`'s to clean up, not a viewer's to delete. The
     stale value is ignored instead; `og start`/`tunnel_url` will clear it.
 
@@ -1342,15 +1350,71 @@ def _tty_available() -> bool:
     return True
 
 
+# What the pane says when Enter could not focus, one line each. Kept short so the
+# reason survives `_clip` in a narrow pane, and kept distinct so the operator can
+# tell "never going to work here" from "try again": NOT_INSIDE is a fact about
+# where the pane runs, the other two are facts about herdr's state.
+NOTICE_FOCUS_OUTSIDE_HERDR = "focus: not inside herdr (no HERDR_ENV)"
+NOTICE_FOCUS_UNAVAILABLE = "focus: herdr client unavailable"
+NOTICE_FOCUS_FAILED = "focus: {0}"
+
+
+def focus_in_herdr(session_id: str,
+                   environ: Optional[dict] = None) -> Optional[str]:
+    """Jump the operator's herdr UI to `session_id`. None on success, else why not.
+
+    THE ONE THING THIS VIEW EVER SENDS. Everything else `og agents` does is a GET
+    through `og_herdr_watch`; this is the single outbound call, `agent.focus`, and
+    it only moves the operator's own terminal to where that session lives — it
+    starts nothing, answers nothing, and changes no session state. The AST guard
+    in tests/test_og_agents.py asserts `agent.focus` is the only method this
+    module ever hands to `HerdrClient.call`.
+
+    Returns None when the UI moved, or a short one-line notice saying why it did
+    not, which `_run_tui` shows in the pane (`Frame.notice`). It NEVER raises: an
+    `og agents` pane an operator leaves open all day must survive a herdr that is
+    absent, a terminal outside a herdr pane, or a socket that is down, so every
+    failure — the client failing to import, a socket that will not connect, an
+    error reply — becomes a notice instead of a traceback that kills the pane.
+    The text keeps the character of the failure, so "this can never work here"
+    reads differently from "try again".
+
+    The herdr client is imported HERE, inside the handler, never at module
+    import: this view is deliberately not herdr-specific and must run in any
+    terminal, so nothing may require herdr (or its client module) to be present
+    just to start. `og_herdr_launch.is_inside` is the single definition of the
+    "inside herdr" signal (`HERDR_ENV=1`) and is reused rather than restated.
+    """
+    env = os.environ if environ is None else environ
+    try:
+        from og_herdr_launch import is_inside
+    except Exception:
+        return NOTICE_FOCUS_UNAVAILABLE
+    if not is_inside(env):
+        return NOTICE_FOCUS_OUTSIDE_HERDR
+    try:
+        from og_herdr_client import HerdrClient
+    except Exception:
+        return NOTICE_FOCUS_UNAVAILABLE
+    try:
+        with HerdrClient() as client:
+            client.call("agent.focus", {"target": session_id})
+    except Exception as exc:
+        return NOTICE_FOCUS_FAILED.format(exc)
+    return None
+
+
 def _run_tui(model: AgentModel, interval: float, server: str,
              start_access: bool = False) -> int:
     """The live view. curses paints exactly what `render` returns; keys drive
     the model.
 
     Keys: `q` quits, `r` forces a refresh, the arrows (or `j`/`k`) move the
-    selection, Enter expands or collapses the selected row's snippet, and `a`
-    toggles the access panel. It is a viewer: it never sends anything to a
-    session.
+    selection, Enter FOCUSES the selected worker in herdr (jumping the operator's
+    herdr UI to that session, see `focus_in_herdr`), Space expands or collapses
+    the selected row's snippet, and `a` toggles the access panel. It sends
+    nothing to a session and changes no session state: `agent.focus` is the ONE
+    outbound call it makes, and it moves the operator's own terminal alone.
 
     TWO CLOCKS, deliberately. The data poll (`interval`, 3s) asks the server for
     new rows; the spinner tick (SPIN_TICK, 120ms) only advances a counter that
@@ -1387,8 +1451,12 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         selected = 0
         offset = 0
         expanded: set[str] = set()
+        # The one-line reason the last Enter could not focus, shown in the pane
+        # through `Frame.notice`. It is cleared on the NEXT keypress, so it sits
+        # for as long as the operator is reading it and goes once they act.
+        notice: Optional[str] = None
         # `poll` asks for a refresh now; `force` additionally drops the selected
-        # row's cached report so it is read again. They are separate so Enter can
+        # row's cached report so it is read again. They are separate so Space can
         # redraw the tree this tick without paying for a second 121 KB fetch.
         poll = True
         force = True
@@ -1444,6 +1512,7 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             frame.access = access if show_access else None
             frame.selected = selected
             frame.spin = spin
+            frame.notice = notice
             working = frame_working(frame)
             if working and now >= next_spin:
                 spin += 1
@@ -1485,6 +1554,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             key = stdscr.getch()
             if key == -1:
                 continue
+            # Any real keypress dismisses the last focus notice: it was painted
+            # for the operator to read, and they have now acted.
+            notice = None
             if key in (ord("q"), 27):
                 return
             if key == ord("r"):
@@ -1499,15 +1571,27 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             elif key in (curses.KEY_DOWN, ord("j")):
                 selected = move_selection(frame.rows, selected, 1)
             elif key in (curses.KEY_ENTER, 10, 13):
+                # Enter FOCUSES the selected worker in herdr — it jumps the
+                # operator's own terminal to where that session lives. It is a
+                # no-op on a header (nothing to jump to), and it deliberately
+                # does NOT set `poll`: focus changes nothing this view draws, so
+                # a refetch would be a listing walk for nothing. A failed focus
+                # sets a notice, and the next paint shows it. See
+                # `focus_in_herdr` for every way it can decline.
+                if 0 <= selected < len(frame.rows) \
+                        and not frame.rows[selected].is_root:
+                    notice = focus_in_herdr(frame.rows[selected].session_id)
+            elif key == ord(" "):
+                # Expand/collapse moved off Enter when Enter took focus. It DOES
+                # set `poll`: the expanded set feeds the rebuild, so the tree has
+                # to be redrawn, and the report is already cached, so this costs
+                # nothing beyond the listing walk.
                 if 0 <= selected < len(frame.rows):
                     sid = frame.rows[selected].session_id
                     if sid in expanded:
                         expanded.discard(sid)
                     else:
                         expanded.add(sid)
-                    # Redraw on this tick rather than up to three seconds from
-                    # now; the report is already cached, so this costs nothing
-                    # beyond the listing walk.
                     poll = True
 
     curses.wrapper(loop)
