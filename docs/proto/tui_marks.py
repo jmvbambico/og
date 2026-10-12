@@ -12,11 +12,17 @@ Code" in letters, and letters are slow. "The orange starburst" is faster.
 
 THE TIERS, same agents, same layout, so they compare directly:
 
-  TIER 0  OPERATOR PICKS. Seven glyphs the operator chose by hand, rendered
-          exactly as given - not as proposals, not improved. Two of them
-          (U+1F40B WHALE, U+1F980 CRAB) are East Asian WIDE and occupy two
-          cells, which tier 1 ruled out. Tier 0 is therefore the tier that
-          needs the FIXED 2-COLUMN MARK SLOT, `mark_slot` below.
+  TIER 0  OPERATOR PICKS. Fourteen glyphs the operator chose by hand, rendered
+          exactly as given - not as proposals, not improved. EVERY VENDOR now
+          has a mark here: no blanks remain. Measured with the same
+          `unicodedata` this file lays out with, eleven are East Asian NARROW
+          (one cell) and three are AMBIGUOUS (U+1F13A, U+26EF, U+2554 - one
+          cell in a western terminal, two in a CJK-locale one). Dropping the
+          crab and the whale removed BOTH WIDE picks, so tier 0 no longer has
+          a single two-cell glyph - but the FIXED 2-COLUMN MARK SLOT is still
+          required, because `slot_cells` charges Ambiguous two cells on
+          purpose. See section 6 for which of these a stock monospace font
+          will actually have.
   TIER 1  plain Unicode. One column, no emoji, a font shipped with every
           terminal since about 1990. Nine of the fifteen agents have an honest
           mark here. Kept whole and unchanged: it is the all-Narrow
@@ -28,7 +34,7 @@ THE TIERS, same agents, same layout, so they compare directly:
   TIER 3  `[CC]`. Four ASCII columns, no dependency at all, for `--once`
           output that gets piped into a log where a starburst is a mystery.
 
-Plus five numbered sections the tiers cannot answer alone, and the two older
+Plus six numbered sections the tiers cannot answer alone, and the two older
 ones (A, the mark in the layouts beside the real capture; B, brand colour
 with the real ANSI 256 escapes):
 
@@ -37,13 +43,19 @@ with the real ANSI 256 escapes):
   2  DELIBERATE BREAKAGE - the same rows WITHOUT the slot, printed on
      purpose, directly above the same rows WITH it. This is the section that
      justifies the slot: the shear is rendered, not asserted.
-  3  THE MARKS IN CONTEXT - V1/V2/V5 with the tier-0 mark in the ROOT HEADER.
-     Root only. Section A's per-worker comparison is kept below as the
-     evidence for why; it is not promoted.
+  3  THE MARKS IN CONTEXT - V1/V2/V5 with the tier-0 mark in the ROOT HEADER,
+     plus W1 WEB-PARITY, the new variant from tui_beauty.py, rendered here
+     with the tier-0 mark on the header AND on every worker row. Section A's
+     per-worker comparison is kept below as the evidence for why V1/V2/V5
+     stay root-only; W1 is the one layout the marks do earn a column in.
   4  U+2554 BESIDE A REAL BOX CORNER - a box-drawing glyph inside a pane made
      of box-drawing. Rendered for the operator to judge, with the risk stated.
-  5  COLOUR INTERACTION - a tier-0 pane is two-tone, because an emoji carries
-     its own colour and cannot be recoloured by init_pair.
+  5  COLOUR INTERACTION - which tier-0 marks take the row attribute and which
+     draw their own colour out of the font's colour table.
+  6  FONT COVERAGE - every pick with its codepoint, its plane and its Unicode
+     block, beside a deliberately UNASSIGNED codepoint as a control: a mark
+     that looks like the control is tofu. The slot is what keeps that miss
+     cosmetic.
 
 WIDTH IS MEASURED, NOT ASSUMED. `len(line)` is the wrong ruler three times
 over: it counts ANSI escapes as visible characters, it calls a double-width
@@ -52,16 +64,16 @@ glyph one column wide, and it calls every one of these glyphs ONE character.
 the same approach `installer/og_agents.py` uses for its QR panel.
 
 The slot itself is the one place where "one column" is not good enough: a
-Narrow mark next to a Wide one starts the name column at two different
+Narrow mark next to an Ambiguous one starts the name column at two different
 offsets and every rule, box edge and right-aligned clock shears with it.
-`mark_slot` pads each mark to exactly two display columns - a Wide mark fills
-the slot, a Narrow mark is followed by one space, a blank vendor is two
-spaces, and an AMBIGUOUS mark is charged two without being padded, because
-Ambiguous is one cell in a western terminal and two in a CJK-locale one and
-only the pessimistic reading is safe in both. `check_marks()` ASSERTS the
-invariant instead of trusting it: tier-1 marks must still be Narrow or
-Neutral, and a tier-0 mark is legal at any width ONLY if it goes through the
-slot and lands on exactly two columns under the pessimistic ruler.
+`mark_slot` pads each mark to exactly two display columns - a Narrow mark is
+followed by one space, a blank vendor is two spaces, and an AMBIGUOUS mark is
+charged two without being padded, because Ambiguous is one cell in a western
+terminal and two in a CJK-locale one and only the pessimistic reading is safe
+in both. `check_marks()` ASSERTS the invariant instead of trusting it: tier-1
+marks must still be Narrow or Neutral, and a tier-0 mark is legal at any width
+ONLY if it goes through the slot and lands on exactly two columns under the
+pessimistic ruler.
 
 Nothing here changes the live view. This is a design prototype.
 """
@@ -146,19 +158,24 @@ def slot_width(s):
 def mark_slot(mark):
     """`mark` padded to exactly SLOT_COLS display columns. THE slot.
 
-    A U+2318 in one cell on the row above a U+1F980 in two makes the name
-    column after it start at two different offsets, and with it every rule,
-    box edge and right-aligned clock downstream shears - section 2 prints that
-    failure deliberately, because the operator should see it rather than take
-    this function's word for it. Padding to a fixed slot is what removes it:
+    An Ambiguous mark in one cell on the row above a Narrow mark in two makes
+    the name column after it start at two different offsets, and with it every
+    rule, box edge and right-aligned clock downstream shears - section 2
+    prints that failure deliberately, because the operator should see it rather
+    than take this function's word for it. Padding to a fixed slot is what
+    removes it:
 
-        WIDE       fills the slot          🦀          2 cells
         NARROW     followed by one space   ⌘·         1 + 1
         BLANK      two spaces              ··         2
         AMBIGUOUS  NOT padded - `slot_cells` already charges it two, so the
                    slot holds one character that measures 1 here and 2 under
                    a CJK locale. That row is the one honest casualty of the
                    pessimistic ruler and section 2 names it out loud.
+
+    There is no WIDE line any more: the crab and the whale were replaced in
+    this round and tier 0 now has no glyph a western terminal draws two cells
+    wide. The slot does not become optional - Ambiguous is still charged two -
+    but the failure it now exists to prevent is the CJK one, not the emoji one.
 
     NEVER `len()` here, which is the mistake section 2's top half makes on
     purpose: every mark in tier 0 is ONE python character, whatever it draws
@@ -476,48 +493,193 @@ VENDORS = [
 # ----------------------------------------------------------- tier 0: the
 # operator's own picks. THESE ARE DECISIONS, NOT SUGGESTIONS: rendered exactly
 # as given, with no substitution for a "better" glyph and no fallback to tier
-# 1 when the glyph is inconvenient. Two of the seven are East Asian WIDE, which
-# tier 1's own rule forbids - that is the engineering this tier pays for, and
-# `mark_slot` is what pays it.
+# 1 when the glyph is inconvenient. Fourteen picks for fourteen vendors - this
+# round closed the last four blanks - and NOT ONE of them is East Asian WIDE:
+# the crab and the whale are gone, which removed both two-cell picks at once.
+# What is left is eleven Narrow marks and three Ambiguous ones (kilo U+1F13A,
+# cognition U+26EF, z-ai U+2554), measured with `unicodedata.east_asian_width`
+# and asserted in check_marks(). The 2-column slot is still required, because
+# `slot_cells` charges Ambiguous two on purpose; what changed is WHICH failure
+# it prevents. Section 6 is the font-coverage bill for five of these fourteen.
 #
-# `why` says what the glyph IS and where it stands. It does not argue that the
-# glyph is better than the tier-1 one on the row below it; on two rows
-# (google, openai) the operator picked the same glyph tier 1 already had, and
-# on one (opencode-zen) they named a glyph for a row tier 1 left honestly
-# blank. Both are outcomes worth showing, not resolving.
+# `why` says what the glyph IS, what it replaced, and what it costs at the
+# slot. It does not argue that the glyph is better than the tier-1 pick on the
+# row below it, and it does not argue the other way either: on several rows the
+# operator's pick IS tier 1's mark (anthropic, google, openai), on one it is a
+# different glyph for the same brand (cursor takes the arrow aws-kiro used),
+# and on one it is a glyph tier 1 left honestly blank. All three are outcomes
+# worth showing rather than resolving.
 OPERATOR_PICKS = {
     "moonshotai": {
-        "mark": "⌘", "why": "the map place-of-interest sign, standing in for "
-        "cmdcode; it is also the command key, so it reads as the CLI you type"},
+        "mark": "⌘", "why": "KEPT. the map place-of-interest sign, standing in "
+        "for cmdcode; it is also the command key, so it reads as the CLI you "
+        "type. Narrow"},
     "deepseek": {
-        "mark": "\U0001F40B", "why": "DeepSeek's whale - the animal tier 1 had "
-        "to drop, leaving only its water (≋). First mark here that needs the slot"},
+        "mark": "\U0001319E", "why": "REPLACES the whale (U+1F40B). an Egyptian "
+        "hieroglyph, K004 - a different skeleton for the brand than the animal "
+        "tier 1 had to drop. Narrow, and astral: see section 6"},
     "anthropic": {
-        "mark": "\U0001F980", "why": "the crab, where tier 1 shipped a starburst "
-        "for the orange. Second mark here that needs the slot"},
+        "mark": "✳", "why": "REPLACES the crab (U+1F980), and returns tier 1's "
+        "own starburst - the one mark the operator already says out loud. The "
+        "slot now costs it the same two columns the crab did, with no emoji "
+        "font involved"},
     "google": {
-        "mark": "✦", "why": "unchanged from tier 1 - the one row where the "
-        "operator's pick and the safe default are the same glyph"},
+        "mark": "✦", "why": "KEPT, unchanged from tier 1 - the one row where "
+        "the operator's pick and the safe default are the same glyph"},
     "openai": {
-        "mark": "⬡", "why": "unchanged from tier 1 - the hexagonal rosette's "
-        "outline, Neutral width, so the slot costs it nothing"},
+        "mark": "⬡", "why": "KEPT, unchanged from tier 1 - the hexagonal "
+        "rosette's outline, Neutral width, so the slot costs it nothing"},
     "opencode-zen": {
-        "mark": "▯", "why": "a white vertical rectangle: a multi-provider "
+        "mark": "▯", "why": "KEPT. a white vertical rectangle: a multi-provider "
         "router has no one logo, so the operator drew the empty slot itself"},
     "z-ai": {
-        "mark": "╔", "why": "a box-drawing corner standing in for a Z wordmark. "
-        "Ambiguous width; section 4 renders it beside a real corner"},
+        "mark": "╔", "why": "KEPT. a box-drawing corner standing in for a Z "
+        "wordmark. Ambiguous width; section 4 renders it beside a real corner"},
+    "kilo": {
+        "mark": "\U0001F13A", "why": "NEW - tier 1 left this row blank for want "
+        "of a one-cell mark of a letter K in a tile. AMBIGUOUS: one cell here, "
+        "two under a CJK locale, so the slot charges it two. Astral, and "
+        "outside the BMP: see section 6"},
+    "aws-kiro": {
+        "mark": "\U0001680C", "why": "REPLACES U+21D7, which tier 1 used and "
+        "which the operator has now given to cursor. A Bamum letter, narrow "
+        "but astral: see section 6"},
+    "cursor": {
+        "mark": "⇗", "why": "REPLACES U+25F2 (the cube's near corner). The "
+        "double arrow is tier 1's own mark for aws-kiro - it moves across "
+        "rather than being invented, and the two rows no longer collide "
+        "because aws-kiro's pick is now U+1680C. Narrow"},
+    "goose": {
+        "mark": "\U0001316F", "why": "NEW - tier 1 left this row blank because "
+        "every Unicode bird is an emoji or an obscure icon. G041 is a G-series "
+        "bird glyph, so the mark is a bird without the emoji font. Narrow, and "
+        "astral: see section 6"},
+    "hermes": {
+        "mark": "☤", "why": "NEW - tier 1 left this row blank because a winged "
+        "helmet has no one-cell skeleton in Unicode. Caduceus, BMP, narrow"},
+    "xai": {
+        "mark": "\U0001D54F", "why": "REPLACES U+2297 CIRCLED TIMES. The "
+        "double-struck X drops the circle and keeps the letter. Narrow, but "
+        "astral and in Mathematical Alphanumeric Symbols: see section 6"},
+    "cognition": {
+        "mark": "⛯", "why": "NEW - tier 1 left this row blank because Devin's "
+        "mark is a wordmark. The lighthouse is the brand's shape in one "
+        "glyph. AMBIGUOUS: one cell here, two under a CJK locale, so the slot "
+        "charges it two"},
 }
+
+# The same round, frozen as plain codepoints. `check_marks()` compares the table
+# above against this, so the picks are a decision with a test on it rather than
+# a comment that quietly stops matching. Written out rather than derived from
+# OPERATOR_PICKS on purpose: derived from it, it would assert nothing at all.
+EXPECTED_T0 = {
+    "anthropic": "✳",
+    "opencode-zen": "▯",
+    "google": "✦",
+    "openai": "⬡",
+    "deepseek": "\U0001319E",
+    "kilo": "\U0001F13A",
+    "aws-kiro": "\U0001680C",
+    "cursor": "⇗",
+    "goose": "\U0001316F",
+    "hermes": "☤",
+    "xai": "\U0001D54F",
+    "cognition": "⛯",
+    "z-ai": "╔",
+    "moonshotai": "⌘",
+}
+
+# The operator's own width measurement of the round, restated as data. Eleven
+# Narrow and these three Ambiguous, which is what `east_asian_width` says about
+# U+1F13A, U+26EF and U+2554 on this machine - verified, not assumed, and
+# checked on every run so a Unicode data upgrade that changes a class is caught
+# here instead of in somebody's terminal.
+EXPECTED_AMBIGUOUS = {"kilo": "A", "cognition": "A", "z-ai": "A"}
 
 # Emoji-presentation codepoints draw from the FONT's colour table and cannot be
 # recoloured by a curses colour pair. Listed rather than inferred from
 # `ord(m) >= 0x1F000` because that range also holds text-default glyphs, and
-# because section 5's two-tone claim - some marks self-colour and some inherit
-# the row attribute - is only true if this set is exactly right. A hand-
-# maintained list is the honest form: `unicodedata` does not expose
-# Emoji_Presentation, so a new Wide pick has to be classified by eye once, and
-# check_marks() refuses to render tier 0 until it has been.
-EMOJI_PRESENTATION = ("\U0001F40B", "\U0001F980")
+# because section 5's self-coloured/inherits split is only true if this set is
+# exactly right. A hand-maintained list is the honest form: `unicodedata` does
+# not expose Emoji_Presentation.
+#
+# IT IS EMPTY NOW, and that is a measurement rather than an oversight: the crab
+# and the whale were the only two Wide picks tier 0 had, and the operator
+# replaced both with Narrow glyphs. Every tier-0 mark is a monochrome text
+# glyph, so every one of them takes the row attribute and none self-colours.
+# The list stays because the rule stays: a tier-0 mark is legal at any width, so
+# re-adding an emoji is one edit away, and an unclassified Wide mark would make
+# section 5's numbers a coincidence. check_marks() asserts both directions.
+EMOJI_PRESENTATION = ()
+
+# Which tier-0 picks a stock monospace font is unlikely to carry, and why. This
+# is not a judgement about the picks - it is a statement about font coverage.
+# Five of the fourteen are outside the BMP, and outside the BMP is where the
+# coverage cliff is: fonts are built block by block, and a project that carries
+# Latin, Greek, Cyrillic, Box Drawing, Dingbats and Mathematical Operators has
+# no reason whatsoever to carry Egyptian Hieroglyphs or Bamum.
+#
+# check_marks() asserts the list against the marks: every non-BMP pick must be
+# declared here, and every entry here must really be non-BMP, so a future pick
+# cannot quietly join the table without a coverage note attached.
+FONT_RISK = {
+    "deepseek": "an SMP historic script",
+    "goose": "an SMP historic script",
+    "aws-kiro": "an SMP historic script",
+    "xai": "a styled-letter block, commonly missing",
+    "kilo": "a squared-letter block, commonly missing",
+}
+
+# Range -> block name, for section 6. `unicodedata` exposes no block API, so
+# the ranges that matter here are written out; only the blocks tier 0 actually
+# touches are listed, and an unlisted codepoint prints as "BMP block".
+_BLOCKS = (
+    (0x2190, 0x21FF, "Arrows"),
+    (0x2300, 0x23FF, "Miscellaneous Technical"),
+    (0x2500, 0x257F, "Box Drawing"),
+    (0x25A0, 0x25FF, "Geometric Shapes"),
+    (0x2600, 0x26FF, "Miscellaneous Symbols"),
+    (0x2700, 0x27BF, "Dingbats"),
+    (0x2B00, 0x2BFF, "Miscellaneous Symbols and Arrows"),
+    (0xE000, 0xF8FF, "Private Use Area"),
+    (0x13000, 0x1342F, "Egyptian Hieroglyphs"),
+    (0x16800, 0x16A3F, "Bamum Supplement"),
+    (0x1D400, 0x1D7FF, "Mathematical Alphanumeric Symbols"),
+    (0x1F100, 0x1F1FF, "Enclosed Alphanumeric Supplement"),
+    (0x1F000, 0x1FAFF, "Emoji blocks"),
+)
+
+
+def plane_of(cp):
+    """0 = BMP, 1 = SMP, 2 = SMP Supplement, 3 = planes 3-16."""
+    if cp < 0x10000:
+        return 0
+    if cp < 0x20000:
+        return 1
+    if cp < 0x30000:
+        return 2
+    return 3
+
+
+def plane_name(cp):
+    return ("BMP", "SMP", "SMP ext", "plane %d" % plane_of(cp))[plane_of(cp)]
+
+
+def block_of(cp):
+    for lo, hi, name in _BLOCKS:
+        if lo <= cp <= hi:
+            return name
+    return "?"
+
+
+# U+0378 is the first codepoint the standard never assigns, so a terminal that
+# has no glyph for it draws the same substitute it draws for every codepoint it
+# does not have. Printing it beside each mark is the only font test that needs
+# no font-config tooling and no second run: if the two cells match, the mark on
+# the left is missing too. Some terminals draw unassigned as blank rather than
+# as tofu, and on those the control reads as an empty cell - still not the mark,
+# still a usable answer.
+UNASSIGNED = "\u0378"
 
 
 def codepoint_of(mark):
@@ -529,15 +691,18 @@ def t0_of(vendor):
     """The tier-0 row for one vendor: operator pick, else tier 1, else blank.
 
     A vendor the operator did not name keeps whatever tier 1 already decided,
-    which for seven of the fourteen vendors is an honest blank. Nothing here
+    which in tier 1 is an honest blank on six of the fourteen. Nothing here
     invents a glyph for them: an un-named row that quietly gained a mark would
-    be the pane asserting a vendor claim nobody made.
+    be the pane asserting a vendor claim nobody made. Every vendor IS named
+    now, so the first branch is only reachable for a vendor that is not in the
+    catalog at all - which is what a missing `installer/registry.json` looks
+    like, and it gets the same honest blank rather than a crash.
     """
-    row = by_id()[vendor]
+    row = by_id().get(vendor, {})
     pick = OPERATOR_PICKS.get(vendor)
     if pick:
         return {"mark": pick["mark"], "src": "OPERATOR PICK", "why": pick["why"]}
-    if row["t1"] == " ":
+    if row.get("t1", " ") == " ":
         return {"mark": " ", "src": "DEFAULT - blank",
                 "why": "the slot holds two spaces, not a glyph: no operator "
                        "pick, and no honest mark in tier 1 either"}
@@ -874,11 +1039,65 @@ def paint(idx, text):
     return "\x1b[38;5;%dm%s\x1b[0m" % (idx, text)
 
 
+# The three attributes W1 uses, as raw SGR. Named rather than inlined because
+# the header bar and the selection treatment are both about WHICH attribute is
+# spent where, and that is a thing the operator is choosing, not a detail.
+#   A_REVERSE - the filled header bar, and nowhere else (see `w1_header`)
+#   A_DIM     - the rail and the report snippet
+#   A_BOLD    - the selected worker's title, with the caret
+REV, NOREV = "\x1b[7m", "\x1b[27m"
+DIM, UNDIM = "\x1b[2m", "\x1b[22m"
+BOLD, UNBOLD = "\x1b[1m", "\x1b[22m"
+
+
 def _hex_spread(hexcol):
     """How far a brand hex sits from grey: max channel minus min channel."""
     h = hexcol.lstrip("#")
     r, g, b = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
     return max(r, g, b) - min(r, g, b)
+
+
+def _check_w1_parity(w=46):
+    """The W1 renderers in this file and in tui_beauty.py must agree, exactly.
+
+    Neither prototype can import the other - tui_beauty needs the marks and
+    this file needs the layout - so both carry the same geometry and this
+    renders the same worker rows through both and compares. It is the check
+    that makes "not a lookalike" a fact instead of an intention: if the two
+    rungs of the degradation ladder ever disagree, or one file starts padding a
+    gutter differently, the render differs and this fails.
+
+    Skipped, not faked, if tui_beauty.py cannot be imported - a prototype that
+    refuses to run because its sibling moved is worse than one that runs.
+    """
+    try:
+        import tui_beauty
+    except Exception:
+        return
+    kid = {"title": "stock-concurrency-lock", "agent": "cmdcode",
+           "state": "working", "meta": "2m14s", "elic": 0}
+    root = {"title": "Project Status Review", "harness": "hivemind",
+            "state": "working", "kids": [kid]}
+    mine = a_web(root, w, slot_for("moonshotai"),
+                 lambda k: t0_mark_for(k["agent"]))
+    theirs = tui_beauty.v_web(root, w,
+                              mark_of=lambda k: t0_mark_for(k["agent"]),
+                              root_mark=slot_for("moonshotai"))
+    # The header bar differs by construction (this file passes the operator's
+    # mark, the other defaults to a tile), and so does the trailing grade
+    # paragraph, which is prose rather than geometry. The worker rows are the
+    # geometry under test, and their count is exact: two lines a worker plus a
+    # gap row between workers, so `3n - 1` of them. Slicing by that count
+    # rather than to the end means the check does not silently stop covering
+    # the rows if the grade paragraph ever changes length.
+    nrows = 3 * len(root["kids"]) - 1
+    mine_rows, their_rows = mine[2:2 + nrows], theirs[2:2 + nrows]
+    assert mine_rows == their_rows, (
+        "the W1 renderers in tui_marks.py and tui_beauty.py disagree:\n  %r\n  %r"
+        % (mine_rows, their_rows))
+    assert [w1_layout(x) for x in (46, 80, 20)] == \
+        [tui_beauty.w1_layout(x) for x in (46, 80, 20)], (
+        "the W1 degradation ladder differs between the two prototypes")
 
 
 # -------------------------------------------------------------- checking
@@ -889,13 +1108,20 @@ def check_marks():
     Neutral - because it is still offered as the all-Narrow alternative and a
     wide glyph in it would shear exactly the boxes it exists to keep straight.
 
-    Tier 0's rule is deliberately different: a WIDE mark is now LEGAL, because
-    the operator picked two of them, and the thing that has to be true instead
-    is that the mark goes through `mark_slot` and lands on exactly two columns.
-    So the assertions here are about the slot, not about the glyph: one
-    character, not a combining mark, one or two cells under the pessimistic
-    ruler, unique, and - the property that actually protects every box below -
-    the same column before the vendor name on every row.
+    Tier 0's rule is deliberately different: a WIDE mark is LEGAL, because the
+    operator may pick one, and the thing that has to be true instead is that
+    the mark goes through `mark_slot` and lands on exactly two columns. So the
+    assertions here are about the slot, not about the glyph: one character, not
+    a combining mark, one or two cells under the pessimistic ruler, unique, and
+    - the property that actually protects every box below - the same column
+    before the vendor name on every row.
+
+    On top of the geometry, the DECISION is asserted too: `EXPECTED_T0` is the
+    operator's round as a frozen codepoint table, so a later edit that changes a
+    pick - deliberately or by typo - fails here rather than shipping quietly.
+    Same for `FONT_RISK`: every non-BMP pick must be declared in it and every
+    declaration must really be non-BMP, which is what stops the coverage note
+    in section 6 from drifting away from the marks it describes.
 
     The failure messages name the row, the glyph and the width class, because
     the failure this check prevents ("the pane shears by one column") is
@@ -929,6 +1155,27 @@ def check_marks():
 
     seen0 = {}
     marks = {v["vendor"]: t0_of(v["vendor"])["mark"] for v in VENDORS}
+
+    # Every vendor has an operator mark now. This round closed the last four
+    # blanks (kilo, goose, hermes, cognition), and the claim the tier-0 table
+    # makes in its own header - "no blanks remain" - is checked here rather
+    # than trusted, because a blank row in that table is exactly what makes a
+    # reader think the table is unfinished.
+    assert not [v for v in VENDORS if marks[v["vendor"]] == " "], (
+        "tier-0 blanks remain: %s"
+        % sorted(v["vendor"] for v in VENDORS if marks[v["vendor"]] == " "))
+    assert len(OPERATOR_PICKS) == len(VENDORS), (
+        "tier 0 is meant to be complete: %d operator picks for %d vendors"
+        % (len(OPERATOR_PICKS), len(VENDORS)))
+
+    # The operator's round as a frozen table. Every vendor, the codepoint they
+    # named, and nothing derived: the point is that a diff which changes a pick
+    # has to change this line too, in the same commit, on purpose.
+    assert marks == EXPECTED_T0, (
+        "tier-0 picks differ from the operator's round. expected %s, got %s"
+        % (sorted("%s=%s" % (k, codepoint_of(v)) for k, v in EXPECTED_T0.items()),
+           sorted("%s=%s" % (k, codepoint_of(v)) for k, v in marks.items())))
+
     for vid, m in marks.items():
         slot = mark_slot(m)
         if m == " ":
@@ -972,19 +1219,24 @@ def check_marks():
         "%s (expected exactly %s)" % (SLOT_COLS, sorted(short), sorted(ambiguous)))
     assert ambiguous, "no Ambiguous mark left to exercise the pessimistic slot"
 
-    # Section 5's two-tone claim is derived from these two sets at render time,
-    # and asserted here so the two can never drift apart: a glyph declared
-    # self-colouring must be Wide (an emoji that drew in one cell would make
-    # section 5's "the wide ones self-colour" a coincidence), and every Wide
-    # mark must be DECLARED one way or the other. The declaration is a hand-
+    # Section 5's self-coloured/inherits split is derived from these two sets at
+    # render time, and asserted here so the two can never drift apart: a glyph
+    # declared self-colouring must be Wide (an emoji that drew in one cell would
+    # make section 5's "the wide ones self-colour" a coincidence), and every
+    # Wide mark must be DECLARED one way or the other. The declaration is a hand-
     # maintained list on purpose - `unicodedata` does not expose
     # Emoji_Presentation - so a new Wide pick has to be classified deliberately,
     # and this is the line that makes it deliberate.
+    #
+    # Both sets are EMPTY this round, and the rule is still armed: tier 0 has no
+    # two-cell glyph left, so section 5's honest answer is "every mark takes the
+    # row attribute", but a future Wide pick cannot be added without being
+    # classified here. The two assertions below are the same ones as before with
+    # the non-emptiness requirement removed - not weakened, just no longer
+    # demanding a Wide mark exists.
     wide = {vid for vid, m in marks.items()
             if m != " " and unicodedata.east_asian_width(m) in _WIDE}
     selfcolour = {vid for vid, m in marks.items() if m in EMOJI_PRESENTATION}
-    assert wide, "no Wide tier-0 mark left to exercise the slot"
-    assert selfcolour, "no self-coloured tier-0 mark left to exercise section 5"
     assert selfcolour <= wide, (
         "glyphs declared emoji-presentation that are not Wide, so section 5's "
         "'the wide ones self-colour, the rest do not' is not what the pane "
@@ -994,6 +1246,48 @@ def check_marks():
         "them in EMOJI_PRESENTATION if they are emoji-presentation, or expect "
         "section 5's numbers to be wrong: %s"
         % sorted(wide - selfcolour))
+    assert EMOJI_PRESENTATION == (), (
+        "EMOJI_PRESENTATION must be empty: the crab and the whale left tier 0 "
+        "this round, so a leftover entry here would be a ghost that section 5 "
+        "counts as a self-coloured mark nothing draws. Add the new pick to the "
+        "list in the same commit that adds it to OPERATOR_PICKS.")
+
+    # The operator's measurement of their own round, restated as an assertion:
+    # everything is Narrow except kilo, cognition and z-ai, which are Ambiguous.
+    # Ambiguous is the only non-Narrow class left - if a future pick arrives Wide
+    # this fails and the tier-0 header's "no Wide picks" line has to be rewritten.
+    non_narrow = {vid: unicodedata.east_asian_width(m) for vid, m in marks.items()
+                  if unicodedata.east_asian_width(m) not in ("N", "Na")}
+    assert non_narrow == EXPECTED_AMBIGUOUS, (
+        "tier-0 width classes changed. expected exactly %s, got %s - the header "
+        "text and section 6 both quote that measurement"
+        % (sorted("%s=%s" % kv for kv in EXPECTED_AMBIGUOUS.items()),
+           sorted("%s=%s" % kv for kv in non_narrow.items())))
+    assert not wide, (
+        "tier-0 has a Wide mark again (%s). That is allowed by the slot, but the "
+        "tier-0 header, section 2 and section 5 all say tier 0 has no two-cell "
+        "pick, and an emoji there also has to go in EMOJI_PRESENTATION"
+        % sorted(wide))
+
+    # Section 6's coverage table and FONT_RISK describe the same set, so the two
+    # are checked against each other: every pick outside the BMP is declared a
+    # coverage risk, and every declared risk really is outside the BMP.
+    astral = {vid for vid, m in marks.items() if ord(m) > 0xFFFF}
+    assert astral == set(FONT_RISK), (
+        "section 6's coverage risk list and the tier-0 table disagree. "
+        "outside the BMP: %s; declared: %s"
+        % (sorted(astral), sorted(FONT_RISK)))
+    assert astral, "no non-BMP tier-0 pick left for section 6 to be about"
+
+    # `_t0_marks` walks the table a second time, by a different route than
+    # `marks` above, so comparing the two costs nothing and catches a vendor
+    # that fell out of the loop entirely.
+    assert sorted(_t0_marks()) == sorted(marks.values()), (
+        "t0_of and the mark table disagree about which vendors have a mark")
+    assert len(set(_t0_marks())) == len(VENDORS), (
+        "two vendors share a tier-0 mark: %s"
+        % sorted(m for m in set(_t0_marks())
+                 if list(_t0_marks()).count(m) > 1))
 
     # The ambiguous call itself, asserted so it cannot drift silently.
     assert mark_slot("╔") == "╔" and slot_width(mark_slot("╔")) == SLOT_COLS, (
@@ -1006,6 +1300,10 @@ def check_marks():
     assert len(set(AGENT_TAGS.values())) == len(AGENT_TAGS), \
         "two agents share a tier-3 tag"
     assert set(AGENT_TAGS) == catalog, "tier-3 tags do not cover the catalog"
+
+    # The two prototypes draw W1 from the same geometry; prove it rather than
+    # assume it. Last, because it is the only check that touches the sibling.
+    _check_w1_parity()
 
 
 # -------------------------------------------------------------- sections
@@ -1127,6 +1425,165 @@ def a_dense(r, w, root_mark, row_mark):
     return out
 
 
+# ---- W1 web-parity: the geometry lives here, and tui_beauty.py copies it
+# ---------------------------------------------------------------------
+# WHY IT LIVES IN THIS FILE AND NOT IN THE OTHER ONE. W1's mark column is two
+# cells wide under the PESSIMISTIC ruler - the same `mark_slot` as the tier-0
+# table - so the one renderer of W1 has to be able to call `mark_slot`, and
+# `mark_slot` lives here. Rather than import one prototype from the other
+# (which is a cycle: tui_beauty needs the marks, this file needs the layout),
+# both files carry the same small geometry and `check_marks()` asserts they
+# still agree - see `_check_w1_parity`. The earlier sections set the precedent:
+# a_nested/a_banner/a_dense are re-implementations of tui_beauty's V1/V2/V5,
+# not a lookalike, and the parity check is how "not a lookalike" is enforced
+# rather than merely intended.
+W1_CARET = "▸"
+# U+2299 CIRCLED DOT OPERATOR for the node, U+2502 for the rule joining them.
+# Both are Ambiguous, like every box-drawing glyph the pane already draws, so
+# W1 introduces no new class of width risk - it adds more of a class the pane
+# has always had.
+W1_DOT = "⊙"
+W1_RULE = "│"
+# The avatar tile in the header bar when no vendor mark is available. U+25A1,
+# Neutral-ish and one cell in both rulers, which matters in a bar that is
+# filled to the full pane width.
+W1_TILE = "□"
+# Below this many columns for the title, the three gutters are not worth their
+# columns and the form degrades. The title is the pane's content; the gutters
+# are aids to reading it.
+W1_MIN_TITLE = 18
+W1_MIN_TITLE_SMALL = 11
+
+# The web shows a green check for done and a red exclamation for failed. The
+# TUI keeps its OWN state vocabulary instead - ● ⏸ ✗ ○, the same four glyphs
+# every other variant in this file uses - so the chip column reads as the same
+# language as the rest of the pane and a state never changes meaning between
+# layouts. Colour is not available to it either way: the chip is one cell of
+# monochrome text glyph, so it inherits the row attribute exactly as the mark
+# does. That divergence from the web shot is deliberate and it is the only one.
+#
+# The capture carries NO report text - a kid row has a title, a status, an
+# agent name, two timestamps and an elicitation count - so the snippet below is
+# SYNTHESISED from the fields that do exist, and the section says so where the
+# line is printed. What is under test is the second LINE: always present,
+# always dim, truncated with an ellipsis at the pane edge, never expanded on
+# demand. The words in it are placeholders of the right length to make that
+# visible.
+SNIPPET = {
+    "working": "in progress, no report line yet",
+    "blocked": "holding an elicitation, needs a decision",
+    "failed": "stopped on an error, nothing reported",
+    "idle": "finished, report at the tail of the log",
+}
+
+
+def snippet_for(k):
+    """The DIM second line W1 shows under every worker."""
+    who = k.get("agent") or "role"
+    return "%s · %s · %s" % (who, SNIPPET[k["state"]], k["meta"])
+
+
+def w1_cols(rail_on, mark_on):
+    """Columns the W1 gutter occupies: caret, [rail], chip, [mark] + spaces."""
+    return 4 + 2 * rail_on + 3 * mark_on
+
+
+def w1_layout(w):
+    """`(grade, rail_on, mark_on)` for W1 at pane width `w`.
+
+    The three gutters are dropped in a fixed order when the pane is too narrow
+    to carry them, and the order is the design, not an accident: the timeline
+    rail goes first because it is decoration on top of a single cell; then the
+    harness mark, which is the one the rest of this file argues hardest for;
+    then the chip, whose information is the state word the title already
+    carries. The title is the last thing to go, and the grade string is printed
+    with every render, so a degraded W1 always says so on the same screen.
+    """
+    for grade, rail, mk, need in (
+            ("full - timeline rail, status chip and harness mark",
+             True, True, W1_MIN_TITLE),
+            ("DEGRADED - the timeline rail is dropped", False, True,
+             W1_MIN_TITLE_SMALL),
+            ("DEGRADED - rail and mark dropped, chip kept", False, False,
+             W1_MIN_TITLE_SMALL)):
+        if w - w1_cols(rail, mk) >= need:
+            return grade, rail, mk
+    return "DEGRADED - caret only, no gutters", False, False
+
+
+def w1_prefix(caret, rail_char, rail_on, chip, mark, mark_on):
+    """The gutter in front of every W1 line. Identical in both prototypes.
+
+    The rail column is DIM here and nowhere else, which is what makes the rail
+    read as a rail: a full-brightness vertical rule beside a list is a border,
+    and the whole point of W1 is that this layout has no borders.
+    """
+    s = caret + " "
+    if rail_on:
+        s += DIM + rail_char + UNDIM + " "
+    s += chip + " "
+    if mark_on:
+        s += mark + " "
+    return s
+
+
+def w1_header(r, w, mark):
+    """The filled bar: A_REVERSE across the full pane, tile plus bold name.
+
+    THE ONE PLACE REVERSE VIDEO BELONGS. W1 marks the selected worker with a
+    caret (and A_BOLD on its title), so the attribute is not competing with
+    selection for the same channel: one thing is a filled bar at the top, the
+    other is an arrow in the gutter, and the operator can see both at once.
+    """
+    lead = " %s " % ((mark or "").strip() or W1_TILE)
+    name = clip(r["harness"], max(2, w - _visible_width(lead) - 1))
+    return REV + pad(lead + BOLD + name + UNBOLD, w) + NOREV
+
+
+def a_web(r, w, root_mark, row_mark):
+    """tui_beauty V8 (W1 web-parity): the web view's shape, in this pane.
+
+    Flat list, no boxes, a filled header bar, a DIM timeline rail down the
+    left, a status chip, the harness mark in its own gutter, two lines a
+    worker, and a blank row between workers. Selection is the caret alone.
+    """
+    grade, rail_on, mark_on = w1_layout(w)
+    mark_of = row_mark or (lambda k: " ")
+    cols = w1_cols(rail_on, mark_on)
+    room = max(0, w - cols)
+    out = [w1_header(r, w, root_mark), ""]
+    for i, k in enumerate(r["kids"]):
+        if i:
+            # The blank row is not blank: it carries the rail's vertical rule,
+            # which is what joins one node to the next.
+            out.append(w1_prefix(" ", W1_RULE, rail_on, " ", "  ", mark_on))
+        slot = mark_slot(mark_of(k) or " ")
+        title = BOLD + k["title"] + UNBOLD if i == 0 else k["title"]
+        out.append(w1_prefix(W1_CARET if i == 0 else " ", W1_DOT, rail_on,
+                             GLYPH[k["state"]], slot, mark_on)
+                   + clip(title, room))
+        out.append(w1_prefix(" ", W1_RULE, rail_on, " ", "  ", mark_on)
+                   + DIM + clip(snippet_for(k), room) + UNDIM)
+    # Wrapped, not clipped: a degraded W1 that cannot say which gutter it
+    # dropped has failed at the one job the degradation ladder has.
+    out += para("W1 at width %d: %s. %d columns of gutter, %d left for the "
+                "title and the snippet." % (w, grade, cols, room), w,
+               indent=2)
+    return out
+
+
+def t0_mark_for(agent):
+    """The TIER-0 mark for a worker row's agent name, or a blank.
+
+    Same three outcomes as `mark_for` - a catalog agent gets its vendor's pick,
+    a role and an unknown name get a blank - because a role row has no vendor
+    and the pane must not invent one. Where `mark_for` returns tier 1's glyph,
+    this returns the operator's pick for the same vendor.
+    """
+    v = vendor_for(agent)
+    return t0_of(v)["mark"] if v else " "
+
+
 CONTEXTS = [
     ("V1 nested-container", "tui_beauty.py", a_nested,
      "root mark only: +2 cols in the container's title row, once per tree"),
@@ -1140,6 +1597,8 @@ CONTEXTS = [
      "root mark only: +2 cols on the header row, once per tree"),
     ("V5 dense-rows", "tui_beauty.py", a_dense,
      "+ a mark on EVERY worker row: +2 cols a row"),
+    ("W1 web-parity", "tui_beauty.py", a_web,
+     "+ a mark on EVERY worker row, in its OWN gutter"),
 ]
 
 
@@ -1157,17 +1616,22 @@ def context_block(w, root, root_mark, with_worker_marks):
 
 
 # ---- section 2: the deliberate breakage
-# The rows the demo uses: one of each interesting width, plus a blank, so the
-# naive render shows three different offsets where the slot shows one.
-BREAKAGE = ("moonshotai", "opencode-zen", "deepseek", "anthropic", "z-ai",
-            "goose")
+# The rows the demo uses: every Ambiguous pick, plus enough Narrow ones to show
+# that the Narrow rows are the ones the naive padder gets RIGHT. That ratio is
+# the section's finding now - the crab and the whale are gone, so no tier-0
+# mark draws two cells in a western terminal any more, and the shear that
+# remains is entirely the Ambiguous three, which is only visible under the
+# other ruler.
+BREAKAGE = ("moonshotai", "deepseek", "anthropic", "kilo", "cognition",
+            "z-ai", "goose")
 # What the pane would plausibly put on a worker row, so the demo is a real row
 # and not a column of glyphs with nothing to shear.
 DEMO_TASKS = {
     "moonshotai": ("fix-auth", "2m ago"),
-    "opencode-zen": ("fix-auth", "2m ago"),
     "deepseek": ("fix-auth", "2m ago"),
     "anthropic": ("fix-auth", "2m ago"),
+    "kilo": ("fix-auth", "2m ago"),
+    "cognition": ("fix-auth", "2m ago"),
     "z-ai": ("fix-auth", "2m ago"),
     "goose": ("fix-auth", "2m ago"),
 }
@@ -1186,6 +1650,17 @@ def _naive_row(mark, task, clock, cell, body):
     return (left + " " * max(1, body - len(left) - len(right)) + right)[:body]
 
 
+def _cjk_width(s):
+    """Display columns under the CJK-locale ruler: Ambiguous counts two.
+
+    The other half of the measurement in section 2. `slot_cells` already is
+    that ruler; this is it applied to a whole line, so the table can show both
+    readings of the same row side by side instead of asserting that one of them
+    is hypothetical.
+    """
+    return sum(slot_cells(c) for c in _ANSI_SGR.sub("", s))
+
+
 def breakage_block(w):
     """Print the shear, then the fix, from the same rows. Section 2.
 
@@ -1194,14 +1669,20 @@ def breakage_block(w):
     `mark_slot`. The two are printed from the same data one after the other,
     with the right-hand ruler under each, so the drift is a thing the operator
     looks at rather than a sentence they have to believe.
+
+    Both blocks are measured under the ruler of THIS terminal, where an
+    Ambiguous glyph is one cell. That is not a flattering choice for the
+    argument - it hides the worst of the naive render - so the MEASURED table
+    underneath prints the same rows under BOTH rulers, and the prose says
+    which one this terminal is.
     """
     cell = 3
     dw = max(12, w - 2)
     # No headroom, deliberately: the naive block is a column WIDER than the
-    # pane wherever a Wide mark appears, and the point of the demo is that the
-    # row does not fit, not that it fits crookedly. The naive rows are clipped
-    # to fit THIS file's budget (the gate forbids a long line), which is a
-    # kinder failure than the one a terminal gives them, which is a wrap.
+    # pane wherever a mark draws two cells, and the point of the demo is that
+    # the row does not fit, not that it fits crookedly. The naive rows are
+    # clipped to fit THIS file's budget (the gate forbids a long line), which is
+    # a kinder failure than the one a terminal gives them, which is a wrap.
     body = max(10, dw)
     out = section(
         w, "2. DELIBERATE BREAKAGE - the same rows without the slot, and with it",
@@ -1209,7 +1690,9 @@ def breakage_block(w):
         "and the right-hand edge of each row. THE TOP BLOCK IS SUPPOSED TO BE "
         "BROKEN. It is printed on purpose. Nothing about it is a bug in this "
         "file; it is what the pane renders if the mark is padded as text, and "
-        "it is the whole justification for mark_slot().")
+        "it is the whole justification for mark_slot(). Both blocks are drawn "
+        "with THIS terminal's ruler, where an Ambiguous glyph is one cell - "
+        "the kinder reading. The table under them prints both.")
     out.append("")
 
     def ruler(label):
@@ -1229,85 +1712,121 @@ def breakage_block(w):
 
     # Measured, so the claim above is arithmetic the operator can check rather
     # than a sentence they have to believe. "believed" is what the padder
-    # computed from len(); "drawn" is where the terminal actually puts it.
-    out.append(hdr(w, "MEASURED - where the task name actually lands"))
+    # computed from len(); "drawn" is where the terminal actually puts it, under
+    # each of the two rulers a real terminal could be using.
+    out.append(hdr(w, "MEASURED - where the task name actually lands, under "
+                      "BOTH rulers"))
+    out += para("W = this terminal's ruler, Ambiguous counts 1. C = a CJK-"
+                "locale terminal, Ambiguous counts 2. `slot_cells` is C; the "
+                "file's own width check is W.", w, indent=6)
     believed = 2 + cell + 1
-    drifts, ends = {}, {}
-    out.append("  " + clip(pad("vendor", 11) + " " + pad("", 2) + " " + pad("cells", 6)
-                       + " " + pad("name col", 12) + " " + pad("row end", 5), dw))
+    drifts, ends, ends_c = {}, {}, {}
+    out.append("  " + clip(pad("vendor", 11) + " " + "  " + " "
+                           + pad("name W", 8) + " " + pad("name C", 8)
+                           + " " + pad("end W", 5) + " " + pad("end C", 5), dw))
     for vid in BREAKAGE:
         mark = t0_of(vid)["mark"]
+        naive = _naive_row(mark, DEMO_TASKS[vid][0], DEMO_TASKS[vid][1],
+                           cell, body)
         drawn = 2 + _visible_width(mark.ljust(cell)) + 1
-        drifts[vid] = drawn - believed
-        ends[vid] = 2 + _visible_width(
-            _naive_row(mark, DEMO_TASKS[vid][0], DEMO_TASKS[vid][1], cell, body))
-        cls = {"N": "N 1", "W": "W 2", "F": "F 2", "A": "A 1|2",
-               "Na": "N 1"}.get(unicodedata.east_asian_width(mark), "- 0")
+        drawn_c = 2 + _cjk_width(mark.ljust(cell)) + 1
+        drifts[vid] = (drawn - believed, drawn_c - believed)
+        ends[vid] = 2 + _visible_width(naive)
+        ends_c[vid] = 2 + _cjk_width(naive)
         out.append("  " + clip(
-            pad(vid, 11) + " " + pad(slot_for(vid), 2) + " " + pad(cls, 6)
-            + " " + pad("%d -> %d (%+d)" % (believed, drawn, drawn - believed), 12)
-            + " " + pad(str(ends[vid]), 5), dw))
+            pad(vid, 11) + " " + slot_for(vid) + " "
+            + pad("%d->%d %+d" % (believed, drawn, drawn - believed), 8) + " "
+            + pad("%d->%d %+d" % (believed, drawn_c, drawn_c - believed), 8)
+            + " " + pad(str(ends[vid]), 5) + " " + pad(str(ends_c[vid]), 5),
+            dw))
     out.append("")
-    sheared = [v for v in BREAKAGE if drifts[v]]
+    narrow_drift = [v for v in BREAKAGE if drifts[v][0]]
+    amb_drift = [v for v in BREAKAGE if drifts[v][1]]
     out += para(
         "Read the name column. The padder BELIEVES the task name starts at "
         "column %d on every row, because len(mark) is %d for every glyph in "
-        "tier 0 - the whale, the crab and the place-of-interest sign are all "
-        "single python characters, whatever they draw as. The terminal "
-        "disagrees on %d of these %d rows: %s draw in two cells and push "
-        "everything after them one column right. One row of the set is left "
-        "alone by that drift and is still wrong for another reason - U+2554 is "
-        "Ambiguous, and the naive padder charged it the one cell it draws as "
-        "here, which is right in this terminal and wrong under a CJK locale."
-        % (believed, len(t0_of("anthropic")["mark"]), len(sheared),
-           len(BREAKAGE), ", ".join(sheared)), w, indent=6)
-    over = {v: c for v, c in ends.items() if c > w}
+        "tier 0 - the hieroglyphs, the arrow and the place-of-interest sign are "
+        "all single python characters, whatever they draw as. In THIS terminal "
+        "that belief is %s - it is the accident the previous round relied on, "
+        "and it held only because the crab and the whale were there to break "
+        "it. With them gone, every glyph in tier 0 draws one cell here, "
+        "Ambiguous included. Under the CJK ruler the belief is wrong on %d of "
+        "the %d rows: %s draw two cells there and land a column PAST the slot. "
+        "Same padder, same glyph, two terminals, two different truths - and "
+        "the naive version cannot be right in both, which is the whole reason "
+        "`slot_cells` picks the worse one on purpose."
+        % (believed, len(t0_of("anthropic")["mark"]),
+           "accidentally right on all %d" % len(BREAKAGE) if not narrow_drift
+           else "wrong on %d" % len(narrow_drift),
+           len(amb_drift), len(BREAKAGE), ", ".join(amb_drift)), w, indent=6)
+    over_w = {v for v in BREAKAGE if ends[v] > w}
+    over_c = {v for v in BREAKAGE if ends_c[v] > w}
     out += para(
         "And at the right edge, which is where the pane actually fails: the "
-        "naive rows end at %s. The pane is %d columns wide. %d of the %d rows "
-        "end PAST it - a row that does not fit is not clipped by a terminal, "
-        "it is WRAPPED, and a wrapped row in a right-aligned clock column is "
-        "the failure that gets reported as 'the agents pane is broken'. Those "
-        "rows are clipped above only because this file refuses to print a long "
-        "line; the slotted block needs no clipping and ends at column %d on "
-        "every row."
-        % (", ".join("%s %d" % (v, ends[v]) for v in BREAKAGE), w, len(over),
-           len(BREAKAGE), w), w, indent=6)
+        "naive rows end at %s under this terminal's ruler and at %s under the "
+        "CJK one. The pane is %d columns wide. %s under this ruler; %d of the "
+        "%d rows end PAST it under the other%s - and a row that does not fit is "
+        "not clipped by a terminal, it is WRAPPED, and a wrapped row in a "
+        "right-aligned clock column is the failure that gets reported as 'the "
+        "agents pane is broken'. The slotted block needs no clipping at all: "
+        "it ends at column %d on every row, in both locales."
+        % (", ".join("%s %d" % (v, ends[v]) for v in BREAKAGE),
+           ", ".join("%s %d" % (v, ends_c[v]) for v in BREAKAGE), w,
+           ("no row overruns" if not over_w
+            else "%d overrun (%s)" % (len(over_w), ", ".join(sorted(over_w)))),
+           len(over_c), len(BREAKAGE),
+           " (%s)" % ", ".join(sorted(over_c)) if over_c else "", w), w,
+        indent=6)
     out += para(
-        "THE ONE ROW THE SLOT DOES NOT FULLY FIX, named rather than buried: "
-        "the U+2554 row. `slot_cells` charges Ambiguous two cells, so the slot "
-        "leaves it unpadded - padding it would make the slot three cells wide "
-        "under a CJK locale, and a three-cell slot shears everything after it, "
-        "which is the worse failure. The bill for that choice falls on this row "
-        "alone: in a western terminal it lands %d cell of the %d-column slot, "
-        "one column short, which is why the z-ai row of the tier-0 table above "
-        "carries one space less than its neighbours. Every other row is exact "
-        "in both locales."
-        % (_visible_width(mark_slot("╔")), SLOT_COLS), w, indent=6)
+        "THE ROWS THE SLOT DOES NOT FULLY FIX, named rather than buried: the "
+        "Ambiguous ones. `slot_cells` charges Ambiguous two cells, so the slot "
+        "leaves them unpadded - padding them would make the slot three cells "
+        "wide under a CJK locale, and a three-cell slot shears everything "
+        "after it, which is the worse failure. The bill for that choice falls "
+        "on these %d rows alone: in a western terminal they land %d cell of the "
+        "%d-column slot, one column short, which is why the kilo, cognition "
+        "and z-ai rows of the tier-0 table carry one space less than their "
+        "neighbours. The other %d rows are exact in both locales. Note what is "
+        "NOT in this section any more: the crab and the whale used to be the "
+        "two rows that overran the edge on every terminal. They are gone from "
+        "tier 0, and the slot's remaining job is the one that is invisible "
+        "until you change locale."
+        % (len(EXPECTED_AMBIGUOUS), _visible_width(mark_slot("╔")), SLOT_COLS,
+           len(BREAKAGE) - len(EXPECTED_AMBIGUOUS)), w, indent=6)
     return out
 
 
 # ---- section 3: tier-0 mark in the root header only
 def tier0_context_block(w, root):
-    """V1/V2/V5 with the tier-0 mark in the root header, root only.
+    """V1/V2/V5 with the tier-0 mark in the root header, then W1 with it on
+    every worker row too.
 
-    Root only, deliberately. The previous run measured what a per-worker mark
-    costs - section A below still carries that comparison, and it has not been
-    deleted, because a verdict with its evidence removed is just an assertion.
-    It is not promoted either: the operator has not overridden it, so the
-    recommendation stays root-header-only and the evidence stays visible.
+    V1, V2 and V5 stay ROOT HEADER ONLY. The previous run measured what a
+    per-worker mark costs in those three layouts - section A below still
+    carries that comparison, and it has not been deleted, because a verdict
+    with its evidence removed is just an assertion.
+
+    W1 is the exception, and it is an exception for a reason the other three
+    cannot supply: there the mark sits in its OWN ALIGNED GUTTER, a column of
+    its own that lines up down the whole list, instead of being jammed in front
+    of the title where it costs the title its first three columns and lands
+    against whatever the previous row's title happened to end with. Same mark,
+    same two columns, different place - and that is the whole of the reversal.
+    FOR W1 ONLY: section A's verdict does not transfer.
     """
     slot = slot_for(ORCHESTRATOR_VENDOR)
     out = section(
-        w, "3. THE MARKS IN CONTEXT - tui_beauty V1 / V2 / V5, tier-0 mark in "
-           "the ROOT HEADER",
+        w, "3. THE MARKS IN CONTEXT - tui_beauty V1 / V2 / V5 in the ROOT "
+           "HEADER, then W1 with the mark on EVERY row",
         "The operator's %s mark for the orchestrator vendor (%s), through "
         "mark_slot, in the three tui_beauty layouts that place a label in a "
         "header. ROOT HEADER ONLY. The capture names the root %r - the bundle, "
         "not a harness - so the mark drawn here is the mark for the "
         "orchestrator this repo installs (`claude`, harness `claude-native`); "
         "the pane resolves the real harness id per session and draws a blank "
-        "when the registry does not name it."
+        "when the registry does not name it. W1 follows, drawn twice: once "
+        "here with the tier-0 mark on every worker row, and once in section A "
+        "with tier 1's."
         % (codepoint_of(t0_of(ORCHESTRATOR_VENDOR)["mark"]), ORCHESTRATOR_VENDOR,
            root["harness"]))
     for name, src, fn, cap in CONTEXTS:
@@ -1316,11 +1835,29 @@ def tier0_context_block(w, root):
         out.append(hdr(w, "%s (%s) - %s" % (name, src, cap)))
         out += fn(root, w, slot, None)
         out.append("")
+    out.append(hdr(w, "W1 web-parity (tui_beauty.py) - tier-0 mark on the "
+                      "header AND on every worker row"))
+    out += a_web(root, w, slot, lambda k: t0_mark_for(k["agent"]))
+    out.append("")
+    out += para("WHY W1 AND NOT V1/V2/V5: the mark costs the same two columns "
+                "in all four, and in the first three it is spent out of the "
+                "title's three leading columns on every row, against a ragged "
+                "left edge. In W1 it is a gutter column that aligns down the "
+                "list, next to a chip column and a rail column, so the title "
+                "starts in the same place on every row by construction rather "
+                "than by a promise. This REVERSES the verdict in section A for "
+                "this variant only; section A is kept whole, and its arithmetic "
+                "- a column blank on %d of %d rows under tier 1 - is also what "
+                "tier 0's completeness has changed underneath it."
+                % (len(root["kids"]) - sum(
+                    1 for k in root["kids"] if mark_for(k["agent"]) != " "),
+                   len(root["kids"])), w, indent=2)
     out += para("The mark is %d columns of a %d-column pane, once per tree, on "
-                "the one label in the pane that names a company. The two Wide "
-                "operator picks (U+1F40B, U+1F980) cost exactly what a Narrow "
-                "one costs, because the slot is the size of the mark rather "
-                "than the size of the text."
+                "the one label in the pane that names a company. Tier 0 has no "
+                "WIDE pick left, so every mark in the header costs exactly what "
+                "a Narrow one costs - and the slot is still what makes that "
+                "true, because Ambiguous is charged two cells here rather than "
+                "the one it happens to draw as."
                 % (slot_width(slot), w), w, indent=2)
     return out
 
@@ -1391,24 +1928,40 @@ def corner_block(w):
 
 # ---- section 5: colour interaction
 def twotone_block(w):
-    """The two-tone consequence, rendered with the real escapes.
+    """Which marks take the row attribute and which bring their own colour.
 
-    U+1F40B and U+1F980 are emoji-presentation codepoints: the terminal draws
+    This section used to be about two marks in a fourteen-glyph table: the
+    whale and the crab were Emoji_Presentation codepoints, the terminal drew
     them from the FONT's colour table, and a SGR foreground - which is all
-    init_pair produces - does not touch them. They cannot be recoloured and
-    do not need to be. Every other tier-0 mark is a monochrome text glyph, and
-    it takes the row attribute like any other letter. A tier-0 pane is
-    therefore inherently two-tone: some marks self-colour and the rest inherit
-    the row. That is the trade, named.
+    init_pair produces - did not touch them. The operator replaced both with
+    Narrow glyphs, so the split this section exists to show is now empty: all
+    %d marks are monochrome text glyphs and every one of them takes the row
+    attribute.
+
+    It is kept, and kept honest, for two reasons. The number it prints is
+    derived from the marks rather than typed in, so it now says "0 of %d
+    self-colour" instead of quietly claiming a whale it no longer has. And the
+    rule that made the old numbers right is still armed: `check_marks()` fails
+    if a Wide mark is ever added without being classified in
+    EMOJI_PRESENTATION, at which point this section starts counting again
+    without a code change.
     """
     out = section(
-        w, "5. COLOUR INTERACTION - a tier-0 pane is inherently TWO-TONE",
+        w, "5. COLOUR INTERACTION - which marks bring their own colour, and "
+           "which take the row's",
         "Painted with the same init_pair-derived escape on every row, brand "
         "colour for the vendor, exactly as section B does. Watch which rows "
-        "change colour: the two that are emoji ignore the escape entirely, "
-        "because their colour comes from the font's colour table and not from "
-        "the terminal's attribute. The five monochrome glyphs take it.")
+        "change colour: NONE of them refuse it. An Emoji_Presentation "
+        "codepoint draws from the font's colour table and ignores the escape; "
+        "tier 0 had two of those - the whale and the crab - and the operator "
+        "replaced both. Every mark in the table below is a monochrome text "
+        "glyph and obeys the escape like a letter does.")
     out.append("")
+    # The two counts come from `_t0_emoji`/`_t0_monochrome`, which walk the
+    # table a second time by a different route, and the rows are painted from
+    # a third. If any of the three ever disagrees, this section's prose - which
+    # is generated from them - is generated from the wrong one.
+    n_emoji, n_mono = _t0_emoji(), _t0_monochrome()
     selfcol, inherit = [], []
     for v in VENDORS:
         mark = t0_of(v["vendor"])["mark"]
@@ -1420,6 +1973,12 @@ def twotone_block(w):
         (selfcol if mark in EMOJI_PRESENTATION else inherit).append(v["vendor"])
     picks_inherit = [v for v in inherit if v in OPERATOR_PICKS]
     defaults = [v for v in inherit if v not in OPERATOR_PICKS]
+    # Every row is an operator pick now, so the "and the N default rows" tail
+    # is normally empty - said rather than printed as "the 0 default rows ()".
+    tail = (" and the %d default rows (%s)" % (len(defaults), ", ".join(defaults))
+            if defaults else
+            " - and there are no default rows left, because the operator named "
+            "all %d of them" % len(OPERATOR_PICKS))
     # How much of that list is actually a hue. Counted rather than asserted:
     # "brand colour" on a 256-colour terminal is sometimes a grey, and saying
     # eight brand colours when two of them are #3C3C3C would be the same kind
@@ -1428,35 +1987,142 @@ def twotone_block(w):
                if _hex_spread(by_id()[v]["hex"]) >= 20)
     out.append("")
     out += para(
-        "SELF-COLOURED (%s): %s are Emoji_Presentation codepoints. The "
-        "terminal picks their colour from the FONT, so the escape above "
-        "changed nothing about them - they were never going to obey a curses "
-        "colour pair, and they do not need to: a whale and a crab are "
-        "recognisable in any colour."
-        % (", ".join(selfcol), " and ".join(codepoint_of(t0_of(v)["mark"])
-                                             for v in selfcol)), w, indent=2)
+        "SELF-COLOURED (%d of %d rows): %s. That is the change this round "
+        "made to the pane, and it is invisible until you were looking for it: "
+        "the whale and the crab used to ignore the escape entirely, so a "
+        "tier-0 header was never one brand colour - it was two emoji in "
+        "whatever colours the font's table gave them, standing beside %d "
+        "monochrome glyphs that took the brand colour properly. Now every "
+        "glyph in the header is on the same footing, and `paint()` above "
+        "reaches all of them."
+        % (n_emoji, n_emoji + n_mono,
+           "none" if not selfcol else ", ".join(selfcol), n_mono), w,
+        indent=2)
     out += para(
-        "INHERITS THE ROW ATTRIBUTE (%d rows): the operator's other %d picks "
-        "(%s) and the %d default rows (%s). These are monochrome text glyphs. "
-        "They take the brand colour from the row, or the row's dim/reverse "
-        "attribute when the terminal has no colour - so these are the marks "
-        "that carry branding, and also the ones that lose it entirely on a "
-        "monochrome terminal."
-        % (len(inherit), len(picks_inherit),
+        "INHERITS THE ROW ATTRIBUTE (%d rows): the operator's %d picks (%s)%s. "
+        "These are monochrome text glyphs. They take the brand colour from the "
+        "row, or the row's dim/reverse attribute when the terminal has no "
+        "colour - so these are the marks that carry branding, and also the "
+        "ones that lose it entirely on a monochrome terminal."
+        % (n_mono, len(picks_inherit),
            ", ".join(codepoint_of(t0_of(v)["mark"]) for v in picks_inherit),
-           len(defaults), ", ".join(defaults)), w, indent=2)
+           tail), w, indent=2)
     out += para(
-        "THE TRADE, PLAINLY: the operator's two widest marks are the two the "
-        "pane cannot colour, and the marks that do carry the brand colour are "
-        "the narrow ones. A tier-0 header is therefore not one brand colour - "
-        "it is a whale and a crab in whatever colours the font's table gives "
-        "them, beside %d monochrome glyphs in the brand colours section B "
-        "derived: %d hues and %d greys. check_marks() asserts the self-colour "
-        "split rather than trusting it: every Wide tier-0 mark must be "
-        "emoji-presentation, and no Narrow one may be. If the operator would "
-        "rather have one colour than a whale, the fix is a tier-0 mark that is "
-        "not an emoji - and the slot is already the right size for it."
-        % (len(inherit), hues, len(inherit) - hues), w, indent=2)
+        "THE TRADE, PLAINLY: it used to be a trade, and it is not any more. "
+        "Two marks the pane could not colour were two marks that would not "
+        "have taken a brand colour if it could, so losing them cost the "
+        "operator the recognisability of a whale and a crab in exchange for a "
+        "header where every mark obeys `init_pair`: %d hues and %d greys, all "
+        "of them paintable, none of them self-coloured behind the pane's "
+        "back. What the swap did NOT buy is width: U+1319E and U+1D54F are as "
+        "wide as the whale in the only sense that matters now, which is "
+        "'present in your font' - section 6."
+        % (hues, n_mono - hues), w, indent=2)
+    out += para(
+        "STILL ARMED: check_marks() asserts that every Wide tier-0 mark is "
+        "declared in EMOJI_PRESENTATION and that no Narrow one is, so a "
+        "future emoji cannot slip into the table and quietly turn this section "
+        "back into a two-tone pane without the numbers here changing.", w,
+        indent=2)
+    return out
+
+
+# ---- section 6: does your font have these?
+def font_block(w):
+    """The operator's picks, with codepoint, plane and block, beside a control.
+
+    Not a recommendation and not a review. A statement about font coverage,
+    because five of the fourteen picks live outside the BMP and that is where
+    fonts end: a project that ships Latin, Greek, Cyrillic, Box Drawing,
+    Dingbats and Mathematical Operators has no reason at all to carry Egyptian
+    Hieroglyphs or Bamum, and the terminal will draw whatever substitute it has
+    for a codepoint the font does not.
+
+    The left column is the pick; the RIGHT column of that same pair is
+    `UNASSIGNED`, a codepoint the standard never assigns to anything. Any
+    terminal renders both of them with the same substitute when it has no
+    glyph, so the pair is a self-contained test: look at the two cells side by
+    side on your own terminal, and if they match, the mark is missing. No
+    second run, no font config, no `fc-list`.
+    """
+    out = section(
+        w, "6. FONT COVERAGE - does your terminal's font have these?",
+        "FIVE of the operator's %d picks are outside the BMP: the two Egyptian "
+        "Hieroglyphs (U+1319E for deepseek, U+1316F for goose) and the Bamum "
+        "letter (U+1680C for aws-kiro) are SMP historic scripts that a stock "
+        "monospace font is unlikely to carry, and U+1D54F (xai, Mathematical "
+        "Alphanumeric Symbols) and U+1F13A (kilo, Enclosed Alphanumeric "
+        "Supplement) are outside the BMP and commonly missing too. The other "
+        "nine are in blocks a monospace font has carried since about 1990. "
+        "Each row prints the glyph beside U+0378, a codepoint the standard "
+        "never assigns: if the two cells look the same, the font is missing "
+        "the glyph."
+        % len(VENDORS))
+    out.append("")
+    # The mark goes through `slot_pad` before it is padded again, so this
+    # table is measured on the same pessimistic ruler as the pane - a CJK
+    # terminal does not see a different offset here than it would there.
+    out.append("  " + clip(pad("glyph", 5) + " " + pad("ctrl", 4) + " "
+                           + pad("codepoint", 10) + pad("plane", 6)
+                           + "vendor", w - 2))
+    risky = []
+    for v in VENDORS:
+        vid = v["vendor"]
+        mark = t0_of(vid)["mark"]
+        cp = ord(mark)
+        line = ("  " + pad(slot_pad(mark, SLOT_COLS), 5) + " "
+                + pad(UNASSIGNED, 4) + " " + pad(codepoint_of(mark), 10)
+                + pad(plane_name(cp), 6) + vid)
+        out.append(clip(line, w - 2))
+        block = block_of(cp)
+        if vid in FONT_RISK:
+            risky.append(vid)
+            note = ("%s - %s. Outside the BMP: very likely drawn as a "
+                    "substitute." % (block, FONT_RISK[vid]))
+        else:
+            note = ("%s - inside the BMP, in a block a monospace font has "
+                    "carried for decades." % block)
+        out += para(note, w, indent=6)
+    out.append("")
+    out += para(
+        "WHAT A MISS COSTS: one glyph, in its own %d-column slot, on one row. "
+        "The slot is charged before the terminal is asked anything, so a "
+        "substitute box, a hex-digit box or a blank cell all land in the same "
+        "two columns the mark would have - the vendor column does not move, "
+        "nothing after it shears, and the row is still readable as a row. That "
+        "is the whole argument for `mark_slot`: it is what makes a font miss "
+        "cosmetic rather than structural. What a miss does NOT do is pretend: "
+        "a tofu cell reads as 'this terminal has no glyph here', which is true."
+        % SLOT_COLS, w, indent=2)
+    tier1_have = len([v for v in VENDORS if v["t1"] != " "])
+    out += para(
+        "THE ONE PLACE A MISS COULD BITE: a terminal that falls back to an "
+        "EMOJI font for a codepoint outside the BMP may draw it TWO cells wide "
+        "even when the primary font had nothing, which would push that row one "
+        "column past the slot. Two cells is what the slot has already "
+        "reserved, so even that case lands inside the reservation - the "
+        "pessimistic ruler is doing its job for a reason that is not about "
+        "East Asian width at all. TIER 1 above is the escape hatch for a "
+        "terminal where several of these are missing at once: %d marks, every "
+        "one asserted Narrow, none of them outside the BMP."
+        % tier1_have, w, indent=2)
+    out += para(
+        "WHAT THIS TEST CANNOT SEE: font FALLBACK. Most terminals - "
+        "Terminal.app and iTerm2 among them - do not stop at the pane's font; "
+        "they walk a fallback list per character, so a glyph the primary font "
+        "lacks can still arrive from another installed font, drawn in that "
+        "font's style rather than the pane's. A font-file scan is therefore a "
+        "different question from 'will I see tofu', and this section is "
+        "deliberately the terminal question: look at the two cells on your own "
+        "screen. What a scan does answer, and it is worth knowing, is whether "
+        "the pick exists on this machine at all.", w, indent=2)
+    out += para(
+        "WHAT IS NOT CLAIMED HERE: nothing about whether these are the right "
+        "marks. They are the operator's decisions, this section measures "
+        "whether a given terminal can draw them, and the answer to that is "
+        "per-terminal and not per-vendor. %d of %d picks are outside the BMP; "
+        "the rest are in blocks with no meaningful coverage risk."
+        % (len(risky), len(VENDORS)), w, indent=2)
     return out
 
 
@@ -1507,19 +2173,30 @@ def build(root, w, rows, note):
             "%s. %s" % (width_class(t0_of(r["vendor"])["mark"]),
                         t0_of(r["vendor"])["why"])
             if t0_of(r["vendor"])["mark"] != " " else t0_of(r["vendor"])["why"]),
-    }, "COST %d columns for the slot plus the space that separates it from the "
-       "name: %d columns a row, whatever the glyph is - that is the entire "
-       "point of mark_slot(), and the reason this table is not simply tier 1 "
-       "with different characters in it. DEPENDS nothing tier 1 does not: no "
-       "private use area, no patched font, and no emoji font for the %d "
-       "monochrome rows. The %d emoji rows DO depend on the terminal's emoji "
-       "font, and a terminal without one draws a tofu box IN a two-cell slot - "
-       "which still does not shear anything, so that failure stays cosmetic. "
-       "%d operator picks, %d rows the operator did not name (they keep tier "
-       "1's mark, or its honest blank: %s)."
-       % (SLOT_COLS, SLOT_COLS + 1, _t0_monochrome(), _t0_emoji(),
-          len(OPERATOR_PICKS), len(VENDORS) - len(OPERATOR_PICKS),
-          ", ".join(v for v in sorted(by_vendor) if v not in OPERATOR_PICKS)),
+    }, "COMPLETE: %d picks for %d vendors, so no row in this table is blank - "
+       "the previous round left four (kilo, goose, hermes, cognition) and this "
+       "one closed them. COST %d columns for the slot plus the space that "
+       "separates it from the name: %d columns a row, whatever the glyph is - "
+       "that is the entire point of mark_slot(), and the reason this table is "
+       "not simply tier 1 with different characters in it. WIDTHS: %d Narrow, "
+       "%d Ambiguous, 0 Wide - dropping the crab and the whale removed BOTH "
+       "two-cell picks, so every mark in this table now draws in one cell here "
+       "or in two under a CJK locale, and never in two here. THE SLOT IS STILL "
+       "REQUIRED: `slot_cells` charges Ambiguous two on purpose, so kilo, "
+       "cognition and z-ai hold their two columns in both locales while a "
+       "naive padder would let all three shear the column after them. "
+       "DEPENDS a font carrying the codepoints listed in section 6 - no "
+       "private use area, no patched font, and, since the whale and the crab "
+       "went, no emoji font at all: every glyph here is a monochrome text "
+       "glyph that takes the row attribute. FONT RISK: %d of the %d are "
+       "outside the BMP, in blocks a stock monospace font often does not "
+       "carry, and will likely draw as tofu; section 6 is the test, and the "
+       "slot is what keeps such a miss cosmetic. TIER 1 below is unchanged "
+       "and keeps its %d honest blanks: it is the all-Narrow alternative, and "
+       "the thing to fall back to if a mark here turns out to be missing."
+       % (len(OPERATOR_PICKS), len(VENDORS), SLOT_COLS, SLOT_COLS + 1,
+          len(VENDORS) - len(EXPECTED_AMBIGUOUS), len(EXPECTED_AMBIGUOUS),
+          len(FONT_RISK), len(VENDORS), len(tier1_blanks)),
        mark_w=SLOT_COLS, mark_padder=slot_pad)
 
     out += tier_block(w, tier1_rows, {
@@ -1653,6 +2330,24 @@ def build(root, w, rows, note):
                    "; %s have a vendor with no honest mark" % ", ".join(vendor_rows)
                    if vendor_rows else "",
                    blanks, len(root["kids"])), w)
+    # Two things changed underneath that verdict this round, and a verdict whose
+    # inputs have moved is not a verdict any more - it is a fossil. Both changes
+    # are stated here rather than by deleting the section above.
+    out += para(
+        "WHAT THIS ROUND CHANGES ABOUT IT, both ways. (1) The arithmetic above "
+        "is a TIER-1 measurement and tier 1 still has %d blank vendors, but "
+        "tier 0 has none: the operator named a mark for all %d, so a per-worker "
+        "column drawn in tier 0 would be full on this capture rather than blank "
+        "on %d rows. (2) The other half of the verdict - that the mark costs "
+        "the title its first columns - still stands for V1, V2 and V5, because "
+        "in those three the mark is jammed in FRONT of the title and lands "
+        "against whatever the row above ended with. W1 (section 3) is the "
+        "layout where that half is false: there the mark is a gutter column of "
+        "its own, aligned down the whole list. So the verdict is REVERSED FOR "
+        "W1 ONLY, on the strength of the render above rather than a new "
+        "opinion, and unchanged everywhere else."
+        % (len([v for v in VENDORS if v["t1"] == " "]), len(VENDORS), blanks),
+        w)
 
     # ---- B: colour
     out += ["", rule(w, "═"),
@@ -1723,6 +2418,9 @@ def build(root, w, rows, note):
 
     # ---- 5: what emoji do to that colour, named
     out += twotone_block(w)
+
+    # ---- 6: whether a stock font has any of this, said plainly
+    out += font_block(w)
 
     picks = len(OPERATOR_PICKS)
     out += ["", rule(w, "═"),
