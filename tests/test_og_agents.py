@@ -832,11 +832,41 @@ def _herdr_call_methods(source: str) -> list:
         fetched by string, hiding it from an `Attribute` walk while still
         reaching it.
 
-    It does NOT catch a seam name that is itself data — `getattr(client, some_var)`,
-    a method pulled from a dict, `exec` — where no node names `call`. See
-    `test_the_ast_guard_catches_every_planted_bypass` for the honest boundary.
+    THE HONEST BOUNDARY. This is a static walk, not a dataflow analysis, so it
+    cannot defeat DELIBERATE indirection: any DYNAMIC DISPATCH to the seam
+    escapes — `operator.methodcaller("call", …)`, an aliased `getattr` invoked as
+    `alias("call", …)`, a method pulled from a dict or list, `exec`/`eval`, or a
+    wrapper function — and it escapes whether or not a literal appears. What the
+    walk DOES promise is the shape an accidental edit actually takes: every
+    DIRECT and SIMPLY-ALIASED spelling is refused (below), along with the
+    dynamic-dispatch entry points this module could never legitimately need,
+    which are rejected by mere presence. It does not attempt to out-think
+    deliberate indirection; that is the trade, not a gap. See
+    `test_the_ast_guard_catches_every_planted_bypass` for the planted cases that
+    pin the caught set.
     """
     tree = ast.parse(source)
+
+    # Dynamic dispatch is refused on SIGHT, not by dataflow: this module has no
+    # legitimate reason to reach a method by any route but a literal `.call(...)`,
+    # and each name below reaches past a static walk rather than through it. The
+    # list is deliberately short — a spelling needing type inference to catch
+    # belongs in the boundary above, not here.
+    called_funcs = {id(node.func) for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)}
+    for node in ast.walk(tree):
+        name = node.id if isinstance(node, ast.Name) \
+            else node.attr if isinstance(node, ast.Attribute) else None
+        if name in ("methodcaller", "exec", "eval"):
+            raise AssertionError(
+                f"`{name}` reaches a method dynamically; this module never "
+                "needs it: " + ast.dump(node))
+        if isinstance(node, ast.Name) and node.id == "getattr" \
+                and id(node) not in called_funcs:
+            raise AssertionError(
+                "`getattr` is bound to another name, an alias this scan cannot "
+                "follow: " + ast.dump(node))
+
     directly_called = {
         id(node.func)
         for node in ast.walk(tree)
@@ -877,8 +907,9 @@ def _herdr_call_methods(source: str) -> list:
 def _assert_only_agent_focus(source: str) -> None:
     """The tightened guard: `agent.focus` is the ONLY method handed to `call`.
 
-    Refuses outright if the seam is aliased, fetched by string, or called with a
-    method name that is not a literal (see `_herdr_call_methods`).
+    Refuses outright if the seam is aliased, fetched by string, called with a
+    method name that is not a literal, or reached by dynamic dispatch (see
+    `_herdr_call_methods`).
     """
     methods = _herdr_call_methods(source)
     assert methods, "expected the view to make its one outbound focus call"
@@ -929,17 +960,23 @@ def test_the_ast_guard_catches_every_planted_bypass():
         assuming;
       * indirect client — `getattr(client, "call")(…)` and
         `client.__getattribute__("call")(…)`: the seam is fetched by string,
-        bypassing the `.call` spelling entirely.
+        bypassing the `.call` spelling entirely;
+      * dynamic dispatch — `operator.methodcaller("call", …)`, a bare
+        `methodcaller`, `exec`, `eval`, and `getattr` bound to another name: none
+        of these names the seam directly, so each is refused by its mere
+        presence. The guard cannot follow where they point, and does not try.
 
-    WHAT THE GUARD DOES NOT PROMISE. It is a static scan, not a dataflow
-    analysis. A seam name that is itself DATA — `getattr(client, some_var)`, a
-    method pulled out of a dict, `exec` — is NOT caught: no attribute node names
-    `call` and no string literal does either, so there is nothing for the scan to
-    recognise. The promise is bounded to the spellings above. It fails closed on
-    everything it can SEE — every literal `.call(…)`, every `.call` used as a
-    value, and every literal-string `getattr`/`__getattribute__` — and an honest
-    boundary beats a false one. A spelling outside that set needs this test's
-    contract changed, not the guard quietly widened.
+    THE GUARD'S REAL PROMISE, AND ITS CEILING. This is a static scan, not a
+    dataflow analysis, so it catches every DIRECT and SIMPLY-ALIASED spelling —
+    the shape an accidental edit actually takes — and does not try to defeat
+    DELIBERATE indirection. Any DYNAMIC DISPATCH to the seam escapes it, literal
+    or not: `operator.methodcaller("call", …)`, an aliased `getattr` invoked as
+    `alias("call", …)`, a method pulled from a dict or list, `exec`/`eval`, a
+    wrapper function. The guard refuses everything it can SEE — every literal
+    `.call(…)`, every `.call` used as a value, every literal-string `getattr`/
+    `__getattribute__`, and the bare dynamic-dispatch entry points this module
+    never needs — and an honest boundary beats a false one. A spelling that needs
+    type inference to recognise belongs in this paragraph, not in the code.
     """
     source = Path(a.__file__).read_text()
     evasions = {
@@ -981,6 +1018,30 @@ def test_the_ast_guard_catches_every_planted_bypass():
             '\n\ndef _planted():\n'
             '    c = _make_client()\n'
             '    return c.call("workspace.focus", {"workspace_id": "w1"})\n'
+        ),
+        "operator-methodcaller": (
+            '\n\ndef _planted(client):\n'
+            '    import operator\n'
+            '    return operator.methodcaller(\n'
+            '        "call", "workspace.focus", {})(client)\n'
+        ),
+        "bare-methodcaller": (
+            '\n\ndef _planted(client):\n'
+            '    from operator import methodcaller\n'
+            '    return methodcaller("call", "workspace.focus", {})(client)\n'
+        ),
+        "aliased-getattr": (
+            '\n\ndef _planted(client):\n'
+            '    fetch = getattr\n'
+            '    return fetch(client, "call")("workspace.focus", {})\n'
+        ),
+        "exec": (
+            '\n\ndef _planted(client):\n'
+            '    return exec("client.call(\'workspace.focus\', {})")\n'
+        ),
+        "eval": (
+            '\n\ndef _planted(client):\n'
+            '    return eval("client.call(\'workspace.focus\', {})")\n'
         ),
     }
     missed = []

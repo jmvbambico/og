@@ -1485,7 +1485,14 @@ def focus_in_herdr(session_id: str,
         with HerdrClient() as client:
             client.call("agent.focus", {"target": session_id})
     except Exception as exc:
-        return NOTICE_FOCUS_FAILED.format(exc)
+        # The notice is FORMED inside the handler, not after it: "NEVER raises"
+        # is the contract, and a failure whose own message cannot be rendered
+        # (`str(exc)` raising, say) must still become a notice rather than a
+        # traceback that kills the pane. So even the formatting is guarded.
+        try:
+            return NOTICE_FOCUS_FAILED.format(exc)
+        except Exception:
+            return NOTICE_FOCUS_FAILED
     return None
 
 
