@@ -1064,8 +1064,15 @@ class Bridge:
             # the release on removal matches exactly what was reported. herdr
             # matches the two by that string; a release naming something else
             # would leave the marker up.
+            #
+            # `agent_session_id` is the Omnigent session id, and it is sent so
+            # the record can be focused later: `agent.focus {target}` resolves a
+            # target against a record's id, and the `og agents` pane aims focus
+            # at `Row.session_id` — the very id passed here. Without it the
+            # record carries no id for a target to match, so that pane could
+            # never bring this agent's space forward.
             self.client.report_agent(pane_id, self.source, agent=rec["agent"],
-                                     state=state)
+                                     state=state, agent_session_id=sid)
             rec["step"] = 2
         if rec["step"] <= 2:
             self.client.report_metadata(pane_id, self.source, title=rec["title"])
@@ -1129,8 +1136,13 @@ class Bridge:
         # carries the LISTING row, which has no `harness` to derive from, and
         # reporting a different agent string than the one we claimed would make
         # herdr show two markers for one pane.
+        #
+        # Re-sent every time so the record keeps the id that `agent.focus` matches
+        # on — the same Omnigent session id the `og agents` pane holds in
+        # `Row.session_id` and would send as the target.
         self.client.report_agent(rec["pane_id"], self.source,
-                                 agent=rec["agent"], state=state)
+                                 agent=rec["agent"], state=state,
+                                 agent_session_id=sid)
         if title_changed:
             self.client.report_metadata(rec["pane_id"], self.source, title=title)
         rec["title"] = title
