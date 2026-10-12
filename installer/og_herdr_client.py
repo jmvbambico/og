@@ -498,6 +498,25 @@ class HerdrClient:
         """Close a tab and its panes."""
         self.call("tab.close", {"tab_id": tab_id})
 
+    def tab_rename(self, tab_id: str, label: str) -> None:
+        """Rename a tab.
+
+        The wire method is `tab.rename` and its `TabRenameParams` requires BOTH
+        `tab_id` and `label`. This exists because `workspace.create` has no tab
+        label: its `label` is the WORKSPACE's, so the first tab that create makes
+        implicitly is unlabelled and herdr falls back to the tab number — the
+        bare `1` the operator sees. Relabelling that tab is how a space's first
+        tab is made to read the same as the space (see og_herdr._rename_first_tab
+        and og_herdr_launch's `_open_space`/`_adopt`).
+
+        A named wrapper and not the generic `call`, for the same reason
+        `workspace_rename` is one: the schema conformance guard in
+        tests/test_og_herdr_client.py enumerates wrappers by introspection, so a
+        frame sent through `call` is invisible to it — which is how `pane.run`, a
+        method herdr never had, survived 223 green tests.
+        """
+        self.call("tab.rename", {"tab_id": tab_id, "label": label})
+
     def pane_send_text(self, pane_id: str, text: str) -> None:
         """Type `text` into a pane WITHOUT submitting it.
 
