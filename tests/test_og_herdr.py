@@ -1080,6 +1080,36 @@ def test_the_history_space_cap_is_honoured_when_one_is_set(seams, tmp_path):
     assert any("past-2" in ln and "cap" in ln for ln in lines), lines
 
 
+def test_lowering_the_cap_governs_new_spaces_and_closes_none_that_are_open(seams,
+                                                                        tmp_path):
+    # Lowering `herdr_session_space_cap` in og-install.json does NOT retroactively
+    # close the history spaces already on screen. It says what may open from here
+    # on, and nothing here reaches for a live herdr space to enforce the number:
+    # a space the operator may be reading a past conversation in is not ours to
+    # close behind their back. Deliberate, and pinned here so the next reader
+    # does not have to guess whether it was an oversight.
+    client = RecordingClient()
+    first = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=5)
+    first.reconcile([Ev("added", f"d{i}", root_session(
+        f"past-{i}", runner_online=False, workspace=str(tmp_path)))
+        for i in range(2)])
+    assert _names(client).count("workspace_create") == 2
+    client.calls.clear()
+
+    # The restart a lowered config actually produces: same state file, same
+    # herdr, a lower cap.
+    second = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=1)
+    lines = second.reconcile([Ev("added", "d2", root_session(
+        "past-2", runner_online=False, workspace=str(tmp_path)))])
+
+    # The two already-open spaces are untouched and still counted…
+    assert not {"workspace_close", "tab_close", "pane_close"} & set(_names(client))
+    assert second._history_space_count() == 2
+    # …and the new one is refused, because the cap governs what opens next.
+    assert any("past-2" in ln and "cap" in ln for ln in lines), lines
+    assert _names(client).count("workspace_create") == 0
+
+
 def test_a_live_root_is_never_subject_to_the_history_cap(seams, tmp_path):
     # The cap is on PAST conversations only: a live session always gets its
     # space, even when the cap is already full — otherwise a machine at its cap
