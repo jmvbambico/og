@@ -422,7 +422,7 @@ class HerdrClient:
         way to reach a process the pane spawns — the pane runs a fresh shell, so
         an `export` in the launcher never touches it. og passes `BROWSER` here
         so the pane's `og chat` (-> `omnigent run`) cannot open a browser (see
-        og_herdr_launch.pane_env_for). Omitted when unset, so a caller with
+        og_herdr.pane_env_for). Omitted when unset, so a caller with
         nothing to set sends exactly the frame it always did.
         """
         params = {"label": label, "cwd": cwd, "focus": focus}
@@ -498,6 +498,46 @@ class HerdrClient:
         """Close a tab and its panes."""
         self.call("tab.close", {"tab_id": tab_id})
 
+    def tab_rename(self, tab_id: str, label: str) -> None:
+        """Rename a tab.
+
+        The wire method is `tab.rename` and its `TabRenameParams` requires BOTH
+        `tab_id` and `label`. This exists because `workspace.create` has no tab
+        label: its `label` is the WORKSPACE's, so the first tab that create makes
+        implicitly is unlabelled and herdr falls back to the tab number — the
+        bare `1` the operator sees. Relabelling that tab is how a space's first
+        tab is made to read the same as the space (see og_herdr._rename_first_tab
+        and og_herdr_launch's `_open_space`/`_adopt`).
+
+        A named wrapper and not the generic `call`, for the same reason
+        `workspace_rename` is one: the schema conformance guard in
+        tests/test_og_herdr_client.py enumerates wrappers by introspection, so a
+        frame sent through `call` is invisible to it — which is how `pane.run`, a
+        method herdr never had, survived 223 green tests.
+        """
+        self.call("tab.rename", {"tab_id": tab_id, "label": label})
+
+    def pane_send_text(self, pane_id: str, text: str) -> None:
+        """Type `text` into a pane WITHOUT submitting it.
+
+        The wire method is `pane.send_text` and the only thing that submits a
+        line is a trailing newline IN the text — so a caller that omits one
+        leaves the text sitting in the pane (measured; see `pane_run`, which is
+        this call plus the newline). That is exactly what a space for a
+        HISTORICAL session needs: its pane must hold `og chat --resume <id>` as
+        an un-executed line, so the operator resumes the conversation by
+        pressing Enter and nothing runs until they do.
+
+        Named and separate from `pane_run` rather than a flag on it, so that
+        "submit" and "leave unsubmitted" are two spellings a reader can tell
+        apart at the call site — a `submit=False` at the bottom of a long
+        argument list is the kind of thing that gets dropped silently, and the
+        failure mode here is a session resurrected on a machine nobody is
+        watching. Both go through this one wrapper, so the wire method is named
+        in exactly one place.
+        """
+        self.call("pane.send_text", {"pane_id": pane_id, "text": text})
+
     def pane_run(self, pane_id: str, command: str) -> None:
         """Type `command` into a pane and submit it.
 
@@ -519,9 +559,10 @@ class HerdrClient:
         `pane.send_input {"text": …, "keys": ["Enter"]}` likewise. `send_text` is
         the one to use: it is a single call and it does not depend on herdr's
         key-name vocabulary. The trailing newline appended here is the
-        submission — without it the text sits in the pane unexecuted.
+        submission — without it the text sits in the pane unexecuted — and it is
+        the ONLY difference from `pane_send_text`, which this delegates to.
         """
-        self.call("pane.send_text", {"pane_id": pane_id, "text": command + "\n"})
+        self.pane_send_text(pane_id, command + "\n")
 
     def pane_close(self, pane_id: str) -> None:
         """Close one pane."""

@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -132,6 +133,265 @@ def test_a_non_mux_bare_argument_is_still_a_domain(tmp_path):
     assert result.returncode == 0, result.stderr
     assert _vars(result) == {"mux": "", "mode": "tunneled",
                              "domain": "some-other-name", "provider": "ngrok"}
+
+
+# --------------------------------------------------------------------------
+# the launcher's OWN flags — `og start herdr --once`
+# --------------------------------------------------------------------------
+# `--once` is the launcher's documented diagnostic (it does the work, prints it,
+# and returns instead of exec'ing the multiplexer), and until now it could not be
+# TYPED: cmd_start exec'd the launcher with a fixed argv and parse_start_args
+# refused every option but --use, so `og start herdr --once` died here as an
+# unknown option on its way to a parser that has it. It is the one mode in which
+# the launcher's warnings outlive the exec — which is exactly why the failure it
+# was meant to explain could not be reproduced with it.
+#
+# The flags collected here are the launcher's own (og_herdr_launch
+# .build_parser) MINUS the two cmd_start derives itself; see the parse loop for
+# why --mux/--server are excluded. Everything else still dies in this function:
+# a flag that is accepted and quietly discarded is the defect being fixed, one
+# layer up.
+
+_FORWARD_DRIVER = r'''
+src="$0"; args=("$@")
+set --
+source "$src" >/dev/null 2>&1
+parse_start_args ${args[@]+"${args[@]}"} || exit 1
+printf 'mux=%s\nforwarded=%s\n' "${OG_START_MUX-}" "${OG_START_MUX_ARGS[*]-}"
+'''
+
+
+def _forward(result):
+    got = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("mux", "forwarded"):
+            got[key] = value
+    return got
+
+
+# argv -> (mux, what the launcher is handed). The empty rows are the regression
+# guard: an `og start` with no launcher flag must forward NOTHING, or the exec
+# grows a stray argument on every start on the planet.
+FORWARD_CASES = [
+    (["herdr", "--once"], "herdr", ["--once"]),
+    (["--once", "herdr"], "herdr", ["--once"]),          # mux stripped anywhere
+    (["herdr", "tunneled", "--once"], "herdr", ["--once"]),
+    (["herdr", "--socket", "/tmp/h.sock"], "herdr",
+     ["--socket", "/tmp/h.sock"]),
+    (["herdr", "--socket=/tmp/h.sock"], "herdr", ["--socket", "/tmp/h.sock"]),
+    (["herdr", "--bin", "/opt/herdr"], "herdr", ["--bin", "/opt/herdr"]),
+    (["herdr"], "herdr", []),
+    ([], "", []),
+    (["local"], "", []),
+    (["tunneled", "mydomain"], "", []),
+]
+
+
+@pytest.mark.parametrize("argv,mux,forwarded", FORWARD_CASES,
+                         ids=[" ".join(c[0]) or "(empty)" for c in FORWARD_CASES])
+def test_a_launcher_flag_is_forwarded_and_everything_else_is_not(
+        tmp_path, argv, mux, forwarded):
+    result = _source_and_forward(tmp_path, argv)
+    assert result.returncode == 0, result.stderr
+    assert _forward(result) == {"mux": mux,
+                                "forwarded": " ".join(forwarded)}
+
+
+def _source_and_forward(home, argv):
+    return subprocess.run(
+        ["bash", "-c", _FORWARD_DRIVER, str(OG), *argv],
+        capture_output=True, text=True, timeout=30,
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin",
+             "OG_REPO": str(REPO)},
+    )
+
+
+def test_a_launcher_flag_with_no_multiplexer_is_refused_not_swallowed(tmp_path):
+    """There is nothing to forward it to, and accepting it anyway would leave the
+    operator believing `--once` did something. A multiplexer whose BINARY is
+    missing is a different question — that one is cmd_start's, and it is never
+    fatal (see `test_og_start_herdr_warns_and_degrades_without_herdr`)."""
+    result = _source_and_forward(tmp_path, ["--once"])
+    assert result.returncode != 0
+    assert "--once is a flag of 'og start <mux>'" in result.stderr
+    assert "og start herdr --once" in result.stderr
+
+
+def test_an_option_the_launcher_does_not_have_is_still_an_unknown_option(tmp_path):
+    """The refusal is not a hole everything falls through. `--mux` and `--server`
+    land here too, on purpose: cmd_start derives both, and a user override would
+    point the launcher at another space or another server with nothing to show
+    for it."""
+    for flag in ("--nope", "--mux", "--server"):
+        result = _source_and_forward(tmp_path, [flag])
+        assert result.returncode != 0, flag
+        assert "unknown option: {0}".format(flag) in result.stderr
+
+
+@pytest.mark.parametrize("typed", ["--socket", "--socket=", "--bin", "--bin="],
+                         ids=["socket", "socket=", "bin", "bin="])
+def test_a_forwarded_flag_missing_its_value_is_refused(tmp_path, typed):
+    """Both spellings, and the SAME sentence for both. `--socket=` used to
+    normalize into `--socket` plus an empty argument and sail through: an empty
+    socket path is not a socket path, and two spellings of one flag disagreeing
+    about emptiness is exactly how a real path stops being checkable."""
+    result = _source_and_forward(tmp_path, ["herdr", typed])
+    assert result.returncode != 0, typed
+    assert f"{typed.rstrip('=')} needs a value" in result.stderr
+
+
+# --------------------------------------------------------------------------
+# the exec itself -- the flags have to ARRIVE, not merely be collected
+# --------------------------------------------------------------------------
+# The same seam _run_sourced uses (source bin/og, call a function), driven to
+# the one statement that cannot be called on its own: cmd_start's exec. The
+# program it exec's is replaced by a recorder, so the argv is observed rather
+# than inferred from the source.
+_EXEC_DRIVER = r'''
+src="$0"; args=("$@")
+set --
+source "$src" >/dev/null 2>&1
+
+# Seams, all applied AFTER sourcing so the real ones are the ones replaced.
+# Each of these either spawns a process or speaks HTTP to a server this test
+# does not run; cmd_start and parse_start_args are left alone.
+server_running() { return 1; }
+lan_ip() { printf '127.0.0.1'; }
+mint_token() { echo 3600; }
+start_host_daemon() { ok "host daemon stubbed"; return 0; }
+host_online() { return 0; }
+ensure_project() { printf '%s' "$AGENT_NAME"; }
+show_access() { :; }
+start_herdr_bridge() { ok "herdr bridge stubbed"; return 0; }
+
+cmd_start ${args[@]+"${args[@]}"}
+'''
+
+
+def _write_stub(path, script):
+    path.write_text(script)
+    path.chmod(0o755)
+
+
+def _free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _sandbox_port(sandbox):
+    return (sandbox / "port").read_text().strip()
+
+
+def _recorded_exec(sandbox):
+    record = sandbox / "exec-argv"
+    assert record.exists(), "cmd_start never reached the launcher exec"
+    return record.read_text().splitlines()
+
+
+def _run_cmd_start_to_the_exec(tmp_path, argv):
+    """Drive the real cmd_start until it exec's the launcher. Returns the
+    sandbox, which holds the recorded argv and the port the run was given."""
+    sandbox = tmp_path / "sandbox"
+    home = sandbox / "home"
+    (home / ".omnigent" / "agents" / "dev-lead").mkdir(parents=True)
+    # The cookie secret is normally generated with `python3 -c`; the interpreter
+    # on PATH is a recorder, so a well-formed one is planted to skip that.
+    (home / ".omnigent" / ".cookie-secret").write_text("0" * 64)
+
+    fakebin = sandbox / "fakebin"
+    fakebin.mkdir()
+    # The exec under test. `python3 <script>` is recorded and stops there; `-c`
+    # and the heredoc form are og's own inline helpers and must run for real,
+    # or mux_rows cannot read the registry and no mux keyword is recognised.
+    _write_stub(fakebin / "python3", (
+        "#!/bin/sh\n"
+        'case "$1" in -c|-) exec "$OG_REAL_PYTHON" "$@" ;; esac\n'
+        'for a in "$@"; do printf \'%s\\n\' "$a" >> "$OG_EXEC_RECORD"; done\n'
+        "exit 0\n"))
+    # The server. Only the registration line matters: cmd_start greps its own
+    # server log for it, and omnigent writes it to stdout, which the launch's
+    # redirect is what captures.
+    _write_stub(fakebin / "omnigent", (
+        "#!/bin/sh\n"
+        'case "$1:$2" in\n'
+        '  server:--agent) printf \'  agent: dev-lead (from %s)\\n\' '
+        '"$HOME/.omnigent/agents/dev-lead" ;;\n'
+        "esac\n"
+        "exit 0\n"))
+    # The /health poll. Answers only once the registration line is in the log,
+    # so the grep that follows cannot race the backgrounded spawn.
+    _write_stub(fakebin / "curl", (
+        "#!/bin/sh\n"
+        "i=0\n"
+        'while [ "$i" -lt 50 ]; do\n'
+        '  grep -qs -e \'^  agent: \' "$OG_SERVER_LOGS"/server/*-og.log '
+        '2>/dev/null && exit 0\n'
+        '  i=$((i + 1)); sleep 0.1\n'
+        "done\n"
+        "exit 0\n"))
+    # cmd_start drops the mux keyword if its binary is missing, so the test
+    # cannot depend on herdr being installed on the machine running it.
+    _write_stub(fakebin / "herdr", "#!/bin/sh\nexit 0\n")
+
+    port = _free_port()
+    (sandbox / "port").write_text(str(port))
+    result = subprocess.run(
+        ["bash", "-c", _EXEC_DRIVER, str(OG), *argv],
+        capture_output=True, text=True, timeout=120,
+        env={
+            "HOME": str(home),
+            "OG_REPO": str(REPO),
+            "OG_SKIP_UPDATE": "1",
+            # A port of its own, bound by nothing: the live og server is not
+            # this test's to probe, collide with, or stop.
+            "OG_PORT": str(port),
+            "PATH": str(fakebin) + os.pathsep + os.environ.get("PATH", ""),
+            "OG_REAL_PYTHON": sys.executable,
+            "OG_EXEC_RECORD": str(sandbox / "exec-argv"),
+            "OG_SERVER_LOGS": str(home / ".omnigent" / "logs"),
+        })
+    assert result.returncode == 0, (
+        "cmd_start did not reach the exec:\n" + result.stdout + result.stderr)
+    return sandbox
+
+
+def test_cmd_start_hands_the_forwarded_flags_to_the_launcher(tmp_path):
+    """Collection is not delivery. parse_start_args only ever proved that the
+    flags are gathered; the exec at the end of cmd_start is the only place they
+    reach the launcher, and a launcher exec'd without them is exactly the bug
+    being fixed. So this drives the REAL cmd_start all the way to that exec,
+    with the program it exec's replaced by a recorder — a fake `python3` first
+    on PATH that writes its argv out and exits — and asserts on the argv that
+    was actually handed over.
+
+    The previous version of this test read bin/og's SOURCE and asserted the
+    forwarding text appeared after `--server`. That passed whether or not the
+    arguments arrived: it pinned the shape of a line, not a behaviour, and a
+    rewrite that dropped the flags one line above it would still have gone
+    green. Only a recorded argv can fail for that reason.
+    """
+    sandbox = _run_cmd_start_to_the_exec(tmp_path, ["herdr", "--once"])
+    assert _recorded_exec(sandbox) == [
+        str(REPO / "installer" / "og_herdr_launch.py"),
+        "--mux", "herdr",
+        "--server", f"http://127.0.0.1:{_sandbox_port(sandbox)}",
+        "--once",
+    ]
+
+
+def test_the_launcher_gets_nothing_but_the_derived_flags_when_none_were_typed(
+        tmp_path):
+    """The other half of "the flags arrive": the exec must not have GROWN. Every
+    plain `og start <mux>` on the planet runs through this line, so a stray
+    argument here is a regression nobody would notice from the terminal."""
+    sandbox = _run_cmd_start_to_the_exec(tmp_path, ["herdr"])
+    assert _recorded_exec(sandbox) == [
+        str(REPO / "installer" / "og_herdr_launch.py"),
+        "--mux", "herdr",
+        "--server", f"http://127.0.0.1:{_sandbox_port(sandbox)}",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -416,7 +676,7 @@ def test_cmd_start_calls_the_helpers_it_is_meant_to():
 # the operator kept getting came from og's own openers. These pin that the mux
 # suppression (a) sets the flag og's own needs_setup path consults, and (b)
 # writes NOTHING to omnigent's config — the chat pane's browser is shut with
-# BROWSER in herdr's pane env instead (the launcher's pane_env_for), so omnigent
+# BROWSER in herdr's pane env instead (og_herdr.pane_env_for), so omnigent
 # must not be invoked at all. The `omnigent` CLI is STUBBED so that an invocation
 # would be observed.
 
@@ -470,7 +730,7 @@ def test_a_plain_start_leaves_og_own_browser_alone(tmp_path):
 
 def test_a_mux_launch_never_writes_global_omnigent_config(tmp_path):
     """The browser is suppressed PER PANE now (BROWSER in herdr's pane env, see
-    og_herdr_launch.pane_env_for), not by mutating the operator's omnigent
+    og_herdr.pane_env_for), not by mutating the operator's omnigent
     config. An earlier fix ran `omnigent config set --global
     auto_open_conversation=false`; that leaked one `og start herdr` into a
     persistent, machine-wide change. This pins the behaviour (the suppression

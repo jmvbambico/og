@@ -51,16 +51,29 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from og_herdr import (
+    DEFAULT_SPACE_CAP,
     OWNER_LAUNCHER,
     SPACE_LIVE,
     _id_of,
     attach_command,
     default_state_path,
     load_state,
+    # The pane environment is stated ONCE, in og_herdr, next to the pane
+    # commands it is about — the bridge opens panes too and had no copy of the
+    # rule at all, which is how `og start herdr` left panes that opened a
+    # browser. Imported here, not redefined: see og_herdr.pane_env_for.
+    pane_env_for,
     save_state,
     space_status,
     workspace_index,
 )
+
+# The runner rule, imported rather than re-implemented: `poll_once` applies it
+# for a SUB-AGENT but deliberately withholds it from a ROOT (a dead root is a
+# history space, the spaces feature), so `live_session` is the one caller that
+# has to ask it again — see the note there. The watcher is stdlib-only and
+# imports nothing of ours at module load, so this is a cheap, acyclic import.
+from og_herdr_watch import runner_is_offline
 
 # The only multiplexer with a backend. A registry row buys detection and
 # documentation; the code behind it is written per multiplexer (see
@@ -103,10 +116,11 @@ AGENTS_PANE_RATIO = 0.7
 # or runner-offline session must not block a fresh start.
 LIVE_STATUSES = frozenset({"running", "idle"})
 
-# og-install.json keys. Both have a default, so an install that predates them
+# og-install.json keys. All have a default, so an install that predates one
 # still launches.
 AGENT_NAME_KEY = "agent_name"
 AGENTS_PANE_KEY = "herdr_agents_pane"
+SESSION_SPACE_CAP_KEY = "herdr_session_space_cap"
 DEFAULT_AGENT_NAME = "dev-lead"
 
 # How long to wait for `herdr server` to answer a ping before giving up. Bounded
@@ -114,6 +128,16 @@ DEFAULT_AGENT_NAME = "dev-lead"
 # and never says why.
 SERVER_WAIT_SECONDS = 15.0
 SERVER_POLL_SECONDS = 0.25
+
+# The launcher's OWN log, beside herdr's. See `launch_log_path` for why it is a
+# separate file rather than an append to `log_path`.
+LAUNCH_LOG_NAME = "herdr-launch.log"
+
+# How long to hold the terminal before exec'ing herdr, when something degraded.
+# Whole seconds, counted with a bounded loop rather than a wall-clock deadline so
+# the hold cannot outlive its own budget on a loaded machine (and so a test can
+# shorten it). See `_hold_for_problems` for why there is one at all.
+DEGRADE_HOLD_SECONDS = 6
 
 
 class LaunchError(Exception):
@@ -170,6 +194,30 @@ def agents_pane_enabled(config: dict) -> bool:
     return True if value is None else bool(value)
 
 
+def session_space_cap(config: dict) -> int:
+    """How many past-conversation spaces the bridge may keep open.
+
+    0 MEANS NO LIMIT and 0 is the default, so an install that never answered (and
+    one that predates the key) lists every non-archived root — the parity with
+    the web sidebar that is the point of the feature. A POSITIVE value is a cap
+    the bridge honours, trimming the oldest first (see og_herdr.DEFAULT_SPACE_CAP).
+    Same shape as `agents_pane_enabled`: one key in `~/.omnigent/og-install.json`
+    read through one function with a default.
+
+    The reader is here, beside the other config readers, but the CONSUMER is the
+    bridge (og_herdr), which counts the history spaces it already has and refuses
+    new ones past this. Only a real, non-negative `int` is honoured; anything
+    else — a missing key, a null, a string, a float, a negative — falls back to
+    the default (no limit) rather than raising, because this feeds a background
+    daemon that must not die over a hand-edited number. A bool is refused on
+    purpose: `True` is an `int` in Python and would otherwise read as a cap of 1.
+    """
+    value = config.get(SESSION_SPACE_CAP_KEY, DEFAULT_SPACE_CAP)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return DEFAULT_SPACE_CAP
+    return value
+
+
 # ---------------------------------------------------------------------------
 # which session, if any, this directory already has
 # ---------------------------------------------------------------------------
@@ -178,9 +226,29 @@ def live_session(watcher, cwd: str) -> Optional[dict]:
     """The live ROOT session whose detail-row `workspace` is `cwd`, or None.
 
     Read through `og_herdr_watch.SessionWatcher` rather than by fetching the API
-    directly, so pagination, `kind=any`, per-server token matching and the
-    runner-offline rule all stay in one place — re-implementing any of them here
-    is how a launcher and a bridge start disagreeing about what is live.
+    directly, so pagination, `kind=any` and per-server token matching stay in one
+    place — re-implementing any of them here is how a launcher and a bridge start
+    disagreeing about what is live.
+
+    The runner rule is the exception, and it is applied HERE rather than inherited
+    from `poll_once`. That predicate answers the BRIDGE's question — "should this
+    session get a space?" — and its answer is yes for a dead ROOT, on purpose: a
+    past conversation becomes a history space (the spaces feature). So an event
+    from `poll_once` is NOT the same thing as a session to attach to. A dead root
+    reads `status: "idle"`, passes every filter below, and would otherwise be
+    returned as "the live session"; `launch` would take case (B) and
+    `_attach_there` would type an `omnigent attach` that dies with:
+
+        Error: Session … has no online runner … its host is offline.
+
+    Applying `runner_is_offline` here is what keeps `poll_once` free to project
+    dead roots for the bridge. The unknown direction is chosen to match the error
+    below: only an explicit `runner_online: False` is dead, so an absent or
+    unreadable answer counts as LIVE. Guessing "none" on a session whose runner
+    state we merely could not read is the one outcome that cannot be undone — it
+    opens a second space and types a second `og chat` into a conversation the
+    operator already had — while attaching to a session that turns out to be dead
+    is a visible error the operator can simply re-run.
 
     `poll_once` is used rather than `list_sessions` because the directory is on
     the DETAIL row only; poll_once enriches exactly the sessions it has not seen
@@ -208,6 +276,13 @@ def live_session(watcher, cwd: str) -> Optional[dict]:
             continue
         if session.get("status") not in LIVE_STATUSES:
             continue
+        # THE RUNNER RULE, re-applied here and NOT inherited from poll_once: a
+        # dead root is projected on purpose (it becomes a history space in the
+        # bridge), has status "idle", and so passes everything above. Handing it
+        # back would send `launch` down case (B) and type an attach that dies. See
+        # the docstring for why an unreadable runner answer counts as live.
+        if runner_is_offline(session):
+            continue
         # The directory is on the DETAIL row, which is why poll_once was used.
         if session.get("workspace") != cwd:
             continue
@@ -227,7 +302,6 @@ class Launch:
     watcher: Any                     # og_herdr_watch.SessionWatcher
     cwd: str
     server: str
-    agent: str
     agents_pane: bool
     env: dict
     state_path: Path
@@ -236,12 +310,131 @@ class Launch:
     pane_env: dict = field(default_factory=dict)
     spawn: Callable[[], Any] = None  # start the mux's own server, if it is down
     log_path: Optional[Path] = None
+    # What this launch could not do, in the order it happened. Filled by `report`
+    # and read by `_hold_for_problems` — it is the only thing that makes "the
+    # launch went fine" and "the launch went fine except for one pane" the same
+    # code path right up until the terminal is handed to herdr.
+    problems: list = field(default_factory=list)
 
     def close(self) -> None:
         try:
             self.client.close()
         except Exception:
             pass
+
+
+def launch_log_path(ctx: Launch) -> Optional[Path]:
+    """The launcher's own log: `~/.omnigent/logs/herdr-launch.log`.
+
+    A SIBLING of `ctx.log_path`, never `ctx.log_path` itself: that file is herdr's
+    stdout and stderr (spawn_herdr_server appends to it), so an og warning written
+    there reads as the multiplexer's — and an operator tailing herdr's log to find
+    out why herdr misbehaved would find og's sentence and no answer. Derived from
+    `log_path` rather than from $HOME so the two can never drift into different
+    directories, and so a launch that redirects the log directory moves both.
+    """
+    if not ctx.log_path:
+        return None
+    return ctx.log_path.parent / LAUNCH_LOG_NAME
+
+
+def log_line(ctx: Launch, line: str) -> None:
+    """Append one timestamped line to the launcher log. Never raises.
+
+    Best effort to exactly the degree the failure it describes is: a log that
+    cannot be written must not turn a degraded launch into a failed one. A
+    launch with no log at all (a test, or an older caller that passes no
+    `log_path`) simply has no durable channel, which is the old behaviour and
+    not a reason to fail.
+    """
+    path = launch_log_path(ctx)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("{0} {1}\n".format(
+                time.strftime("%Y-%m-%d %H:%M:%S"), line))
+    except OSError:
+        pass
+
+
+def report(ctx: Launch, line: str) -> None:
+    """Report a failure the launch SURVIVES, somewhere that outlives it.
+
+    The defect this exists for: `warn` on its own is not a report, because the
+    launch ends in `os.execvp("herdr")` and herdr's TUI takes the terminal into
+    the alternate screen within milliseconds. Every warning that reached only the
+    terminal was wiped before a human could read it — which is how "the agents
+    pane never appeared" became a bug report with no cause. So a degradation goes
+    three places, and the three have different jobs:
+
+      1. `ctx.problems`, which `_hold_for_problems` re-surfaces immediately
+         before the exec. Re-surfacing is not redundancy: `_open_space` prints
+         `info("opened space ...")` AFTER the split, so by exec time the first
+         copy has already scrolled off the top of the terminal.
+      2. The launcher log, which outlives both the exec and the session. This is
+         the part that answers "why did that not happen?" days later, on a
+         machine the operator is no longer sitting at.
+      3. The terminal, as it always was.
+
+    Still non-fatal by construction: nothing here raises, and the caller returns
+    to a working chat pane.
+    """
+    ctx.problems.append(line)
+    log_line(ctx, line)
+    warn(line)
+    path = launch_log_path(ctx)
+    if path:
+        print("  (also in {0})".format(path))
+
+
+def operator_is_watching() -> bool:
+    """Whether a human is at this terminal, as far as this process can tell.
+
+    The only test there is, and the reason the hold is not unconditional: a
+    launcher under `og start herdr > run.log` still logs its problems and still
+    attaches, it just does not sit there counting down for somebody who cannot
+    see the countdown.
+    """
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _hold_for_problems(ctx: Launch) -> None:
+    """Leave the terminal alone long enough to READ a degradation.
+
+    The second half of the fix, and the half that reaches a human in the moment:
+    the log is what they find tomorrow, this is what tells them today that
+    something is wrong. Neither alone is enough — a log nobody knows to open is
+    the same void with a file in it.
+
+    Bounded and non-blocking by construction, and skipped entirely when nothing
+    degraded or nobody is watching, so the ordinary launch costs exactly what it
+    cost before. It never raises: the chat pane is the session, and a cosmetic
+    pane must not be able to stop it — nor, now, to stop it loudly.
+    """
+    if not ctx.problems or not operator_is_watching():
+        return
+    plural = "" if len(ctx.problems) == 1 else "s"
+    warn("{0} thing{1} about this launch did not work — the chat pane itself "
+         "is unaffected:".format(len(ctx.problems), plural))
+    for line in ctx.problems:
+        print("    {0}".format(line))
+    print("  {0} takes this terminal in {1}s (ctrl-c stops the launch)".format(
+        MUX_HERDR, DEGRADE_HOLD_SECONDS))
+    sys.stdout.flush()
+    for left in range(int(DEGRADE_HOLD_SECONDS), 0, -1):
+        time.sleep(1.0)
+        # \r rewrites the countdown in place; ESC[K erases what it overwrites,
+        # without which a shorter number leaves the tail of the longer one.
+        sys.stdout.write("\r  {0} takes this terminal in {1}s".format(
+            MUX_HERDR, left - 1))
+        sys.stdout.flush()
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
 
 
 def launch(ctx: Launch) -> str:
@@ -271,34 +464,32 @@ def is_inside(env: dict) -> bool:
     return env.get("HERDR_ENV") == "1"
 
 
-def pane_env_for(environ: dict) -> dict:
-    """The environment every pane this launch creates is started with.
-
-    A mux launch asked for a TERMINAL interface, so the panes must not steal
-    focus with a browser. The panes run `og chat`, which is `omnigent run`, and
-    an interactive `omnigent run` opens the live conversation in the browser by
-    default (cli.py: `auto_open_conversation` defaults to `prompt is None`).
-    `omnigent run` has no --no-open and no env var for it, but `webbrowser` —
-    what it calls — honours `$BROWSER`, and pointing that at `true(1)` makes
-    `webbrowser.open()` run `/usr/bin/true <url>`: it succeeds and opens
-    nothing. So the suppression is this one variable.
-
-    It has to travel to the PANE, not to this process: an export here reaches
-    only the launcher, and the pane runs `og chat` in a fresh shell. herdr takes
-    an env map on every pane-creating call and installs it in that shell, which
-    is why `ctx.pane_env` is threaded through the creates rather than exported.
-
-    An operator who already set `$BROWSER` has expressed a preference — a real
-    browser — so it is passed through untouched; only an unset `$BROWSER` is
-    defaulted. Same rule the accounts auto-open guard in bin/og follows.
-    """
-    return {"BROWSER": environ["BROWSER"] if "BROWSER" in environ else "true"}
-
-
 def _attach_there(ctx: Launch, session: dict) -> str:
     """(B) A session is already live in this directory, and we are outside.
 
     Put the operator on it instead of starting a second conversation.
+
+    KNOWN GAP, documented rather than fixed: this case NEVER opens the `og agents`
+    pane, and says nothing when the space it is attaching to has none — only
+    `_open_space` splits. So an operator whose directory already had a session
+    gets no agents pane and no explanation, which is indistinguishable at the
+    keyboard from case (A)'s split failing, and for the same reason: the launch
+    says nothing either way. The likely triggers are a space whose agents pane
+    was closed by hand, and a space opened before `herdr_agents_pane` existed.
+
+    It is NOT a small fix, which is why it is written down instead of patched:
+    the split needs a tab id and a root pane, and a focused EXISTING space has
+    neither in the record this launcher keeps (the state file stores workspace_id,
+    tab_id and pane_id, but a space created before the record existed, or one
+    whose layout the operator has since changed, cannot be trusted to match) —
+    so "add the pane if it is missing" needs an answer for which pane is the
+    chat, and that question is a design decision rather than a line of code. It
+    also has to be idempotent: the operator may have deliberately closed the
+    agents pane, and a start that reopens it every time is its own annoyance.
+    Splitting unconditionally is the safe half and could ship on its own.
+
+    Until then `og start herdr --once` is the diagnostic: it prints what this
+    launch did without attaching, and a silent attach is itself the answer.
     """
     record, adopted = space_for(ctx, session)
     if adopted:
@@ -347,6 +538,14 @@ def _open_space(ctx: Launch, attach: bool) -> str:
     space to the conversation title once it appears. That rename is the whole
     reason the pending record is written at all.
 
+    The space's first tab is given that same label. `workspace.create` labels
+    only the WORKSPACE — it has no tab-label field — so the tab it makes
+    implicitly would otherwise be unlabelled and show herdr's tab number. The
+    operator asked for the tab to read the space's own name, so it does, and
+    og_herdr's title-arrival rename carries it onto the title with the space.
+    (`ctx.agent`, which this used to say, is the driving bundle's name; it read
+    as a second, different name beside a space labelled from the directory.)
+
     The pending record is written BEFORE `og chat` is typed, and that order is
     the contract, not a detail. The bridge is already running (bin/og starts it
     before exec'ing this) and polls every few seconds, while `og chat` mints the
@@ -383,7 +582,10 @@ def _open_space(ctx: Launch, attach: bool) -> str:
         raise LaunchError(
             "workspace.create returned no workspace id: {0!r}".format(created))
 
-    ctx.client.call("tab.rename", {"tab_id": tab_id, "label": ctx.agent})
+    # The first tab reads the space's own label, not the agent bundle's name:
+    # `workspace.create` cannot label the tab it makes, so without this it shows
+    # herdr's tab number. See the docstring.
+    ctx.client.tab_rename(tab_id, label)
     # A pending record, not a space record: the session this space is for does
     # not exist yet, so there is no id to key it by. og_herdr claims it by
     # directory when the session appears — and it must be on disk BEFORE the
@@ -425,8 +627,8 @@ def _close_quietly(ctx: Launch, ws_id: str) -> None:
     try:
         ctx.client.workspace_close(ws_id)
     except Exception as exc:
-        warn("could not close the space {0} I just opened ({1}); close it by "
-             "hand".format(ws_id, exc))
+        report(ctx, "could not close the space {0} I just opened ({1}); close "
+                    "it by hand".format(ws_id, exc))
 
 
 def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
@@ -434,6 +636,9 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
 
     Best effort by design: the chat pane is the session, and losing the whole
     launch because a cosmetic second pane could not be found is the wrong trade.
+    That trade is kept — but every one of the three failures below now goes
+    through `report`, so "best effort" no longer means "unobserved": each is
+    recorded, logged, and re-surfaced before the terminal is handed to herdr.
 
     `pane.split` makes a pane too, so it takes the same pane environment as the
     space's own pane; the split runs `og agents`, which opens no browser, but a
@@ -446,18 +651,18 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
     try:
         reply = ctx.client.call("pane.split", params)
     except Exception as exc:
-        warn("could not open the og agents pane ({0}); the chat is up "
-             "without it".format(exc))
+        report(ctx, "could not open the og agents pane ({0}); the chat is up "
+                    "without it".format(exc))
         return
     pane_id = _split_pane_id(ctx, ws_id, tab_id, root_pane, reply)
     if not pane_id:
-        warn("herdr split the chat pane but reported no new pane id; `og "
-             "agents` was not started there")
+        report(ctx, "herdr split the chat pane but reported no new pane id; "
+                    "`og agents` was not started there")
         return
     try:
         ctx.client.pane_run(pane_id, AGENTS_COMMAND)
     except Exception as exc:
-        warn("could not start og agents in the split pane ({0})".format(exc))
+        report(ctx, "could not start og agents in the split pane ({0})".format(exc))
 
 
 def _split_pane_id(ctx: Launch, ws_id: str, tab_id: str, root_pane: str,
@@ -550,6 +755,10 @@ def _adopt(ctx: Launch, session: dict) -> dict:
     `og chat` would mint a NEW conversation — the one thing adoption exists to
     avoid — so the pane gets `omnigent attach --server <url> <session id>`,
     built by og_herdr so there is one spelling of it.
+
+    The space's first tab is labelled with the same string as the space: the
+    session's title when it has one, else the directory's basename. Same reason
+    as `_open_space` — `workspace.create` cannot label the tab it makes.
     """
     sid = str(session.get("id") or "")
     label = session.get("title") or os.path.basename(ctx.cwd.rstrip(os.sep))
@@ -570,7 +779,7 @@ def _adopt(ctx: Launch, session: dict) -> dict:
         raise LaunchError(
             "workspace.create returned {0}; expected workspace, tab and "
             "root_pane".format(sorted(created) or "an empty result"))
-    ctx.client.call("tab.rename", {"tab_id": tab_id, "label": ctx.agent})
+    ctx.client.tab_rename(tab_id, str(label))
     ctx.client.pane_run(pane_id, attach_command(ctx.server, sid))
     record = {"workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
               "owner": OWNER_LAUNCHER, "cwd": str(cwd)}
@@ -714,7 +923,7 @@ def build_launch(args: argparse.Namespace) -> Launch:
                      or Path.home() / ".omnigent") / "logs"
                 / "herdr-server.log")
     return Launch(client=client, watcher=watcher, cwd=os.getcwd(),
-                  server=args.server, agent=agent_name(config),
+                  server=args.server,
                   agents_pane=agents_pane_enabled(config), env=dict(os.environ),
                   state_path=default_state_path(),
                   pane_env=pane_env_for(dict(os.environ)),
@@ -746,8 +955,18 @@ def main(argv=None) -> int:
         ctx.close()
         info("--once: not attaching; the TUI would take over this terminal")
         return 0
+    # A degradation is not fatal and never becomes one — the chat pane IS the
+    # session — but it is also not something the operator may never find out
+    # about. Hand the terminal over only after they have had a moment to read it.
+    # `--once` returned above: nothing takes the terminal in that mode, so the
+    # text is already on screen and a hold would be pure waiting.
+    _hold_for_problems(ctx)
     binary = args.bin or shutil.which(args.mux) or args.mux
     try:
+        # exec does not flush Python's buffers. On a pipe stdout is block
+        # buffered, so without this the warnings above are discarded by the exec
+        # rather than by the TUI — the same loss by a different mechanism.
+        sys.stdout.flush()
         os.execvp(binary, [binary])
     except OSError as exc:  # pragma: no cover - exec only fails if it vanished
         ctx.close()
