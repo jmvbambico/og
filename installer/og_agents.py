@@ -40,7 +40,8 @@ path is GET-only and goes entirely through `og_herdr_watch`, which owns the
 transport, pagination, `kind=any` default, truncation handling and per-server
 token matching; none of that is re-implemented here. It makes exactly ONE
 outbound call of its own: `agent.focus` (see `focus_in_herdr`), which moves the
-operator's own herdr UI to a worker's session and touches no session state. That
+operator's own herdr UI to the pane a row belongs to — a worker's ROOT, the only
+session herdr has a pane for, see `focus_target` — and touches no session state. That
 call is reached lazily — the herdr client is imported inside the handler, so `og
 agents` still runs with no herdr installed, outside a herdr pane, or with the
 socket down — and it is pinned by the AST guard in tests/test_og_agents.py, which
@@ -673,6 +674,16 @@ class Row:
     agent: Optional[str] = None
     meta: str = ""
     harness: str = ""
+    # The ROOT session this row's pane belongs to, needed because a sub-agent's
+    # OWN `session_id` addresses no herdr pane: herdr writes a pane record (and so
+    # an `agent_session_id` a focus target can match) only for a root, so Enter on
+    # a worker must aim at the root instead — see `focus_target`. It has to be a
+    # FIELD rather than re-derived at focus time: `build_rows` FLATTENS the tree
+    # and groups by state, so with `--all` several roots' workers interleave and a
+    # worker's root is not recoverable from a walk of `Frame.rows`. Set for every
+    # worker in `_worker_rows`; a root row leaves it "" and resolves to its own
+    # `session_id` through `is_root`.
+    root_session_id: str = ""
 
 
 @dataclass
@@ -1103,6 +1114,7 @@ def _worker_rows(by_id: dict, children: dict, root_id: str,
             agent=agent,
             meta=worker_meta(session, state, clock),
             harness=harness if isinstance(harness, str) else "",
+            root_session_id=root_id,
         ))
     return out
 
@@ -2427,11 +2439,43 @@ def _tty_available() -> bool:
 NOTICE_FOCUS_OUTSIDE_HERDR = "focus: not inside herdr (no HERDR_ENV)"
 NOTICE_FOCUS_UNAVAILABLE = "focus: herdr client unavailable"
 NOTICE_FOCUS_FAILED = "focus: {0}"
+# Enter on a row that resolves to no herdr pane at all — a worker whose listing
+# carried no root, or a malformed row. Deliberately NOT sent as a target: an id
+# known to match no record would only draw herdr's own `agent_not_found` back.
+NOTICE_FOCUS_NO_ROOT = "focus: no root session to focus"
+
+
+def focus_target(row: Row) -> Optional[str]:
+    """The session id herdr can resolve for `row`: a root is its own, a worker's is its root.
+
+    WHY A WORKER TARGETS ITS ROOT. herdr matches an `agent.focus` target against
+    its PANE RECORDS, and it opens a pane — writing a record that carries
+    `agent_session_id` — only for a ROOT session (see `og_herdr.py`). A sub-agent
+    never gets a pane of its own, so its own id matches no record and herdr answers
+    `agent_not_found`: on every worker, every time, which is the failure this
+    resolves. The worker's work IS visible, though — in its ROOT's pane — so the
+    root is the one target herdr can match and the one Enter should send. A root
+    row owns its own pane and so targets itself.
+
+    None when the row carries no resolvable root (a worker built without one, a
+    malformed row). The caller declines with `NOTICE_FOCUS_NO_ROOT` rather than
+    sending an id it knows will fail.
+    """
+    if row.is_root:
+        return row.session_id or None
+    return row.root_session_id or None
 
 
 def focus_in_herdr(session_id: str,
                    environ: Optional[dict] = None) -> Optional[str]:
     """Jump the operator's herdr UI to `session_id`. None on success, else why not.
+
+    `session_id` is the id the CALLER has already resolved to something herdr can
+    match — a root's own id, or a sub-agent's ROOT (see `focus_target`). It is not
+    necessarily the selected row's own session: only a root has a pane record, so
+    a sub-agent's own id would draw `agent_not_found`. This function sends whatever
+    it is given, unchanged; the row-to-root resolution belongs to the caller that
+    holds the rows.
 
     THE ONE THING THIS VIEW EVER SENDS. Everything else `og agents` does is a GET
     through `og_herdr_watch`; this is the single outbound call, `agent.focus`, and
@@ -2493,8 +2537,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     the model.
 
     Keys: `q` quits, `r` forces a refresh, the arrows (or `j`/`k`) move the
-    selection, Enter FOCUSES the selected worker in herdr (jumping the operator's
-    herdr UI to that session, see `focus_in_herdr`), Space expands or collapses
+    selection, Enter FOCUSES the selected row in herdr (jumping the operator's
+    herdr UI to the pane it belongs to — a worker's ROOT, see `focus_target` and
+    `focus_in_herdr`), Space expands or collapses
     the selected row's snippet, and `a` toggles the access panel. It sends
     nothing to a session and changes no session state: `agent.focus` is the ONE
     outbound call it makes, and it moves the operator's own terminal alone.
@@ -2678,16 +2723,20 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             elif key in (curses.KEY_DOWN, ord("j")):
                 selected = move_selection(frame.rows, selected, 1)
             elif key in (curses.KEY_ENTER, 10, 13):
-                # Enter FOCUSES the selected worker in herdr — it jumps the
-                # operator's own terminal to where that session lives. It is a
-                # no-op on a header (nothing to jump to), and it deliberately
-                # does NOT set `poll`: focus changes nothing this view draws, so
-                # a refetch would be a listing walk for nothing. A failed focus
-                # sets a notice, and the next paint shows it. See
-                # `focus_in_herdr` for every way it can decline.
-                if 0 <= selected < len(frame.rows) \
-                        and not frame.rows[selected].is_root:
-                    notice = focus_in_herdr(frame.rows[selected].session_id)
+                # Enter FOCUSES the selected row in herdr — it jumps the
+                # operator's own terminal to the pane that row belongs to. The
+                # TARGET is resolved first (`focus_target`): a worker sends its
+                # ROOT's id, because a worker's OWN id matches no herdr pane (only
+                # a root gets a pane record), and a root sends its own. It
+                # deliberately does NOT set `poll`: focus changes nothing this view
+                # draws, so a refetch would be a listing walk for nothing. A failed
+                # focus, or a row that resolves to no pane at all, sets a notice,
+                # and the next paint shows it. See `focus_in_herdr` for every way
+                # it can decline.
+                if 0 <= selected < len(frame.rows):
+                    target = focus_target(frame.rows[selected])
+                    notice = focus_in_herdr(target) if target is not None \
+                        else NOTICE_FOCUS_NO_ROOT
             elif key == ord(" "):
                 # Expand/collapse moved off Enter when Enter took focus. It DOES
                 # set `poll`: the expanded set feeds the rebuild, so the tree has

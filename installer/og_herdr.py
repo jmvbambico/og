@@ -2076,10 +2076,12 @@ class Bridge:
             #
             # `agent_session_id` is the Omnigent session id, and it is sent so
             # the record can be focused later: `agent.focus {target}` resolves a
-            # target against a record's id, and the `og agents` pane aims focus
-            # at `Row.session_id` — the very id passed here. Without it the
-            # record carries no id for a target to match, so that pane could
-            # never bring this agent's space forward.
+            # target against a record's id, and the `og agents` pane focuses the
+            # session this id names — a ROOT, since only a root gets a pane (and
+            # so a record) of its own; Enter on a worker aims at that worker's
+            # ROOT for exactly this reason. Without the id the record carries
+            # nothing for a target to match, so that pane could never bring this
+            # agent's space forward.
             self.client.report_agent(pane_id, self.source, agent=rec["agent"],
                                      state=state, agent_session_id=sid)
             rec["step"] = 2
@@ -2166,8 +2168,9 @@ class Bridge:
         # herdr show two markers for one pane.
         #
         # Re-sent every time so the record keeps the id that `agent.focus` matches
-        # on — the same Omnigent session id the `og agents` pane holds in
-        # `Row.session_id` and would send as the target.
+        # on — the Omnigent session id of the ROOT this pane belongs to, which is
+        # what the `og agents` pane resolves a row to and sends as the target (a
+        # worker's OWN id has no record; see `focus_target`).
         self.client.report_agent(rec["pane_id"], self.source,
                                  agent=rec["agent"], state=state,
                                  agent_session_id=sid)
