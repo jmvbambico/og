@@ -316,36 +316,36 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
 
     lines = a.render(a.Frame(rows=rows, selected=2), width=C2_WIDTH)
 
-    # NOTE the two spaces after ╔ (w3's Ambiguous z-ai mark) and after every
-    # Narrow mark: the slot pads them all to the same two WESTERN columns, which
-    # is what starts every title in the same column. One space would be the
-    # sheared-title bug this pins against.
+    # NOTE the two spaces after 𝗙 (w3's z-ai mark — Freebuff, the TOOL) and after every other mark:
+    # the slot pads them all to the same two columns, which is what starts every
+    # title in the same column. One space would be the sheared-title bug this pins
+    # against.
     assert lines == [
         "╭────────────────────────────────────────────╮",
         "│ ✳  Project Status Review        Claude Code│",
         "╰────────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⊙ ⠋ │ ▯  coders                         2m14s│",
+        "⦿ ⠋ │ ▯  coders                         2m14s│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⊙ ⏸ │ ⌘  reviewers             waiting on you│",
+        "⦿ ⏸ │ ⌘  reviewers             waiting on you│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⊙ ✗ │ ╔  scouts                        failed│",
+        "⦿ ✗ │ 𝗙  scouts                        failed│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⊙ ✓ │ ⌘  docs                     done 6m ago│",
+        "⦿ ✓ │ ⌘  docs                     done 6m ago│",
         "│   ╰────────────────────────────────────────╯",
         "",
         a.FOOTER_COMPACT,
     ]
     # Every BOX row — the root's and each worker's — is exactly the pane width.
     box_rows = [line for line in lines
-                if (line.startswith(("│", "⊙")) and line.endswith("│")
+                if (line.startswith(("│", "⦿")) and line.endswith("│")
                     and len(line) > 1)]
     assert box_rows and all(len(line) == C2_WIDTH for line in box_rows)
     # FIVE boxes: the root plus FOUR workers, ONE content row each — five tops and
@@ -353,18 +353,18 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     assert len(box_rows) == 5, box_rows
     assert sum(1 for line in lines if "╭" in line) == 5
     assert sum(1 for line in lines if "╰" in line) == 5
-    # No caret anywhere; the node `⊙` marks each of the FOUR workers at column 0,
+    # No caret anywhere; the node `⦿` marks each of the FOUR workers at column 0,
     # and the root box starts at column 0 too.
     assert "▸" not in "\n".join(lines)
     assert lines[0].index("╭") == 0, "the root box is OUTDENTED at column 0"
     assert lines[4].startswith("│   ╭"), "a worker box starts after the gutter"
     assert lines[4].index("╭") == a.GUTTER
-    nodes = [i for i, line in enumerate(lines) if line.startswith("⊙")]
+    nodes = [i for i, line in enumerate(lines) if line.startswith("⦿")]
     assert nodes == [5, 9, 13, 17], nodes
     # The state glyph rides the gutter's column 2, on the CONTENT row alone, and
     # is NOT inside the box: the spinner is w1's, and every non-content box row
     # carries a space there.
-    assert lines[5][0] == "⊙" and lines[5][2] == a.SPIN_FRAMES[0]
+    assert lines[5][0] == "⦿" and lines[5][2] == a.SPIN_FRAMES[0]
     assert lines[9][2] == "⏸" and lines[13][2] == "✗" and lines[17][2] == "✓"
     assert lines[6][:4] == "│   " and a.SPIN_FRAMES[0] not in lines[5][4:], \
         "the state glyph is in the gutter, never inside the box"
@@ -409,7 +409,7 @@ def test_the_root_box_has_no_gauge_and_shows_the_label_at_every_width():
 
 def test_the_rail_runs_down_the_group_at_the_pane_left_column():
     """The rail is a column of its OWN at the pane's left edge — one unbroken `│`
-    down the whole group, with a `⊙` NODE at each agent's box. On a worker box's
+    down the whole group, with a `⦿` NODE at each agent's box. On a worker box's
     borders and the breathing rows the column carries the rail; on the box's
     content row it carries the node."""
     rows = [header(),
@@ -437,7 +437,7 @@ def test_the_rail_runs_down_the_group_at_the_pane_left_column():
 
 
 def test_the_node_and_spinner_sit_in_the_gutter_not_in_the_box():
-    """`⊙` is drawn in the gutter's NODE column (0) and the state glyph in column
+    """`⦿` is drawn in the gutter's NODE column (0) and the state glyph in column
     2, both on the box's CONTENT row alone; every other row of the box carries the
     rail and a space. The state glyph has LEFT the box — the content inside is just
     the mark and the title."""
@@ -448,14 +448,14 @@ def test_the_node_and_spinner_sit_in_the_gutter_not_in_the_box():
     lines = a.render(a.Frame(rows=rows, selected=2), width=C2_WIDTH)   # w1
 
     # w1's content row (5): node, space, spinner, space, then the box at column 4.
-    assert lines[5][:4] == "⊙" + " " + a.SPIN_FRAMES[0] + " ", lines[5]
+    assert lines[5][:4] == "⦿" + " " + a.SPIN_FRAMES[0] + " ", lines[5]
     assert "╭" not in lines[5], "the content row carries no corner"
     assert lines[5].index("│", 4) == a.GUTTER, "the box edge starts at column 4"
     # The border and bottom rows carry the rail and a blank glyph column.
     assert lines[4][:4] == "│   " and lines[6][:4] == "│   "
     # The UNSELECTED box's content row still carries the node and the spinner: the
     # node marks the AGENT, not the selection (selection is the paint role).
-    assert lines[8][:4] == "⊙" + " " + a.SPIN_FRAMES[0] + " ", lines[8]
+    assert lines[8][:4] == "⦿" + " " + a.SPIN_FRAMES[0] + " ", lines[8]
     # No caret glyph anywhere.
     assert "▸" not in "\n".join(lines)
 
@@ -474,7 +474,7 @@ def test_a_worker_box_is_three_rows_and_four_when_expanded():
     assert plain[0].startswith("│   ╭") and plain[2].startswith("│   ╰")
     assert all(len(line) == C2_WIDTH for line in plain)
     # The state glyph and the node are in the GUTTER, on the content row.
-    assert plain[1].startswith("⊙ " + a.SPIN_FRAMES[0] + " │")
+    assert plain[1].startswith("⦿ " + a.SPIN_FRAMES[0] + " │")
     # ONE content row carries both halves: the title flush left, the meta flush
     # right, on the SAME line.
     assert "task" in plain[1]
@@ -525,7 +525,7 @@ def test_the_title_yields_to_the_meta_on_the_shared_content_row():
     assert "task" not in over[1]
     # The content row is the gutter (node, blank, spacer) + the box edge, then the
     # meta alone (clipped). The state glyph for a blocked box is the static `⏸`.
-    assert over[1] == "⊙ ⏸ │waiting on yo…│", over[1]
+    assert over[1] == "⦿ ⏸ │waiting on yo…│", over[1]
 
 
 def test_the_state_glyphs_are_static_and_working_is_the_spinner():
@@ -752,24 +752,22 @@ def test_a_selection_move_still_repaints_the_pane():
 
 def test_every_harness_mark_fills_the_slot_and_every_title_starts_in_one_column():
     """The box's content row carries the harness mark, and every mark spends the
-    SAME two WESTERN display columns, so the glyph and the title line up down the
-    list.
+    SAME two display columns, so the glyph and the title line up down the list.
 
-    THE THREE AMBIGUOUS MARKS ARE IN HERE ON PURPOSE. kilo, cognition and z-ai are
-    East Asian AMBIGUOUS — a western terminal paints them ONE cell wide — and the
-    slot once charged them two and left them unpadded, so their titles started one
-    column LEFT of every Narrow row's. That is the shear this pins shut: one title
-    column for all fourteen vendors, ambiguous or not, in the locale the operator
-    runs. (Under a CJK locale those three rows shear right by one instead; that is
-    the documented trade in `_slot_width`.)
+    EVERY MARK IS EAST ASIAN NARROW NOW. kilo, cognition and z-ai were once
+    Ambiguous — a western terminal paints an Ambiguous glyph one cell wide but a
+    CJK one paints it two — and the old slot once charged them two and left them
+    unpadded, so their titles started one column LEFT of every other row's. That
+    is the shear this pins shut: one title column for all fourteen vendors, in the
+    locale the operator runs. The replacement glyphs are Narrow, so no row's width
+    depends on the locale at all now — see `test_every_mark_and_the_node_are_narrow`.
     """
     harnesses = _harness_for_vendor()
-    ambiguous = [harnesses[vendor] for vendor in sorted(AMBIGUOUS)]
-    narrow = [harnesses[vendor] for vendor in sorted(set(MARK) - AMBIGUOUS)]
-    assert len(ambiguous) == 3 and len(narrow) == 11, (ambiguous, narrow)
+    all_harnesses = [harnesses[vendor] for vendor in sorted(MARK)]
+    assert len(all_harnesses) == 14, all_harnesses
 
     title_col = {}
-    for harness in narrow + ambiguous + ["totally-unknown", ""]:
+    for harness in all_harnesses + ["totally-unknown", ""]:
         slot = a.harness_mark(harness)
         assert a._slot_width(slot) == 2, (harness, slot)
         line = a.render(a.Frame(rows=[worker("w", "working", text="ZX",
@@ -778,10 +776,10 @@ def test_every_harness_mark_fills_the_slot_and_every_title_starts_in_one_column(
         title_col[harness] = line.index("ZX")
 
     assert len(set(title_col.values())) == 1, title_col
-    # And the ambiguous marks are padded exactly like the Narrow ones: glyph plus
-    # one space, not glyph alone.
-    for vendor in AMBIGUOUS:
-        assert a.harness_mark(harnesses[vendor]) == MARK[vendor] + " ", vendor
+    # And every mark is padded the same way: glyph plus one space, never glyph
+    # alone — the slot's western ruler charges every Narrow glyph one cell.
+    for vendor, mark in MARK.items():
+        assert a.harness_mark(harnesses[vendor]) == mark + " ", vendor
 
 
 def test_a_breathing_rail_row_separates_one_state_group_from_the_next():
@@ -913,13 +911,13 @@ def test_the_worker_row_degrades_in_the_documented_order():
     # 8 and up: the shipped shape — node, space, state glyph, space, box.
     full, _ = a.worker_box(row, 8, selected=True)
     assert full[0].startswith("│   ╭"), full[0]
-    assert full[1].startswith("⊙ ✓ │"), full[1]
+    assert full[1].startswith("⦿ ✓ │"), full[1]
     assert all(len(line) == 8 for line in full)
 
     # 6 and 7: the state glyph column AND its space are gone; the node stays.
     slim, _ = a.worker_box(row, 7, selected=True)
     assert slim[0].startswith("│ ╭"), slim[0]
-    assert slim[1].startswith("⊙ │"), slim[1]
+    assert slim[1].startswith("⦿ │"), slim[1]
     assert all(len(line) == 7 for line in slim)
     assert "✓" not in "".join(slim), "no state glyph column below the full gutter"
 
@@ -1573,26 +1571,25 @@ def test_harness_label_defaults_when_there_is_no_harness():
 
 # The operator's tier-0 picks, copied here so the test states the decision
 # rather than reading it back out of the module it is checking. A drift in
-# `_HARNESS_MARKS` is exactly what this is meant to catch.
+# `_HARNESS_MARKS` is exactly what this is meant to catch. Every pick is East
+# Asian NARROW; kilo, cognition and z-ai were once AMBIGUOUS and were replaced
+# with Narrow glyphs, so no mark's width depends on the locale.
 MARK = {
     "anthropic": "\u2733",
     "opencode-zen": "\u25AF",
     "google": "\u2726",
     "openai": "\u2B21",
-    "deepseek": "\U0001319E",
-    "kilo": "\U0001F13A",
+    "deepseek": "\U0001D5D6",
+    "kilo": "\U0001D5DE",
     "aws-kiro": "\U0001680C",
     "cursor": "\u21D7",
     "goose": "\U0001316F",
     "hermes": "\u2624",
     "xai": "\U0001D54F",
-    "cognition": "\u26EF",
-    "z-ai": "\u2554",
+    "cognition": "\u2316",
+    "z-ai": "\U0001D5D9",
     "moonshotai": "\u2318",
 }
-# The three East Asian AMBIGUOUS picks: the slot charges them two cells and so
-# pads them not at all. The other eleven are Narrow and get one trailing space.
-AMBIGUOUS = {"kilo", "cognition", "z-ai"}
 
 
 def _catalog():
@@ -1628,26 +1625,62 @@ def test_every_vendor_resolves_to_its_mark_in_a_two_column_slot():
         # The glyph is the operator's pick, not something the slot invented.
         assert got.strip() == mark, (vendor, got)
         # ...and whatever its own width, the slot is exactly two columns. Measured
-        # with the SLOT's ruler: the general `_display_width` would charge the
-        # three Ambiguous marks an extra column and so disagree with the slot's
-        # contract on purpose (see `_slot_width`).
+        # with the SLOT's ruler: the general `_display_width` would charge an
+        # Ambiguous mark an extra column and so disagree with the slot's contract
+        # on purpose (see `_slot_width`). No shipped mark is Ambiguous now, so the
+        # two rulers currently agree on all fourteen — but the slot still pins its
+        # own two-column promise against its own ruler.
         assert a._slot_width(got) == 2, (vendor, got)
 
 
-def test_ambiguous_marks_are_padded_like_narrow_ones():
-    # The slot's western ruler charges Ambiguous ONE cell, so those three are
-    # padded exactly like a Narrow mark — glyph plus one space — and their titles
-    # therefore start in the same column. This was the other way round (pessimistic
-    # charge, no pad, sheared titles) and must not go back: see `_slot_width`.
+def test_every_mark_is_narrow_and_padded_with_one_space():
+    # Every mark is East Asian NARROW, so the slot pads each exactly like any
+    # other — glyph plus one space — and every title starts in the same column.
+    # The three then-Ambiguous picks (kilo, cognition, z-ai) used to take the
+    # western one-column branch under a pessimistic charge that left them unpadded
+    # and sheared their titles; they are Narrow glyphs now, so that path is gone.
+    # See `_slot_width` for the (now hypothetical) Ambiguous rule.
     harnesses = _harness_for_vendor()
     for vendor, mark in MARK.items():
         got = a.harness_mark(harnesses[vendor])
         assert got == mark + " ", (vendor, repr(got))
-    # And the classes are what the test claims them to be, not assumed.
-    for vendor in AMBIGUOUS:
-        assert unicodedata.east_asian_width(MARK[vendor]) == "A", vendor
-    for vendor in set(MARK) - AMBIGUOUS:
-        assert unicodedata.east_asian_width(MARK[vendor]) == "N", vendor
+    # And the class is what the test claims it is, not assumed.
+    for vendor, mark in MARK.items():
+        assert unicodedata.east_asian_width(mark) == "N", (vendor, mark)
+
+
+def test_every_mark_and_the_node_are_narrow():
+    # ONE guard for the whole table and the gutter node: every glyph carries an
+    # UNCONDITIONAL one-column width — East Asian NARROW, never Ambiguous ("A",
+    # locale-dependent) and never Wide/Fullwidth ("W"/"F", two columns). This is
+    # what fails if a future edit drops an Ambiguous or Wide glyph back in. The
+    # operator made exactly this swap for the node (⊙ U+2299 -> ⦿ U+29BF) and for
+    # the three then-Ambiguous marks.
+    for vendor, mark in a._HARNESS_MARKS.items():
+        assert unicodedata.east_asian_width(mark) == "N", (vendor, mark)
+        assert a._slot_width(mark) == 1, (vendor, mark)
+    assert unicodedata.east_asian_width(a.NODE) == "N", a.NODE
+    assert a._slot_width(a.NODE) == 1, a.NODE
+
+
+def test_the_narrow_swaps_resolve_to_the_chosen_codepoints():
+    # The explicit replacements, spelled as codepoints so a stray edit to a
+    # look-alike glyph is caught: node ⦿ U+29BF, kilo 𝗞 U+1D5DE, cognition ⌖ U+2316.
+    # 𝗖 (vendor `deepseek` -> CLINE) and 𝗙 (vendor `z-ai` -> FREEBUFF) joined them:
+    # the mark names the TOOL, so the old whale (the MODEL's logo) is gone.
+    # 𝗖, 𝗙 and 𝗞 are outside the BMP, like the existing 𝕏 (xai) and the two
+    # surviving historic glyphs, 𓅯 goose and 𖠌 aws-kiro.
+    assert a.NODE == "\u29bf"
+    assert a._HARNESS_MARKS["kilo"] == "\U0001D5DE"
+    assert a._HARNESS_MARKS["cognition"] == "\u2316"
+    assert a._HARNESS_MARKS["z-ai"] == "\U0001D5D9"
+    assert a._HARNESS_MARKS["deepseek"] == "\U0001D5D6"
+    # The z-ai swap also fixes a second defect: U+2554 was a BOX-DRAWING corner
+    # sitting inside a pane built from box-drawing, so it read as frame damage
+    # beside a real corner.
+    assert a._HARNESS_MARKS["z-ai"] != "\u2554"
+    # The whale named the MODEL (DeepSeek), never the harness — that is why it left.
+    assert a._HARNESS_MARKS["deepseek"] != "\U0001319E"
 
 
 def test_the_blank_slot_is_exactly_two_spaces(monkeypatch):
@@ -1665,8 +1698,9 @@ def test_the_blank_slot_is_exactly_two_spaces(monkeypatch):
 
 def test_every_return_is_exactly_two_slot_columns_including_the_blank():
     # Measured with the SLOT's ruler, not `_display_width`: the slot's contract is
-    # two WESTERN columns, and a general-ruler check would reject the three
-    # Ambiguous marks the slot deliberately pads.
+    # two western columns, and a general-ruler check would (hypothetically) charge
+    # an Ambiguous mark an extra column. Every shipped mark is Narrow now, so the
+    # slot still pads each to exactly two.
     for row in _catalog()["agents"]:
         assert a._slot_width(a.harness_mark(row["harness"])) == 2, row["id"]
     for degenerate in ("brand-new-native", "", None, 7, "  "):
