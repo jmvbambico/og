@@ -419,6 +419,86 @@ def test_kilo_missing_binary(tmp_path, monkeypatch):
     assert rec["state"] == "unknown" and "kilo binary" in rec["detail"]
 
 
+def _kilo_probe(tmp_path, monkeypatch, profile: dict, model=None) -> dict:
+    """A kilo binary on PATH whose `profile --json` prints `profile`."""
+    fake_home(tmp_path, monkeypatch)
+    kilo = tmp_path / "bin"
+    kilo.mkdir()
+    (kilo / "kilo").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("PATH", str(kilo))
+
+    def run(cmd, **kw):
+        assert cmd[1:] == ["profile", "--json"]
+        r = type("R", (), {})()
+        r.returncode, r.stdout = 0, json.dumps(profile)
+        return r
+
+    return q._probe_kilo_profile({"model": model} if model else {},
+                                 ctx(env={"PATH": str(kilo)}, run=run))
+
+
+def test_kilo_free_pin_not_dry_on_zero_paid_balance(tmp_path, monkeypatch):
+    """The field bug: `kilo profile --json` reports `balance` -- the PAID
+    credit pool, which a `kilo/kilo-auto/free` pin never draws on -- so the
+    probe read `dry` on every run and the orchestrator permanently skipped a
+    healthy worker."""
+    rec = _kilo_probe(tmp_path, monkeypatch, {"balance": 0},
+                      model="kilo/kilo-auto/free")
+    assert rec["state"] == "ok"
+    assert rec["tier"] == "assumed"
+    # the free tier exposes no remaining to measure, so claim none
+    assert rec["remaining"] is None and rec["limit"] is None
+    assert "free pin" in rec["detail"]
+
+
+def test_kilo_free_pin_positive_balance_still_not_measured(tmp_path, monkeypatch):
+    # WHY: a free pin does not draw on the paid pool WHENEVER the balance is,
+    # so a positive balance must not fall through to the measured reading --
+    # every other free-pin test uses `balance: 0`, and without this one a
+    # refactor narrowing the branch to `bal <= 0` would pass the whole suite
+    # and bring the bug back for anyone holding paid credit while pinned free.
+    rec = _kilo_probe(tmp_path, monkeypatch, {"balance": 12.5},
+                      model="kilo/kilo-auto/free")
+    assert rec["state"] == "ok"
+    assert rec["tier"] == "assumed"
+    assert rec["remaining"] is None and rec["limit"] is None
+    # still report what was seen, without binding on it
+    assert "12.5" in rec["detail"]
+
+
+def test_kilo_free_pin_shape_maps_any_free_route(tmp_path, monkeypatch):
+    # shape-derived, so a future `kilo/<router>/free` maps without a code change
+    assert q._kilo_free_pin("kilo/kilo-auto/free") is True
+    assert q._kilo_free_pin("kilo/openrouter/free") is True
+    assert q._kilo_free_pin("KILO/Kilo-Auto/Free") is True
+    assert q._kilo_free_pin("kilo/kilo-auto/frontier") is False
+    assert q._kilo_free_pin("kilo/freebeats/balanced") is False
+    assert q._kilo_free_pin(None) is False
+    assert q._kilo_free_pin("") is False
+
+
+def test_kilo_paid_pin_zero_balance_still_dry(tmp_path, monkeypatch):
+    # a paid pin DOES draw on the balance, so 0 still means dry
+    rec = _kilo_probe(tmp_path, monkeypatch, {"balance": 0},
+                      model="kilo/kilo-auto/frontier")
+    assert rec["state"] == "dry" and rec["tier"] == "measured"
+    assert rec["remaining"] == 0.0 and rec["unit"] == "credits"
+
+
+def test_kilo_paid_pin_positive_balance_measured(tmp_path, monkeypatch):
+    rec = _kilo_probe(tmp_path, monkeypatch, {"balance": 12.5},
+                      model="kilo/kilo-auto/frontier")
+    assert rec["state"] == "ok" and rec["tier"] == "measured"
+    assert rec["remaining"] == pytest.approx(12.5)
+
+
+def test_kilo_unpinned_zero_balance_still_dry(tmp_path, monkeypatch):
+    # no pin: pessimism is right, the balance is all we know
+    rec = _kilo_probe(tmp_path, monkeypatch, {"balance": 0})
+    assert rec["state"] == "dry" and rec["tier"] == "measured"
+    assert rec["remaining"] == 0.0
+
+
 # --------------------------------------------------------------------------
 # cursor-dashboard
 # --------------------------------------------------------------------------

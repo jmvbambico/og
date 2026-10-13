@@ -41,6 +41,10 @@ og stats --clear kilo
   balance freebuff last reported in a transcript or runner log).
 - **unknown** — no credential, no endpoint answer, no reported balance since
   the daily reset, no budget configured.
+- **assumed** — the binding quota family/pool was identified from the agent's
+  pinned model, not measured (kilo pinned to the free router: the paid credit
+  balance does not bind it, and the free tier exposes no queryable remaining,
+  so `remaining` is `-`).
 
 ## Probes (one per agent)
 
@@ -49,7 +53,7 @@ og stats --clear kilo
 | anthropic-oauth | claude | Keychain/file OAuth token → Anthropic usage endpoint (5h + 7d windows; 5h binds) |
 | codex-wham | codex | `~/.codex/auth.json` (or opencode's copy) → wham usage (primary binds) |
 | antigravity | agy | `antigravity-accounts.json` cachedQuota, worst family binds |
-| kilo-profile | kilo | `kilo profile --json` balance |
+| kilo-profile | kilo | `kilo profile --json` balance; a `…/free` pin does not draw on the paid balance, so the balance is reported but does not bind |
 | cursor-dashboard | cursor | token from `state.vscdb` → current-period usage |
 | deepseek-balance | cline | `GET user/balance`, needs `$DEEPSEEK_API_KEY` |
 | launch-budget | freebuff | last balance freebuff itself printed (chat.db transcripts + newest runner logs); `unknown` when nothing reported since the daily reset — og never subtracts a per-launch cost. The observation is taken only from freebuff worker sessions' own error output, and anything else — including og's own reports — is ignored by design |
