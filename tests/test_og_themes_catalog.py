@@ -19,6 +19,12 @@ Two things this file pins that a shape test would not:
   * The Dracula parchment exception. dracula.text is #f0e6d2, a warm parchment,
     NOT Dracula's own #f8f8f2. That is the operator's explicit request, not a
     typo -- see test_dracula_text_is_the_operators_parchment.
+
+AND ONE ROW IS NOT A THEME AT ALL. `og` is what the pane painted before themes
+existed, kept as a selectable row so an operator who wants none of this can have
+none of it. It is EXEMPT from every contrast assertion below, and the exemption is
+asserted explicitly rather than quietly skipped -- see OG_EXEMPT and
+test_og_is_the_only_row_exempt_from_contrast_and_says_why.
 """
 from __future__ import annotations
 
@@ -35,8 +41,35 @@ CATALOG = Path(__file__).resolve().parents[1] / "installer" / "themes.json"
 ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "rail")
 HEX_RE = re.compile(r"^#[0-9a-f]{6}$")
 
+# The literal a role carries when it means curses' `-1`: allocate no colour and
+# inherit the terminal's own. Legal in ANY of the seven roles.
+DEFAULT = "default"
+
+# `og` is the row that is exempt from the contrast assertions, and the ONLY one.
+# WHY IT HAS TO BE, because the next reader's first instinct will be to close this
+# gap by inventing hexes for it:
+#
+#   * Four of its seven roles are the string "default". The point of the row is
+#     that the pane keeps the TERMINAL's own background, and a background this
+#     process cannot see has NO luminance. `test_body_text_is_readable_on_the_pane`
+#     over "default" does not fail gently -- `_rgb` raises ValueError on the word,
+#     which is a confusing error about a catalog row that is perfectly correct.
+#   * Its three real hexes are the exact sRGB of the indices the code already
+#     shipped (109 / 46 / 226). Their contrast against anything is a fact about
+#     the TERMINAL's own palette, not about this row, and asserting a number here
+#     would be asserting a property the row does not have.
+#   * Substituting readable hexes for the "default" roles would make the test pass
+#     by turning the regression guard into a decoration. `og` exists so that
+#     `render` is byte-identical to the pre-theme output; a theme with invented
+#     backgrounds would make that check fail for the one row it exists to protect.
+#
+# So: `og` is exempt, the exemption is a named constant, and the test below pins
+# both the exemption and this reasoning. A THIRD row appearing here is a bug.
+OG_EXEMPT = frozenset({"og"})
+
 # The 25 themes, in the order the operator's reference site (ansicolor.com)
-# lists them in its picker. Labels are display names, verbatim.
+# lists them in its picker. Labels are display names, verbatim. `og` is NOT in
+# this list: it is not one of the reference site's themes, it is today's colours.
 EXPECTED_LABELS = [
     "Andromeda", "Ayu Dark", "Ayu Light",
     "Bearded Dark", "Bearded Light",
@@ -320,8 +353,15 @@ def _slugify(label: str) -> str:
 
 
 def _rows(themes: dict):
-    """(slug, label, colors) for every row, in the catalog's own order."""
-    return [(slug, t["label"], t["colors"]) for slug, t in themes.items()]
+    """(slug, label, colors) for every MEASURABLE row, in the catalog's own order.
+
+    `og` is dropped here and only here. Every contrast, polarity and distance
+    assertion in this file iterates `_rows`, so the exemption is stated in ONE
+    place and cannot drift into a per-test `if slug == "og"` that the next edit
+    forgets to extend.
+    """
+    return [(slug, t["label"], t["colors"]) for slug, t in themes.items()
+            if slug not in OG_EXEMPT]
 
 
 def _nudge_comment() -> str:
@@ -342,22 +382,62 @@ def test_version_is_one(catalog):
     assert catalog["version"] == 1
 
 
-def test_exactly_25_themes(themes):
-    assert len(themes) == 25, f"expected 25 themes, found {len(themes)}: {sorted(themes)}"
+def test_exactly_26_themes(themes):
+    assert len(themes) == 26, (
+        f"expected 26 themes (25 from the reference site plus `og`), "
+        f"found {len(themes)}: {sorted(themes)}")
 
 
-def test_labels_are_exactly_the_reference_set(themes):
+def test_labels_are_the_reference_set_plus_og(themes):
     labels = [t["label"] for t in themes.values()]
-    assert sorted(labels) == sorted(EXPECTED_LABELS)
+    assert sorted(labels) == sorted(EXPECTED_LABELS + ["OG"])
     assert len(labels) == len(set(labels)), "duplicate label"
-    # order == the reference site's picker order, and the catalog agrees.
-    for row, expected in zip(sorted(themes.items(), key=lambda kv: kv[1]["order"]), EXPECTED_LABELS):
-        assert row[1]["label"] == expected, f"order {row[1]['order']} should be {expected}"
+    # The 25 keep the reference site's picker order; `og` sits at the front
+    # because order 0 puts it first in the picker and dracula is still the
+    # default. `og` is not one of the reference site's themes, so it is checked
+    # separately rather than folded into EXPECTED_LABELS.
+    ordered = [themes[slug]["label"] for slug, _ in
+               sorted(themes.items(), key=lambda kv: kv[1]["order"])]
+    assert ordered == ["OG"] + EXPECTED_LABELS
 
 
-def test_order_is_a_permutation_of_1_to_25(themes):
+def test_order_is_a_permutation_of_0_to_25(themes):
     orders = sorted(t["order"] for t in themes.values())
-    assert orders == list(range(1, 26))
+    assert orders == list(range(0, 26))
+
+
+def test_og_is_the_only_row_exempt_from_contrast_and_says_why(themes):
+    """THE EXEMPTION, ASSERTED RATHER THAN ASSUMED.
+
+    A contrast test over `"default"` does not fail politely -- `_rgb` raises
+    ValueError on the word -- and an exemption written as `if slug == "og"` in
+    twelve places is an exemption the twelfth place will forget. So the exemption
+    lives in `OG_EXEMPT`, every measurable row goes through `_rows`, and this test
+    pins BOTH: that `og` really is the only exempt row, and that the reason is
+    written down where the next reader will hit it.
+    """
+    assert OG_EXEMPT == {"og"}, "a second exempt row needs its own justification"
+    assert "og" in themes, "the regression guard for the whole change is missing"
+    # Every OTHER row is measured, i.e. carries real hexes throughout.
+    for slug, _label, colors in _rows(themes):
+        assert DEFAULT not in colors.values(), (
+            f"{slug} carries a 'default' role but is not exempt. Either add it to "
+            "OG_EXEMPT with a reason, or give it a real colour.")
+
+    og = themes["og"]
+    assert og["label"] == "OG" and og["order"] == 0
+    assert og["colors"] == {
+        "bg": "default", "text": "default", "meta": "#87afaf",
+        "sel_bg": "default", "idle": "#00ff00", "working": "#ffff00",
+        "rail": "default",
+    }
+    # The four transparent roles are what make the row worth having, so pin them
+    # by name rather than by the dict above alone: a future edit that fills in
+    # `bg` has stopped `og` being the way back to a transparent pane.
+    assert og["colors"]["bg"] == DEFAULT
+    note = og.get("_note", "")
+    for phrase in ("today", "default", "exempt"):
+        assert phrase in note.lower(), f"the _note does not explain {phrase!r}: {note!r}"
 
 
 def test_slug_is_the_kebab_case_of_the_label(themes):
@@ -365,16 +445,32 @@ def test_slug_is_the_kebab_case_of_the_label(themes):
         assert slug == _slugify(label), f"{slug!r} is not the slug of {label!r}"
     assert "tokyo-night-light" in themes and "catppuccin-frappe" in themes
     assert "synthwave-84" in themes and "github-dark" in themes
+    # `og` is the exception to the kebab-case rule and says so: "OG" slugifies to
+    # "og" by accident, not by derivation, and it is spelled lower-case because it
+    # is a slug and not a label.
+    assert themes["og"]["label"] == "OG" and "og" in themes
 
 
-def test_every_row_defines_all_seven_roles_as_lowercase_six_digit_hex(themes):
-    for slug, _, colors in _rows(themes):
+def test_every_row_defines_all_seven_roles(themes):
+    """Seven roles on every row -- and a role is EITHER `#rrggbb` or `"default"`.
+
+    The lowercase-hex half of this used to be the whole rule. `"default"` is now
+    legal in ANY of the seven roles, which is the single structural decision that
+    lets one theme reproduce exactly what the pane painted before themes existed;
+    so the shape test accepts both and the CONTRAST tests are the ones that
+    decide which rows may use `"default"` at all (they may not, except `og` --
+    see OG_EXEMPT).
+    """
+    for slug, theme in themes.items():
+        colors = theme["colors"]
         assert set(colors) == set(ROLES), f"{slug}: roles {sorted(colors)}"
         for role, value in colors.items():
             assert isinstance(value, str), f"{slug}.{role} is not a string"
+            if value == DEFAULT:
+                continue
             assert HEX_RE.match(value), (
-                f"{slug}.{role} = {value!r} is not lowercase #rrggbb "
-                "(no shorthand, no alpha, no uppercase)"
+                f"{slug}.{role} = {value!r} is neither lowercase #rrggbb "
+                "(no shorthand, no alpha, no uppercase) nor \"default\""
             )
 
 
@@ -466,7 +562,8 @@ def test_polarity_agrees_with_the_light_dark_suffix(themes):
 # ---------------------------------------------------------------------------
 
 def test_every_shipped_colour_is_published_or_a_hue_preserving_lightness_nudge(themes):
-    assert set(themes) == set(PUBLISHED), "a theme has no PUBLISHED provenance"
+    assert set(themes) - OG_EXEMPT == set(PUBLISHED), (
+        "a theme has no PUBLISHED provenance")
     for slug, label, colors in _rows(themes):
         moved = NUDGES.get(slug, {})
         assert set(moved) <= set(ROLES)

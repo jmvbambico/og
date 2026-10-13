@@ -24,10 +24,40 @@
     "",
     "Where a theme's published foreground cannot reach its target, that single",
     "value is nudged in LIGHTNESS ONLY (hue and saturation untouched), by the",
-    "minimum amount that clears the target. Nudges are listed in the test file."
+    "minimum amount that clears the target. Nudges are listed in the test file.",
+    "",
+    "THE EXCEPTION IS `og`, WHICH IS NOT A THEME BUT TODAY. It is what this pane",
+    "painted before themes existed, and it is the only row here whose values were",
+    "not chosen: they were READ OFF the code. Its order is 0 so the picker sorts",
+    "it FIRST -- dracula stays the default, and `og` is the way back, not the way",
+    "in. Four of its seven roles are the string \"default\", which means curses -1:",
+    "allocate no colour and inherit the terminal's own. That is the whole of the",
+    "row. The pane used to allocate every pair with a -1 background (\"what lets",
+    "colour and the pane's transparency coexist\"), and dracula's opaque background",
+    "ends that; `og` is the only way to get it back, which makes it the",
+    "REGRESSION GUARD for the whole background change rather than a cosmetic",
+    "extra. Its three hexes are the exact sRGB of the indices the code shipped --",
+    "#87afaf is ansi 109, #00ff00 is 46, #ffff00 is 226 -- and a test asserts the",
+    "round trip, so this row is provably today's colours and not an approximation",
+    "of them. Do not give it invented hexes to make it measurable; see the",
+    "exemption in the test file."
   ],
   "version": 1,
   "themes": {
+    "og": {
+      "label": "OG",
+      "order": 0,
+      "colors": {
+        "bg": "default",
+        "text": "default",
+        "meta": "#87afaf",
+        "sel_bg": "default",
+        "idle": "#00ff00",
+        "working": "#ffff00",
+        "rail": "default"
+      },
+      "_note": "NOT a theme: today's colours, preserved as a choice. bg/text/sel_bg/rail are 'default' (curses -1, the terminal's own background) because that is exactly what the pane painted before themes existed. The three hexes are the exact sRGB of the indices the code shipped and are EXEMPT from every contrast assertion in tests/test_og_themes_catalog.py -- 'default' has no computable luminance, so a contrast test over this row crashes or silently skips, and inventing hexes to satisfy one would destroy the only property this row exists for."
+    },
     "andromeda": {
       "label": "Andromeda",
       "order": 1,
