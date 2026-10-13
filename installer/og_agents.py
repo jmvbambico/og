@@ -2530,14 +2530,21 @@ class _Colours:
     def background_attr(self) -> Optional[int]:
         """The attribute the WINDOW background is set to, or None to leave it alone.
 
-        Set on `stdscr.bkgd` so an OPAQUE theme fills the whole pane rather than
-        only the cells behind glyphs — without it the background shows in stripes,
-        because every cell not covered by an `addnstr` keeps whatever was there.
+        Passed to `window.bkgdset` by `apply_background` so an OPAQUE theme fills
+        the whole pane rather than only the cells behind glyphs — without it the
+        background shows in stripes, because every cell not covered by an
+        `addnstr` keeps whatever was there.
 
         None when the theme's `bg` is `"default"`, and that is the whole of the
-        OG theme's promise: leaving `bkgd` untouched is what lets the terminal's
-        own background through, and setting it to a pair that happened to be
-        allocated for some other role would put a colour on the pane nobody chose.
+        OG theme's promise: leaving the background untouched is what lets the
+        terminal's own background through, and setting it to a pair that happened
+        to be allocated for some other role would put a colour on the pane nobody
+        chose.
+
+        NOT None when the theme is opaque but the colour could not be allocated:
+        `attr` returns 0 in that case, and 0 IS the right background (pair 0,
+        which `use_default_colors` has already made the terminal's own). A
+        theme nobody can colour shows uncoloured, not unthemed.
         """
         if self.theme is None or self.theme.is_default("bg"):
             return None
@@ -2558,6 +2565,67 @@ class _Colours:
         bg = CURSES_DEFAULT if background is None \
             else curses_value(background, self._colors)
         return self.attr(fg, bg)
+
+
+# The character the window background is filled with. `bkgdset(ch, attr)` takes a
+# character AND an attribute; a space is the blank a wipe already uses, so setting
+# it changes the colour without ever putting a glyph on screen.
+BKGD_CHAR = " "
+
+
+def apply_background(stdscr, curses, colours: _Colours,
+                     *, restore: bool = False) -> None:
+    """Fill the pane with the theme's background, or leave the terminal's own.
+
+    `window.bkgdset(ch, attr)` IS A CALL, and that is the whole of why it is a
+    function rather than an assignment. This line once read `stdscr.bkgd = attr`,
+    which on a real `_curses.window` raises:
+
+        AttributeError: '_curses.window' object attribute 'bkgd' is read-only
+
+    `_curses.window` has `__dictoffset__ == 0` — no instance dict — and `bkgd` is a
+    `method_descriptor`, so the name cannot be rebound at all. The assignment sat
+    under `except Exception: pass`, so it never raised on screen: every OPAQUE
+    theme silently rendered as stripes, coloured text on the terminal's own
+    background. The unit tests passed because the fake screen modelled `bkgd` as a
+    plain attribute, where assignment works. A FAKE THAT IS EASIER TO SATISFY THAN
+    THE REAL OBJECT CERTIFIES CODE THAT CANNOT RUN.
+
+    WHY `bkgdset` AND NOT `bkgd`. Both set the window's background character and
+    attribute and both leave `getbkgd()` returning it; `bkgd()` additionally wipes
+    the window immediately, and `bkgdset()` does not. The view repaints as
+    `erase()` -> writes -> `refresh()`, and ncurses' `werase` fills every cell with
+    the window's background character and attributes, so `bkgdset` alone already
+    makes the next `erase()` fill with the theme's colour — measured on a real
+    pty against xterm-256color, an unwritten cell after `erase()` reads back its
+    pair under either call (`stdscr.inch(0, 5) >> 8 == 1`, `getbkgd() == 288`).
+    `bkgdset` is the one that says what is meant: set the default for what comes
+    next, not paint over the screen now.
+
+    `restore` is the one thing the STARTUP call must not do. A `"default"` theme
+    means "do not touch the background", because untouched IS the terminal's own
+    and that is the whole of what `og` promises. Once the background HAS been set
+    — the operator previewed an opaque theme — "do not touch it" is no longer the
+    same thing: leaving the last opaque theme's colour on the pane while the text
+    goes back to `-1` backgrounds is a striped pane with nobody's colours. So a
+    THEME CHANGE passes `restore=True`, which sets pair 0 (attribute 0), which
+    `use_default_colors` has already made the terminal's own.
+
+    `curses.error` is caught BY NAME, as `use_default_colors` is a few lines above.
+    A terminal that refuses the call (some do, for a colour pair its hardware
+    cannot show) still has to show the pane, so that is survivable. An
+    `AttributeError` or a `TypeError` is not a terminal quirk — it is a bug in this
+    function — and a blanket `except Exception` is precisely what hid this one.
+    """
+    attr = colours.background_attr()
+    if attr is None and not restore:
+        # The theme's own background is `"default"` and nothing has been set yet:
+        # the terminal's comes through.
+        return
+    try:
+        stdscr.bkgdset(BKGD_CHAR, 0 if attr is None else attr)
+    except curses.error:
+        pass
 
 
 def paint_line(stdscr, row: int, spans: list[Span], width: int, height: int,
@@ -3248,9 +3316,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # view spends is allocated with a `-1` BACKGROUND when the theme asks for
         # that (see `_Colours`), which paints the glyph on whatever pair 0 now is,
         # i.e. the terminal's own background. An OPAQUE theme inverts that: it
-        # allocates the same pairs against its own `bg` and sets `bkgd` below, so
-        # the pane fills instead of tinting. Both are available to the operator and
-        # neither is a special case in the painter.
+        # allocates the same pairs against its own `bg` and sets the window
+        # background below, so the pane fills instead of tinting. Both are
+        # available to the operator and neither is a special case in the painter.
         try:
             curses.use_default_colors()
         except curses.error:
@@ -3260,16 +3328,12 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # and the pane renders exactly as it did before colour existed.
         colours = _Colours(curses, active_theme)
         # FILL THE PANE, not just the glyphs. Every cell no `addnstr` covers keeps
-        # whatever `bkgd` says, so without this an opaque theme renders as
-        # stripes: coloured text floating on the terminal's own background.
-        # Skipped when the theme's `bg` is `"default"`, which is the whole of what
-        # `og` promises.
-        bkgd = colours.background_attr()
-        if bkgd is not None:
-            try:
-                stdscr.bkgd = bkgd
-            except Exception:
-                pass
+        # the window background, so without this an opaque theme renders as
+        # stripes: coloured text floating on the terminal's own background. It is
+        # a CALL (`bkgdset`) and it is in `apply_background`, which carries the
+        # whole argument; skipped when the theme's `bg` is `"default"`, which is
+        # the entire promise `og` makes.
+        apply_background(stdscr, curses, colours)
         stdscr.keypad(True)
         selected = 0
         offset = 0
@@ -3377,6 +3441,13 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                     if chosen is not None:
                         preview = chosen
                         colours.theme = chosen
+                        # The WINDOW BACKGROUND travels with the preview. It is
+                        # not painted by the overlay's own `erase()` alone: a
+                        # preview of an opaque theme has to fill the pane it is
+                        # previewing on, or the candidate looks striped and the
+                        # one thing the operator is judging is not shown.
+                        apply_background(stdscr, curses_mod, colours,
+                                        restore=True)
                         # Repaint the PANE under the overlay in the previewed
                         # theme. `painted` is deliberately not consulted here:
                         # the overlay is a modal layer, not a mode, and the pane
@@ -3388,10 +3459,15 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             if state.applied is None:
                 # A CANCEL puts the previous theme back, including the pairs
                 # already spent on it — `painted` was never reset, so nothing
-                # about the pane changes.
+                # about the pane changes. The WINDOW BACKGROUND is the one thing
+                # that did change, if the preview moved the caret onto an opaque
+                # theme, so it is restored here too: cancelling has to put back
+                # exactly what was there.
                 colours.theme = current
+                apply_background(stdscr, curses_mod, colours, restore=True)
                 return None
             colours.theme = preview
+            apply_background(stdscr, curses_mod, colours, restore=True)
             return preview
 
         def _theme_by_slug(slug: str) -> Optional[Theme]:
