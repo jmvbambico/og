@@ -168,6 +168,21 @@ def rail(state="working"):
     return a.Row("", "", state, 1, rail=True)
 
 
+def _join(spans):
+    """A span list back to its composed text — the pane's own join."""
+    return "".join(text for text, _role in spans)
+
+
+def _line_text(item):
+    """A `(spans, brightness)` pane item back to its composed text."""
+    return _join(item[0])
+
+
+def _fmts(lines):
+    """Join each span list of a `worker_box`/`_root_lines` result to text."""
+    return [_join(spans) for spans in lines]
+
+
 # The worded group labels the C2 design used to draw, one per group. The pane
 # dropped them — the animated glyph inside each box carries the state now — so
 # every render test asserts none of these lines survives.
@@ -466,11 +481,12 @@ def test_a_worker_box_is_three_rows_and_four_when_expanded():
     still reveals the report as an EXTRA row INSIDE the box — now the only way to
     read a report — so an expanded box is four rows and the snippet is a box body
     row, never a loose line."""
-    plain, selected_row = a.worker_box(
+    spans, selected_row = a.worker_box(
         worker("w", "working", text="task", agent="zen", meta="12s"),
         C2_WIDTH, True)
-    assert len(plain) == 3, plain
+    assert len(spans) == 3, spans
     assert selected_row == 0, "the SELECTED role sits on the box's first row"
+    plain = _fmts(spans)
     assert plain[0].startswith("│   ╭") and plain[2].startswith("│   ╰")
     assert all(len(line) == C2_WIDTH for line in plain)
     # The state glyph and the node are in the GUTTER, on the content row.
@@ -482,11 +498,12 @@ def test_a_worker_box_is_three_rows_and_four_when_expanded():
     # The agent name appears NOWHERE in the box: the mark carries it.
     assert "zen" not in "\n".join(plain)
 
-    expanded, selected_row = a.worker_box(
+    spans, selected_row = a.worker_box(
         worker("w", "working", text="task", agent="zen", meta="12s",
                snippet="the report", expanded=True), C2_WIDTH, True)
-    assert len(expanded) == 4, expanded
+    assert len(spans) == 4, spans
     assert selected_row == 0
+    expanded = _fmts(spans)
     assert expanded[0].startswith("│   ╭") and expanded[3].startswith("│   ╰")
     assert all(len(line) == C2_WIDTH for line in expanded)
     # The report is a body row INSIDE the box, BELOW the content row.
@@ -504,12 +521,12 @@ def test_the_title_yields_to_the_meta_on_the_shared_content_row():
     row = worker("w", "blocked", text=title, agent="cmdcode",
                  meta="waiting on you")
     # Wide: the whole title is present, the meta flush right on the same line.
-    wide, _ = a.worker_box(row, 78, False)
+    wide = _fmts(a.worker_box(row, 78, False)[0])
     assert title in wide[1], wide[1]
     assert wide[1].rstrip("│").endswith("waiting on you")
 
     # Tight: the title is ellipsised and the meta is INTACT and flush right.
-    tight, _ = a.worker_box(row, 34, False)
+    tight = _fmts(a.worker_box(row, 34, False)[0])
     assert len(tight) == 3
     assert "…" in tight[1], tight[1]
     assert title not in tight[1], "the title gave way"
@@ -518,9 +535,9 @@ def test_the_title_yields_to_the_meta_on_the_shared_content_row():
 
     # A meta longer than the line can hold wins outright: the title is dropped and
     # only the meta (clipped) remains — the row still never exceeds the pane.
-    over, _ = a.worker_box(worker("w", "blocked", text="task", agent="cmdcode",
-                                  meta="waiting on you forever and ever"),
-                           20, False)
+    over = _fmts(a.worker_box(worker("w", "blocked", text="task", agent="cmdcode",
+                                     meta="waiting on you forever and ever"),
+                              20, False)[0])
     assert len(over) == 3 and all(len(line) == 20 for line in over)
     assert "task" not in over[1]
     # The content row is the gutter (node, blank, spacer) + the box edge, then the
@@ -696,7 +713,7 @@ def test_the_selected_box_is_normal_and_every_other_box_is_dim():
 
     # root box (0-2), breathing rail (3), w1's box (4-6), w2's box (7-9), tail.
     assert [role for _t, role in items[0:3]] == [a.NORMAL] * 3, "the root box"
-    assert items[3] == ("│", a.NORMAL), "the breathing rail"
+    assert items[3] == ([("│", a.PLAIN)], a.NORMAL), "the breathing rail"
     assert [role for _t, role in items[4:7]] == [a.SELECTED, a.NORMAL, a.NORMAL]
     assert [role for _t, role in items[7:10]] == [a.DIM] * 3
     assert sum(1 for _t, role in items if role == a.SELECTED) == 1
@@ -892,11 +909,12 @@ def test_a_worker_row_never_exceeds_the_pane_at_any_width():
     for width in range(1, 41):
         for state in ("working", "blocked", "failed", "idle"):
             for selected in (False, True):
-                lines, selected_row = a.worker_box(
+                spans, selected_row = a.worker_box(
                     worker("w", state, text="a title long enough to clip",
                            agent="zen", meta="2m14s"),
                     width, selected)
-                assert lines, (width, state)
+                assert spans, (width, state)
+                lines = _fmts(spans)
                 assert all(len(line) <= width for line in lines), (width, lines)
                 assert selected_row == 0, (width, state)
 
@@ -909,26 +927,27 @@ def test_the_worker_row_degrades_in_the_documented_order():
     row = worker("w", "idle", text="zx")
 
     # 8 and up: the shipped shape — node, space, state glyph, space, box.
-    full, _ = a.worker_box(row, 8, selected=True)
+    full = _fmts(a.worker_box(row, 8, selected=True)[0])
     assert full[0].startswith("│   ╭"), full[0]
     assert full[1].startswith("⦿ ✓ │"), full[1]
     assert all(len(line) == 8 for line in full)
 
     # 6 and 7: the state glyph column AND its space are gone; the node stays.
-    slim, _ = a.worker_box(row, 7, selected=True)
+    slim = _fmts(a.worker_box(row, 7, selected=True)[0])
     assert slim[0].startswith("│ ╭"), slim[0]
     assert slim[1].startswith("⦿ │"), slim[1]
     assert all(len(line) == 7 for line in slim)
     assert "✓" not in "".join(slim), "no state glyph column below the full gutter"
 
     # 4 and 5: the node column goes too; the box is the whole row.
-    bare, _ = a.worker_box(row, 5, selected=True)
+    bare = _fmts(a.worker_box(row, 5, selected=True)[0])
     assert bare[0].startswith("╭"), bare[0]
     assert all(len(line) == 5 for line in bare)
     assert bare[1][0] != a.NODE
 
     # 1-3: no box can be drawn at all, so one honest line, state then task.
-    tiny, selected_row = a.worker_box(row, 3, selected=True)
+    tiny = _fmts(a.worker_box(row, 3, selected=True)[0])
+    selected_row = a.worker_box(row, 3, selected=True)[1]
     assert len(tiny) == 1 and tiny[0] == "✓ …", tiny
     assert selected_row == 0, "the SELECTED role still has a row to sit on"
 
@@ -946,18 +965,19 @@ def test_the_narrowest_worker_row_keeps_the_state_glyph():
              ("failed", "✗"), ("idle", "✓"))
     for state, glyph in cases:
         for width in (1, 2, 3):
-            lines, selected_row = a.worker_box(
+            spans, selected_row = a.worker_box(
                 worker("w", state, text="a title long enough to clip"),
                 width, selected=False, spin=2)
-            assert len(lines) == 1, (state, width, lines)
-            assert glyph in lines[0], (state, width, lines)
-            assert len(lines[0]) <= width, (state, width, lines)
+            assert len(spans) == 1, (state, width, spans)
+            line = _join(spans[0])
+            assert glyph in line, (state, width, line)
+            assert len(line) <= width, (state, width, line)
             assert selected_row == 0, (state, width)
     # Width 1 is the glyph ALONE: there is no column left for the task.
-    assert a.worker_box(worker("w", "idle", text="zx"), 1, True)[0] == ["✓"]
+    assert _fmts(a.worker_box(worker("w", "idle", text="zx"), 1, True)[0]) == ["✓"]
     # 2 and 3 follow the glyph with as much of the clipped task as fits.
-    assert a.worker_box(worker("w", "idle", text="zx"), 2, True)[0] == ["✓…"]
-    assert a.worker_box(worker("w", "idle", text="zx"), 3, True)[0] == ["✓ …"]
+    assert _fmts(a.worker_box(worker("w", "idle", text="zx"), 2, True)[0]) == ["✓…"]
+    assert _fmts(a.worker_box(worker("w", "idle", text="zx"), 3, True)[0]) == ["✓ …"]
 
 
 def test_a_whole_rendered_frame_fits_any_pane_at_least_one_column_wide():
@@ -1510,7 +1530,7 @@ def test_a_live_root_in_the_cwd_still_wins_over_a_more_recent_root_elsewhere():
     assert ids == ["mine", "m1"], frame.rows
     # The root's harness label resolves on the content row of its box.
     assert frame.rows[0].is_root
-    assert a._root_lines(frame.rows[0], 60)[1][0].endswith("Claude Code│")
+    assert _join(a._root_lines(frame.rows[0], 60)[1]).endswith("Claude Code│")
     # `other` is MORE recently active than `mine` and is still not the answer:
     # recency breaks a tie between roots in `$PWD`, it does not outrank the cwd.
     assert opener.detail_requests, "both live roots were read"
@@ -2503,10 +2523,11 @@ def test_the_list_keeps_a_floor_of_rows_and_the_panel_is_never_squeezed():
     # keeps at least ACCESS_LIST_FLOOR rows.
     assert pane.list_rows == a.ACCESS_LIST_FLOOR
     # ...and the panel is still shown whole rather than squeezed away.
-    assert any("qr-row-0" in text for text, _role in pane.items)
+    assert any("qr-row-0" in _line_text(item) for item in pane.items)
     # A block is never cut: the kept list is the root's three rows, whole.
-    assert pane.items[0][0].startswith("╭") and pane.items[2][0].startswith("╰")
-    assert all(role == a.NORMAL for _text, role in pane.items[:3])
+    assert _line_text(pane.items[0]).startswith("╭") \
+        and _line_text(pane.items[2]).startswith("╰")
+    assert all(brightness == a.NORMAL for _spans, brightness in pane.items[:3])
 
 
 def test_qr_fit_measures_visible_columns_not_raw_length():
@@ -2571,7 +2592,7 @@ def test_no_line_handed_to_the_painter_contains_an_escape():
     # A moved caret cannot change that.
     frame.selected = 1
     assert not any("\x1b" in text for text in a.render(frame, width=80))
-    assert not any("\x1b" in text for text, _role in a._pane(frame, 80).items)
+    assert not any("\x1b" in _line_text(item) for item in a._pane(frame, 80).items)
     # ...and the block characters survived, so the code still draws.
     assert any("█" * 27 in text for text in a.render(a.Frame(access=acc), width=80))
 
@@ -2748,12 +2769,13 @@ class _FakeStdscr:
 
     `getch` answers `q` at once, so the loop paints exactly one frame and
     returns; `erase` clears `writes` the way it clears the screen, so what is
-    left is one frame's worth of writes.
+    left is one frame's worth of writes. A line is written as ONE `addnstr` per
+    span, so a write records its column too — reassemble with `_rows_to_lines`.
     """
 
     def __init__(self, height, width):
         self.height, self.width = height, width
-        self.writes: list[tuple[int, str, int]] = []
+        self.writes: list[tuple[int, int, str, int]] = []
 
     def keypad(self, flag): pass
     def getmaxyx(self): return (self.height, self.width)
@@ -2763,7 +2785,20 @@ class _FakeStdscr:
     def getch(self): return ord("q")
 
     def addnstr(self, row, col, text, n, attr):
-        self.writes.append((row, text[:n], n))
+        self.writes.append((row, col, text[:n], n))
+
+
+def _rows_to_lines(writes):
+    """Reassemble each painted row from its (possibly several) span writes.
+
+    The painter writes one `addnstr` per span, at the span's cumulative column, so
+    a row is recovered by sorting its writes by column and joining their text.
+    """
+    by_row: dict[int, list] = {}
+    for row, col, text, _n in writes:
+        by_row.setdefault(row, []).append((col, text))
+    return {row: "".join(text for _col, text in sorted(parts))
+            for row, parts in by_row.items()}
 
 
 class _StubModel:
@@ -2811,49 +2846,76 @@ def test_paint_line_writes_the_full_width_and_swallows_the_last_cell_alone():
     Every box line is exactly `width` columns and its closing border lives in the
     last one, so `paint_line` has to write at full width. The window's
     bottom-right cell is the one cell curses genuinely refuses; swallowing that
-    exactly (and no more) is what replaces the old blanket `width - 1`.
+    exactly (and no more) is what replaces the old blanket `width - 1`. A span
+    list of ONE PLAIN run coalesces to a single write, exactly as before.
     """
     import curses
 
     scr = _EdgeStdscr(5, 10, curses.error)
 
+    def plain(_role):
+        return 0
+
     # A normal row is written at the FULL width.
-    a.paint_line(scr, 0, "╭────────╮", 10, 5, 0)
+    a.paint_line(scr, 0, [("╭────────╮", a.PLAIN)], 10, 5, plain)
     assert scr.writes == [(0, 0, "╭────────╮", 10)], scr.writes
 
     # The bottom-right cell is attempted at full width and refused — swallowed,
     # never raised, and never pre-empted by writing a column short.
-    a.paint_line(scr, 4, "╰────────╯", 10, 5, 0)
+    a.paint_line(scr, 4, [("╰────────╯", a.PLAIN)], 10, 5, plain)
 
     # Out of range or a zero width is a no-op, not an error.
-    a.paint_line(scr, 9, "x", 10, 5, 0)
-    a.paint_line(scr, 0, "x", 0, 5, 0)
+    a.paint_line(scr, 9, [("x", a.PLAIN)], 10, 5, plain)
+    a.paint_line(scr, 0, [("x", a.PLAIN)], 0, 5, plain)
     assert scr.writes == [(0, 0, "╭────────╮", 10)], scr.writes
+
+
+def test_paint_line_writes_each_span_at_its_cumulative_column_and_never_overflow():
+    """Spans are written at their own columns, and no write ever exceeds `width`.
+
+    At ANY width >= 1 the painter is the last line of defence: a span that would
+    start at or past `width` is skipped, and a span is column-clipped as it is
+    written. This drives the painter directly (no loop) so the guarantee is
+    checked for every width, including the pathological one-column pane.
+    """
+    scr = _EdgeStdscr(5, 40, Exception)
+    spans = [("ab", a.PLAIN), ("XY", "mark:anthropic"), ("cd", a.META)]
+    for width in range(1, 12):
+        scr.writes.clear()
+        a.paint_line(scr, 0, spans, width, 5, lambda role: 0)
+        for _row, col, text, n in scr.writes:
+            assert col >= 0 and col + n <= width + 0, (width, col, n)
+            assert col + len(text) <= width, (width, col, text)
+        joined = "".join(text for _r, _c, text, _n in sorted(scr.writes))
+        assert len(joined) <= width, (width, joined)
 
 
 def test_the_painter_writes_a_boxes_full_width_so_its_border_survives(
         monkeypatch):
     """A box closes in the pane's last column; `width - 1` clipped it off.
 
-    The old writer passed `width - 1` to `addnstr`, so every row lost its last
-    column — exactly the `╮`, `│` and `╯` of a box's right edge — and every box
-    rendered open on the right. This asserts on the recorded writes, which is
-    where the truncation happened and where a pure `render` test cannot look.
+    A line is now written span by span, so the writes for a row are reassembled
+    before measuring — which is also the check that the spans JOIN to the pane
+    width. The old writer passed `width - 1` to `addnstr`, so every row lost its
+    last column — exactly the `╮`, `│` and `╯` of a box's right edge — and every
+    box rendered open on the right.
     """
     frame = a.Frame(rows=[worker("w1", "working")], selected=0)
     writes = _paint(frame, 60, 20, monkeypatch)
+    lines = _rows_to_lines(writes)
 
-    # A worker draws a guttered, rounded box; its rows are the writes that begin
-    # with the group rail or the node, and a collapsed worker's box is three of
-    # them (top border, one content row, bottom border).
-    box = [text for _row, text, _n in writes
+    # A worker draws a guttered, rounded box; its rows are the reassembled lines
+    # that begin with the group rail or the node, and a collapsed worker's box is
+    # three of them (top border, one content row, bottom border).
+    box = [text for text in lines.values()
            if text.startswith(a.RAIL) or text.startswith(a.NODE)]
     assert len(box) == 3, "one rounded box: top, content, bottom"
     assert all(len(line) == 60 for line in box), "each box row is the pane width"
     assert box[0].endswith(a.ROUND_CORNERS[2]), "the top rule closes on the right"
     assert box[-1].endswith(a.ROUND_CORNERS[5]), "the bottom rule closes on the right"
-    assert all(n == 60 for _row, _text, n in writes), \
-        "no row is written one column short"
+    # No row is written past the pane, and every write is clipped to its columns.
+    assert all(len(text) <= 60 for text in lines.values())
+    assert all(col + n <= 60 for _row, col, _text, n in writes)
 
 
 def test_a_short_list_paints_its_footer_once(monkeypatch):
@@ -2868,7 +2930,7 @@ def test_a_short_list_paints_its_footer_once(monkeypatch):
 
     # A 60-column pane selects the compact footer form, so the expected line is
     # whatever form `_footer` picks for the width — not the full one.
-    footers = [row for row, text, _n in writes if text == a._footer(60)]
+    footers = [row for row, _col, text, _n in writes if text == a._footer(60)]
     assert len(footers) == 1, "the footer is painted exactly once, not twice"
     assert footers[0] == 23, "and once means pinned to the pane's bottom row"
 
@@ -2883,7 +2945,7 @@ def test_a_long_list_keeps_one_footer_pinned_at_the_bottom(monkeypatch):
     frame = a.Frame(rows=rows, selected=1)
     writes = _paint(frame, 60, 12, monkeypatch)
 
-    footers = [row for row, text, _n in writes if text == a._footer(60)]
+    footers = [row for row, _col, text, _n in writes if text == a._footer(60)]
     assert len(footers) == 1, "the footer is painted exactly once"
     assert footers[0] == 11, "and stays pinned to the bottom while the list scrolls"
 
@@ -2899,17 +2961,26 @@ def test_a_long_list_keeps_one_footer_pinned_at_the_bottom(monkeypatch):
 # makes at startup and that it survives that call failing.
 
 class FakeCurses(types.ModuleType):
-    """A curses stand-in that records `use_default_colors`, and can refuse it.
+    """A curses stand-in that records `use_default_colors` and colour pairs.
 
     `refuse=True` makes `use_default_colors` raise the way a terminal with no
     colour support does — the call has to stay survivable, because a view that
     cannot start colour still has to paint.
+
+    `colors` and `color_pairs` stand in for `curses.COLORS` / `COLOR_PAIRS`, so a
+    test can drive a monochrome terminal (`colors=0`, the default — `has_colors()`
+    is then False), an 8-colour one, or a pair table too small to hold every role.
+    `init_pair` records every allocation, so a test can see WHICH colour a role
+    spent and that nothing was allocated when it should not have been.
     """
 
-    def __init__(self, refuse=False):
+    def __init__(self, refuse=False, colors=0, color_pairs=256):
         super().__init__("curses")
         self.refuse = refuse
         self.use_default_colors_calls = 0
+        self.COLORS = colors
+        self.COLOR_PAIRS = color_pairs
+        self.init_pair_calls: list[tuple[int, int, int]] = []
         # `curses.error` is a real exception class the view catches by name, so
         # it must be a class here too, not an instance or a sentinel.
         self.error = type("error", (Exception,), {})
@@ -2923,6 +2994,15 @@ class FakeCurses(types.ModuleType):
         self.use_default_colors_calls += 1
         if self.refuse:
             raise self.error("use_default_colors: ERR")
+
+    def has_colors(self):
+        return self.COLORS > 0
+
+    def init_pair(self, n, fg, bg):
+        self.init_pair_calls.append((n, fg, bg))
+
+    def color_pair(self, n):
+        return n << 8
 
     def wrapper(self, loop):
         loop(FakeScreen())
@@ -2964,8 +3044,8 @@ class FakeScreen:
         return self.keys.pop(0) if self.keys else -1
 
 
-def _fake_curses(monkeypatch, refuse=False):
-    fake = FakeCurses(refuse=refuse)
+def _fake_curses(monkeypatch, refuse=False, colors=0, color_pairs=256):
+    fake = FakeCurses(refuse=refuse, colors=colors, color_pairs=color_pairs)
     monkeypatch.setitem(sys.modules, "curses", fake)
     return fake
 
@@ -2979,14 +3059,17 @@ def test_the_view_takes_the_terminals_own_colours_so_the_pane_is_transparent(
         monkeypatch):
     # `curses.wrapper` calls start_color() before `loop` runs, and that is what
     # made every cell this view paints opaque black: pair 0 is the curses
-    # default, not the terminal's. Nothing here sets a colour pair, so taking
-    # the default for pair 0 is the whole fix.
+    # default, not the terminal's. Taking the default for pair 0 is the whole
+    # fix. Every pair the view then spends uses a `-1` background (`_Colours`),
+    # so the colour tints the glyph and leaves pair 0's background intact — this
+    # is a MONOCHROME stub, so nothing is spent here and the call is all there is.
     fake = _fake_curses(monkeypatch)
 
     assert a._run_tui(_tui_model(), a.DEFAULT_INTERVAL, "http://x") == 0
 
     assert fake.use_default_colors_calls == 1, \
         "pair 0 must be the terminal's own colours, once, at startup"
+    assert fake.init_pair_calls == [], "a monochrome terminal spends no pair"
 
 
 def test_the_view_still_paints_when_use_default_colors_raises(monkeypatch):
@@ -3004,6 +3087,201 @@ def test_the_view_still_paints_when_use_default_colors_raises(monkeypatch):
 
     assert fake.use_default_colors_calls == 1
     assert screens and screens[0].painted, "the frame was painted, not skipped"
+
+
+# ---------------------------------------------------------------------------
+# 15b. the colour roles, and how the painter spends them
+# ---------------------------------------------------------------------------
+#
+# Colour is a SPAN's role, decided by the pure composer; the painter turns it
+# into a curses attribute composed with the line's brightness. These tests split
+# the two: the first group checks the ROLES the composer hangs (pure, no curses),
+# the second drives `_run_tui` with a fake curses that can be monochrome, 8-colour
+# or pair-starved, to check the plumbing spends the right pair and degrades.
+
+class _WriteScreen(FakeScreen):
+    """`FakeScreen` that also records `(row, col, text, attr)` for every write."""
+
+    def __init__(self, height=24, width=80):
+        super().__init__(height, width)
+        self.writes: list[tuple[int, int, str, int]] = []
+
+    def erase(self):
+        self.writes.clear()
+
+    def addnstr(self, row, col, text, n, attr):
+        self.painted.append(text)
+        self.writes.append((row, col, text[:n], attr))
+
+
+def _colour_paint(monkeypatch, frame, width=80, height=24, colors=256,
+                  color_pairs=256):
+    """Paint one frame through `_run_tui` with a colour-capable fake curses."""
+    fake = FakeCurses(colors=colors, color_pairs=color_pairs)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    scr = _WriteScreen(height, width)
+    fake.wrapper = lambda loop: loop(scr)
+    a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x")
+    return fake, scr.writes
+
+
+def _writes_for(writes, text):
+    """The attributes of every write whose text is exactly `text`."""
+    return [attr for _row, _col, chunk, attr in writes if chunk == text]
+
+
+def test_the_mark_span_carries_its_vendors_brand_colour_role():
+    harnesses = _harness_for_vendor()
+    assert set(MARK) == set(harnesses), "test and catalog disagree on vendors"
+    for vendor, harness in harnesses.items():
+        spans = a.worker_box(worker("w", "idle", text="t", harness=harness),
+                             60, False)[0][1]
+        roles = {text: role for text, role in spans}
+        slot = a.harness_mark(harness)
+        assert slot in roles, (vendor, spans)
+        assert roles[slot] == a.mark_role(vendor), (vendor, spans)
+        # The role's colour really exists in the table, so the mark is not blank.
+        assert a._VENDOR_COLOURS[vendor], vendor
+
+
+def test_the_atom_and_blank_mark_spans_carry_plain(monkeypatch):
+    # A named agent whose harness cannot be resolved draws the ATOM, and the atom
+    # has no vendor: PLAIN, no brand colour, no bold. A row with no identity at
+    # all draws the blank slot, also PLAIN.
+    monkeypatch.setattr(a, "agent_harness", lambda name: None)
+    atom_spans = a.worker_box(worker("w", "idle", text="t", agent="mystery"),
+                              60, False)[0][1]
+    assert (a.ATOM + " ", a.PLAIN) in atom_spans
+    assert a.worker_vendor("", "mystery") is None
+
+    blank_spans = a.worker_box(worker("w", "idle", text="t"), 60, False)[0][1]
+    assert ("  ", a.PLAIN) in blank_spans
+    assert a.worker_vendor("", None) is None
+
+
+def test_the_meta_span_carries_the_one_meta_colour():
+    spans = a.worker_box(worker("w", "idle", text="t", meta="2m14s"),
+                         60, False)[0][1]
+    assert ("2m14s", a.META) in spans
+
+
+def test_the_root_name_span_is_orch_and_the_label_plain():
+    spans = a._root_lines(header(text="conversation", harness="claude-native"),
+                          60)[1]
+    assert ("conversation", a.ORCH) in spans
+    assert (a.harness_mark("claude-native"), "mark:anthropic") in spans
+    assert ("Claude Code", a.PLAIN) in spans
+
+
+def test_every_lines_spans_rejoin_to_the_composed_text_at_every_width():
+    # The invariant the two axes rest on: colour only PARTITIONS a line, so the
+    # text is unchanged whether you join the spans or read the rendered list.
+    rows = [header(), rail("idle"),
+            worker("w1", "idle", text="one", harness="claude-native", meta="12s"),
+            worker("w2", "working", text="two", agent="zen", meta="failed")]
+    frame = a.Frame(rows=rows, selected=2, spin=1)
+    for width in (80, 46, 20, 8, 4, 1):
+        pane = a._pane(frame, width)
+        assert a.render(frame, width=width) == [a.line_text(i) for i in pane.items]
+        for item in pane.items:
+            assert a.line_text(item) == _join(item[0])
+    # And a line's spans rejoin to EXACTLY the string the layout composes — pinned
+    # against a literal, so a span helper that dropped or duplicated text fails.
+    tight = a.worker_box(
+        worker("w", "blocked", text="task", agent="cmdcode", meta="waiting on you"),
+        20, False)[0][1]
+    assert _join(tight) == "⦿ ⏸ │waiting on you│"
+    clipped = a.worker_box(
+        worker("w", "blocked", text="task", agent="cmdcode",
+               meta="waiting on you forever and ever"),
+        20, False)[0][1]
+    assert _join(clipped) == "⦿ ⏸ │waiting on yo…│"
+
+
+def test_a_monochrome_terminal_spends_no_pair_and_still_paints(monkeypatch):
+    frame = a.Frame(rows=[header(),
+                          worker("w1", "idle", harness="claude-native",
+                                 agent="zen", meta="12s")], selected=1)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=0)
+    assert fake.init_pair_calls == [], "no colour support, no pair"
+    assert any(chunk.strip() for _r, _c, chunk, _a in writes), "the pane painted"
+
+
+def test_an_eight_colour_terminal_skips_the_256_colour_roles(monkeypatch):
+    # Every vendor colour and the meta slate is >= 8, so an 8-colour terminal can
+    # hold none of them: every coloured role falls back to no colour, and no pair
+    # is spent. It must not raise, and it must not paint a wrong colour.
+    frame = a.Frame(rows=[header(),
+                          worker("w1", "idle", harness="claude-native",
+                                 agent="zen", meta="12s")], selected=1)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=8, color_pairs=256)
+    assert fake.init_pair_calls == []
+    assert writes
+
+
+def test_pair_exhaustion_degrades_rather_than_crashing(monkeypatch):
+    # Pair 0 is reserved, so a `COLOR_PAIRS` of 1 can allocate nothing and one of
+    # 2 can allocate exactly one. Neither may crash, and neither may paint a role
+    # the table could not hold.
+    frame = a.Frame(rows=[header(),
+                          worker("w1", "idle", harness="claude-native",
+                                 agent="zen", meta="12s")], selected=1)
+    starved, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=1)
+    assert starved.init_pair_calls == []
+    assert writes
+
+    one, _writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=2)
+    assert len(one.init_pair_calls) <= 1
+    assert all(pair < 2 for pair, _fg, _bg in one.init_pair_calls)
+
+
+def test_a_coloured_terminal_spends_a_pair_on_the_mark_and_bolds_it(monkeypatch):
+    frame = a.Frame(rows=[header(harness="claude-native"),
+                          worker("w1", "idle", harness="claude-native",
+                                 meta="12s")], selected=1)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=256)
+    # The anthropic mark spent its brand colour, on a `-1` (terminal-owned)
+    # background — the pair that lets colour and transparency coexist.
+    assert (1, a._VENDOR_COLOURS["anthropic"], -1) in fake.init_pair_calls
+    mark = _writes_for(writes, a.harness_mark("claude-native"))
+    assert mark, writes
+    for attr in mark:
+        assert attr & fake.A_BOLD, "the mark is bold"
+        assert attr & 0xFF00, "the mark carries a colour pair"
+
+
+def test_the_root_name_is_bold_and_uncoloured(monkeypatch):
+    frame = a.Frame(rows=[header(text="conversation", harness="claude-native")],
+                    selected=0)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=256)
+    name = _writes_for(writes, "conversation")
+    assert name, writes
+    for attr in name:
+        assert attr & fake.A_BOLD, "ORCH is bold"
+        assert not attr & 0xFF00, "ORCH carries no colour"
+
+
+def test_the_meta_write_carries_the_meta_colour_and_is_not_bold(monkeypatch):
+    frame = a.Frame(rows=[worker("w1", "idle", meta="12s")], selected=0)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=256)
+    meta = _writes_for(writes, "12s")
+    assert meta, writes
+    for attr in meta:
+        assert attr & 0xFF00, "META is coloured"
+        assert not attr & fake.A_BOLD, "META is not bold"
+    assert (1, a.META_COLOR, -1) in fake.init_pair_calls
+
+
+def test_bold_roles_still_bold_on_a_monochrome_terminal(monkeypatch):
+    # Bold is not a colour, so ORCH and the marks stay bold with no colour at all.
+    frame = a.Frame(rows=[header(), worker("w1", "idle",
+                                           harness="claude-native", meta="12s")],
+                    selected=1)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=0)
+    assert all(attr & fake.A_BOLD
+               for attr in _writes_for(writes, "conversation"))
+    assert all(attr & fake.A_BOLD
+               for attr in _writes_for(writes, a.harness_mark("claude-native")))
 
 
 # ---------------------------------------------------------------------------
@@ -3030,6 +3308,10 @@ class _KeyScreen(FakeScreen):
     LAST frame looked like after a key changed the view. `frame_attrs` is the
     parallel list of curses attributes per frame, so a test can see SELECTION —
     which is a paint attribute (DIM vs NORMAL), not a glyph.
+
+    A line is now written one `addnstr` per SPAN, so `frame_writes` keeps
+    `(row, col, text, attr)` for every write: reconstruct whole lines (and their
+    brightness) with `_rows_with_attr` when a test needs a row, not a span.
     """
 
     def __init__(self, keys, height=24, width=80):
@@ -3037,16 +3319,36 @@ class _KeyScreen(FakeScreen):
         self.keys = list(keys)
         self.frames: list[list[str]] = []
         self.frame_attrs: list[list[int]] = []
+        self.frame_writes: list[list[tuple[int, int, str, int]]] = []
 
     def erase(self):
         self.frames.append([])
         self.frame_attrs.append([])
+        self.frame_writes.append([])
 
     def addnstr(self, row, col, text, n, attr):
         self.painted.append(text)
         if self.frames:
             self.frames[-1].append(text)
             self.frame_attrs[-1].append(attr)
+            self.frame_writes[-1].append((row, col, text[:n], attr))
+
+
+def _rows_with_attr(writes):
+    """Reassemble rows from span writes: {row: (text, first_span_attr)}.
+
+    All spans of a line share the line's brightness, so the FIRST span's attribute
+    carries it — enough for a test to tell a bright box from a dim one.
+    """
+    by_row: dict[int, list] = {}
+    for row, col, text, attr in writes:
+        by_row.setdefault(row, []).append((col, text, attr))
+    out: dict[int, tuple[str, int]] = {}
+    for row, parts in by_row.items():
+        parts.sort()
+        out[row] = ("".join(text for _col, text, _attr in parts),
+                    parts[0][2])
+    return out
 
 
 def _fake_herdr_client(monkeypatch, error=None):
@@ -3220,13 +3522,12 @@ def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_ref
     assert seen == [None, "w2"], seen
     # And the box it resolved points at w2 — its task says "two" — not at w1's box,
     # which is what the old index-preserving snap would have chosen. Selection is
-    # a paint ATTRIBUTE now (bright vs DIM), so read it off the painted attrs: the
-    # worker content rows are the ones that start with the node, and the bright
-    # (non-DIM) one is w2's.
-    final = screen.frames[-1]
-    attrs = screen.frame_attrs[-1]
-    dim = attrs[-1]   # the footer is painted DIM
-    node_rows = [(text, attr) for text, attr in zip(final, attrs)
+    # a paint ATTRIBUTE now (bright vs DIM), so read it off the painted attrs: a
+    # line is written span by span, so reassemble the rows first, and the bright
+    # (non-DIM) worker content row is w2's.
+    lines = _rows_with_attr(screen.frame_writes[-1])
+    dim = lines[max(lines)][1]     # the footer is pinned to the bottom row, DIM
+    node_rows = [(text, attr) for text, attr in lines.values()
                  if text.startswith(a.NODE)]
     bright = [text for text, attr in node_rows if attr != dim]
     dimmed = [text for text, attr in node_rows if attr == dim]
