@@ -275,8 +275,8 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 # maps it to a curses attribute.
 #
 #   PLAIN      no colour, the default foreground — everything not named below.
-#   META       the worker's meta (`12s`, `done 2h ago`, `failed`, `waiting on
-#              you`): ONE colour for every meta, not bold.
+#   META       the worker's meta (`12s`, `done`, `failed`, `waiting on you`):
+#              ONE colour for every meta, not bold.
 #   ORCH       the ROOT box's NAME: bold, no colour.
 #   mark:<v>   a harness brand mark: bold, plus vendor `v`'s brand colour.
 #   state:<s>  a worker's STATUS GLYPH, in that state's colour (see
@@ -501,21 +501,28 @@ def _failure_reason(session: dict) -> Optional[str]:
 
 
 def worker_meta(session: dict, state: str, now: float) -> str:
-    """The right half of a worker's content row: `2m14s`, `waiting on you`, …
+    """The right half of a worker's content row: `2m14s`, `waiting on you`, `done`.
 
-    The clock is honest about what it actually knows. BOTH timestamps come off
-    the LISTING row (so no detail fetch buys a clock on every row), and neither
-    is a measured start: `created_at` is when the server created the session
-    ROW, and `updated_at` is its LAST ACTIVITY — a worker that has been thinking
-    for ten minutes updates it constantly. So:
+    The clock is honest about what it actually knows. `created_at` comes off the
+    LISTING row (so no detail fetch buys a clock on every row), and it is not a
+    measured start: it is when the server created the session ROW, so a worker
+    that has been thinking for ten minutes reads as its whole EXISTENCE, not as
+    a measured duration. So:
 
-      * working -> how long the session has EXISTED. For a worker dispatched to
-        run a task that is close to its runtime, and it is labelled for what it
-        is rather than dressed up as a measured duration.
-      * idle -> `updated_at` IS when it stopped, so `done 6m ago` is exact.
+      * working -> `_age(now - created_at)`, the count-up while it runs.
+      * idle -> a bare `done`. It once read `done 6m ago` — exact, since for an
+        idle row `updated_at` IS when it stopped — but the elapsed figure was
+        noise beside the name, so a stopped worker now says only that it stopped.
 
-    A row with no usable timestamp falls back to a plain word rather than a
-    figure derived from the epoch.
+    `blocked` and `failed` keep their own words (`waiting on you`, and the failure
+    reason or `failed`): a row that is waiting on a human, or has failed, must not
+    be flattened into `done`. The states the vocabulary does not name share the
+    `done` branch they have always shared.
+
+    `updated_at` is deliberately NOT read any more: the state already says the
+    worker has stopped, so there is no figure to derive from the epoch and no
+    timestamp to require. A stopped row reads `done` whether or not the listing
+    gave it an `updated_at`.
     """
     if state == "blocked":
         return "waiting on you"
@@ -525,8 +532,7 @@ def worker_meta(session: dict, state: str, now: float) -> str:
     if state == "working":
         created = _epoch(session.get("created_at"))
         return _age(now - created) if created is not None else "working"
-    updated = _epoch(session.get("updated_at"))
-    return f"done {_ago(now - updated)}" if updated is not None else "idle"
+    return "done"
 
 
 # ---------------------------------------------------------------------------
@@ -1836,11 +1842,18 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     first line, which carries SELECTED: selection is brightness, not a glyph. A
     line's brightness is the DEFAULT its spans paint at — a span hung through
     `undim` (the worker's gutter and status glyph) ignores it and stays bright.
+
+    A focus NOTICE takes the footer's row while it is up (see the tail below), so
+    the pane is exactly as tall with a notice as without one — a failed Enter must
+    not change the view's shape.
     """
     items: list[Line] = []
-    if frame.notice:
-        items.append(([(_clip(frame.notice, width), PLAIN)], NORMAL))
-    elif frame.truncated:
+    # The truncation banner stays at the TOP: it is a fact about the LISTING
+    # (rows past the page cap are missing), not about an action, so it belongs
+    # over the rows it warns about. The focus notice has a different home — it
+    # takes the footer's row, below. The two are independent, so a notice no
+    # longer suppresses this banner the way it did when both fought for row 0.
+    if frame.truncated:
         items.append(([(_clip(TRUNCATED_NOTICE, width), PLAIN)], NORMAL))
 
     blocks = _blocks(frame, width)
@@ -1850,7 +1863,17 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
         tail.extend(([(line, PLAIN)], DIM)
                     for line in access_lines(frame.access, width))
         tail.append(([("", PLAIN)], NORMAL))
-    tail.append(([(_clip(_footer(width), width), PLAIN)], DIM))
+    # The focus notice, while it is up, TAKES the footer's row rather than adding
+    # one above it: the tail is the same length either way, so the pane's row
+    # count (and its list window) does not move when a notice appears. The notice
+    # is clipped to the pane exactly as the footer is, so a long herdr error can
+    # never overflow the row. It paints NORMAL, not the footer's DIM: it reports
+    # an action that JUST FAILED, and dim is the treatment for chrome — an error
+    # an operator skims past is the one thing this line must not be.
+    if frame.notice:
+        tail.append(([(_clip(frame.notice, width), PLAIN)], NORMAL))
+    else:
+        tail.append(([(_clip(_footer(width), width), PLAIN)], DIM))
 
     room = None if height is None else max(ACCESS_LIST_FLOOR, height - len(tail))
     kept: list[list[Line]] = []
@@ -2801,8 +2824,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         offset = 0
         expanded: set[str] = set()
         # The one-line reason the last Enter could not focus, shown in the pane
-        # through `Frame.notice`. It is cleared on the NEXT keypress, so it sits
-        # for as long as the operator is reading it and goes once they act.
+        # through `Frame.notice` — on the FOOTER row, replacing it while it is up
+        # (`_pane`). It is cleared on the NEXT keypress, so it sits for as long as
+        # the operator is reading it and goes once they act.
         notice: Optional[str] = None
         # `poll` asks for a refresh now; `force` additionally drops the selected
         # row's cached report so it is read again. They are separate so Space can
