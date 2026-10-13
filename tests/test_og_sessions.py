@@ -157,12 +157,21 @@ def run(argv, opener, *, stdin=None, env=None, now=NOW):
 # the listing
 # ---------------------------------------------------------------------------
 
-def test_listing_renders_id_title_status_runner_workspace_and_age():
+def test_listing_renders_id_title_status_runner_workspace_and_age(
+        monkeypatch, tmp_path):
+    # The listing collapses a leading `$HOME` to `~`, and `shorten_home` reads
+    # it through `os.path.expanduser`, i.e. the process's HOME. Pinning the
+    # fixture at the developer's real home passes only there: in CI, HOME is
+    # /home/runner, nothing collapses, and the assertion fails on a raw path.
+    # So own the home, and DERIVE the workspace beneath it so the path and the
+    # prefix it must collapse cannot drift apart.
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
     sid = "3a3528974420426eb7d723df2bb0488d"
     opener = RecordingOpener(
         listing=[{"data": [listed(sid, title="Fix issue 502")],
                   "has_more": False}],
-        details={sid: detail_of(workspace="/Users/cryogenix/projects/og")},
+        details={sid: detail_of(workspace=str(home / "projects" / "og"))},
     )
 
     rc, out, _err = run([], opener)
