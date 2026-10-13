@@ -281,7 +281,13 @@ def test_c2_shape_is_verbatim_title_gauge_rails_and_rounded_boxes():
     heavy title bar, the gauge, a breathing rail opening each state group, and a
     ROUNDED box per worker BEHIND a rail+caret gutter. Built through `build_rows`
     from a listing, so the names, agents and glyphs are the ones the model
-    produces at width 46. The working box's glyph is the first spinner frame."""
+    produces at width 46. The working box's glyph is the first spinner frame.
+
+    A box is THREE rows: top border, ONE content row, bottom border. The content
+    row is the operator's order — glyph, 2-column mark slot, title flush left —
+    with the meta right-aligned on the SAME row. The AGENT NAME is gone (the mark
+    already says it), so nothing on a row repeats the mark.
+    """
     sessions = [
         dict(listed("root", title="Project Status Review", status="running"),
              harness="claude-native"),
@@ -311,23 +317,19 @@ def test_c2_shape_is_verbatim_title_gauge_rails_and_rounded_boxes():
         "██░░░░░░░░  1/4 done               Claude Code",
         "│",
         "│ ▸ ╭────────────────────────────────────────╮",
-        "│   │ ⠋ ▯  coders                            │",
-        "│   │ zen                               2m14s│",
+        "│   │ ⠋ ▯  coders                       2m14s│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "│   │ ⏸ ⌘  reviewers                         │",
-        "│   │ cmdcode                  waiting on you│",
+        "│   │ ⏸ ⌘  reviewers           waiting on you│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "│   │ ✗ ╔  scouts                            │",
-        "│   │ freebuff                         failed│",
+        "│   │ ✗ ╔  scouts                      failed│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "│   │ ○ ⌘  docs                              │",
-        "│   │ cmdcode                     done 6m ago│",
+        "│   │ ○ ⌘  docs                   done 6m ago│",
         "│   ╰────────────────────────────────────────╯",
         "",
         a.FOOTER_COMPACT,
@@ -337,10 +339,24 @@ def test_c2_shape_is_verbatim_title_gauge_rails_and_rounded_boxes():
     box_rows = [line for line in lines
                 if (line.startswith("│") and line.endswith("│") and len(line) > 1)]
     assert box_rows and all(len(line) == C2_WIDTH for line in box_rows)
+    # FOUR workers, ONE content row each — and FOUR tops and FOUR bottoms, so each
+    # box is top border, content row, bottom border: three rows, not four.
+    assert len(box_rows) == 4, box_rows
+    assert sum(1 for line in lines if "╭" in line) == 4
+    assert sum(1 for line in lines if "╰" in line) == 4
     assert sum(1 for line in lines if "▸" in line) == 1
     assert lines[3].startswith("│ ▸ ╭"), "the caret points at the box from outside"
     assert lines[3].index("▸") == 2, "the caret sits in its own column, after the rail"
     assert lines[3].index("╭") == 4, "the box starts after the gutter"
+    # The AGENT NAME is dropped from every row: the mark carries it, so `zen`,
+    # `cmdcode` and `freebuff` — the whole of the old second row — appear NOWHERE.
+    for name in ("zen", "cmdcode", "freebuff"):
+        assert name not in "\n".join(lines), name
+    # The meta is right-aligned on the CONTENT row: each one ends at the box's
+    # right edge, on the same line as the title.
+    for row_index, meta in ((4, "2m14s"), (8, "waiting on you"),
+                            (12, "failed"), (16, "done 6m ago")):
+        assert lines[row_index].endswith(meta + "│"), lines[row_index]
 
 
 def test_the_done_gauge_is_right_at_0_of_n_n_of_n_and_no_workers():
@@ -399,12 +415,80 @@ def test_the_caret_sits_between_the_rail_and_the_box_on_the_first_row_only():
             worker("w2", "working", text="two")]
     lines = a.render(a.Frame(rows=rows, selected=2), width=C2_WIDTH)   # w1
 
-    # Row 2 is the breathing rail; the box's four rows follow at 3..6.
+    # Row 2 is the breathing rail; the box's THREE rows follow at 3..5, then the
+    # next box at 6..8.
     assert lines[3][:4] == "│ ▸ ", "the caret leads the box's top border"
-    assert "▸" not in lines[4] and "▸" not in lines[5] and "▸" not in lines[6]
-    assert "▸" not in lines[7], "the unselected box draws no caret at all"
+    assert "▸" not in lines[4] and "▸" not in lines[5], \
+        "blank on the content and bottom rows of its own box"
+    assert "▸" not in lines[6] and "▸" not in lines[7] and "▸" not in lines[8], \
+        "the unselected box draws no caret at all"
     # The caret column (2) is strictly between the rail (0) and the box (4).
     assert lines[3].index("▸") == 2 and lines[3].index("╭") == a.GUTTER
+
+
+def test_a_worker_box_is_three_rows_and_four_when_expanded():
+    """The box collapsed from FOUR rows to THREE: top border, ONE content row,
+    bottom border. The second content row held the agent name and is gone. SPACE
+    still reveals the report as an EXTRA row INSIDE the box — now the only way to
+    read a report — so an expanded box is four rows and the snippet is a box body
+    row, never a loose line."""
+    plain, caret_row = a.worker_box(
+        worker("w", "working", text="task", agent="zen", meta="12s"),
+        C2_WIDTH, True)
+    assert len(plain) == 3, plain
+    assert caret_row == 0, "the caret row is the box's first row"
+    assert plain[0].startswith("│ ▸ ╭") and plain[2].startswith("│   ╰")
+    assert all(len(line) == C2_WIDTH for line in plain)
+    # ONE content row carries both halves: the title flush left, the meta flush
+    # right, on the SAME line.
+    assert "task" in plain[1]
+    assert plain[1].rstrip("│").endswith("12s")
+    # The agent name appears NOWHERE in the box: the mark carries it.
+    assert "zen" not in "\n".join(plain)
+
+    expanded, caret_row = a.worker_box(
+        worker("w", "working", text="task", agent="zen", meta="12s",
+               snippet="the report", expanded=True), C2_WIDTH, True)
+    assert len(expanded) == 4, expanded
+    assert caret_row == 0
+    assert expanded[0].startswith("│ ▸ ╭") and expanded[3].startswith("│   ╰")
+    assert all(len(line) == C2_WIDTH for line in expanded)
+    # The report is a body row INSIDE the box, BELOW the content row.
+    assert "the report" in expanded[2]
+    assert expanded[2].startswith("│   │") and expanded[2].endswith("│")
+    assert "task" in expanded[1] and expanded[1].rstrip("│").endswith("12s")
+
+
+def test_the_title_yields_to_the_meta_on_the_shared_content_row():
+    """TITLE and META share one line. The meta keeps its columns — it is the thing
+    being waited on — and the TITLE is what gives way first, ELLIPSISED by `_clip`
+    rather than silently blanked, so a tight row still reads the task (cut) and
+    the meta (intact), and never exceeds the pane."""
+    title = "fix: keep the state glyph at width one"
+    row = worker("w", "blocked", text=title, agent="cmdcode",
+                 meta="waiting on you")
+    # Wide: the whole title is present, the meta flush right on the same line.
+    wide, _ = a.worker_box(row, 78, False)
+    assert title in wide[1], wide[1]
+    assert wide[1].rstrip("│").endswith("waiting on you")
+
+    # Tight: the title is ellipsised and the meta is INTACT and flush right.
+    tight, _ = a.worker_box(row, 34, False)
+    assert len(tight) == 3
+    assert "…" in tight[1], tight[1]
+    assert title not in tight[1], "the title gave way"
+    assert tight[1].rstrip("│").endswith("waiting on you"), tight[1]
+    assert len(tight[1]) == 34, "and the row still fits the pane"
+
+    # A meta longer than the line can hold wins outright: the title is dropped and
+    # only the meta (clipped) remains — the row still never exceeds the pane.
+    over, _ = a.worker_box(worker("w", "blocked", text="task", agent="cmdcode",
+                                  meta="waiting on you forever and ever"),
+                           20, False)
+    assert len(over) == 3 and all(len(line) == 20 for line in over)
+    assert "task" not in over[1]
+    # The content row is the gutter + the box edge, then the meta alone (clipped).
+    assert over[1] == "│   │waiting on yo…│", over[1]
 
 
 def test_the_state_glyphs_are_static_and_working_is_the_spinner():
@@ -569,14 +653,14 @@ def test_only_the_caret_row_of_the_selected_box_carries_the_selected_role():
 
     items = a._pane(frame, 48).items
 
-    # bar, gauge, rail, box-top (caret), content, agent, box-bottom, ...
+    # bar, gauge, rail, box-top (caret), content, box-bottom, then w2's box...
     caret_rows = [i for i, (text, _role) in enumerate(items) if "▸" in text]
     assert caret_rows == [3], "the caret is on the box's top border"
     assert items[3][1] == a.SELECTED, "the caret row carries SELECTED"
-    # The rows around the caret — the rail above, and the box's content, agent
-    # and bottom rows — are NORMAL, or the whole box would read as highlighted.
+    # Everything else is NORMAL — the rail, the selected box's content and bottom
+    # rows, and the whole unselected box — or the box would read as highlighted.
     assert [role for _text, role in items[2:3]] == [a.NORMAL]
-    assert [role for _text, role in items[4:7]] == [a.NORMAL] * 3
+    assert [role for _text, role in items[4:9]] == [a.NORMAL] * 5
     assert sum(1 for _text, role in items if role == a.SELECTED) == 1
     # ...and it is the TITLE bar, not SELECTED, that spends REVERSE.
     assert items[0][1] == a.TITLE
@@ -596,10 +680,10 @@ def test_the_caret_is_the_only_marker_and_moves_with_the_selection():
             worker("w2", "idle", text="two")]
 
     on_w1 = a.render(a.Frame(rows=rows, selected=2), width=48)   # caret row 3
-    on_w2 = a.render(a.Frame(rows=rows, selected=3), width=48)   # caret row 7
+    on_w2 = a.render(a.Frame(rows=rows, selected=3), width=48)   # caret row 6
 
-    assert "▸" in on_w1[3] and "▸" not in on_w1[7]
-    assert "▸" in on_w2[7] and "▸" not in on_w2[3]
+    assert "▸" in on_w1[3] and "▸" not in on_w1[6]
+    assert "▸" in on_w2[6] and "▸" not in on_w2[3]
     # The two frames differ ONLY in where the caret sits.
     blanked = [[line.replace("▸", " ") for line in frame] for frame in (on_w1, on_w2)]
     assert blanked[0] == blanked[1]
@@ -624,8 +708,8 @@ def test_a_selection_move_still_repaints_the_pane():
 
     assert after != before, "the caret moved, so the composed lines changed"
     assert a.paint_needed(after, before) is True
-    # The caret really did move to the other worker's box.
-    assert "▸" in after[7][0] and "▸" not in after[3][0]
+    # The caret really did move to the other worker's box (w2's first row is 6).
+    assert "▸" in after[6][0] and "▸" not in after[3][0]
 
 
 def test_every_harness_mark_fills_the_slot_and_every_title_starts_in_one_column():
@@ -708,7 +792,8 @@ def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
     """The trimmer works in whole blocks (a root, or a rail and its boxes), so a
     box can never be cut in half and a group's rail never leaves its boxes. With
     the worded labels gone there is no label left to orphan, which is why the
-    block is now just the rail and the boxes."""
+    block is now just the rail and the boxes. A box is THREE rows, so the block
+    arithmetic below is a rail + three rows."""
     rows = [header(), rail("working"),
             worker("w1", "working", text="one"),
             rail("idle"),
@@ -717,9 +802,9 @@ def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
     joined = "\n".join(full)
     assert joined.count("╭") == 2 and joined.count("╰") == 2
 
-    # Room for the root block (2 rows) and the first group (rail + box = 5 rows)
-    # but not the second group: the second group is dropped WHOLE, so its box is
-    # never cut and its rail is never left behind without it.
+    # Room for the root block (2 rows) and the first group (rail + 3-row box = 4
+    # rows) but not the second group: the second group is dropped WHOLE, so its box
+    # is never cut and its rail is never left behind without it.
     short = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=10)
     short_joined = "\n".join(short)
     assert "one" in short_joined
@@ -728,6 +813,23 @@ def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
     # And no label word is left behind anywhere.
     for word in OLD_GROUP_LABELS:
         assert word not in short_joined, word
+
+
+def test_height_trimming_never_splits_an_expanded_four_row_box():
+    """The trim arithmetic follows the shorter box automatically, and it must
+    still keep an EXPANDED box whole. A block is now a rail + a three-row box (four
+    when expanded); across a range of heights a box is either absent or complete —
+    its borders always come as a pair and the report row never outlives them."""
+    rows = [header(), rail("working"),
+            worker("w1", "working", text="one", snippet="the report",
+                   expanded=True)]
+    for height in range(6, 14):
+        lines = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=height)
+        joined = "\n".join(lines)
+        assert joined.count("╭") == joined.count("╰"), (height, lines)
+        if "╭" in joined:
+            assert "one" in joined and "the report" in joined, (height, lines)
+            assert "\n".join(lines).count("╰") == 1, (height, lines)
 
 
 def test_a_worker_row_never_exceeds_the_pane_at_any_width():
