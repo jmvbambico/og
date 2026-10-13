@@ -261,7 +261,71 @@ def rgb_to_hex(rgb: Iterable[float]) -> str:
 # is also already the constant `oklab_hue` uses to decide whether a colour has a
 # hue at all, so the guard and the hue test cannot disagree about what "neutral"
 # means.
+#
+# It says WHEN a colour is worth protecting. `MAX_CHROMA_PENALTY`, below, says
+# how far the converter may go to protect it, and neither number means anything
+# without the other.
 NEUTRAL_CHROMA = 0.02
+
+# How much WORSE than its own nearest cell the converter may answer, in OKLab
+# distance, in order to keep a colour's chroma. The other half of the no-
+# desaturation rule, and the boundary of it.
+#
+# `NEUTRAL_CHROMA` says WHEN a colour is worth protecting; this says HOW FAR the
+# converter may go to protect it, and the two are the same kind of number on
+# purpose: both are distances in the metric `hex_to_ansi256` already minimises.
+# An unbounded guard is not a guard, it is a second objective. Measured over the
+# chromatic role-colours in installer/themes.json, refusing neutral cells outright
+# makes the converter 4.5x worse in exactly the metric it minimises, on the
+# palette's darkest and most common ground:
+#
+#     tokyo-night.bg      #1a1b26  nearest 234 #1c1c1c 0.0214  -> 17 #00005f 0.1319
+#     ayu-dark.sel_bg     #253340  nearest 236 #303030 0.0304  -> 23 #005f5f 0.1395
+#     palenight.bg        #292d3e  nearest 236 #303030 0.0324  -> 52 #5f0000 0.1414
+#     nord.bg             #2e3440  nearest 236 #303030 0.0275  -> 23 #005f5f 0.1350
+#     dracula.bg          #282a36  nearest 235 #262626 0.0295  -> 52 #5f0000 0.1359
+#
+# The operator's DEFAULT pane background would be dark maroon and Nord's and Ayu
+# Dark's would be teal: a more visible wrong than the grey the guard replaced.
+#
+# WHY IT HAPPENS, AND IT IS NOT A BUG IN THE SEARCH. The 6x6x6 cube's lowest
+# non-zero rung is 95, and of the 240 cells only twenty carry a tint rather than a
+# hue -- #5f5f87, #87afaf, #ffd7af, the operator's parchment among them -- and
+# every one of the twenty sits above OKLab L 0.502. Below that the only chromatic
+# cells are saturated primaries (#00005f, chroma 0.152; #005f5f, 0.075; #5f0000,
+# 0.125), so a dark target asking for a chroma of 0.02 to 0.07 is asking for a
+# colour the palette does not contain. The guard was reaching for it anyway.
+#
+# 68 of the 121 chromatic role-colours the catalog publishes pay NO penalty at
+# all -- the chromatic cell IS the nearest cell, so the guard is free for them --
+# and the rest are two populations rather than one. THE PENALTY AND THE LIGHTNESS
+# AGREE ON WHICH IS WHICH: every chromatic role above OKLab L 0.44 pays at most
+# 0.0328 (the heaviest is Bearded Dark's meta #515666, L 0.455), and every role
+# paying more than 0.0393 sits at or below L 0.434 (the lightest is One Dark's rail
+# #495162). Nothing lives between.
+#
+# THE NUMBER IS THE HOLE BETWEEN THOSE TWO POPULATIONS. The non-zero penalties run
+# 0.0052 to 0.1105 with two gaps big enough to be a boundary, 0.0328-0.0393
+# (0.0066) and 0.0428-0.0502 (0.0075). The second is the wider of the two and it
+# is NOT the one: both its sides are dark targets, so it splits a single
+# population and is arithmetic rather than a line between two kinds of colour. The
+# first separates them, and 0.035 sits inside it -- 0.0022 above the heaviest
+# cheap penalty and 0.0043 below the lightest expensive one. On the shipped,
+# nudged catalog the same hole reads 0.0331-0.0357 and falls to the same
+# partition, and test_the_cap_sits_in_the_gap_the_catalog_leaves pins both edges
+# so a later nudge cannot slide a role across one of them unnoticed.
+#
+# NOT 0.03, AND THE TWO ROLES THAT DECIDE IT. On the published palettes a cap of
+# 0.03 would refuse Bearded Dark's meta #515666 at L 0.455; on the shipped one it
+# would refuse Monokai Light's rail #d3c5bc at L 0.832, a colour on a LIGHT pane
+# that paints as cell 251 (#d7d7d7), a pure grey. Either is the original defect
+# re-created in the band where it shows most, so the cut goes above both.
+#
+# This is not a retreat from NEUTRAL_CHROMA. It is that constant's boundary. A grey
+# 0.03 away beats a maroon 0.14 away, and the z-ai row of `_VENDOR_COLOURS`
+# already argues the shape of it: it pays 2.187 of OKLab to keep a hue. Bounded,
+# not any price.
+MAX_CHROMA_PENALTY = 0.035
 
 
 def rgb_to_oklab(rgb: Iterable[float]) -> tuple:
@@ -288,6 +352,15 @@ def rgb_to_oklab(rgb: Iterable[float]) -> tuple:
     return (0.2104542553 * long_ + 0.7936177850 * medium - 0.0040720468 * short,
             1.9779984951 * long_ - 2.4285922050 * medium + 0.4505937099 * short,
             0.0259040371 * long_ + 0.7827717662 * medium - 0.8086757660 * short)
+
+
+# The palette in OKLab, and the chromatic half of it, built once at import. The
+# converter searches one or the other for every colour on every call, and it does
+# the arithmetic once more than it used to (see MAX_CHROMA_PENALTY), so the cells
+# are converted here rather than inside a `key=` on each of the 240 candidates.
+PALETTE_LAB = tuple((index, rgb_to_oklab(rgb)) for index, rgb in PALETTE)
+CHROMATIC_LAB = tuple((index, rgb_to_oklab(rgb))
+                      for index, rgb in CHROMATIC_PALETTE)
 
 
 def oklab_hue(rgb: Iterable[float]) -> tuple:
@@ -317,35 +390,50 @@ HUE_TOLERANCE = 12.0
 MARK_MIN_CONTRAST = 3.0
 
 
+def _nearest(pool: tuple, target: tuple) -> tuple:
+    """`(index, distance)` for the cell of `pool` nearest `target` in OKLab.
+
+    Ties go to the LOWER index, which is what makes the converter reproducible
+    on any machine: `min` over a tuple is stable, so the answer cannot depend on
+    dict or set iteration order.
+    """
+    return min(((index, math.dist(target, lab)) for index, lab in pool),
+               key=lambda pair: (pair[1], pair[0]))
+
+
 def hex_to_ansi256(value: str) -> int:
     """The palette index NEAREST `value`, judged in OKLab over all 240 cells —
-    or over the subset of them that can HONOUR the colour.
+    or over the subset of them that can HONOUR the colour, and only within a
+    bounded extra distance.
 
-    THE RULE: a target whose OKLab chroma exceeds `NEUTRAL_CHROMA` is searched
-    against `CHROMATIC_PALETTE` only, so it can never resolve to a neutral cell.
-    A target at or below the threshold really is neutral, has no hue to preserve,
-    and is searched against the whole palette exactly as before — the greyscale
-    ramp is the correct answer for it. The threshold is the same constant
-    `oklab_hue` uses to decide whether a colour has a hue at all, so the converter
-    and the hue test cannot disagree about what "neutral" means.
+    THE RULE, IN TWO CLAUSES. A target whose OKLab chroma exceeds
+    `NEUTRAL_CHROMA` is searched against `CHROMATIC_LAB` instead of the whole
+    palette, so it can never resolve to a neutral cell — UNLESS the nearest
+    chromatic cell costs more than `MAX_CHROMA_PENALTY` of OKLab distance over
+    the nearest cell overall, in which case the palette plainly cannot hold this
+    colour's tint and the nearest cell wins. A target at or below the chroma
+    threshold really is neutral, has no hue to preserve, and is searched against
+    the whole palette exactly as before: the greyscale ramp is the correct
+    answer for it. Both constants are the ones `oklab_hue` uses to decide
+    whether a colour has a hue at all, so the converter and the hue test cannot
+    disagree about what "neutral" means.
 
-    WHY, WHEN "NEAREST" LOOKS LIKE THE WHOLE RULE. The z-ai row of
-    `_VENDOR_COLOURS` already made the argument in its own words — "HUE IS THE
-    CHANNEL A BRAND MARK IS RECOGNISED BY", and a sage that lands on a grey is
-    "simply the wrong colour", so 144 (the strictly nearer cell) is overridden by
-    108. Nearest is a tie-break among cells that are the RIGHT COLOUR. Measured
-    over the whole palette it is not even that, because the greyscale ramp is
-    spread across the entire lightness axis and so is usually the nearest cell to
-    any dim, low-chroma colour: dracula's background #282a36 (OKLab chroma 0.022)
-    resolved to 235, nord's #2e3440 to 236, and solarized-dark's #002b36 (chroma
-    0.049) to 235. Twenty-three of the twenty-five catalog themes lost at least
-    one role that way — 52 roles, target chroma from 0.0212 to 0.0788 — and the
-    feature was neutralised on every terminal that reports 256 colours, which is
-    every terminal that does NOT claim truecolor, tmux included. That is why this
-    is a guard and not a penalty: a penalty still lets a strong-enough lightness
-    match win, and the ramp must not be a candidate at all.
+    WHY THE FIRST CLAUSE ALONE WAS NOT ENOUGH. The greyscale ramp is spread
+    across the entire lightness axis and so is usually the nearest cell to any
+    dim, low-chroma colour, so refusing it outright handed 52 role-colours across
+    23 of the 25 catalog themes to the cube's saturated primaries: dracula's
+    background became 52 (#5f0000, a dark maroon), nord's 23 (#005f5f, teal),
+    solarized-dark's 17 (#00005f). Every one of those is 4.5x further from the
+    colour that was asked for than the grey it replaced, in the metric this
+    function exists to minimise — a more visible wrong than the one it fixed.
+    The cube's lowest non-zero rung is 95, so a dark chromatic target has no
+    unsaturated chromatic cell near it at all; `MAX_CHROMA_PENALTY` is what says
+    so out loud instead of shipping the primary. See that constant for the
+    measurement, and NEUTRAL_CHROMA for the defect the first clause exists to
+    fix: dracula's parchment #f0e6d2 painting as 254, a pure grey, 96 degrees of
+    hue from the colour that was asked for.
 
-    Deterministic: the cube is walked in index order and ties go to the lower
+    Deterministic: the cells are walked in index order and ties go to the lower
     index, so the same hex always answers with the same number on every machine.
     Raises on anything that is not a hex — a caller that passes `"default"` has a
     bug, and `Theme.index` is where that case is meant to be caught.
@@ -353,10 +441,12 @@ def hex_to_ansi256(value: str) -> int:
     if not ANY_HEX_RE.match(value):
         raise ThemeError(f"{value!r} is not a #rrggbb colour")
     target = rgb_to_oklab(hex_to_rgb(value))
-    chromatic = math.hypot(target[1], target[2]) > NEUTRAL_CHROMA
-    best = min(CHROMATIC_PALETTE if chromatic else PALETTE,
-               key=lambda row: (math.dist(target, rgb_to_oklab(row[1])), row[0]))
-    return best[0]
+    nearest, distance = _nearest(PALETTE_LAB, target)
+    if math.hypot(target[1], target[2]) > NEUTRAL_CHROMA:
+        tinted, tinted_distance = _nearest(CHROMATIC_LAB, target)
+        if tinted_distance - distance <= MAX_CHROMA_PENALTY:
+            return tinted
+    return nearest
 
 
 # A terminal reporting at least this many colours takes a 24-bit RGB value

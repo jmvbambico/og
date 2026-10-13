@@ -26,10 +26,15 @@
     "is what paints. On the terminal this ships to -- TERM=tmux-256color, so",
     "curses.COLORS is 256 and init_color does not exist -- a hex is quantised to",
     "one of the 240 palette cells, and a theme can clear every floor above on",
-    "paper and still paint under it. A colour that carries chroma may never",
+    "paper and still paint under it. A colour that carries chroma will not",
     "resolve to a neutral cell (installer/og_themes.py refuses it): 52 roles",
     "across 23 of the 25 themes used to lose their chroma to the greyscale ramp,",
     "so Nord and Solarized Dark and every Catppuccin lavender rendered as grey.",
+    "That refusal is BOUNDED, because the 6x6x6 cube's darkest cells are",
+    "saturated primaries -- no tinted cell exists below OKLab L 0.502, so a dark",
+    "tint costs 0.13 to keep and 0.03 to drop. Past MAX_CHROMA_PENALTY the ramp",
+    "wins and the nearest cell is the honest answer; 33 of the 175 role-colours",
+    "here take that route and every one of them is below that lightness.",
     "",
     "Where a theme's published foreground cannot reach its target, that single",
     "value is nudged in LIGHTNESS ONLY (hue and saturation untouched), by the",
@@ -100,11 +105,11 @@
       "colors": {
         "bg": "#fafafa",
         "text": "#5c6773",
-        "meta": "#899099",
+        "meta": "#888f97",
         "sel_bg": "#f0eee4",
-        "idle": "#729900",
-        "working": "#bf8500",
-        "rail": "#cecccb"
+        "idle": "#739a00",
+        "working": "#bd8400",
+        "rail": "#cdcbca"
       }
     },
     "bearded-dark": {
@@ -117,7 +122,7 @@
         "sel_bg": "#34373d",
         "idle": "#37ae6f",
         "working": "#c9a022",
-        "rail": "#3b404a"
+        "rail": "#3b414b"
       }
     },
     "bearded-light": {
@@ -129,21 +134,21 @@
         "meta": "#68909c",
         "sel_bg": "#c9e4ec",
         "idle": "#189433",
-        "working": "#9b7c00",
-        "rail": "#bcc2c7"
+        "working": "#9c7d00",
+        "rail": "#bbc1c6"
       }
     },
     "catppuccin-frappe": {
       "label": "Catppuccin Frappe",
       "order": 6,
       "colors": {
-        "bg": "#444963",
+        "bg": "#303446",
         "text": "#c6d0f5",
-        "meta": "#a5a9ba",
+        "meta": "#797f98",
         "sel_bg": "#414559",
         "idle": "#a6d189",
         "working": "#e5c890",
-        "rail": "#6c7492"
+        "rail": "#51576d"
       }
     },
     "catppuccin-latte": {
@@ -151,11 +156,11 @@
       "order": 7,
       "colors": {
         "bg": "#eff1f5",
-        "text": "#484b63",
+        "text": "#4a4d66",
         "meta": "#777d93",
         "sel_bg": "#ccd0da",
-        "idle": "#3e9b29",
-        "working": "#b57318",
+        "idle": "#3e9c2a",
+        "working": "#b47317",
         "rail": "#bcc0cc"
       }
     },
@@ -182,7 +187,7 @@
         "sel_bg": "#313244",
         "idle": "#a6e3a1",
         "working": "#f9e2af",
-        "rail": "#393d53"
+        "rail": "#3a3e54"
       }
     },
     "dracula": {
@@ -222,7 +227,7 @@
         "sel_bg": "#504945",
         "idle": "#b8bb26",
         "working": "#fabd2f",
-        "rail": "#494442"
+        "rail": "#494542"
       }
     },
     "monokai-dark": {
@@ -235,7 +240,7 @@
         "sel_bg": "#49483e",
         "idle": "#a8dc76",
         "working": "#ffd966",
-        "rail": "#464538"
+        "rail": "#464539"
       }
     },
     "monokai-light": {
@@ -244,11 +249,11 @@
       "colors": {
         "bg": "#faf4f2",
         "text": "#29242a",
-        "meta": "#8d8687",
+        "meta": "#8e8687",
         "sel_bg": "#eee5de",
         "idle": "#259966",
-        "working": "#c4750a",
-        "rail": "#d2c4bb"
+        "working": "#c2740a",
+        "rail": "#d3c5bc"
       }
     },
     "nord": {
@@ -256,12 +261,12 @@
       "order": 15,
       "colors": {
         "bg": "#2e3440",
-        "text": "#dbe1eb",
-        "meta": "#909bb0",
-        "sel_bg": "#4a5367",
+        "text": "#d8dee9",
+        "meta": "#717e99",
+        "sel_bg": "#3b4252",
         "idle": "#a3be8c",
         "working": "#ebcb8b",
-        "rail": "#67748f"
+        "rail": "#4c566a"
       }
     },
     "one-dark": {
@@ -269,8 +274,8 @@
       "order": 16,
       "colors": {
         "bg": "#282c34",
-        "text": "#c7ccd4",
-        "meta": "#6e7686",
+        "text": "#abb2bf",
+        "meta": "#6e7786",
         "sel_bg": "#3e4451",
         "idle": "#98c379",
         "working": "#d19a66",
@@ -283,10 +288,10 @@
       "colors": {
         "bg": "#fafafa",
         "text": "#2a2b33",
-        "meta": "#8e8f96",
+        "meta": "#8c8d95",
         "sel_bg": "#d0d0d0",
         "idle": "#3e953a",
-        "working": "#af8a3c",
+        "working": "#ae893b",
         "rail": "#cccccc"
       }
     },
@@ -313,7 +318,7 @@
         "sel_bg": "#31353a",
         "idle": "#19f9d8",
         "working": "#ffb86c",
-        "rail": "#424655"
+        "rail": "#424756"
       }
     },
     "solarized-dark": {
@@ -321,12 +326,12 @@
       "order": 20,
       "colors": {
         "bg": "#002b36",
-        "text": "#c5cdcd",
+        "text": "#93a1a1",
         "meta": "#5d757c",
         "sel_bg": "#073642",
         "idle": "#859900",
         "working": "#b58900",
-        "rail": "#0a4a5b"
+        "rail": "#0a4b5b"
       }
     },
     "solarized-light": {
@@ -334,12 +339,12 @@
       "order": 21,
       "colors": {
         "bg": "#fdf6e3",
-        "text": "#586a72",
+        "text": "#576970",
         "meta": "#809090",
         "sel_bg": "#eee8d5",
-        "idle": "#829600",
+        "idle": "#839600",
         "working": "#b28700",
-        "rail": "#d3c493"
+        "rail": "#d3c392"
       }
     },
     "synthwave-84": {
@@ -352,7 +357,7 @@
         "sel_bg": "#34294f",
         "idle": "#72f1b8",
         "working": "#f3e70f",
-        "rail": "#3e3e6d"
+        "rail": "#3e3e6e"
       }
     },
     "tailwind": {
@@ -362,7 +367,7 @@
         "bg": "#0f172a",
         "text": "#e2e8f0",
         "meta": "#64748b",
-        "sel_bg": "#253249",
+        "sel_bg": "#1e293b",
         "idle": "#22c55e",
         "working": "#eab308",
         "rail": "#334155"
@@ -373,12 +378,12 @@
       "order": 24,
       "colors": {
         "bg": "#1a1b26",
-        "text": "#bfc5e0",
+        "text": "#bec4e0",
         "meta": "#6872a0",
         "sel_bg": "#33467c",
         "idle": "#9ece6a",
         "working": "#e0af68",
-        "rail": "#363a53"
+        "rail": "#393d58"
       }
     },
     "tokyo-night-light": {
@@ -387,11 +392,11 @@
       "colors": {
         "bg": "#e6e7ed",
         "text": "#343b59",
-        "meta": "#6671a3",
+        "meta": "#6771a4",
         "sel_bg": "#dcdee3",
         "idle": "#385f0d",
         "working": "#8f5e15",
-        "rail": "#b4b5bc"
+        "rail": "#b5b6bc"
       }
     }
   }

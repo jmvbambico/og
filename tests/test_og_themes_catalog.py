@@ -28,9 +28,12 @@ Three things this file pins that a shape test would not:
     A nudge marked `post-conversion` was needed by the SECOND run of the floors
     -- the one that measures the resolved cells -- and POST_CONVERSION names them.
 
-  * NO ROLE COLLAPSES TO NEUTRAL. What a theme hex converts to is half the spec;
-    what it converts to is the rest of it. See
-    test_no_role_collapses_from_chromatic_to_a_neutral_cell.
+  * NO ROLE COLLAPSES TO NEUTRAL UNLESS THE PALETTE CANNOT HOLD ITS TINT. What a
+    theme hex converts to is half the spec; what it converts to is the rest of
+    it. The converter refuses neutral cells for any colour carrying chroma, and
+    -- because the cube's dark cells are saturated primaries -- it stops refusing
+    past a bounded price. See test_a_chromatic_role_only_collapses_where_the_palette
+    _has_no_tint and test_the_cap_sits_in_the_gap_the_catalog_leaves.
 
   * The Dracula parchment exception. dracula.text is #ffd7af, ansi 223 exactly,
     NOT Dracula's own #f8f8f2. That is the operator's explicit request, not a
@@ -222,152 +225,164 @@ PUBLISHED = {
 #
 # THE TWO ROUNDS. A line marked `post-conversion` was moved by the SECOND run of
 # the floors -- the one that measures the RESOLVED 256-colour CELLS rather than
-# the declared hexes. Every one of them passed on paper and failed on the
-# terminal, which is the whole point: the hex is half the spec and the cell it
-# converts to is the other half, and the hex alone is not what anyone looks at.
-# A colour can clear 3.07:1 on paper and paint at 1.99:1, because the cell it
-# lands on is a different colour.
+# the declared hexes. Most of the table is that round: 39 of the 42. Every one of
+# them passed on paper and failed on the terminal, which is the whole point: the
+# hex is half the spec and the cell it converts to is the other half, and the hex
+# alone is not what anyone looks at. A colour can clear 3.07:1 on paper and paint
+# at 1.99:1, because the cell it lands on is a different colour.
 #
 # THE MOVEMENT IS MOSTLY `meta` and `rail`, for two reasons that happen to agree:
 # comment colours are dim by design and most sat under 3.0, and structural greys
-# were effectively invisible against their own background. `bg` moves once
-# (Catppuccin Frappe, +0.096) and `sel_bg` twice (Nord, Tailwind), because the
-# converter put both of them on the same cell as the pane in three themes and a
-# selected row you cannot see is not a selected row.
+# were effectively invisible against their own background.
 #
-# `text` moved in six themes and the cell run is why three of them exist at all.
-# Solarized Dark is the worst case at +0.184: its #93a1a1 has so little chroma
-# (0.016, below the threshold) that it is a neutral, it resolves to ramp cell
-# 247, and on a 256 terminal that is 2.80:1 against its own selection cell --
-# so the only direction available to a dark theme is up, and the text ends up on
-# cell 252. It is a visible departure from Solarized's published foreground and it
-# is recorded here rather than hidden: the alternative was shipping a body text
-# that does not clear its floor.
+# WHAT THE CAP CHANGED, AND IT IS WORTH THE SPACE. This table was re-derived from
+# scratch when `MAX_CHROMA_PENALTY` bounded the converter, and three things moved
+# that are easier to state than to rediscover:
+#
+#   * `bg` is no longer nudged anywhere, and `sel_bg` is not either. Under the
+#     unbounded guard a dark background was forced onto a saturated cube cell --
+#     Catppuccin Frappe's #303446 became #005f5f, so its meta painted at 1.99:1
+#     and the background itself had to move +0.096 in lightness to give the meta
+#     something to read on. With the cap both roles land on the ramp one rung
+#     apart, which is what a pane and a selected row actually want, and Nord's
+#     and Tailwind's two sel_bg nudges exist no more.
+#   * Solarized Dark's body text stops moving at all. Its #93a1a1 has chroma 0.016,
+#     below the threshold, so it is a neutral and took the ramp either way; what
+#     the unbounded guard did was drag the BACKGROUND onto #00005f, 0.1311 of
+#     OKLab away where the grey it replaced is 0.0486, which is why the text had to
+#     climb to +0.184 to clear 4.5:1 against it. On the capped mapping it clears
+#     at 5.65:1 un-nudged.
+#   * Bearded Dark's rail is the longest move left in the table, +0.214, and it
+#     has to be: #0b0c0e is nearly the same colour as its own background, so a
+#     rail you can see is a long way from the published one no matter what.
 NUDGES = {
     "ayu-dark": {
-        "rail": ("#2d3640", "#2e3741"),  # L +0.004
+        "rail": ("#2d3640", "#2e3741"),  # L +0.004, post-conversion
     },
     "ayu-light": {
-        "idle": ("#86b300", "#729900"),  # L -0.051, post-conversion
-        "meta": ("#abb0b6", "#899099"),  # L -0.124
-        "rail": ("#d9d8d7", "#cecccb"),  # L -0.045
-        "working": ("#eba400", "#bf8500"),  # L -0.086
+        "idle": ("#86b300", "#739a00"),  # L -0.049, post-conversion
+        "meta": ("#abb0b6", "#888f97"),  # L -0.129, post-conversion
+        "rail": ("#d9d8d7", "#cdcbca"),  # L -0.049, post-conversion
+        "working": ("#eba400", "#bd8400"),  # L -0.090, post-conversion
     },
     "bearded-dark": {
         "meta": ("#515666", "#6c7388"),  # L +0.120, post-conversion
-        "rail": ("#0b0c0e", "#3b404a"),  # L +0.212, post-conversion
+        "rail": ("#0b0c0e", "#3b414b"),  # L +0.214, post-conversion
     },
     "bearded-light": {
-        "rail": ("#c9ced2", "#bcc2c7"),  # L -0.047, post-conversion
-        "working": ("#bb9600", "#9b7c00"),  # L -0.063, post-conversion
+        "rail": ("#c9ced2", "#bbc1c6"),  # L -0.051, post-conversion
+        "working": ("#bb9600", "#9c7d00"),  # L -0.061, post-conversion
     },
     "catppuccin-frappe": {
-        "bg": ("#303446", "#444963"),  # L +0.096, post-conversion
-        "meta": ("#737994", "#a5a9ba"),  # L +0.173, post-conversion
-        "rail": ("#51576d", "#6c7492"),  # L +0.125, post-conversion
+        "meta": ("#737994", "#797f98"),  # L +0.020, post-conversion
     },
     "catppuccin-latte": {
-        "idle": ("#40a02b", "#3e9b29"),  # L -0.014, post-conversion
+        "idle": ("#40a02b", "#3e9c2a"),  # L -0.010, post-conversion
         "meta": ("#9ca0b0", "#777d93"),  # L -0.129, post-conversion
-        "text": ("#4c4f69", "#484b63"),  # L -0.020, post-conversion
-        "working": ("#df8e1d", "#b57318"),  # L -0.092, post-conversion
+        "text": ("#4c4f69", "#4a4d66"),  # L -0.010, post-conversion
+        "working": ("#df8e1d", "#b47317"),  # L -0.096, post-conversion
     },
     "catppuccin-mocha": {
-        "rail": ("#292c3c", "#393d53"),  # L +0.076
+        "rail": ("#292c3c", "#3a3e54"),  # L +0.080, post-conversion
     },
     "gruvbox": {
-        "rail": ("#3c3836", "#494442"),  # L +0.049
+        "rail": ("#3c3836", "#494542"),  # L +0.049, post-conversion
     },
     "monokai-dark": {
-        "meta": ("#727072", "#737173"),  # L +0.004
-        "rail": ("#3e3d32", "#464538"),  # L +0.027
+        "meta": ("#727072", "#737173"),  # L +0.004, post-conversion
+        "rail": ("#3e3d32", "#464539"),  # L +0.029, post-conversion
     },
     "monokai-light": {
         "idle": ("#269d69", "#259966"),  # L -0.010, post-conversion
-        "meta": ("#a59fa0", "#8d8687"),  # L -0.096, post-conversion
-        "rail": ("#e6ded9", "#d2c4bb"),  # L -0.098, post-conversion
-        "working": ("#cc7a0a", "#c4750a"),  # L -0.016, post-conversion
+        "meta": ("#a59fa0", "#8e8687"),  # L -0.094, post-conversion
+        "rail": ("#e6ded9", "#d3c5bc"),  # L -0.094, post-conversion
+        "working": ("#cc7a0a", "#c2740a"),  # L -0.020, post-conversion
     },
     "nord": {
-        "meta": ("#616e88", "#909bb0"),  # L +0.171, post-conversion
-        "rail": ("#4c566a", "#67748f"),  # L +0.125, post-conversion
-        "sel_bg": ("#3b4252", "#4a5367"),  # L +0.071, post-conversion
-        "text": ("#d8dee9", "#dbe1eb"),  # L +0.010, post-conversion
+        "meta": ("#616e88", "#717e99"),  # L +0.065, post-conversion
     },
     "one-dark": {
-        "meta": ("#5c6370", "#6e7686"),  # L +0.078
-        "text": ("#abb2bf", "#c7ccd4"),  # L +0.096, post-conversion
+        "meta": ("#5c6370", "#6e7786"),  # L +0.078, post-conversion
     },
     "one-light": {
-        "meta": ("#a0a1a7", "#8e8f96"),  # L -0.069
-        "rail": ("#d4d4d4", "#cccccc"),  # L -0.031
-        "working": ("#d2b67b", "#af8a3c"),  # L -0.192
+        "meta": ("#a0a1a7", "#8c8d95"),  # L -0.075, post-conversion
+        "rail": ("#d4d4d4", "#cccccc"),  # L -0.031, post-conversion
+        "working": ("#d2b67b", "#ae893b"),  # L -0.196, post-conversion
     },
     "palenight": {
-        "meta": ("#697098", "#6f769c"),  # L +0.020
+        "meta": ("#697098", "#6f769c"),  # L +0.020, post-conversion
     },
     "panda": {
-        "rail": ("#3e4250", "#424655"),  # L +0.018
+        "rail": ("#3e4250", "#424756"),  # L +0.020
     },
     "solarized-dark": {
-        "meta": ("#586e75", "#5d757c"),  # L +0.024
-        "rail": ("#073642", "#0a4a5b"),  # L +0.055
-        "text": ("#93a1a1", "#c5cdcd"),  # L +0.184, post-conversion
+        "meta": ("#586e75", "#5d757c"),  # L +0.024, post-conversion
+        "rail": ("#073642", "#0a4b5b"),  # L +0.055, post-conversion
     },
     "solarized-light": {
-        "idle": ("#859900", "#829600"),  # L -0.006
-        "meta": ("#93a1a1", "#809090"),  # L -0.071
-        "rail": ("#eee8d5", "#d3c493"),  # L -0.182, post-conversion
-        "text": ("#657b83", "#586a72"),  # L -0.059
+        "idle": ("#859900", "#839600"),  # L -0.006
+        "meta": ("#93a1a1", "#809090"),  # L -0.071, post-conversion
+        "rail": ("#eee8d5", "#d3c392"),  # L -0.184, post-conversion
+        "text": ("#657b83", "#576970"),  # L -0.065, post-conversion
         "working": ("#b58900", "#b28700"),  # L -0.006
     },
     "synthwave-84": {
-        "rail": ("#1a1a2e", "#3e3e6d"),  # L +0.194
+        "rail": ("#1a1a2e", "#3e3e6e"),  # L +0.196, post-conversion
     },
     "tokyo-night": {
         "meta": ("#565f89", "#6872a0"),  # L +0.080, post-conversion
-        "rail": ("#1e202e", "#363a53"),  # L +0.120
-        "text": ("#a9b1d6", "#bfc5e0"),  # L +0.063, post-conversion
+        "rail": ("#1e202e", "#393d58"),  # L +0.135, post-conversion
+        "text": ("#a9b1d6", "#bec4e0"),  # L +0.061, post-conversion
     },
     "tokyo-night-light": {
-        "meta": ("#848cb5", "#6671a3"),  # L -0.094, post-conversion
-        "rail": ("#c1c2c7", "#b4b5bc"),  # L -0.047, post-conversion
-    },
-    "tailwind": {
-        "sel_bg": ("#1e293b", "#253249"),  # L +0.041, post-conversion
+        "meta": ("#848cb5", "#6771a4"),  # L -0.090, post-conversion
+        "rail": ("#c1c2c7", "#b5b6bc"),  # L -0.045, post-conversion
     },
 }
 
+
 POST_CONVERSION = {
+    "ayu-dark.rail",
     "ayu-light.idle",
+    "ayu-light.meta",
+    "ayu-light.rail",
+    "ayu-light.working",
     "bearded-dark.meta",
     "bearded-dark.rail",
     "bearded-light.rail",
     "bearded-light.working",
-    "catppuccin-frappe.bg",
     "catppuccin-frappe.meta",
-    "catppuccin-frappe.rail",
     "catppuccin-latte.idle",
     "catppuccin-latte.meta",
     "catppuccin-latte.text",
     "catppuccin-latte.working",
+    "catppuccin-mocha.rail",
+    "gruvbox.rail",
+    "monokai-dark.meta",
+    "monokai-dark.rail",
     "monokai-light.idle",
     "monokai-light.meta",
     "monokai-light.rail",
     "monokai-light.working",
     "nord.meta",
-    "nord.rail",
-    "nord.sel_bg",
-    "nord.text",
-    "one-dark.text",
-    "solarized-dark.text",
+    "one-dark.meta",
+    "one-light.meta",
+    "one-light.rail",
+    "one-light.working",
+    "palenight.meta",
+    "solarized-dark.meta",
+    "solarized-dark.rail",
+    "solarized-light.meta",
     "solarized-light.rail",
-    "tailwind.sel_bg",
+    "solarized-light.text",
+    "synthwave-84.rail",
     "tokyo-night-light.meta",
     "tokyo-night-light.rail",
     "tokyo-night.meta",
+    "tokyo-night.rail",
     "tokyo-night.text",
 }
+
 
 
 # What each role has to beat, and against what.
@@ -392,6 +407,12 @@ CELL_FLOOR_CASES = [
     (role, against, target)
     for (role, against), target in CELL_FLOORS.items()
 ]
+
+# What counts as a TINT on this palette, as opposed to a hue: the twenty cells
+# that carry some chroma without carrying a primary's worth of it. The bound the
+# collapse inventory is judged against is derived from them rather than written
+# down -- see _darkest_unsaturated_cell.
+UNSATURATED_CELL_CHROMA = 0.07
 
 
 # ---------------------------------------------------------------------------
@@ -699,37 +720,131 @@ def test_the_selected_row_is_still_a_different_colour_from_the_pane(themes):
         )
 
 
-def test_no_role_collapses_from_chromatic_to_a_neutral_cell(themes):
-    """THE SURVEY, FROZEN. 52 role-colours across 23 themes used to lose their
-    chroma to the greyscale ramp, and nothing caught it because every contrast
-    assertion in this file looked at the hex.
+def _penalty(value: str) -> tuple:
+    """`(penalty, nearest, tinted)` for `value`, in OKLab distance.
 
-    A colour that carries chroma is a colour somebody recognised, and the ramp
-    cannot carry it: nord's background #2e3440 painted as 236 (#303030, grey),
-    solarized-dark's #002b36 as 235, dracula's as 235, synthwave-84's rail
-    #3e3e6d as 238. The whole Catppuccin lavender family, every Nord frost, the
-    entire feature -- neutralised on the one terminal it shipped to, with a green
-    test suite.
+    `penalty` is what the guard costs: how much further the best CHROMATIC cell is
+    than the best cell of any kind. Zero means the converter had no choice to
+    make; a large one means the palette does not hold this colour's tint at any
+    price and the ramp is the honest answer.
+    """
+    target = th.rgb_to_oklab(th.hex_to_rgb(value))
+    best = min(th.PALETTE_LAB, key=lambda row: (math.dist(target, row[1]), row[0]))
+    tinted = min(th.CHROMATIC_LAB, key=lambda row: (math.dist(target, row[1]), row[0]))
+    return (math.dist(target, tinted[1]) - math.dist(target, best[1]),
+            best[0], tinted[0])
 
-    The threshold is the catalog's own: below `th.NEUTRAL_CHROMA` a target really
-    IS neutral and the ramp is the correct answer, and the darkest neutral role
-    here sits at 0.019 while the lightest chromatic one sits at 0.021. Nothing
-    lives in the gap, which is why the cut can be one number rather than a
-    judgement call.
+
+def _darkest_unsaturated_cell() -> float:
+    """The lightness of the DARKEST cell that carries a tint rather than a hue.
+
+    Computed from the palette rather than written down, because it is a fact about
+    the 6x6x6 cube and the cube does not change. Of the 240 cells, twenty carry
+    chroma without carrying a primary's worth of it -- #5f5f87, #87afaf, #ffd7af,
+    the operator's parchment among them -- and every one of the twenty sits above
+    OKLab L 0.502. Below that there is no such cell: the cube's lowest two rungs
+    are 0 and 95, so the only chromatic cells down there are #00005f (chroma
+    0.152), #005f5f (0.075) and #5f0000 (0.125), and a dark role asking for a
+    chroma of 0.02 to 0.07 is asking for a tint the palette simply does not have.
+    """
+    tints = [lightness for lightness, chroma, _hue in
+             (th.oklab_hue(rgb) for _index, rgb in th.PALETTE)
+             if th.NEUTRAL_CHROMA <= chroma < UNSATURATED_CELL_CHROMA]
+    assert tints, "no cell carries a tint; the palette changed underneath this"
+    return min(tints)
+
+
+def test_a_chromatic_role_only_collapses_where_the_palette_has_no_tint(themes):
+    """THE SURVEY, INVENTORIED. The guard is bounded, so some collapses are CORRECT.
+
+    52 role-colours across 23 themes used to lose their chroma to the greyscale
+    ramp, and nothing caught it because every contrast assertion in this file
+    looked at the hex. Refusing neutral cells outright fixed that and created the
+    opposite fault: the cube's darkest cells are saturated primaries, so dracula's
+    background became 52 (#5f0000, a dark maroon) and nord's 23 (#005f5f, teal) --
+    each about 0.13 from the colour that was asked for, where the grey was 0.03.
+    Four and a half times worse, in the metric the converter minimises, on the
+    operator's DEFAULT pane background.
+
+    `th.MAX_CHROMA_PENALTY` is the boundary between those two mistakes, and THIS
+    is the test that says which side of it the catalog is on. The claim is
+    structural, not numerical: a role may only collapse to a grey if it is DARKER
+    than every cell on the palette that carries a tint. `_darkest_unsaturated_cell`
+    puts that line at OKLab L 0.502, and the lightest role the cap refuses is at
+    0.434 -- 0.068 below it, in a band where six other Catppuccin, Dracula and
+    Nord selection cells sit too.
+
+    Thirty-three roles collapse. Nothing above L 0.434 collapses, which is the
+    assertion that matters: a mid- or high-lightness colour going grey is the
+    original defect, and this test fails the moment one does.
     """
     collapses = []
     for slug, label, colors in _rows(themes):
         for role, value in colors.items():
-            target = th.oklab_hue(th.hex_to_rgb(value))
+            lightness, chroma, _hue = th.oklab_hue(th.hex_to_rgb(value))
             cell = th.oklab_hue(th.ansi256_rgb(_index(value)))
-            if target[1] > th.NEUTRAL_CHROMA and cell[1] < th.NEUTRAL_CHROMA:
+            if chroma > th.NEUTRAL_CHROMA and cell[1] < th.NEUTRAL_CHROMA:
+                penalty, nearest, tinted = _penalty(value)
+                assert penalty > th.MAX_CHROMA_PENALTY, (
+                    f"{label}.{role} {value} collapsed with a penalty of "
+                    f"{penalty:.4f}, inside the cap -- that is the ramp winning a "
+                    "colour it should have lost, not the cap allowing one"
+                )
+                assert lightness < _darkest_unsaturated_cell(), (
+                    f"{label}.{role} {value} collapsed at OKLab L {lightness:.3f}, "
+                    "which is NOT darker than every tinted cell on the palette "
+                    f"({_darkest_unsaturated_cell():.3f}) -- the palette could have "
+                    f"held this tint and did not: nearest cell {nearest}, tinted "
+                    f"{tinted}, penalty {penalty:.4f}"
+                )
                 collapses.append(
-                    f"{label}.{role} {value} (chroma {target[1]:.3f}) -> cell "
-                    f"{_index(value)} {th.rgb_to_hex(th.ansi256_rgb(_index(value)))}")
-    assert not collapses, (
-        f"{len(collapses)} role-colours lost their chroma to a grey cell:\n  "
-        + "\n  ".join(collapses)
-    )
+                    f"{label}.{role} {value} (L {lightness:.3f}, chroma "
+                    f"{chroma:.3f}, penalty {penalty:.4f}) -> cell {_index(value)}")
+    assert len(collapses) == 33, (
+        "the collapse set moved; re-read it before accepting it\n  "
+        + "\n  ".join(collapses))
+
+
+def test_the_cap_sits_in_the_gap_the_catalog_leaves(themes):
+    """THE NUMBER IS THE DATA'S, and this is what will say so if it stops being so.
+
+    Across the 122 chromatic role-colours here, 69 have no penalty at all -- the
+    chromatic cell IS the nearest cell and the guard is free. The rest are
+    bimodal: a cheap band from 0.005 to 0.033, which is what paying for a tint
+    actually costs, and an expensive band from 0.036 to 0.111, which is what
+    reaching for a saturated primary costs. `MAX_CHROMA_PENALTY` sits in the hole
+    between them, so moving it either way changes which side a role is on only
+    when a theme is nudged again.
+
+    This is the margin. A cap that had been picked to make today's catalog look
+    right would have no room here: nudge a hex by one lightness step and it slides
+    across. 0.035 has 0.0019 above the heaviest keeper and 0.0007 below the
+    lightest collapse, and both of those numbers are small enough that this test is
+    worth having on every run rather than once.
+    """
+    kept = []
+    for _slug, _label, colors in _rows(themes):
+        for value in colors.values():
+            if th.oklab_hue(th.hex_to_rgb(value))[1] <= th.NEUTRAL_CHROMA:
+                continue
+            kept.append((_penalty(value)[0], value, _index(value)))
+    kept.sort()
+    refused = [(p, v, i) for p, v, i in kept if p > th.MAX_CHROMA_PENALTY]
+    cheap = [(p, v, i) for p, v, i in kept if p <= th.MAX_CHROMA_PENALTY]
+    assert len(kept) == 122, len(kept)
+    assert len(refused) == 33, len(refused)
+    assert max(p for p, _v, _i in cheap) == pytest.approx(0.0331, abs=5e-4), \
+        "the heaviest keeper moved; re-check the cap"
+    assert min(p for p, _v, _i in refused) == pytest.approx(0.0357, abs=5e-4), \
+        "the lightest collapse moved; re-check the cap"
+    # The cut is between them, which is the whole claim.
+    assert max(p for p, _v, _i in cheap) < th.MAX_CHROMA_PENALTY \
+        < min(p for p, _v, _i in refused)
+    # And the cap is not the 0.03 that would push Monokai Light's rail -- a
+    # LIGHT-pane colour at L 0.832 -- onto the ramp, which is the defect the
+    # guard exists to prevent, in the band where it shows most.
+    assert th.MAX_CHROMA_PENALTY > 0.0331, "a mid-lightness colour would go grey"
+    assert th.hex_to_ansi256("#d3c5bc") == 181, "monokai-light's rail lost its tint"
 
 
 def test_a_genuinely_neutral_role_still_lands_on_the_greyscale_ramp(themes):
@@ -894,7 +1009,8 @@ def test_nudge_table_covers_every_shipped_palette():
     provenance here, or test_every_shipped_colour_is_published_or_a_hue_preserving
     _lightness_nudge starts failing on the new row for the right reason."""
     summary = _nudge_comment()
-    assert len(NUDGES) == 21, f"nudged-theme count changed; re-read the table:\n{summary}"
+    assert len(NUDGES) == 20, f"nudged-theme count changed; re-read the table:\n{summary}"
+    assert sum(len(m) for m in NUDGES.values()) == 42, summary
 
 
 # ---------------------------------------------------------------------------

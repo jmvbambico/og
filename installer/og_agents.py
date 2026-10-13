@@ -2367,7 +2367,10 @@ def _role_value(role: str, theme: Optional[Theme], colors: int) -> Optional[int]
     instead of being quantised. Below truecolor the same hex goes through
     `hex_to_ansi256`, which will NOT let a colour with chroma land on a grey —
     the hex this replaced, #f0e6d2, resolved to cell 254, a pure grey, and took
-    every chromatic theme role in the catalog down with it.
+    every chromatic theme role in the catalog down with it. It will also not let
+    a DARK tint reach for the cube's saturated primaries, because paying 0.13 of
+    OKLab to hold a hue the palette cannot express is a worse failure than a
+    charcoal grey; see MAX_CHROMA_PENALTY.
 
     MARK ROLES STAY 256-PALETTE INDICES even on a truecolor terminal, because
     `_VENDOR_COLOURS` IS a table of palette indices and the readability guard

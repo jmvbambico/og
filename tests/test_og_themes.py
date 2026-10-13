@@ -102,38 +102,118 @@ def test_the_converter_is_deterministic_and_exact_on_cube_cells():
     assert th.hex_to_ansi256("#7f7f7f") in {row[0] for row in th.PALETTE}
 
 
-def test_a_chromatic_colour_never_resolves_to_a_neutral_cell():
-    """THE CONVERTER MUST NOT DESATURATE, and the numbers here are the ones.
+def test_the_converter_never_spends_more_than_the_cap_of_oklab_error():
+    """THE CONVERTER MUST NOT DESATURATE — AND MUST NOT BUY CHROMA AT ANY PRICE.
 
-    The greyscale ramp spans the whole lightness axis, so a nearest-cell search
-    over all 240 cells hands it any dim, low-chroma colour: dracula's background
-    #282a36 (OKLab chroma 0.022) resolved to 235, nord's #2e3440 to 236, and
-    solarized-dark's #002b36 (chroma 0.049) to 235. Fifty-two role-colours across
-    twenty-three of the twenty-five catalog themes lost their chroma that way,
-    and on the terminal this actually ships to -- TERM=tmux-256color, so
-    curses.COLORS is 256 and init_color does not exist -- the entire feature
-    rendered grey.
+    THE DEFECT. The greyscale ramp spans the whole lightness axis, so a
+    nearest-cell search over all 240 cells hands it any dim, low-chroma colour:
+    dracula's background #282a36 (OKLab chroma 0.022) resolved to 235, nord's
+    #2e3440 to 236, and solarized-dark's #002b36 (chroma 0.049) to 235.
+    Fifty-two role-colours across twenty-three of the twenty-five catalog themes
+    lost their chroma that way, and on the terminal this actually ships to --
+    TERM=tmux-256color, so curses.COLORS is 256 and init_color does not exist --
+    the entire feature rendered grey. So a chromatic target is searched against
+    the chromatic cells only.
 
-    So the converter excludes the ramp and the cube's own neutral diagonal from
-    the candidate set whenever the TARGET has chroma above NEUTRAL_CHROMA. One
-    rule, every colour, no per-theme exceptions.
+    THE CONSEQUENCE NOBODY DREW AT FIRST, WHICH IS WHY THIS TEST HAS TWO HALVES.
+    The cube's lowest non-zero rung is 95, so a dark chromatic target has NO
+    unsaturated chromatic cell anywhere near it and the nearest chromatic cell is
+    a saturated primary: refusing the ramp outright made dracula's background 52
+    (#5f0000, a dark maroon) and nord's 23 (#005f5f, teal), each about 0.13 from
+    the colour asked for against the grey's 0.03. That is 4.5x worse in exactly the
+    metric `hex_to_ansi256` minimises, on the DEFAULT theme's background.
+
+    So the guard is bounded by `MAX_CHROMA_PENALTY`: past that much extra OKLab
+    error the palette plainly cannot hold the colour's tint, and the nearest cell
+    wins. One rule, every colour, no per-theme exceptions.
+
+    THE RULE, over a grid of real colours rather than five of them: for a
+    chromatic target the resolved cell is neutral if and only if the nearest
+    chromatic cell costs more than the cap over the nearest cell overall. Both
+    directions are asserted, so neither a loosened cap nor a hard ban on the ramp
+    can pass.
     """
-    assert th.hex_to_ansi256("#282a36") == 52, "dracula's background went grey"
-    assert th.hex_to_ansi256("#2e3440") == 23, "nord's background went grey"
-    assert th.hex_to_ansi256("#002b36") == 17, "solarized-dark's background went grey"
-    assert th.hex_to_ansi256("#3e3e6d") == 24, "synthwave-84's rail went grey"
-    assert th.hex_to_ansi256("#f0e6d2") == 224, "the old parchment went grey"
-
-    # The rule itself, over a grid of real colours rather than five of them.
     neutral = {index for index, rgb in th.PALETTE if rgb[0] == rgb[1] == rgb[2]}
     assert len(neutral) == 30, "24 ramp cells plus the cube's own six-cell diagonal"
+    chromatic_pool = [(index, th.rgb_to_oklab(rgb))
+                      for index, rgb in th.PALETTE if index not in neutral]
+    every_pool = [(index, th.rgb_to_oklab(rgb)) for index, rgb in th.PALETTE]
+    kept = refused = 0
     for r in range(0, 256, 17):
         for g in range(0, 256, 17):
             for b in range(0, 256, 17):
                 value = "#%02x%02x%02x" % (r, g, b)
                 index = th.hex_to_ansi256(value)
-                chromatic = th.oklab_hue(th.hex_to_rgb(value))[1] > th.NEUTRAL_CHROMA
-                assert (index not in neutral) == chromatic, (value, index)
+                target = th.rgb_to_oklab(th.hex_to_rgb(value))
+                if target[1] ** 2 + target[2] ** 2 <= th.NEUTRAL_CHROMA ** 2:
+                    assert index in neutral, (value, index)
+                    continue
+                nearest = min(math.dist(target, lab) for _i, lab in every_pool)
+                tinted = min(math.dist(target, lab) for _i, lab in chromatic_pool)
+                over_cap = tinted - nearest > th.MAX_CHROMA_PENALTY
+                assert (index in neutral) == over_cap, (value, index)
+                refused += over_cap
+                kept += not over_cap
+    # Neither half may be empty: a converter that refused everything, or one that
+    # never refused anything, would both satisfy the loop above.
+    assert kept > 400 and 0 < refused < 100, (kept, refused)
+
+
+def test_the_cap_sends_draculas_background_to_its_nearest_cell():
+    """THE CAP ON THE DEFAULT THEME, WHICH IS WHERE IT MATTERS MOST.
+
+    dracula is the default theme, so this hex is the operator's pane background
+    on every terminal that reports 256 colours. Its OKLab chroma is 0.022, just
+    above NEUTRAL_CHROMA, and at lightness 0.288 the only chromatic cells within
+    reach are the cube's dark saturated ones: 52 (#5f0000, a dark maroon) at
+    0.1359 and 17 (#00005f, a navy) are both candidates the ramp-less search
+    wanted, and both are 0.106+ further from the colour than 235 (#262626, a
+    charcoal grey) at 0.0295. The palette has no charcoal-blue cell to give it;
+    235 is the honest answer and MAX_CHROMA_PENALTY is what says so out loud
+    rather than shipping the maroon.
+
+    Every number in that paragraph is asserted below, so the test fails loudly if
+    the palette, the cap or the converter moves.
+    """
+    target = th.rgb_to_oklab(th.hex_to_rgb("#282a36"))
+    nearest = min((math.dist(target, th.rgb_to_oklab(rgb)), index)
+                  for index, rgb in th.PALETTE)
+    tinted = min((math.dist(target, th.rgb_to_oklab(rgb)), index)
+                 for index, rgb in th.PALETTE
+                 if rgb[0] != rgb[1] or rgb[1] != rgb[2])
+    assert nearest == (pytest.approx(0.0295, abs=5e-4), 235), nearest
+    assert tinted[1] == 52 and tinted[0] == pytest.approx(0.1359, abs=5e-4), tinted
+    assert tinted[0] - nearest[0] > th.MAX_CHROMA_PENALTY, "the cap moved and this is no longer an example"
+    assert th.hex_to_ansi256("#282a36") == nearest[1]
+    # And the two it must NOT be: the saturated primaries the unbounded guard
+    # reached for. The operator's default pane background was going to be maroon.
+    assert th.ansi256_rgb(52) == (95, 0, 0)
+    assert th.ansi256_rgb(17) == (0, 0, 95)
+    assert th.hex_to_ansi256("#282a36") not in (17, 52)
+
+
+def test_a_chromatic_colour_the_cap_allows_still_keeps_its_hue():
+    """THE OTHER HALF OF THE CAP, so it cannot be "fixed" by deleting itself.
+
+    The cap is a bound on the PRICE of chroma, not a licence to desaturate
+    anything dark. nord's background #2e3440 (chroma 0.023, lightness 0.324) is
+    the same shape as dracula's and does get refused the ramp -- but
+    synthwave-84's rail #3e3e6d (chroma 0.079) is only 0.023 from the nearest
+    cell overall, so it keeps a chromatic cell, and the old parchment #f0e6d2
+    that used to paint as 254, a pure grey, is 0.015 from its nearest cell and
+    keeps cell 224 (#ffd7d7, a pale pink).
+    """
+    for value, index in (("#3e3e6d", 24), ("#f0e6d2", 224), ("#3e3e6d", 24)):
+        assert th.hex_to_ansi256(value) == index, value
+        rgb = th.ansi256_rgb(th.hex_to_ansi256(value))
+        assert rgb[0] != rgb[1] or rgb[1] != rgb[2], (value, rgb)
+    # Both are inside the cap, so this is the guard, not the fallback.
+    for value in ("#3e3e6d", "#f0e6d2"):
+        target = th.rgb_to_oklab(th.hex_to_rgb(value))
+        nearest = min(math.dist(target, th.rgb_to_oklab(rgb)) for _i, rgb in th.PALETTE)
+        tinted = min(math.dist(target, th.rgb_to_oklab(rgb)) for _i, rgb in th.PALETTE
+                     if not (rgb[0] == rgb[1] == rgb[2]))
+        assert tinted - nearest <= th.MAX_CHROMA_PENALTY, (value, tinted - nearest)
 
 
 def test_a_neutral_colour_still_lands_on_the_ramp():
@@ -156,16 +236,16 @@ def test_a_neutral_colour_still_lands_on_the_ramp():
 def test_the_threshold_is_the_constants_own_and_the_catalog_straddles_it():
     """WHY 0.02, FROM THE DATA RATHER THAN FROM TASTE.
 
-    The catalog's own chroma distribution straddles the cut: the most chromatic
-    NEUTRAL role sits at 0.0185 (Solarized Light's `meta`) and the least
-    chromatic CHROMATIC one at 0.0201 (Monokai Light's rail, which a
+The catalog's own chroma distribution straddles the cut: the most chromatic
+    NEUTRAL role sits at 0.0196 (Monokai Dark's rail #464539) and the least
+    chromatic CHROMATIC one at 0.0201 (Monokai Light's rail #d3c5bc, which a
     post-conversion nudge pushed just over the line), with nothing in between.
-    `NEUTRAL_CHROMA` is already the constant `oklab_hue` uses to decide whether
-    a colour has a hue at all, so reusing it here means the converter and the hue
+    `NEUTRAL_CHROMA` is already the constant `oklab_hue` uses to decide whether a
+    colour has a hue at all, so reusing it here means the converter and the hue
     test cannot disagree about what neutral means.
 
-    The margin is worth watching rather than trusting: it is about 0.0015 wide on
-    each side, so a future hex nudged to land near 0.02 could move it. The
+    The margin is worth watching rather than trusting: it is about 0.0005 wide on
+    the neutral side, so a future hex nudged to land near 0.02 could move it. The
     assertion below is what will say so.
     """
     catalog = th.load_catalog()
