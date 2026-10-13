@@ -27,6 +27,7 @@ import pytest
 import og_agents as a
 import og_herdr as h
 import og_herdr_watch as w
+import og_themes as th
 
 
 # ---------------------------------------------------------------------------
@@ -2905,7 +2906,10 @@ def _paint(frame, width, height, monkeypatch):
     scr = _FakeStdscr(height, width)
     monkeypatch.setattr(curses, "curs_set", lambda *_: None)
     monkeypatch.setattr(curses, "wrapper", lambda fn, *a, **k: fn(scr))
-    a._run_tui(_StubModel(frame), 3.0, "http://x")
+    # The `og` theme explicitly, not "whatever is configured": these tests are
+    # about paint GEOMETRY and a developer's $OG_AGENTS_THEME or a persisted
+    # choice must not change what they assert.
+    a._run_tui(_StubModel(frame), 3.0, "http://x", theme=_theme("og"))
     return scr.writes
 
 
@@ -3108,6 +3112,11 @@ class FakeScreen:
         self.height, self.width = height, width
         self.painted: list[str] = []
         self.keys = [ord("q")]
+        # The window background the view sets for an opaque theme, and leaves
+        # None for a `"default"` one. `None` is meaningful here rather than
+        # "unset": setting it is half the background decision, and the `og` theme
+        # exists to assert it does NOT happen.
+        self.bkgd = None
 
     def keypad(self, flag):
         pass
@@ -3201,20 +3210,53 @@ class _WriteScreen(FakeScreen):
         self.writes.append((row, col, text[:n], attr))
 
 
+def _theme(slug: str):
+    """A catalog theme by slug. Read through the loader, so a test can never pin
+    a `Theme` object the pane could not actually resolve."""
+    return th.load_catalog()[slug]
+
+
 def _colour_paint(monkeypatch, frame, width=80, height=24, colors=256,
-                  color_pairs=256):
-    """Paint one frame through `_run_tui` with a colour-capable fake curses."""
+                  color_pairs=256, theme=None):
+    """Paint one frame through `_run_tui` with a colour-capable fake curses.
+
+    DEFAULT THEME IS `og`, AND THAT IS A CLAIM, NOT A CONVENIENCE. `og` is the
+    theme that reproduces what this pane painted before themes existed — a `-1`
+    background and meta 109 / idle 46 / working 226 — so every test that asserts
+    WHICH colour a role spends keeps asserting today's colour rather than
+    dracula's. That is the regression guard the whole change needed: if the theme
+    wiring ever changed what a role resolves to, these tests would fail on the
+    values, not on the plumbing.
+
+    A caller that wants a real theme's own colours passes one.
+    """
     fake = FakeCurses(colors=colors, color_pairs=color_pairs)
     monkeypatch.setitem(sys.modules, "curses", fake)
     scr = _WriteScreen(height, width)
     fake.wrapper = lambda loop: loop(scr)
-    a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x")
+    a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
+               theme=_theme("og") if theme is None else theme)
     return fake, scr.writes
 
 
 def _writes_for(writes, text):
     """The attributes of every write whose text is exactly `text`."""
     return [attr for _row, _col, chunk, attr in writes if chunk == text]
+
+
+class _PickerScreen(_WriteScreen):
+    """A screen that answers a longer key queue, for the modal theme overlay.
+
+    `FakeScreen.getch` pops from a list and returns -1 when it empties, which is
+    what lets every other test drive exactly one paint and then quit. The overlay
+    needs three keys (open, cancel, quit) and must record that it opened.
+    """
+    def __init__(self, height=24, width=80, keys=None):
+        super().__init__(height, width)
+        self.keys = list(keys) if keys else [ord("q")]
+
+    def getch(self):
+        return self.keys.pop(0) if self.keys else -1
 
 
 def test_the_mark_span_carries_its_vendors_brand_colour_role():
@@ -4020,16 +4062,38 @@ def test_the_footer_names_every_key_at_every_width():
 def test_the_footer_chooses_a_form_by_measured_width():
     # The threshold is each form's own width, measured — not a magic number
     # that can drift out of step with the strings.
+    #
+    # THE NUMBERS MOVED WHEN `t theme` JOINED, and the shape did not. The full
+    # form grew to 73 (it carries every word), and COMPACT deliberately SHED the
+    # word `refresh` to stay at 45 — the width the ~46-column agents split has
+    # always used. Had COMPACT simply grown to 53, every real pane would have
+    # fallen through to the bare KEYS form, which is a far worse trade than
+    # losing one label. The key `r` is still in all three forms: only labels
+    # degrade.
     assert a._footer(80) == a.FOOTER
-    assert a._footer(64) == a.FOOTER, "the full form fits a 64-column pane"
-    assert a._footer(63) == a.FOOTER_COMPACT
+    assert a._footer(73) == a.FOOTER, "the full form fits a 73-column pane"
+    assert a._footer(72) == a.FOOTER_COMPACT
     assert a._footer(45) == a.FOOTER_COMPACT, "the compact form fits 46"
     assert a._footer(44) == a.FOOTER_KEYS
-    assert a._display_width(a.FOOTER) == 64
+    assert a._footer(43) == a.FOOTER_KEYS
+    assert a._display_width(a.FOOTER) == 73
     assert a._display_width(a.FOOTER_COMPACT) == 45
-    # Only labels degrade: every form names every key.
+    assert a._display_width(a.FOOTER_KEYS) == 14
+    # And the boundary is the MEASUREMENT, checked from both sides of each form,
+    # so a future edit to the strings cannot quietly move a threshold. FOOTER_KEYS
+    # is excluded from the lower side on purpose: it is the FLOOR, and `_footer`
+    # returns it unconditionally below COMPACT rather than measuring it.
+    for form in (a.FOOTER, a.FOOTER_COMPACT):
+        exact = a._display_width(form)
+        assert a._footer(exact) == form, form
+        assert a._footer(exact - 1) != form, form
+    floor = a._display_width(a.FOOTER_KEYS)
+    assert a._footer(floor) == a.FOOTER_KEYS
+    assert all(a._footer(w) == a.FOOTER_KEYS for w in range(0, floor + 1))
+    # Only labels degrade: every form names every key, and every form now names
+    # `t` too.
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
-        assert "q" in form and "r" in form and "a" in form, form
+        assert "q" in form and "r" in form and "a" in form and "t" in form, form
         assert ("^/v" in form or "^v" in form), form
 
 
@@ -4052,7 +4116,7 @@ def test_the_footer_is_measured_the_same_in_a_cjk_locale():
     # ⏎ and ␣ stay Narrow, and the wider keys still fit under the CJK rule.
     for glyph in ("⏎", "␣"):
         assert unicodedata.east_asian_width(glyph) == "N", glyph
-    assert _cjk_width(a.FOOTER) == 64
+    assert _cjk_width(a.FOOTER) == 73
     assert _cjk_width(a.FOOTER_COMPACT) <= 46
 
     # Every form `_footer` picks for a pane at least as wide as the KEYS floor
@@ -4060,3 +4124,502 @@ def test_the_footer_is_measured_the_same_in_a_cjk_locale():
     floor = _cjk_width(a.FOOTER_KEYS)
     for width in range(floor, 90):
         assert _cjk_width(a._footer(width)) <= width, width
+
+
+# ---------------------------------------------------------------------------
+# 22. THEMES: the background decision the `_VENDOR_COLOURS` comment deferred
+# ---------------------------------------------------------------------------
+#
+# The comment above `_VENDOR_COLOURS` said, in as many words: "That is a
+# background decision, not a fourteen-colour retune, so it is not made here." It
+# is made here. These tests pin the decision on both sides of it:
+#
+#   * under a real theme the theme's `bg` reaches `init_pair` as the SECOND
+#     argument, and the window background is filled so the pane is not stripes;
+#   * under `og` — and `og` only — nothing changes at all, which is what the
+#     golden render at the bottom of this section exists to prove.
+#
+# The COLOUR-ROLE tests above all paint the `og` theme (see `_colour_paint`), so
+# every one of them still asserts today's indices. That is the point of the row.
+
+DRACULA_BG = a.hex_to_ansi256("#282a36")
+
+
+def test_the_themes_background_reaches_init_pair_as_the_second_argument(monkeypatch):
+    """THE DECISION. `init_pair(n, fg, -1)` gave every colour the TERMINAL's own
+    background; on a light terminal that inverted the whole logo table into the
+    failure the table's own floor exists to prevent. A theme supplies the
+    background, and it has to arrive as the second argument to be any use."""
+    frame = a.Frame(rows=[header(),
+                          worker("w1", "idle", harness="claude-native",
+                                 meta="12s")], selected=1)
+    fake, writes = _colour_paint(monkeypatch, frame, theme=_theme("dracula"))
+    assert fake.init_pair_calls, "a coloured frame must spend a pair"
+    selected_bg = a.hex_to_ansi256(_theme("dracula").colour("sel_bg"))
+    allowed = {DRACULA_BG, selected_bg}
+    for _pair, fg, bg in fake.init_pair_calls:
+        assert bg in allowed, (fg, bg)
+        assert bg != -1, "the -1 background is exactly what this change replaced"
+    assert any(bg == DRACULA_BG for _p, _fg, bg in fake.init_pair_calls)
+    # And the body's own colour comes from the theme too, not from pair 0.
+    meta = _writes_for(writes, "12s")
+    assert meta and all(attr & 0xFF00 for attr in meta)
+
+
+def test_the_window_background_is_filled_for_an_opaque_theme(monkeypatch):
+    """`bkgd`, or the background shows in STRIPES. Every cell no `addnstr` covers
+    keeps whatever `bkgd` says, so an opaque theme that does not set it paints
+    coloured text floating on the terminal's own background."""
+    frame = a.Frame(rows=[header()], selected=0)
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    scr = _WriteScreen(24, 80)
+    fake.wrapper = lambda loop: loop(scr)
+    a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
+               theme=_theme("dracula"))
+    assert scr.bkgd, "an opaque theme must set the window background"
+    assert scr.bkgd & 0xFF00
+
+
+def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
+    """AND NOT FOR `og`. Setting `bkgd` to a pair allocated for some other role
+    would put a colour on the pane nobody chose; the whole of what this row
+    promises is that the terminal's own background keeps coming through."""
+    frame = a.Frame(rows=[header()], selected=0)
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    scr = _WriteScreen(24, 80)
+    fake.wrapper = lambda loop: loop(scr)
+    a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
+               theme=_theme("og"))
+    assert not scr.bkgd, "og leaves bkgd untouched"
+    assert [bg for _p, _fg, bg in fake.init_pair_calls] == [-1]
+
+
+def test_a_default_role_spends_no_pair_at_all():
+    """`"default"` is legal in EVERY role, and it means the terminal's own. The
+    whole reason `og` can be expressed at all is that PLAIN, sel_bg and rail all
+    take that value — a loader that only allowed it in `bg` could not describe
+    what the pane painted before themes existed. META is the one role `og` still
+    colours, because the pane always did."""
+    og = _theme("og")
+    for role in (a.PLAIN, "undim:plain", a.ORCH):
+        assert a._role_colour(role, og) is None, role
+    assert a._role_colour(a.META, og) == 109, "og's meta is ansi 109, as today"
+    assert a._role_background(role, og) is None, role
+    assert a._role_background(a.SELECTED, og) is None, role
+    # ...while the theme that DOES carry them spends real pairs for them.
+    dracula = _theme("dracula")
+    assert a._role_colour(a.PLAIN, dracula) == a.hex_to_ansi256("#ffd7af")
+    assert a._role_colour(a.META, dracula) == a.hex_to_ansi256("#6272a4")
+    assert a._role_colour(a.state_role("idle"), dracula) \
+        == a.hex_to_ansi256("#50fa7b")
+    assert a._role_colour(a.state_role("working"), dracula) \
+        == a.hex_to_ansi256("#f1fa8c")
+
+
+def test_parchment_is_the_dominant_text_colour_on_the_default_theme():
+    """THE OPERATOR'S ASK. dracula.text is #ffd7af, a warm parchment, and PLAIN is
+    what paints agent names, titles and box borders — so routing PLAIN at the
+    theme's `text` is what makes parchment DOMINANT rather than merely present.
+
+    #ffd7af is the cell the operator picked from the 256-colour palette, and it
+    is ansi 223 exactly. It replaces #f0e6d2, whose nearest cell was 254 -- a
+    pure grey -- so this used to be parchment on paper and grey on the terminal."""
+    dracula = _theme("dracula")
+    assert dracula.colour("text") == "#ffd7af"
+    assert a._role_colour(a.PLAIN, dracula) == a.hex_to_ansi256("#ffd7af") == 223
+    # ORCH is still a WEIGHT and no colour, and `undim:` is still not a colour.
+    assert a._role_colour(a.ORCH, dracula) is None
+    assert a._role_bold(a.ORCH) is True
+
+
+def test_only_the_selected_row_gets_a_background(monkeypatch):
+    """`sel_bg` is the one role that is a BACKGROUND, and selection was already a
+    brightness axis — DIM vs NORMAL is untouched. Under `og` it is `"default"`
+    and nothing moves, which is why the golden render below still holds."""
+    frame = a.Frame(rows=[header(),
+                          worker("w1", "blocked", text="one"),
+                          worker("w2", "blocked", text="two", meta="12s")],
+                    selected=2)
+    dracula = _theme("dracula")
+    assert a._role_background(a.PLAIN, dracula) == dracula.colour("bg")
+    assert a._role_background(a.META, dracula) == dracula.colour("bg")
+    # The selected LINE, which is a brightness rather than a span role -- so the
+    # painter is what knows it, and passes it down.
+    assert a._role_background(a.PLAIN, dracula, on_selected=True) \
+        == dracula.colour("sel_bg")
+    assert dracula.colour("sel_bg") != dracula.colour("bg")
+    og = _theme("og")
+    assert a._role_background(a.PLAIN, og) is None
+    assert a._role_background(a.PLAIN, og, on_selected=True) is None
+
+    fake, writes = _colour_paint(monkeypatch, frame, theme=dracula)
+    backgrounds = {bg for _p, _fg, bg in fake.init_pair_calls}
+    assert DRACULA_BG in backgrounds
+    assert a.hex_to_ansi256(dracula.colour("sel_bg")) in backgrounds
+
+
+def test_a_truecolor_terminal_paints_the_themes_exact_hexes(monkeypatch):
+    """On truecolor the pane paints the catalog's hexes and not an approximation
+    of them. That was worth arguing from the 256 path, where the operator's
+    parchment #f0e6d2 mapped onto a pure GREY — the converter has since been
+    fixed so that cannot happen, and the operator pinned the hex to the cell they
+    chose instead. Truecolor still takes the exact 24-bit value."""
+    frame = a.Frame(rows=[header(),
+                          worker("w1", "idle", harness="claude-native",
+                                 meta="12s")], selected=1)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=1 << 24,
+                                 theme=_theme("dracula"))
+    spent = [(fg, bg) for _p, fg, bg in fake.init_pair_calls]
+    # The parchment reaches init_pair as the exact 24-bit value the catalog
+    # names -- #ffd7af, which is also cell 223 below truecolor, so the two paths
+    # agree on the colour and only the precision differs.
+    assert (0xFFD7AF, 0x282A36) in spent, spent
+    # The window background asks for the terminal's own foreground (-1) against
+    # the theme's own background, so the pane fills without a foreground.
+    assert (-1, 0x282A36) in spent, spent
+    # Every background is one the theme named -- the pane's, or the selected
+    # row's -- and never the terminal's own.
+    assert {bg for _fg, bg in spent} == {0x282A36, 0x44475A}, spent
+    # And a mark is still its 256 PALETTE index even here: `_VENDOR_COLOURS` is
+    # a table of palette cells, and the guard above it is reasoned in that space.
+    assert (173, 0x282A36) in spent, spent
+
+
+def test_the_pair_table_is_keyed_by_the_pair_not_the_foreground():
+    """One foreground against two backgrounds is two different paints. Keying the
+    cache by fg alone would hand back the wrong pair the second time a theme
+    changed, and the failure would be a background nobody chose."""
+    class _C:
+        has_colors = staticmethod(lambda: True)
+        COLORS, COLOR_PAIRS = 256, 256
+        error = type("error", (Exception,), {})
+        init_pair_calls = []
+
+        @staticmethod
+        def init_pair(n, fg, bg):
+            _C.init_pair_calls.append((n, fg, bg))
+
+        @staticmethod
+        def color_pair(n):
+            return n << 8
+
+    colours = a._Colours(_C, _theme("dracula"))
+    first = colours.attr(109, DRACULA_BG)
+    second = colours.attr(109, DRACULA_BG + 1)
+    assert first != second, "the same fg on two backgrounds is two allocations"
+    assert colours.attr(109, DRACULA_BG) == first, "and each is cached"
+    assert len(_C.init_pair_calls) == 2
+
+
+# --- the theme picker -------------------------------------------------------
+
+def _picker_frame():
+    return a.Frame(rows=[header(),
+                         worker("w1", "idle", text="one"),
+                         worker("w2", "working", text="two")], selected=1)
+
+
+def test_the_picker_lists_every_theme_in_catalog_order():
+    state = a._picker(active="dracula")
+    assert state.slugs == [t.slug for t in th.ordered_themes(th.load_catalog())]
+    assert state.slugs[0] == "og", "order 0 puts OG first in the menu"
+    assert state.current() == "dracula", "it opens on the LIVE theme, not row one"
+    assert state.labels["dracula"] == "Dracula"
+
+
+@pytest.mark.parametrize("down,up", [(a.PICKER_DOWN, "k"),
+                                     (ord("j"), ord("k"))])
+def test_the_caret_moves_with_both_the_arrows_and_jk(down, up):
+    start = a._picker(active="dracula")
+    next_slug = start.slugs[start.cursor + 1]
+    moved = a.picker_key(start, down)
+    assert moved.current() == next_slug, (down, up)
+    back = a.picker_key(moved, ord(up) if isinstance(up, str) else up)
+    assert back.current() == "dracula", (down, up)
+
+
+def test_the_caret_clamps_rather_than_wrapping():
+    """A list you can fall off the end of and come back on is a list you can get
+    lost in, and this one is read by eye."""
+    state = a._picker(active="og")
+    for _ in range(40):
+        state = a.picker_key(state, a.PICKER_UP)
+    assert state.cursor == 0
+    for _ in range(40):
+        state = a.picker_key(state, a.PICKER_DOWN)
+    assert state.cursor == len(state.slugs) - 1
+
+
+def test_enter_applies_and_esc_or_q_cancels():
+    state = a._picker(active="dracula")
+    state = a.picker_key(state, a.PICKER_DOWN)
+    state = a.picker_key(state, 10)
+    assert state.closed and state.applied == state.slugs[state.cursor]
+
+    for cancel in (27, ord("q")):
+        state = a._picker(active="dracula")
+        state = a.picker_key(state, a.PICKER_DOWN)
+        state = a.picker_key(state, cancel)
+        assert state.closed, cancel
+        assert state.applied is None, "a cancel is not an apply"
+
+
+def test_an_unrecognised_key_is_ignored_rather_than_falling_through_to_the_pane():
+    """The overlay owns the keyboard while it is up, so a key it does not answer
+    must do NOTHING — not quit the pane behind it, not move the selection."""
+    state = a._picker(active="dracula")
+    for key in (ord("a"), ord("r"), ord(" "), ord("z")):
+        after = a.picker_key(state, key)
+        assert after.cursor == state.cursor and not after.closed, key
+        assert after.applied is None
+
+
+def test_a_closed_picker_ignores_everything_after_it():
+    state = a.picker_key(a._picker(active="dracula"), 27)
+    assert a.picker_key(state, 10).applied is None
+
+
+def test_the_picker_draws_a_box_with_the_active_theme_marked():
+    rows = [a.line_text(line) for line in a.picker_lines(
+        a._picker(active="dracula"), 80, 24)]
+    assert rows[0].startswith("┌─ theme ") and rows[-1].startswith("└")
+    body = rows[1:-1]
+    assert any("Dracula" in row and "•" in row for row in body), body
+    assert any("▸ •Dracula" in row for row in body), body
+    assert a.PICKER_KEYS in "\n".join(body)
+
+
+def test_the_picker_shows_fewer_entries_rather_than_overflowing_the_pane():
+    """The `access_lines`-drops-its-QR precedent. Twenty-six themes do not fit a
+    short pane, and an overlay with its own bottom edge off-screen takes the key
+    hint that says how to close it with it."""
+    state = a._picker(active="dracula")
+    for height in (6, 8, 12, 24):
+        rows = a.picker_lines(state, 80, height)
+        assert len(rows) <= height, (height, len(rows))
+        assert all(len(a.line_text(row)) <= 80 for row in rows)
+    # Truncated, and it says so, and the CARET is never one of the dropped rows.
+    short = [a.line_text(line) for line in a.picker_lines(state, 80, 10)]
+    assert any("…" in row for row in short), short
+    assert any("▸" in row for row in short), short
+    # And with the whole catalog on screen there is nothing to apologise for.
+    tall = [a.line_text(line) for line in a.picker_lines(state, 80, 40)]
+    assert not any("…" in row for row in tall), tall
+
+
+def test_the_picker_scrolls_to_keep_the_caret_visible():
+    state = a._picker(active="tokyo-night-light")     # the last row
+    rows = [a.line_text(line) for line in a.picker_lines(state, 40, 10)]
+    assert any("▸" in row and "Tokyo Night Light" in row for row in rows), rows
+
+
+def test_the_picker_never_overflows_a_narrow_pane():
+    state = a._picker(active="dracula")
+    for width in range(a.PICKER_MIN_WIDTH, 48):
+        for height in range(1, 30):
+            rows = a.picker_lines(state, width, height)
+            assert len(rows) <= height, (width, height, len(rows))
+            assert all(len(a.line_text(row)) <= width for row in rows), (width, height)
+    # Below the width a box can close in, it draws NOTHING rather than a
+    # rectangle that does not close. The agents pane is never this narrow -- its
+    # own footer floor is 14 columns -- so this guards the arithmetic.
+    assert a.picker_lines(state, a.PICKER_MIN_WIDTH - 1, 24) == []
+    assert a.picker_lines(state, 80, 0) == []
+    assert a.picker_lines(state, 0, 0) == []
+
+
+def test_t_opens_the_picker_and_esc_leaves_the_previous_theme(monkeypatch, tmp_path):
+    """`t` reaches the overlay, Esc leaves it, and the pane behind it is intact.
+
+    `save_theme` is replaced with a recorder rather than merely pointed at a
+    temporary home: a test that can write into the OPERATOR's real ~/.omnigent
+    if a future key change reaches Enter is not a test anyone should leave
+    unattended, and the recorder turns that into a visible failure.
+    """
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    saved = []
+    monkeypatch.setattr(a, "save_theme", lambda slug: saved.append(slug))
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    scr = _PickerScreen(24, 80)
+    scr.keys = [ord("t"), 27, ord("q")]
+    fake.wrapper = lambda loop: loop(scr)
+    assert a._run_tui(_StubModel(_picker_frame()), a.DEFAULT_INTERVAL,
+                      "http://x", theme=_theme("dracula")) == 0
+    assert any(a.PICKER_TITLE in row for row in scr.painted), "the overlay opened"
+    assert saved == [], "a cancel persists nothing"
+    assert not th.theme_state_path().exists()
+
+
+def test_enter_in_the_picker_applies_and_persists_the_theme(monkeypatch, tmp_path):
+    """The other half: Enter applies, the pane keeps its own state, and the choice
+    survives into the next launch. The live repaint is what makes applying
+    VISIBLE, and it is the one thing `paint_needed` would otherwise skip — the
+    lines are byte-identical under any theme, so nothing else would repaint.
+    """
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "access_info", lambda server, environ=None: None)
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    scr = _PickerScreen(24, 80)
+    # t, down (onto the theme after dracula), Enter, q.
+    scr.keys = [ord("t"), a.PICKER_DOWN, 10, ord("q")]
+    fake.wrapper = lambda loop: loop(scr)
+    assert a._run_tui(_StubModel(_picker_frame()), a.DEFAULT_INTERVAL,
+                      "http://x", theme=_theme("dracula")) == 0
+    assert th.load_theme() == "github-dark", th.load_theme()
+    assert not th.theme_state_path().parent.joinpath("og-install.json").exists()
+
+
+# --- the CLI ----------------------------------------------------------------
+
+def test_theme_is_a_parser_flag_and_does_not_persist(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    args = a.build_parser().parse_args(["--theme", "nord"])
+    assert args.theme == "nord"
+    assert a.build_parser().parse_args([]).theme is None
+
+
+def test_an_unknown_theme_is_refused_by_name(capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    opener = RoutingOpener([], details={})
+    assert a.main(["--once", "--server", "http://x", "--theme", "nosuchtheme"],
+                  opener=opener) == 2
+    err = capsys.readouterr().err
+    assert "nosuchtheme" in err
+    for slug in ("dracula", "nord", "og"):
+        assert slug in err, "the message names the valid ones"
+
+
+# --- the golden -------------------------------------------------------------
+
+GOLDEN_FRAME = [
+    '╭──────────────────────────────────────────────────────────────────────────────╮',
+    '│ ✳  conversation                                                   Claude Code│',
+    '╰──────────────────────────────────────────────────────────────────────────────╯',
+    '│',
+    '│   ╭──────────────────────────────────────────────────────────────────────────╮',
+    '⦿ ⠋ │    w1                                                             working│',
+    '│   ╰──────────────────────────────────────────────────────────────────────────╯',
+    '│   ╭──────────────────────────────────────────────────────────────────────────╮',
+    '⦿ ⠋ │    w2                                                             working│',
+    '│   ╰──────────────────────────────────────────────────────────────────────────╯',
+    '│   ╭──────────────────────────────────────────────────────────────────────────╮',
+    '⦿ ⠋ │    w3                                                             working│',
+    '│   ╰──────────────────────────────────────────────────────────────────────────╯',
+    '',
+    a.FOOTER,
+]
+
+
+def _golden_frame(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+    frame = _model(opener).refresh()
+    frame.selected = a.snap_selection(frame.rows, None, 0)
+    frame.access = None
+    return frame, opener
+
+
+def test_render_is_byte_identical_under_every_theme(monkeypatch, tmp_path):
+    """THE STRUCTURAL FACT `og` DEPENDS ON. `render` is a pure function from
+    state to text and never sees a colour, so all twenty-six themes have to
+    produce the same bytes. If this ever fails, the whole "choose `og` and get
+    today's pane" promise is already false."""
+    frame, _opener = _golden_frame(monkeypatch, tmp_path)
+    rendered = {theme.slug: a.render(frame, width=80)
+                for theme in th.ordered_themes(th.load_catalog())}
+    assert len(rendered) == 26
+    for slug, lines in rendered.items():
+        assert lines == rendered["og"], (slug, lines)
+    assert rendered["og"] == GOLDEN_FRAME
+
+
+def test_the_golden_frame_is_what_the_pane_has_always_rendered(monkeypatch, tmp_path):
+    """A FROZEN copy, not just self-consistency. Without it "every theme renders
+    the same" would happily pass on a frame that had quietly changed shape, and
+    the only proof that this whole background change cost an `og` user nothing is
+    that the bytes did not move."""
+    frame, _opener = _golden_frame(monkeypatch, tmp_path)
+    assert a.render(frame, width=80) == GOLDEN_FRAME
+
+
+def test_once_with_og_selected_is_byte_identical_to_once_with_no_theme(
+        monkeypatch, tmp_path, capsys):
+    """THE WHOLE ARGUMENT, end to end through `main`. With `og` selected --theme
+    og, and again with it merely configured -- the output is the frozen golden,
+    which is what an operator who wants none of this is entitled to."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+    monkeypatch.setattr(a.shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
+
+    assert a.main(["--once", "--all", "--server", "http://x", "--theme", "og"],
+                  opener=opener) == 0
+    assert capsys.readouterr().out.splitlines() == GOLDEN_FRAME
+
+    monkeypatch.setenv(th.THEME_ENV, "og")
+    assert a.main(["--once", "--all", "--server", "http://x"], opener=opener) == 0
+    assert capsys.readouterr().out.splitlines() == GOLDEN_FRAME
+
+
+def test_a_one_shot_theme_flag_does_not_write_the_stored_choice(
+        monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+    monkeypatch.setattr(a.shutil, "get_terminal_size", lambda *a, **kw: os.terminal_size((80, 24)))
+    a.main(["--once", "--all", "--server", "http://x", "--theme", "nord"],
+           opener=opener)
+    capsys.readouterr()
+    assert not th.theme_state_path().exists(), \
+        "--theme is a one-shot; only the picker persists"
+
+
+def test_the_stored_choice_survives_into_the_next_launch(monkeypatch, tmp_path,
+                                                         capsys):
+    """The env beats the stored slug and the stored slug beats the default, in that
+    order -- the env is set before the command and the flag is typed now."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    th.save_theme("gruvbox")
+    assert th.load_theme() == "gruvbox"
+    monkeypatch.setenv(th.THEME_ENV, "nord")
+    assert th.load_theme() == "nord"
+
+
+def test_the_picker_closes_rather_than_spinning_when_the_keyboard_breaks(
+        monkeypatch, tmp_path):
+    """`getch` returning ERR is a curses error, not a keypress. A dialog that
+    spins forever because the keyboard is broken is worse than one that gives up
+    and leaves the pane exactly as it was."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "save_theme", lambda slug: pytest.fail("persisted"))
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    scr = _PickerScreen(24, 80)
+    scr.keys = [ord("t"), -1, -1, ord("q")]     # open, then only ERR
+    fake.wrapper = lambda loop: loop(scr)
+    assert a._run_tui(_StubModel(_picker_frame()), a.DEFAULT_INTERVAL,
+                      "http://x", theme=_theme("dracula")) == 0
+
+
+def test_the_pane_scroll_offset_survives_a_theme_change(monkeypatch, tmp_path):
+    """The overlay's row number must not be mistaken for the PANE's scroll
+    offset. `offset` is the list's window in the enclosing loop, so a shadowing
+    local in the overlay would repaint the tree at the overlay's row and scroll
+    the operator's view to somewhere they never asked for."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    frame = a.Frame(rows=[header()] + [worker(f"w{i}", "idle", text=f"t{i}")
+                                       for i in range(12)], selected=1)
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    scr = _PickerScreen(10, 46)
+    scr.keys = [ord("t"), 27, ord("q")]
+    fake.wrapper = lambda loop: loop(scr)
+    a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
+               theme=_theme("dracula"))
+    # The short pane forces a non-zero offset; the overlay must not change it.
+    after = [row for _spans, row in
+             [(l, a.line_text(l)) for l in a._pane(frame, 46, 10).items]
+             if "t0" in row]
+    assert after, "the tree still shows its first worker after a cancelled pick"
