@@ -3106,17 +3106,38 @@ class FakeScreen:
     view's only contract with the window is the method set below, and a screen
     that records its own calls would assert less about the fix than the call it
     exists to make possible.
+
+    THE FAKE IS NOT ALLOWED TO BE EASIER TO SATISFY THAN THE REAL OBJECT. Every
+    curses method here is a real METHOD, and `__setattr__` refuses to let a test
+    rebind one — which is exactly what `_curses.window` does. That guard is not
+    decoration: `bkgd` used to be a plain attribute here, so `stdscr.bkgd = attr`
+    succeeded in every test and raised `AttributeError` on every real terminal,
+    and the blanket `except Exception` around it swallowed the raise. 1213 tests
+    passed over code that could not run.
     """
 
     def __init__(self, height=24, width=80):
         self.height, self.width = height, width
         self.painted: list[str] = []
         self.keys = [ord("q")]
-        # The window background the view sets for an opaque theme, and leaves
-        # None for a `"default"` one. `None` is meaningful here rather than
-        # "unset": setting it is half the background decision, and the `og` theme
-        # exists to assert it does NOT happen.
-        self.bkgd = None
+        # Every `(name, ch, attr)` the view handed to the window background, in
+        # order. An EMPTY list is meaningful rather than "unset": setting it is
+        # half the background decision, and the `og` theme exists to assert it
+        # does NOT happen.
+        self.bkgd_calls: list[tuple[str, str, int]] = []
+
+    def __setattr__(self, name, value):
+        # `curses.window` is a C type with `__dictoffset__ == 0` — an instance
+        # carries no dict, so a name that is a method on the class cannot be
+        # rebound on the instance and Python raises
+        # `AttributeError: ... object attribute 'bkgd' is read-only`. Mirroring
+        # that here means an assignment fails in the test exactly where it fails
+        # in curses, instead of passing here and failing on the operator's
+        # terminal. Keyed on the CLASS, so every screen fake inherits the guard.
+        if name in _screen_method_names(type(self)):
+            raise AttributeError("%r object attribute %r is read-only"
+                                 % (type(self).__name__, name))
+        object.__setattr__(self, name, value)
 
     def keypad(self, flag):
         pass
@@ -3138,6 +3159,36 @@ class FakeScreen:
 
     def getch(self):
         return self.keys.pop(0) if self.keys else -1
+
+    # The two spellings the window background can be set with, recorded the same
+    # way so a test asserts on the CALL rather than on which name was used.
+    # `bkgd` is here as well as `bkgdset` because the view is allowed to pick:
+    # these are records, not a pin on the choice.
+    def bkgd(self, ch, attr):
+        self.bkgd_calls.append(("bkgd", ch, attr))
+
+    def bkgdset(self, ch, attr):
+        self.bkgd_calls.append(("bkgdset", ch, attr))
+
+
+_SCREEN_METHOD_NAMES: dict = {}
+
+
+def _screen_method_names(cls) -> frozenset:
+    """Every public name on `cls` (or a base) that binds a method.
+
+    The set curses makes unassignable. Cached per class because it is walked on
+    every attribute assignment the fake receives.
+    """
+    names = _SCREEN_METHOD_NAMES.get(cls)
+    if names is None:
+        names = frozenset(
+            name
+            for klass in cls.__mro__
+            for name, value in vars(klass).items()
+            if not name.startswith("_") and callable(value))
+        _SCREEN_METHOD_NAMES[cls] = names
+    return names
 
 
 def _fake_curses(monkeypatch, refuse=False, colors=0, color_pairs=256):
@@ -4166,10 +4217,20 @@ def test_the_themes_background_reaches_init_pair_as_the_second_argument(monkeypa
     assert meta and all(attr & 0xFF00 for attr in meta)
 
 
+def _background_calls(scr):
+    """The attributes the view handed to the window background, in order."""
+    return [attr for _name, _ch, attr in scr.bkgd_calls]
+
+
 def test_the_window_background_is_filled_for_an_opaque_theme(monkeypatch):
-    """`bkgd`, or the background shows in STRIPES. Every cell no `addnstr` covers
-    keeps whatever `bkgd` says, so an opaque theme that does not set it paints
-    coloured text floating on the terminal's own background."""
+    """`bkgdset`, or the background shows in STRIPES. Every cell no `addnstr`
+    covers keeps the window background, so an opaque theme that does not set it
+    paints coloured text floating on the terminal's own background.
+
+    A CALL, not an attribute. `scr.bkgd_calls` records what was handed to
+    `window.bkgdset(ch, attr)`; the previous version of this test read an
+    assignable `scr.bkgd`, which the real `_curses.window` rejects outright.
+    """
     frame = a.Frame(rows=[header()], selected=0)
     fake = FakeCurses(colors=256, color_pairs=256)
     monkeypatch.setitem(sys.modules, "curses", fake)
@@ -4177,14 +4238,18 @@ def test_the_window_background_is_filled_for_an_opaque_theme(monkeypatch):
     fake.wrapper = lambda loop: loop(scr)
     a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
                theme=_theme("dracula"))
-    assert scr.bkgd, "an opaque theme must set the window background"
-    assert scr.bkgd & 0xFF00
+    assert scr.bkgd_calls, "an opaque theme must SET the window background"
+    name, ch, attr = scr.bkgd_calls[-1]
+    assert ch == a.BKGD_CHAR, ("the background is a blank painted in a colour, "
+                               "never a glyph", ch)
+    assert attr & 0xFF00, attr
 
 
 def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
-    """AND NOT FOR `og`. Setting `bkgd` to a pair allocated for some other role
-    would put a colour on the pane nobody chose; the whole of what this row
-    promises is that the terminal's own background keeps coming through."""
+    """AND NOT FOR `og`. Setting the background to a pair allocated for some
+    other role would put a colour on the pane nobody chose; the whole of what
+    this row promises is that the terminal's own background keeps coming
+    through. NO CALL AT ALL is the claim, so that is what is asserted."""
     frame = a.Frame(rows=[header()], selected=0)
     fake = FakeCurses(colors=256, color_pairs=256)
     monkeypatch.setitem(sys.modules, "curses", fake)
@@ -4192,8 +4257,129 @@ def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
     fake.wrapper = lambda loop: loop(scr)
     a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
                theme=_theme("og"))
-    assert not scr.bkgd, "og leaves bkgd untouched"
+    assert scr.bkgd_calls == [], "og leaves the window background untouched"
     assert [bg for _p, _fg, bg in fake.init_pair_calls] == [-1]
+
+
+def test_the_window_background_is_set_by_a_CALL_a_terminal_will_accept():
+    """The test that would have caught the defect without a terminal.
+
+    Three claims, all checkable in a suite that never opens a pty:
+
+    1. On the REAL `_curses.window`, `bkgd`/`bkgdset` are callable methods, so
+       the view has to CALL one. It was assigned instead, which cannot work.
+    2. The real window has `__dictoffset__ == 0` — no instance dict — which is
+       the MECHANISM that makes (1) unbinding impossible rather than merely
+       discouraged, and is what `FakeScreen.__setattr__` mirrors.
+    3. The fake's own background setter is callable too, and carries the same
+       `(ch, attr)` parameter names the real one takes, so the two cannot drift
+       into a shape one of them accepts and the other rejects.
+
+    THE PRINCIPLE, and the reason this exists: a fake that is EASIER TO SATISFY
+    THAN THE REAL OBJECT WILL CERTIFY CODE THAT CANNOT RUN. `FakeScreen.bkgd` was
+    an assignable attribute on a plain Python object, so an assignment the real
+    window refuses passed 1213 tests and did nothing on every terminal.
+    """
+    import curses
+    import inspect
+
+    real = curses.window
+    assert callable(getattr(real, "bkgd")) \
+        and callable(getattr(real, "bkgdset")), \
+        "the window background is a METHOD on curses.window, never an attribute"
+    assert real.__dictoffset__ == 0, \
+        "curses.window carries no instance dict, which is why its methods are " \
+        "read-only on an instance -- the reason FakeScreen.__setattr__ guards"
+
+    scr = FakeScreen()
+    assert callable(scr.bkgd) and callable(scr.bkgdset)
+    for name in ("bkgd", "bkgdset"):
+        # The real one is read off the CLASS (so `self` is still in it), the
+        # fake off an INSTANCE (so `self` is already bound away).
+        real_params = list(inspect.signature(getattr(real, name)).parameters)[1:]
+        fake_params = list(inspect.signature(getattr(scr, name)).parameters)
+        assert real_params == fake_params, (name, real_params, fake_params)
+
+    # And the guard is live, not just documented: an assignment that curses
+    # refuses must be refused here too.
+    with pytest.raises(AttributeError):
+        scr.bkgd = 256
+
+
+def test_a_background_the_terminal_refuses_does_not_stop_the_view(monkeypatch):
+    """A terminal that rejects the background call still has to show the pane,
+    so `curses.error` — and ONLY `curses.error` — is survivable.
+
+    The companion is the real point: a `TypeError` from the same line is a BUG IN
+    THE CALL, and a blanket `except Exception` around it is exactly what let the
+    `stdscr.bkgd = attr` assignment fail silently on every terminal.
+    """
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+
+    class _Refuses(FakeScreen):
+        def bkgdset(self, ch, attr):
+            raise fake.error("bkgdset: ERR")
+
+    scr = _Refuses(24, 80)
+    fake.wrapper = lambda loop: loop(scr)
+    a._run_tui(_StubModel(a.Frame(rows=[header()], selected=0)),
+               a.DEFAULT_INTERVAL, "http://x", theme=_theme("dracula"))
+    assert scr.painted, "the frame was painted, not skipped"
+
+    class _MisCalled(FakeScreen):
+        def bkgdset(self, ch, attr):
+            raise TypeError("bkgdset() takes exactly 2 arguments (1 given)")
+
+    boom = _MisCalled(24, 80)
+    fake.wrapper = lambda loop: loop(boom)
+    with pytest.raises(TypeError):
+        a._run_tui(_StubModel(a.Frame(rows=[header()], selected=0)),
+                   a.DEFAULT_INTERVAL, "http://x", theme=_theme("dracula"))
+
+
+def _picker_backgrounds(scr):
+    """The background attributes the view set during a run driven by the picker."""
+    return [attr for _name, _ch, attr in scr.bkgd_calls]
+
+
+def test_a_theme_change_moves_the_window_background_with_it(monkeypatch, tmp_path):
+    """The background is not a STARTUP decision. Previewing an opaque theme under
+    the picker has to fill the pane being previewed on, and CANCELLING it has to
+    hand the terminal's own background back — otherwise the operator cancels and
+    is left with a pane of colours they just rejected, painted behind glyphs that
+    went back to `-1` backgrounds.
+
+    Driven from `og`, so the startup sets nothing and every call recorded here is
+    one the theme CHANGE made.
+    """
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(a, "save_theme", lambda slug: None)
+    monkeypatch.setattr(a, "access_info", lambda server, environ=None: None)
+
+    fake = FakeCurses(colors=256, color_pairs=256)
+    monkeypatch.setitem(sys.modules, "curses", fake)
+    # t, down onto the theme after `og`, Enter, q.
+    apply_scr = _PickerScreen(24, 80)
+    apply_scr.keys = [ord("t"), a.PICKER_DOWN, ENTER, ord("q")]
+    fake.wrapper = lambda loop: loop(apply_scr)
+    a._run_tui(_StubModel(_picker_frame()), a.DEFAULT_INTERVAL, "http://x",
+               theme=_theme("og"))
+    applied = _picker_backgrounds(apply_scr)
+    assert applied, "applying a theme must move the window background"
+    assert applied[-1] & 0xFF00, applied[-1]
+
+    # t, down onto the same opaque theme, Esc, q. Cancelling hands back pair 0,
+    # which `use_default_colors` has already made the terminal's own.
+    cancel_scr = _PickerScreen(24, 80)
+    cancel_scr.keys = [ord("t"), a.PICKER_DOWN, 27, ord("q")]
+    fake.wrapper = lambda loop: loop(cancel_scr)
+    a._run_tui(_StubModel(_picker_frame()), a.DEFAULT_INTERVAL, "http://x",
+               theme=_theme("og"))
+    cancelled = _picker_backgrounds(cancel_scr)
+    assert any(attr & 0xFF00 for attr in cancelled), "the preview filled the pane"
+    assert cancelled[-1] == 0, \
+        "and cancelling gave the terminal's own background back"
 
 
 def test_a_default_role_spends_no_pair_at_all():
