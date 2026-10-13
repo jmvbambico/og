@@ -219,9 +219,11 @@ def test_renderer_shows_a_root_box_not_a_bare_line():
     assert "Omnigent Herdr Integration" in lines[1]
     assert lines[1].endswith("Claude Code│"), "the harness label is flush right"
     assert lines[2].startswith("╰") and lines[2].endswith("╯"), lines[2]
-    # The gauge and the heavy bar are gone.
+    # The gauge and the heavy bar are gone. The gauge's word `done` is no longer
+    # a marker to forbid — an idle worker's meta is the bare word `done` now — so
+    # the bar glyphs carry the guard.
     joined = "\n".join(lines)
-    assert "━" not in joined and "█" not in joined and "done" not in joined
+    assert "━" not in joined and "█" not in joined
 
 
 def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
@@ -353,7 +355,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⦿ ✓ │ ⌘  docs                     done 6m ago│",
+        "⦿ ✓ │ ⌘  docs                            done│",
         "│   ╰────────────────────────────────────────╯",
         "",
         a.FOOTER_COMPACT,
@@ -390,7 +392,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     # The meta is right-aligned on the CONTENT row: each one ends at the box's
     # right edge, on the same line as the title.
     for row_index, meta in ((5, "2m14s"), (9, "waiting on you"),
-                            (13, "failed"), (17, "done 6m ago")):
+                            (13, "failed"), (17, "done")):
         assert lines[row_index].endswith(meta + "│"), lines[row_index]
 
 
@@ -838,8 +840,9 @@ def test_multiple_roots_each_get_their_own_box():
     assert all(line.index("╭") == 0 for line in roots)
     assert any("first conv" in line and line.endswith("Claude Code│") for line in lines)
     assert any("second conv" in line and line.endswith("Cline│") for line in lines)
-    # No gauge and no heavy bar anywhere.
-    assert "done" not in joined and "━" not in joined
+    # No gauge and no heavy bar anywhere. (`done` is a worker's meta now, so the
+    # bar glyphs, not the word, mark the gauge's absence.)
+    assert "━" not in joined
 
 
 def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
@@ -1996,9 +1999,10 @@ def test_the_meta_line_says_what_the_timestamps_can_support():
     assert a.worker_meta(working, "working", NOW) == "2m14s"
     assert a.worker_meta({"status": "running", "created_at": NOW - 41},
                          "working", NOW) == "41s"
-    # updated_at IS when an idle worker stopped, so "done N ago" is exact.
+    # A stopped worker says a bare `done`: the age it used to carry (`done 6m
+    # ago`) was noise next to the name, so `updated_at` is no longer read here.
     assert a.worker_meta({"status": "idle", "updated_at": NOW - 360},
-                         "idle", NOW) == "done 6m ago"
+                         "idle", NOW) == "done"
     assert a.worker_meta({}, "blocked", NOW) == "waiting on you"
     # A failure reason is used when the row carries one, and is never invented.
     assert a.worker_meta({"status": "failed"}, "failed", NOW) == "failed"
@@ -2006,7 +2010,22 @@ def test_the_meta_line_says_what_the_timestamps_can_support():
                          "failed", NOW) == "boot failed"
     # No timestamp: a word, not a figure derived from the epoch.
     assert a.worker_meta({}, "working", NOW) == "working"
-    assert a.worker_meta({}, "idle", NOW) == "idle"
+    assert a.worker_meta({}, "idle", NOW) == "done"
+
+
+def test_a_finished_worker_says_done_with_no_elapsed_suffix():
+    # The reported regression: a stopped worker read `done 6m ago`. It must now
+    # read exactly `done`, however long ago it stopped.
+    assert a.worker_meta({"status": "idle", "updated_at": NOW - 360},
+                         "idle", NOW) == "done"
+    assert a.worker_meta({"status": "idle", "updated_at": NOW - 90_000},
+                         "idle", NOW) == "done"
+
+
+def test_a_working_worker_still_counts_up():
+    # The live count-up is untouched: a running worker's meta is still its age.
+    assert a.worker_meta({"status": "running", "created_at": NOW - 134},
+                         "working", NOW) == "2m14s"
 
 
 # ---------------------------------------------------------------------------
@@ -3452,6 +3471,60 @@ def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(
     # the loop is still taking keys after the first failure.
     assert [method for method, _params in calls] == ["agent.focus", "agent.focus"]
     assert any("focus: " in text for text in screen.painted), screen.painted
+
+
+# ---- the focus notice takes the FOOTER row (see `_pane`) -------------------
+
+def _notice_frame(notice=None, truncated=False):
+    rows = [header(), rail(), worker("w1", "working", text="one")]
+    return a.Frame(rows=rows, notice=notice, truncated=truncated)
+
+
+def test_a_notice_takes_the_bottom_row_in_place_of_the_footer():
+    lines = a.render(_notice_frame(a.NOTICE_FOCUS_OUTSIDE_HERDR), width=80)
+    assert lines[-1] == a.NOTICE_FOCUS_OUTSIDE_HERDR
+    assert a._footer(80) not in lines, "the footer gives its row to the notice"
+
+
+def test_without_a_notice_the_bottom_row_is_still_the_footer():
+    lines = a.render(_notice_frame(), width=80)
+    assert lines[-1] == a._footer(80)
+
+
+def test_a_notice_longer_than_the_pane_is_clipped_not_overflowed():
+    long = "focus: " + "x" * 200
+    lines = a.render(_notice_frame(long), width=20)
+    assert lines[-1] == a._clip(long, 20)
+    assert len(lines[-1]) <= 20, "the row is cut to the pane, never run past it"
+
+
+def test_the_pane_is_the_same_height_with_and_without_a_notice():
+    without = a.render(_notice_frame(), width=80)
+    with_notice = a.render(_notice_frame(a.NOTICE_FOCUS_UNAVAILABLE), width=80)
+    assert len(without) == len(with_notice)
+
+
+def test_a_notice_paints_bright_where_the_footer_paints_dim():
+    # An error painted DIM is easy to miss: the footer is chrome and dim, the
+    # notice reports a failure and is painted at NORMAL brightness.
+    with_notice = a._pane(_notice_frame(a.NOTICE_FOCUS_UNAVAILABLE), 80)
+    assert with_notice.items[-1][1] == a.NORMAL
+    assert a._pane(_notice_frame(), 80).items[-1][1] == a.DIM
+
+
+def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
+    # End to end through the loop: after a failed Enter the notice IS the pane's
+    # last row and the footer's line is gone from that frame.
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    _fake_herdr_client(monkeypatch)
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT])
+
+    rows = _rows_with_attr(screen.frame_writes[-1])
+    bottom = rows[max(rows)][0]
+    assert bottom == a.NOTICE_FOCUS_OUTSIDE_HERDR, rows
+    assert a._footer(80) not in [text for text, _attr in rows.values()], \
+        "the footer does not share the pane with the notice"
 
 
 def test_space_expands_and_collapses_the_selected_snippet(monkeypatch):
