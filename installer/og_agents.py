@@ -63,7 +63,7 @@ from typing import Any, Iterable, Optional
 
 from og_herdr import (
     DEFAULT_AGENT_LABEL,
-    agent_vendor,
+    agent_harness,
     harness_labels,
     harness_vendors,
 )
@@ -580,9 +580,9 @@ class Row:
 
     `harness` holds a HARNESS ID when the row knows one — a root, whose detail
     fetch supplies it — and is "" otherwise, which is every worker: a worker's
-    LISTING row carries no `harness`, so its mark is resolved from `agent`
-    instead (see `worker_box` and `agent_mark`). "" is the honest blank, never a
-    guessed vendor.
+    LISTING row carries no `harness`, so its mark is resolved from the harness
+    the agent's installed spec declares, found by `agent` (see `worker_box` and
+    `worker_mark`). "" is the honest blank, never a guessed vendor.
 
     Only a WORKER row is selectable (see `_is_box`): the caret belongs to a box,
     so the rails and the roots are stepped over by the selection.
@@ -708,10 +708,10 @@ MARK_SLOT = 2
 # The mark for an agent whose VENDOR could not be identified — U+269B ATOM SYMBOL.
 # It is East Asian NARROW (measured: `east_asian_width("\u269b") == "N"`), so its
 # slot is the glyph plus one trailing space, exactly two display columns like
-# every other Narrow mark. It means "an agent whose vendor I could not identify",
+# every other Narrow mark. It means "an agent whose harness I could not identify",
 # NOT "no agent here": a row that names no agent identity at all draws the blank
-# slot instead (see `harness_mark` / `agent_mark`), so the atom never appears on a
-# row that simply has nothing to mark.
+# slot instead (see `harness_mark` / `worker_mark`), so the atom never appears on
+# a row that simply has nothing to mark.
 ATOM = "\u269b"
 
 
@@ -774,22 +774,34 @@ def harness_mark(harness: Any) -> str:
     return _vendor_mark(harness_vendors().get(harness))
 
 
-def agent_mark(agent: Any) -> str:
-    """The brand mark for an agent NAME (a worker's title-derived identity).
+def worker_mark(harness: Any, agent: Any) -> str:
+    """The brand mark for a WORKER row, by the resolution order (highest first).
 
-    The WORKER counterpart of `harness_mark`, and the fix for the blank marks on
-    every worker row: a worker's LISTING row carries no `harness`, so the mark has
-    to come from the name the title already gives — `zen`, `cmdcode`, `freebuff`.
-    Resolves name -> vendor through `og_herdr.agent_vendor` (registry `id`, or the
-    registry `worker` field with its `coder_` prefix stripped) and then vendor ->
-    glyph, sharing `_vendor_mark` with the harness path so the two agree.
+    A mark identifies THE HARNESS THE SESSION ACTUALLY RAN ON, and nothing else —
+    never a role, never inferred from what the agent is merely CALLED. So:
 
-    Same blank/atom split as `harness_mark` and for the same reason: no name is
-    blank, a name the registry cannot resolve is the atom. Never raises.
+      1. the row's OWN harness, when it carries one. A worker's LISTING row does
+         not, but any source that supplies one is reporting what ACTUALLY ran, so
+         it wins over anything the name would imply;
+      2. otherwise the harness the agent's installed SPEC declares, looked up by
+         the row's agent name through `og_herdr.agent_harness`. This is the
+         harness the worker was dispatched on, read from the truth rather than
+         guessed from the name;
+      3. the ATOM when an agent IS named but no harness could be found for it —
+         the honest "something ran here that I cannot identify".
+
+    A row with NO agent identity at all (neither a harness nor a name) draws the
+    BLANK slot instead: there is nothing to mark, which is a different fact from
+    "an agent I could not identify". Never raises.
     """
+    if isinstance(harness, str) and harness.strip():
+        return harness_mark(harness)
     if not isinstance(agent, str) or not agent.strip():
         return _mark_slot("")
-    return _vendor_mark(agent_vendor(agent))
+    declared = agent_harness(agent)
+    if not declared:
+        return _vendor_mark(None)
+    return harness_mark(declared)
 
 
 def build_rows(
@@ -1140,10 +1152,11 @@ def worker_box(row: Row, width: int, selected: bool,
     """
     box_width = max(4, width - GUTTER)
     inner = max(0, box_width - 2)
-    # A real harness on the row wins; a worker carries none, so its mark is
-    # resolved from the agent name the title gave — only when BOTH are absent is
-    # the slot blank (see `harness_mark` / `agent_mark`).
-    mark = harness_mark(row.harness) if row.harness else agent_mark(row.agent)
+    # The row's own harness wins; a worker carries none, so its mark comes from
+    # the harness its SPEC declares (found by the agent name the title gave) —
+    # only when BOTH the harness and the name are absent is the slot blank (see
+    # `worker_mark`).
+    mark = worker_mark(row.harness, row.agent)
     line1 = (" " + state_glyph(row.state, spin) + " " + mark + " "
              + _clip(row.text, inner - ROW_PREFIX))
     lines = [line1, _two_col(" " + (row.agent or "role"), row.meta, inner)]

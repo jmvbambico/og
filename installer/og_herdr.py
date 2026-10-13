@@ -300,86 +300,174 @@ def harness_vendors() -> dict[str, str]:
     return vendors
 
 
-# The third view of the same catalog, and the one `og agents` needs: an agent
-# NAME (the `zen` / `cmdcode` a worker's title carries) to the vendor its brand
-# mark is keyed by. A worker's LISTING row has no `harness` — only a root's
-# detail fetch carries one — so a mark that resolved harness->vendor alone drew
-# a blank for every worker. The name is a registry fact (the `id`, or the
-# `worker` field the orchestrator dispatches under), so this reads it from the
-# catalog rather than keeping a second alias table that could drift.
-_REGISTRY_AGENT_VENDORS: dict[str, str] | None = None
+# The harness an installed sub-agent ACTUALLY runs on, read from the spec
+# Omnigent installed for it — the one honest answer a WORKER row can give.
+#
+# A worker's LISTING row carries no `harness` (only a root's detail fetch does),
+# so a mark resolved from the row alone drew a blank for every worker. The fix is
+# NOT to guess a vendor from the agent's NAME: a name that merely resembles a
+# registry id says nothing about which harness ran, and a plausible wrong mark is
+# worse than an honest atom because nothing on screen flags the guess. The name
+# is still the KEY we look up by — but the VALUE comes from the spec, whose
+# `executor.harness` is the harness the session was dispatched on. Layout:
+#
+#     <home>/agents/<Bundle>/agents/<name>/config.yaml
+#
+# There can be more than one bundle directory; see `_scan_agent_harnesses` for
+# how a collision is resolved deterministically.
+_REGISTRY_AGENT_HARNESSES: dict[str, str] | None = None
 
 # The prefix the orchestrator puts on a worker name in a session title
-# (`coder_zen:task`). Stripped on BOTH the table keys and the lookup, because
-# the catalog spells the alias `coder_zen` while the view's `split_title` hands
-# over `zen`.
+# (`coder_zen:task`). The installed spec is named/`dir`'d `coder_zen` while the
+# row's title, through `split_title`, hands over `zen` — so both spellings are
+# indexed and either resolves.
 _WORKER_PREFIX = "coder_"
 
+# The two directory levels under the home, and the spec's filename:
+#   <home>/agents/<Bundle>/agents/<name>/config.yaml
+AGENTS_DIRNAME = "agents"
+SPEC_FILENAME = "config.yaml"
 
-def agent_vendors() -> dict[str, str]:
-    """`{agent name: vendor}` from installer/registry.json, cached, lowercased.
+try:
+    import yaml as _yaml
+except Exception:  # pragma: no cover - the "no PyYAML" test drives this path
+    # PyYAML is NOT a dependency of `og agents` — the module docstring insists it
+    # must run in any terminal — so its absence has to degrade to "no worker
+    # harness known" (every worker falls to the atom) rather than stop the pane
+    # from starting. The spec scan below is the only reader of YAML here, and it
+    # is the only thing this guard protects.
+    _yaml = None
 
-    The name is EITHER the row's `id` (the stable identity — `cmdcode`,
-    `freebuff`, `kilo`, `codex`) OR its `worker` field with the `coder_` prefix
-    stripped (the name the orchestrator actually dispatches under — the
-    opencode row's `worker: "coder_zen"` is where the alias `zen` comes from,
-    since `zen` is not an `id` at all). Reading the `worker` field rather than
-    hardcoding `zen -> opencode` is what keeps the alias derivable from the
-    catalog alone.
 
-    The same degradation contract as `harness_labels` and `harness_vendors`, and
-    for the same reason: never raises and never returns a half-read table. A
-    missing, unreadable or malformed catalog yields `{}`, and a name that is
-    absent resolves to no vendor — the caller then draws the unknown-agent mark
-    rather than guessing a vendor the registry does not name. A broken catalog
-    must cost a cosmetic detail, never a pane.
+def default_home() -> Path:
+    """The Omnigent home directory, read from the environment NOW.
+
+    `$OMNIGENT_HOME`, else `~/.omnigent`. Deliberately a function and not a
+    module-level constant, for the same reason `default_state_path` is: the value
+    depends on the environment, and a test (or an operator running against a
+    sandbox home) must be able to redirect it without editing a constant frozen
+    at import time.
     """
-    global _REGISTRY_AGENT_VENDORS
-    if _REGISTRY_AGENT_VENDORS is not None:
-        return _REGISTRY_AGENT_VENDORS
-    vendors: dict[str, str] = {}
+    return Path(os.environ.get("OMNIGENT_HOME") or Path.home() / ".omnigent")
+
+
+def agent_harnesses() -> dict[str, str]:
+    """`{agent name: harness id}` from the installed agent specs, cached.
+
+    The WORKER counterpart of `harness_labels` / `harness_vendors`, and the one
+    input `og agents` needs to mark a row by the harness it ran on rather than by
+    what its name resembles.
+
+    Cached on ONE scan of the specs, not a filesystem walk per call: the pane
+    polls every few seconds and re-scans on every row, so after the first call
+    this must cost nothing. A test redirecting the home (or making PyYAML
+    disappear) resets `_REGISTRY_AGENT_HARNESSES` to force a fresh scan.
+
+    The same degradation contract as its two siblings, and for the same reason:
+    never raises and never returns a half-read table. A missing home, a missing
+    agents directory, an unreadable or malformed spec or the absence of PyYAML
+    all yield `{}` (or omit that one agent) — the caller then draws the atom,
+    which is a cosmetic loss, never a pane that fails to render.
+    """
+    global _REGISTRY_AGENT_HARNESSES
+    if _REGISTRY_AGENT_HARNESSES is not None:
+        return _REGISTRY_AGENT_HARNESSES
+    _REGISTRY_AGENT_HARNESSES = _scan_agent_harnesses(default_home())
+    return _REGISTRY_AGENT_HARNESSES
+
+
+def _scan_agent_harnesses(home: Path) -> dict[str, str]:
+    """One walk of `<home>/agents/*/agents/*/config.yaml` -> `{alias: harness}`.
+
+    DETERMINISTIC across bundles: the bundle directories are sorted by name and
+    the FIRST spec that names a given alias wins (`setdefault`). A mark that
+    changed between runs because a directory listing happened to come back in a
+    different order would be a bug, so the order is fixed here rather than left
+    to the filesystem. (There is normally one bundle — the one `og install.sh`
+    wrote — so this only matters if a machine carries several.)
+
+    Both the spec's own `name:` field and its DIRECTORY name are indexed, and each
+    is indexed with the `coder_` prefix stripped as well: the row's agent name is
+    the title's `<role>_<agent>` prefix with `coder_` removed (see `split_title`),
+    while the installed spec is spelled `coder_zen`.
+
+    Never raises: a missing/unreadable `agents` directory, or an unreadable
+    bundle, contributes nothing. See `_read_spec` for the per-file contract.
+    """
+    out: dict[str, str] = {}
     try:
-        catalog = json.loads(REGISTRY_PATH.read_text())
-    except (OSError, ValueError):
-        catalog = None
-    rows = catalog.get("agents") if isinstance(catalog, dict) else None
-    for row in rows or []:
-        if not isinstance(row, dict):
+        bundles = sorted(p for p in (home / AGENTS_DIRNAME).iterdir()
+                         if p.is_dir())
+    except OSError:
+        return out
+    for bundle in bundles:
+        try:
+            specs = sorted(p for p in (bundle / AGENTS_DIRNAME).iterdir()
+                           if p.is_dir())
+        except OSError:
             continue
-        vendor = row.get("vendor")
-        if not isinstance(vendor, str) or not vendor:
-            continue
-        for field in ("id", "worker"):
-            value = row.get(field)
-            if not isinstance(value, str) or not value:
+        for spec_dir in specs:
+            name, harness = _read_spec(spec_dir / SPEC_FILENAME)
+            if not harness:
                 continue
-            key = value.strip().lower()
-            if key.startswith(_WORKER_PREFIX):
-                key = key[len(_WORKER_PREFIX):]
-            if key:
-                # First row wins, matching `harness_vendors`: two rows sharing an
-                # alias would be an ambiguous catalog, and the first is the one
-                # `--questions` would offer.
-                vendors.setdefault(key, vendor)
-    _REGISTRY_AGENT_VENDORS = vendors
-    return vendors
+            for alias in (name, spec_dir.name):
+                if not alias:
+                    continue
+                if alias.startswith(_WORKER_PREFIX):
+                    out.setdefault(alias[len(_WORKER_PREFIX):], harness)
+                out.setdefault(alias, harness)
+    return out
 
 
-def agent_vendor(agent: object) -> str | None:
-    """The vendor for an agent NAME, or None.
+def _read_spec(path: Path) -> tuple:
+    """`(name, harness)` from one spec's `config.yaml`, or `(None, None)`.
 
-    Case-insensitive and `coder_`-tolerant, because that is the shape the names
-    arrive in: a title reads `Coder_Zen:task` as readily as `coder_zen:task`, and
-    `split_title` hands over the part after the prefix. Never raises: a non-string
-    or empty name resolves to None, exactly as a name the catalog does not list
-    does, and the caller renders the unknown-agent mark for it.
+    Never raises. A missing file, unreadable bytes, malformed YAML, a spec that
+    is not a mapping, an `executor` that is not one, or an executor with no
+    harness all read as "no harness known": the caller draws the atom, which is a
+    cosmetic loss and never a pane that fails to render.
+
+    The harness is read from `executor.harness`, and from `executor.config.harness`
+    where the installer actually writes it (see templates/coder.yaml.tmpl) — the
+    two are checked so a spec in either shape resolves.
+    """
+    if _yaml is None:
+        return None, None
+    try:
+        data = _yaml.safe_load(path.read_text())
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    name = data.get("name")
+    name = name if isinstance(name, str) and name else None
+    executor = data.get("executor")
+    if not isinstance(executor, dict):
+        return name, None
+    harness = executor.get("harness")
+    if not isinstance(harness, str) or not harness:
+        config = executor.get("config")
+        harness = config.get("harness") if isinstance(config, dict) else None
+    if not isinstance(harness, str) or not harness:
+        harness = None
+    return name, harness
+
+
+def agent_harness(agent: object) -> str | None:
+    """The harness id the agent NAME's installed spec declares, or None.
+
+    The lookup is EXACT (case-sensitive): the names come from `split_title`,
+    which strips `coder_` from the title's prefix, and the scan indexes both the
+    `coder_`-prefixed and bare spellings — so `zen` and `coder_zen` both resolve
+    and no case-folding is needed for the names this view actually sees (verified
+    against a live listing: every worker name is lowercase).
+
+    Never raises: a non-string or empty name resolves to None, exactly as a name
+    with no installed spec does, and the caller then draws the atom.
     """
     if not isinstance(agent, str) or not agent.strip():
         return None
-    key = agent.strip().lower()
-    if key.startswith(_WORKER_PREFIX):
-        key = key[len(_WORKER_PREFIX):]
-    return agent_vendors().get(key)
+    return agent_harnesses().get(agent.strip())
 
 
 def agent_label(session: dict) -> str:
@@ -1411,11 +1499,11 @@ def default_state_path() -> Path:
     Deliberately not a module-level constant: the value depends on
     $OMNIGENT_HOME, and a test (or an operator running against a sandbox home)
     must be able to redirect it by setting the variable, not by editing a
-    constant that was frozen when the module happened to be imported. Same
-    resolution as every other module here: $OMNIGENT_HOME, else ~/.omnigent.
+    constant that was frozen when the module happened to be imported. The home
+    itself is resolved by `default_home`, so this and the agent-spec scan cannot
+    disagree about which home they are reading.
     """
-    return Path(os.environ.get("OMNIGENT_HOME") or Path.home() / ".omnigent") \
-        / STATE_FILENAME
+    return default_home() / STATE_FILENAME
 
 
 def load_state(path: Path, note: list[str] | None = None) -> dict:
