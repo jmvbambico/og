@@ -40,7 +40,8 @@ path is GET-only and goes entirely through `og_herdr_watch`, which owns the
 transport, pagination, `kind=any` default, truncation handling and per-server
 token matching; none of that is re-implemented here. It makes exactly ONE
 outbound call of its own: `agent.focus` (see `focus_in_herdr`), which moves the
-operator's own herdr UI to a worker's session and touches no session state. That
+operator's own herdr UI to the pane a row belongs to — a worker's ROOT, the only
+session herdr has a pane for, see `focus_target` — and touches no session state. That
 call is reached lazily — the herdr client is imported inside the handler, so `og
 agents` still runs with no herdr installed, outside a herdr pane, or with the
 socket down — and it is pinned by the AST guard in tests/test_og_agents.py, which
@@ -255,6 +256,11 @@ TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
 # block to scroll to. Lose it and scroll-to-selection breaks silently, with no
 # symptom until the list outgrows the pane.
 #
+# THE BRIGHTNESS A LINE HANGS IS A DEFAULT, NOT A VERDICT: a span carrying the
+# `undim:` role prefix paints NORMAL whatever its line says (see below). That is
+# what keeps the gutter and the status glyph full-brightness on an unselected
+# box — reported as "I cannot tell which workers are running at a glance".
+#
 # There is no TITLE/A_REVERSE role any more: the root is a rounded box like a
 # worker's, not a reverse-video bar, so the pane spends no A_REVERSE at all.
 NORMAL, SELECTED, DIM = "normal", "selected", "dim"
@@ -269,15 +275,41 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 # maps it to a curses attribute.
 #
 #   PLAIN      no colour, the default foreground — everything not named below.
-#   META       the worker's meta (`12s`, `done 2h ago`, `failed`, `waiting on
-#              you`): ONE colour for every meta, not bold.
+#   META       the worker's meta (`12s`, `done`, `failed`, `waiting on you`):
+#              ONE colour for every meta, not bold.
 #   ORCH       the ROOT box's NAME: bold, no colour.
 #   mark:<v>   a harness brand mark: bold, plus vendor `v`'s brand colour.
+#   state:<s>  a worker's STATUS GLYPH, in that state's colour (see
+#              `_STATE_COLOURS`); PLAIN for the states that have none.
+#   undim:<r>  NOT A COLOUR: a prefix that exempts a span from its line's DIM and
+#              hands it back `r` as its colour role (see `_bare_role`). This is
+#              how brightness became a PER-SPAN axis — the gutter and the status
+#              glyph are exempt on every row, selected or not.
 PLAIN, META, ORCH = "plain", "meta", "orch"
+UNDIM = "undim:"
+
+
+def undim(role: str) -> str:
+    """`role`, EXEMPT from the brightness its line would otherwise paint at.
+
+    DIM is a per-LINE default (`_blocks`), so before this a segment that had to
+    stay bright regardless was unreachable: the operator reporting "the dim
+    swallows the gutter and the status glyph" could not tell which workers were
+    running, because the rail, the node and the spinner dimmed WITH the box
+    drawn around them. Naming the exemption on the span is what makes it
+    explicit at the site that composes it, rather than inferred from its
+    position in the line.
+
+    Exempt means NORMAL, never BOLD: a status glyph at full brightness is the
+    whole point, and there is no brighter axis to spend.
+    """
+    return UNDIM + role
+
 
 # (text, colour_role) — one run of a line and the role it paints under.
 Span = tuple[str, str]
-# (spans, brightness) — a whole line: its spans and the brightness they share.
+# (spans, brightness) — a whole line: the brightness its spans paint at BY
+# DEFAULT. A span whose role carries the `undim:` prefix is exempt (see `undim`).
 Line = tuple[list[Span], str]
 
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
@@ -432,21 +464,6 @@ def _age(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
-def _ago(seconds: float) -> str:
-    """How long ago, coarse: `12s ago`, `6m ago`, `2h ago`.
-
-    "How long since" is read at a glance, so it drops to the largest unit that
-    still says something; `_age` is for the running figure, which is watched
-    ticking.
-    """
-    total = max(0, int(seconds))
-    if total < 60:
-        return f"{total}s ago"
-    if total < 3600:
-        return f"{total // 60}m ago"
-    return f"{total // 3600}h ago"
-
-
 # The listing row fields a failure reason might arrive in, if it ever does. The
 # listing carries none of them today (see og_herdr_watch's measured key list),
 # so `_failure_reason` normally finds nothing and the row reads plain `failed`.
@@ -469,21 +486,28 @@ def _failure_reason(session: dict) -> Optional[str]:
 
 
 def worker_meta(session: dict, state: str, now: float) -> str:
-    """The right half of a worker's content row: `2m14s`, `waiting on you`, …
+    """The right half of a worker's content row: `2m14s`, `waiting on you`, `done`.
 
-    The clock is honest about what it actually knows. BOTH timestamps come off
-    the LISTING row (so no detail fetch buys a clock on every row), and neither
-    is a measured start: `created_at` is when the server created the session
-    ROW, and `updated_at` is its LAST ACTIVITY — a worker that has been thinking
-    for ten minutes updates it constantly. So:
+    The clock is honest about what it actually knows. `created_at` comes off the
+    LISTING row (so no detail fetch buys a clock on every row), and it is not a
+    measured start: it is when the server created the session ROW, so a worker
+    that has been thinking for ten minutes reads as its whole EXISTENCE, not as
+    a measured duration. So:
 
-      * working -> how long the session has EXISTED. For a worker dispatched to
-        run a task that is close to its runtime, and it is labelled for what it
-        is rather than dressed up as a measured duration.
-      * idle -> `updated_at` IS when it stopped, so `done 6m ago` is exact.
+      * working -> `_age(now - created_at)`, the count-up while it runs.
+      * idle -> a bare `done`. It once read `done 6m ago` — exact, since for an
+        idle row `updated_at` IS when it stopped — but the elapsed figure was
+        noise beside the name, so a stopped worker now says only that it stopped.
 
-    A row with no usable timestamp falls back to a plain word rather than a
-    figure derived from the epoch.
+    `blocked` and `failed` keep their own words (`waiting on you`, and the failure
+    reason or `failed`): a row that is waiting on a human, or has failed, must not
+    be flattened into `done`. The states the vocabulary does not name share the
+    `done` branch they have always shared.
+
+    `updated_at` is deliberately NOT read any more: the state already says the
+    worker has stopped, so there is no figure to derive from the epoch and no
+    timestamp to require. A stopped row reads `done` whether or not the listing
+    gave it an `updated_at`.
     """
     if state == "blocked":
         return "waiting on you"
@@ -493,8 +517,7 @@ def worker_meta(session: dict, state: str, now: float) -> str:
     if state == "working":
         created = _epoch(session.get("created_at"))
         return _age(now - created) if created is not None else "working"
-    updated = _epoch(session.get("updated_at"))
-    return f"done {_ago(now - updated)}" if updated is not None else "idle"
+    return "done"
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +696,16 @@ class Row:
     agent: Optional[str] = None
     meta: str = ""
     harness: str = ""
+    # The ROOT session this row's pane belongs to, needed because a sub-agent's
+    # OWN `session_id` addresses no herdr pane: herdr writes a pane record (and so
+    # an `agent_session_id` a focus target can match) only for a root, so Enter on
+    # a worker must aim at the root instead — see `focus_target`. It has to be a
+    # FIELD rather than re-derived at focus time: `build_rows` FLATTENS the tree
+    # and groups by state, so with `--all` several roots' workers interleave and a
+    # worker's root is not recoverable from a walk of `Frame.rows`. Set for every
+    # worker in `_worker_rows`; a root row leaves it "" and resolves to its own
+    # `session_id` through `is_root`.
+    root_session_id: str = ""
 
 
 @dataclass
@@ -797,17 +830,96 @@ _HARNESS_MARKS = {
 #     coloured and INVISIBLE on a dark pane. 252, a light neutral, is used.
 #   * cursor's is #3C3C3C -> ansi 237, luminance 60: the same problem, less
 #     severe. 244 is used.
+#
+# KILO IS NOT A SUBSTITUTION but its hex is recorded anyway, because its index is
+# not re-derivable by eye and 99 (135,135,255) was a blue-violet that matched
+# nothing about Kilo — the mark's colour simply did not correspond to its brand.
+#   * the brand is #F3EF4E, a bright lemon, and only the TOP rung of the 6x6x6
+#     cube can hold it: 243 and 239 are both above the 215 rung. Blue 78 has no
+#     rung nearer than the lowest non-zero one (95), so the whole of the
+#     conversion error is blue 78 -> 95 and the colour is 227 (255,255,95). Its
+#     two cube neighbours both read further from the hex — 221 (255,215,95) is
+#     orange, 191 (215,255,95) is green — and neither is nearer in sRGB either
+#     (1009 and 1329 against 689). The greyscale ramp is not a candidate at all:
+#     its closest rung is 26x further out than the winner.
+#
+# 227 IS ADJACENT TO 226, the spinner's neon yellow (`_STATE_COLOURS`), and both
+# paint on the same worker row — spinner in the gutter, mark in the box. They do
+# not smear, but not because the numbers do it: the ONLY channel between them is
+# blue, 0 against 95, so 226 is a saturated yellow and 227 a pale one. Three axes
+# carry the rest of the separation, and any of them can go: the mark is BOLD and
+# the spinner is not (`_role_bold`), the mark takes its line's brightness while the
+# spinner is `undim`-exempt, and the glyphs are different shapes in different
+# columns. Worth re-checking rather than assuming the index alone separates them.
+#
+# FREEBUFF IS THE THIRD NON-SUBSTITUTION, AND THE ROW THAT MISLED: the key is
+# `z-ai`, which names z.ai the MODEL PROVIDER, but the glyph and this colour are
+# FREEBUFF'S, the harness the registry files under that vendor — which is exactly
+# what `_HARNESS_MARKS` says on this very key ("the mark names the TOOL, so an F,
+# not a Z"). A logo here is the HARNESS's, glyph AND colour; the tables are keyed
+# by vendor only as STORAGE, and the harness -> vendor hop is the registry's job.
+# So a reader who takes the key at face value converts a model provider's brand
+# instead of the tool's, which is how a sage green mark came to be painted 26 — a
+# saturated blue belonging to nothing in this table. Read `_HARNESS_MARKS` before
+# converting a colour; `deepseek` and `moonshotai` are the same trap, already
+# flagged on their marks.
+#   * the brand is #A4BA96, a muted sage. The NEAREST index in the whole palette is
+#     144, (175,175,135), at OKLab 3.087 and sRGB 21.6 — but 108, (135,175,135), is
+#     shipped instead, at 5.274 and 34.45. It is deliberately NOT the nearest, and it
+#     is the next-nearest of all 240. The cube takes the brand's red 164 DOWN to the
+#     135 rung (29, where the next rung 95 is 69 away), green 186 down to 175 (11,
+#     next 29 away) and blue 150 down to 135 (15, against 25 for 175), so the whole
+#     of the conversion error is 29, 11 and 15. The greyscale ramp is still not a
+#     candidate: its best is 249, a pure neutral, at 5.567.
+#
+# Two things pay for the 2.187 of OKLab the second-nearest costs, and both were
+# decided rather than drifted into:
+#
+# HUE IS THE CHANNEL A BRAND MARK IS RECOGNISED BY. The brand's OKLab hue is 133
+#     degrees; 144 sits at 108 and reads OLIVE, 108 at 145 and reads green. For a
+#     logo that is the error that shows — a sage gone olive is simply the wrong
+#     colour — and 2.187 of total distance is a fair price for keeping the hue.
+#
+# 108 ALSO CLEARS THE TIGHTEST PAIR IN THIS TABLE. At 144 the mark would have sat
+#     5.578 from 145, `opencode-zen`'s mark: red and green EQUAL at 175 each and
+#     OKLab lightness barely separating them (0.744 against 0.754), so the whole of
+#     the difference is 40 of blue — 145 exactly NEUTRAL (chroma 0.000) where 144
+#     carries 0.055. That is closer than openai 36 against goose 37 at 5.969, which
+#     has the SAME one-channel geometry and has always shipped unremarked. 108 puts
+#     the pair at 8.234, clear of it. So the row that moved is not the one whose
+#     brand colour was closest; it is the one that sat next to a neutral.
+#
+# 145 IS NOT A BRAND COLOUR AT ALL, which is worth having on the record before
+#     anyone reads the 108/145 distance as a collision between two brands.
+#     `opencode-zen`'s glyph is ▯, U+25AF WHITE VERTICAL RECTANGLE, and "white"
+#     there is the Unicode naming convention for HOLLOW — unfilled — not a colour.
+#     The operator confirmed the mark carries no brand colour, so 145 is a flat
+#     neutral standing in for no identity. That row had nothing to preserve and
+#     COULD have been the one to move; it did not have to be, because 108 is
+#     independently the better sage. Written down so the next person to sit with
+#     this pair does not re-run the investigation from scratch.
+#
+# Luminance falls from 0.415 to 0.376 — far above the dark-pane floor, and still NOT
+#     the darkest colour the table ships: hermes 130 at 0.173 keeps that slot, which
+#     is why the floor test still names hermes rather than this row.
+#
+# THE FLOOR ABOVE IS A DARK-PANE FLOOR, and it is an ASSUMPTION, not an enforced
+# one: `_Colours.attr` colours a FOREGROUND on the TERMINAL'S OWN background (the
+# `-1` in `init_pair`), so on a light terminal every entry here inverts into the
+# very problem the floor exists to prevent — 227 is the second-brightest mark in
+# the table (only xai's white is brighter) and would wash out against white. That
+# is a background decision, not a fourteen-colour retune, so it is not made here.
 _VENDOR_COLOURS = {
     "anthropic": 173,
     "openai": 36,
     "google": 69,
-    "kilo": 99,
+    "kilo": 227,
     "aws-kiro": 208,
     "xai": 231,
     "goose": 37,
     "hermes": 130,
     "cognition": 32,
-    "z-ai": 26,
+    "z-ai": 108,
     "opencode-zen": 145,
     "deepseek": 63,
     "cursor": 244,
@@ -818,10 +930,41 @@ _VENDOR_COLOURS = {
 # as secondary on a dark pane). Not bold — see `_role_bold`.
 META_COLOR = 109
 
+# THE STATUS GLYPH's colours, asked for by name: the check mark NEON GREEN and the
+# spinner NEON YELLOW, so a pane with four workers running reads as four lit
+# glyphs down the gutter rather than four identical grey ⠋ braille cells at two
+# brightnesses. Only these two states are coloured — `⏸` blocked, `✗` failed and
+# `?` unknown stay PLAIN, because a red `✗` and a grey `⏸` are taste as much as
+# they are meaning and nobody asked for them; the table is the whole of it, and a
+# state absent here paints uncoloured.
+#
+# BOTH INDICES ARE PURE HUE AT FULL VALUE ON THE 6x6x6 CUBE, not a pale tint of
+# one: 46 is (0,255,0) and 226 is (255,255,0), the two cells in the cube that are
+# a neon green and a neon yellow with nothing shaded out of them. The cells beside
+# them shade toward white (118, 190, 229) and read as a pastel, which on a gutter
+# reads as "secondary"; the named 8 are duller still. Both indices are > 16, so
+# like every vendor colour here they want a 256-colour terminal and fall back to
+# uncoloured below that (`_Colours.attr`).
+_STATE_COLOURS = {
+    "idle": 46,
+    "working": 226,
+}
+
 
 def mark_role(vendor: str) -> str:
     """The colour role for a harness mark painted on `vendor`'s brand colour."""
     return f"mark:{vendor}"
+
+
+def state_role(state: str) -> str:
+    """The colour role for `state`'s status glyph: `state:<state>`, or PLAIN.
+
+    The same shape as `mark_role`, and for the same reason — the ROLE is the
+    colour's NAME and the colour is looked up in one table (`_STATE_COLOURS`), so
+    the layout composes glyph and state and never a palette.
+    """
+    return f"state:{state}" if state in _STATE_COLOURS else PLAIN
+
 
 # A mark is padded into a FIXED two display columns, not left as-is. Without the
 # slot, a Narrow mark (one cell) and a Wide or Ambiguous one (more) on
@@ -1103,6 +1246,7 @@ def _worker_rows(by_id: dict, children: dict, root_id: str,
             agent=agent,
             meta=worker_meta(session, state, clock),
             harness=harness if isinstance(harness, str) else "",
+            root_session_id=root_id,
         ))
     return out
 
@@ -1315,7 +1459,7 @@ def _two_col(left: list[Span], right: list[Span], width: int) -> list[Span]:
     thing the row is really about, so it is worth keeping whole while the elastic
     left gives way — which is also what preserves its COLOUR ROLE: a tight line
     loses the title, never the meta's META. Both callers rely on this: the worker
-    row hands it the meta — `2m14s`, `failed`, `waiting on you`, `done 6m ago` —
+    row hands it the meta — `2m14s`, `failed`, `waiting on you`, `done` —
     and the root box's content row the harness label (`Claude Code`). Only when
     `right` alone is wider than `width` is it clipped itself.
     """
@@ -1376,9 +1520,11 @@ def worker_box(row: Row, width: int, selected: bool,
                spin: int = 0) -> tuple[list[list[Span]], int]:
     """One worker as a guttered, rounded box, and the index of its SELECTED row.
 
-    Each returned line is a list of SPANS (the caller hangs the brightness on it);
-    joined, a returned line is exactly `width` columns: the four-column gutter
-    plus a box `width - GUTTER` wide.
+    Each returned line is a list of SPANS; joined, a returned line is exactly
+    `width` columns: the four-column gutter plus a box `width - GUTTER` wide. The
+    caller hangs the line's DEFAULT brightness on it — everything here paints at
+    that brightness except a span whose role carries the `undim:` prefix, which is
+    exempt from it (see `undim`).
 
     The gutter's NODE column carries `⦿` on the box's CONTENT row — the point
     where this agent's box hangs off the rail — and the rail `│` on every other
@@ -1392,6 +1538,15 @@ def worker_box(row: Row, width: int, selected: bool,
     the caller hangs on `selected_row`, never a glyph. So `--once`, which has no
     attributes, cannot show which worker is selected — a one-shot dump carries no
     selection signal at all (see `main`).
+
+    THE GUTTER IS EXEMPT FROM DIM, ON EVERY ROW. The user reported that the dim
+    swallowed it: an unselected worker's rail, node and status glyph dimmed with
+    the box, and "which workers are running at a glance" — the one thing the
+    gutter exists to answer — became unreadable. Every gutter span is hung through
+    `undim`, so it paints at full brightness whatever the box around it does,
+    while the box's border and body still take the line's brightness. Selection is
+    unaffected: the selected box was already at full brightness, so it renders
+    exactly as before.
 
     The box is THREE rows — top border, ONE content row, bottom border — and FOUR
     when the report is expanded (the extra row is the dimmed snippet, INSIDE the
@@ -1446,9 +1601,15 @@ def worker_box(row: Row, width: int, selected: bool,
         # promises the state. So only the trailing task is clipped, into the
         # columns left after the glyph; width 1 leaves none, and the glyph stands
         # alone. Width <= 0 has no column at all; `_clip`'s own floor.
+        #
+        # Two spans, not one concatenated string, and for the same reason the
+        # guttered row splits them: there is no box here, but the GLYPH is still
+        # the status and is still exempt from the line's DIM and still wears its
+        # state's colour, while the task beside it takes the line's brightness.
         if width < 1:
             return [[]], 0
-        return [[(glyph + _clip(" " + row.text, width - 1), PLAIN)]], 0
+        return [[(glyph, undim(state_role(row.state))),
+                 (_clip(" " + row.text, width - 1), PLAIN)]], 0
 
     if width >= GUTTER + BOX_MIN:
         box_width, node_column, glyph_column = width - GUTTER, True, True
@@ -1488,12 +1649,21 @@ def worker_box(row: Row, width: int, selected: bool,
         # The node and the state glyph ride on that row alone; the rail and a space
         # fill every other row, so the line down column 0 is unbroken.
         on_content = index == 1
-        prefix = ""
+        # THE GUTTER IS NOT PART OF THE BOX, so it does not paint like it. Both of
+        # its spans go through `undim` and the glyph's through `state_role`, which
+        # is the whole of the reported "the dim swallows the gutter and the status
+        # glyph": the rail, the node and the `⠋`/`✓` used to dim with the box they
+        # sit beside, so a pane could not be read for what was RUNNING. Exempt from
+        # brightness and coloured are ORTHOGONAL — the glyph is `undim:` AND
+        # `state:working`, and paints neon yellow at full brightness on an
+        # unselected row while the box around it stays DIM.
+        gutter: list[Span] = []
         if node_column:
-            prefix += (NODE if on_content else RAIL) + " "
+            gutter.append(((NODE if on_content else RAIL) + " ", undim(PLAIN)))
         if glyph_column:
-            prefix += (glyph if on_content else " ") + " "
-        out.append([(prefix, PLAIN)] + spans if prefix else spans)
+            glyph_role = state_role(row.state) if on_content else PLAIN
+            gutter.append(((glyph if on_content else " ") + " ", undim(glyph_role)))
+        out.append(gutter + spans if gutter else spans)
     return out, 0
 
 
@@ -1593,7 +1763,11 @@ def _blocks(frame: Frame, width: int) -> list[list[Line]]:
     `build_rows` at the head of every group, so it is the group's opening brace).
 
     This is ALSO where BRIGHTNESS is hung: the layout functions return spans with
-    colour roles only, and the selection axis is decided here (see below).
+    colour roles only, and the selection axis is decided here (see below). What
+    is hung here is the LINE'S DEFAULT: a span whose role carries the `undim:`
+    prefix paints NORMAL whatever this decides, which is how the gutter and the
+    status glyph stay bright on an unselected box without this function needing
+    to know which spans they are.
     """
     blocks: list[list[Line]] = []
     unit: Optional[list[Line]] = None
@@ -1619,6 +1793,12 @@ def _blocks(frame: Frame, width: int) -> list[list[Line]]:
                 # — because that is the row `_run_tui` scrolls to keep visible; it
                 # maps to the same attribute as NORMAL, so the box reads uniformly
                 # white.
+                #
+                # DIM IS THE BOX, NOT THE ROW: `worker_box` marks its gutter and
+                # status glyph `undim:`, so this value is what the BOX paints at
+                # and those segments override it. That exemption is the reported
+                # fix, and it lives in the spans rather than here so that this
+                # function keeps one rule for every line it composes.
                 if not on_selected:
                     brightness = DIM
                 elif position == selected_row:
@@ -1644,12 +1824,21 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     whole blocks; see `_blocks`).
 
     An unselected worker's box is DIM, the selected worker's box NORMAL except its
-    first line, which carries SELECTED: selection is brightness, not a glyph.
+    first line, which carries SELECTED: selection is brightness, not a glyph. A
+    line's brightness is the DEFAULT its spans paint at — a span hung through
+    `undim` (the worker's gutter and status glyph) ignores it and stays bright.
+
+    A focus NOTICE takes the footer's row while it is up (see the tail below), so
+    the pane is exactly as tall with a notice as without one — a failed Enter must
+    not change the view's shape.
     """
     items: list[Line] = []
-    if frame.notice:
-        items.append(([(_clip(frame.notice, width), PLAIN)], NORMAL))
-    elif frame.truncated:
+    # The truncation banner stays at the TOP: it is a fact about the LISTING
+    # (rows past the page cap are missing), not about an action, so it belongs
+    # over the rows it warns about. The focus notice has a different home — it
+    # takes the footer's row, below. The two are independent, so a notice no
+    # longer suppresses this banner the way it did when both fought for row 0.
+    if frame.truncated:
         items.append(([(_clip(TRUNCATED_NOTICE, width), PLAIN)], NORMAL))
 
     blocks = _blocks(frame, width)
@@ -1659,7 +1848,17 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
         tail.extend(([(line, PLAIN)], DIM)
                     for line in access_lines(frame.access, width))
         tail.append(([("", PLAIN)], NORMAL))
-    tail.append(([(_clip(_footer(width), width), PLAIN)], DIM))
+    # The focus notice, while it is up, TAKES the footer's row rather than adding
+    # one above it: the tail is the same length either way, so the pane's row
+    # count (and its list window) does not move when a notice appears. The notice
+    # is clipped to the pane exactly as the footer is, so a long herdr error can
+    # never overflow the row. It paints NORMAL, not the footer's DIM: it reports
+    # an action that JUST FAILED, and dim is the treatment for chrome — an error
+    # an operator skims past is the one thing this line must not be.
+    if frame.notice:
+        tail.append(([(_clip(frame.notice, width), PLAIN)], NORMAL))
+    else:
+        tail.append(([(_clip(_footer(width), width), PLAIN)], DIM))
 
     room = None if height is None else max(ACCESS_LIST_FLOOR, height - len(tail))
     kept: list[list[Line]] = []
@@ -1819,18 +2018,44 @@ def _clip_columns(text: str, width: int) -> str:
     return "".join(out)
 
 
+def _bare_role(role: str) -> str:
+    """`role` with any `undim:` exemption prefix stripped — its colour role proper.
+
+    The prefix is a modifier on the other axis, so colour and bold both have to
+    look past it: `undim:mark:anthropic` is still anthropic's brand colour and
+    still bold, and `undim:state:idle` is still the neon green of `✓`.
+    """
+    return role[len(UNDIM):] if role.startswith(UNDIM) else role
+
+
+def _role_brightness(role: str) -> Optional[str]:
+    """The BRIGHTNESS `role` paints at, or None to inherit its line's.
+
+    Only the `undim:` prefix sets one, and it sets NORMAL. Colour and brightness
+    stay independent exactly as they were: a vendor mark is still its brand
+    colour merely dimmed, and an exempt span is at full brightness while keeping
+    whichever colour role it carries.
+    """
+    return NORMAL if role.startswith(UNDIM) else None
+
+
 def _role_colour(role: str) -> Optional[int]:
     """The ANSI-256 foreground a colour role names, or None for the default.
 
     PLAIN and ORCH carry no colour (ORCH is bold only); META has its one slate;
     a `mark:<vendor>` names its vendor's brand colour, or None when that vendor
     has none (which cannot happen for a vendor with a mark, but keeps the table
-    the single source).
+    the single source); a `state:<state>` names the STATUS GLYPH's colour for
+    that state, or None for the states that have none. Any `undim:` prefix is
+    not a colour and is stripped first (see `_bare_role`).
     """
+    role = _bare_role(role)
     if role == META:
         return META_COLOR
     if role.startswith("mark:"):
         return _VENDOR_COLOURS.get(role[len("mark:"):])
+    if role.startswith("state:"):
+        return _STATE_COLOURS.get(role[len("state:"):])
     return None
 
 
@@ -1839,8 +2064,10 @@ def _role_bold(role: str) -> bool:
 
     Bold is a WEIGHT, not a colour, so it applies whether or not the terminal can
     colour: the root's name (ORCH) and every harness mark are bold even on a
-    monochrome terminal. The unknown-harness atom is PLAIN, so it is not.
+    monochrome terminal. The unknown-harness atom is PLAIN, so it is not. An
+    `undim:` prefix is not a weight either, so it is stripped first.
     """
+    role = _bare_role(role)
     return role == ORCH or role.startswith("mark:")
 
 
@@ -1858,11 +2085,15 @@ class _Colours:
 
     Degrades rather than crashes, in this order: no colour support (`has_colors()`
     false) -> every role paints uncoloured; a terminal with fewer colours than a
-    role needs (the vendor brand colours want 256) -> that role paints uncoloured;
+    role needs (the vendor brand colours and the status glyph's neon green and
+    yellow want 256) -> that role paints uncoloured, the glyph falling back to the
+    default foreground exactly as every other colour here does;
     the pair table exhausted -> the roles that could not be allocated paint
     uncoloured. NEVER a wrong colour and never an exception: a terminal that
     cannot colour still has to show the pane, and a bare-but-correct pane beats a
-    crash. A bold role still bolds (see `_role_bold`) — bold is not a colour.
+    crash. A bold role still bolds (see `_role_bold`) — bold is not a colour, and
+    neither is the `undim:` exemption, so it survives a terminal with no colour at
+    all.
     """
 
     def __init__(self, curses: Any):
@@ -2427,11 +2658,43 @@ def _tty_available() -> bool:
 NOTICE_FOCUS_OUTSIDE_HERDR = "focus: not inside herdr (no HERDR_ENV)"
 NOTICE_FOCUS_UNAVAILABLE = "focus: herdr client unavailable"
 NOTICE_FOCUS_FAILED = "focus: {0}"
+# Enter on a row that resolves to no herdr pane at all — a worker whose listing
+# carried no root, or a malformed row. Deliberately NOT sent as a target: an id
+# known to match no record would only draw herdr's own `agent_not_found` back.
+NOTICE_FOCUS_NO_ROOT = "focus: no root session to focus"
+
+
+def focus_target(row: Row) -> Optional[str]:
+    """The session id herdr can resolve for `row`: a root is its own, a worker's is its root.
+
+    WHY A WORKER TARGETS ITS ROOT. herdr matches an `agent.focus` target against
+    its PANE RECORDS, and it opens a pane — writing a record that carries
+    `agent_session_id` — only for a ROOT session (see `og_herdr.py`). A sub-agent
+    never gets a pane of its own, so its own id matches no record and herdr answers
+    `agent_not_found`: on every worker, every time, which is the failure this
+    resolves. The worker's work IS visible, though — in its ROOT's pane — so the
+    root is the one target herdr can match and the one Enter should send. A root
+    row owns its own pane and so targets itself.
+
+    None when the row carries no resolvable root (a worker built without one, a
+    malformed row). The caller declines with `NOTICE_FOCUS_NO_ROOT` rather than
+    sending an id it knows will fail.
+    """
+    if row.is_root:
+        return row.session_id or None
+    return row.root_session_id or None
 
 
 def focus_in_herdr(session_id: str,
                    environ: Optional[dict] = None) -> Optional[str]:
     """Jump the operator's herdr UI to `session_id`. None on success, else why not.
+
+    `session_id` is the id the CALLER has already resolved to something herdr can
+    match — a root's own id, or a sub-agent's ROOT (see `focus_target`). It is not
+    necessarily the selected row's own session: only a root has a pane record, so
+    a sub-agent's own id would draw `agent_not_found`. This function sends whatever
+    it is given, unchanged; the row-to-root resolution belongs to the caller that
+    holds the rows.
 
     THE ONE THING THIS VIEW EVER SENDS. Everything else `og agents` does is a GET
     through `og_herdr_watch`; this is the single outbound call, `agent.focus`, and
@@ -2493,8 +2756,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     the model.
 
     Keys: `q` quits, `r` forces a refresh, the arrows (or `j`/`k`) move the
-    selection, Enter FOCUSES the selected worker in herdr (jumping the operator's
-    herdr UI to that session, see `focus_in_herdr`), Space expands or collapses
+    selection, Enter FOCUSES the selected row in herdr (jumping the operator's
+    herdr UI to the pane it belongs to — a worker's ROOT, see `focus_target` and
+    `focus_in_herdr`), Space expands or collapses
     the selected row's snippet, and `a` toggles the access panel. It sends
     nothing to a session and changes no session state: `agent.focus` is the ONE
     outbound call it makes, and it moves the operator's own terminal alone.
@@ -2545,8 +2809,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         offset = 0
         expanded: set[str] = set()
         # The one-line reason the last Enter could not focus, shown in the pane
-        # through `Frame.notice`. It is cleared on the NEXT keypress, so it sits
-        # for as long as the operator is reading it and goes once they act.
+        # through `Frame.notice` — on the FOOTER row, replacing it while it is up
+        # (`_pane`). It is cleared on the NEXT keypress, so it sits for as long as
+        # the operator is reading it and goes once they act.
         notice: Optional[str] = None
         # `poll` asks for a refresh now; `force` additionally drops the selected
         # row's cached report so it is read again. They are separate so Space can
@@ -2577,12 +2842,22 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             on the selected box's first row so the scroll target survives, not a
             look of its own) — and each span's COLOUR ROLE, its brand colour
             and/or bold. A dim box still shows its mark's colour, merely dimmed.
+
+            The line's brightness is the DEFAULT, not a per-line verdict: a span
+            whose role carries `undim:` (the worker gutter and status glyph, which
+            dimmed with the box until the operator reported that a pane could not
+            be read for what was RUNNING) overrides it with NORMAL. Because that
+            is a property of the ROLE and not of its position, colour and
+            brightness stay independent — the exempt glyph paints its neon colour
+            at full brightness on an unselected row, and a dim vendor mark keeps
+            its brand colour.
             """
-            base = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_NORMAL,
-                    DIM: curses.A_DIM}[brightness]
+            attr_of = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_NORMAL,
+                       DIM: curses.A_DIM}
 
             def attr_for(role: str) -> int:
-                attr = base
+                own = _role_brightness(role) or brightness
+                attr = attr_of[own]
                 colour = _role_colour(role)
                 if colour is not None:
                     attr |= colours.attr(colour)
@@ -2678,16 +2953,20 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             elif key in (curses.KEY_DOWN, ord("j")):
                 selected = move_selection(frame.rows, selected, 1)
             elif key in (curses.KEY_ENTER, 10, 13):
-                # Enter FOCUSES the selected worker in herdr — it jumps the
-                # operator's own terminal to where that session lives. It is a
-                # no-op on a header (nothing to jump to), and it deliberately
-                # does NOT set `poll`: focus changes nothing this view draws, so
-                # a refetch would be a listing walk for nothing. A failed focus
-                # sets a notice, and the next paint shows it. See
-                # `focus_in_herdr` for every way it can decline.
-                if 0 <= selected < len(frame.rows) \
-                        and not frame.rows[selected].is_root:
-                    notice = focus_in_herdr(frame.rows[selected].session_id)
+                # Enter FOCUSES the selected row in herdr — it jumps the
+                # operator's own terminal to the pane that row belongs to. The
+                # TARGET is resolved first (`focus_target`): a worker sends its
+                # ROOT's id, because a worker's OWN id matches no herdr pane (only
+                # a root gets a pane record), and a root sends its own. It
+                # deliberately does NOT set `poll`: focus changes nothing this view
+                # draws, so a refetch would be a listing walk for nothing. A failed
+                # focus, or a row that resolves to no pane at all, sets a notice,
+                # and the next paint shows it. See `focus_in_herdr` for every way
+                # it can decline.
+                if 0 <= selected < len(frame.rows):
+                    target = focus_target(frame.rows[selected])
+                    notice = focus_in_herdr(target) if target is not None \
+                        else NOTICE_FOCUS_NO_ROOT
             elif key == ord(" "):
                 # Expand/collapse moved off Enter when Enter took focus. It DOES
                 # set `poll`: the expanded set feeds the rebuild, so the tree has

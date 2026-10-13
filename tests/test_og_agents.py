@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import ast
 import io
+import itertools
 import json
+import math
 import os
 import sys
 import types
@@ -219,9 +221,11 @@ def test_renderer_shows_a_root_box_not_a_bare_line():
     assert "Omnigent Herdr Integration" in lines[1]
     assert lines[1].endswith("Claude Code│"), "the harness label is flush right"
     assert lines[2].startswith("╰") and lines[2].endswith("╯"), lines[2]
-    # The gauge and the heavy bar are gone.
+    # The gauge and the heavy bar are gone. The gauge's word `done` is no longer
+    # a marker to forbid — an idle worker's meta is the bare word `done` now — so
+    # the bar glyphs carry the guard.
     joined = "\n".join(lines)
-    assert "━" not in joined and "█" not in joined and "done" not in joined
+    assert "━" not in joined and "█" not in joined
 
 
 def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
@@ -353,7 +357,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⦿ ✓ │ ⌘  docs                     done 6m ago│",
+        "⦿ ✓ │ ⌘  docs                            done│",
         "│   ╰────────────────────────────────────────╯",
         "",
         a.FOOTER_COMPACT,
@@ -390,7 +394,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     # The meta is right-aligned on the CONTENT row: each one ends at the box's
     # right edge, on the same line as the title.
     for row_index, meta in ((5, "2m14s"), (9, "waiting on you"),
-                            (13, "failed"), (17, "done 6m ago")):
+                            (13, "failed"), (17, "done")):
         assert lines[row_index].endswith(meta + "│"), lines[row_index]
 
 
@@ -697,11 +701,16 @@ def test_the_selection_follows_its_session_across_a_state_change_reorder():
     assert a.snap_selection(after, None, 0) == 2
 
 
-def test_the_selected_box_is_normal_and_every_other_box_is_dim():
+def test_the_selected_box_is_normal_and_every_other_box_is_dim_but_its_gutter():
     """SELECTION IS BRIGHTNESS. The selected worker's box paints NORMAL — it reads
     white against the dimmed others — and every line of an UNSELECTED box paints
     DIM. SELECTED still rides on exactly ONE line (the selected box's first row),
     because `_run_tui` scans for it to find the block to scroll to.
+
+    DIM IS THE BOX, NOT THE ROW: the reported fix. An operator could not tell
+    which workers were running, because the unselected box's gutter — the rail,
+    the node, the status glyph — dimmed with it. Those spans are `undim:` and so
+    paint NORMAL regardless; the box's border and body still take the line's DIM.
     """
     rows = [header(),
             rail("idle"),
@@ -719,6 +728,67 @@ def test_the_selected_box_is_normal_and_every_other_box_is_dim():
     assert sum(1 for _t, role in items if role == a.SELECTED) == 1
     # Only the three roles survive: no TITLE/A_REVERSE any more.
     assert set(role for _t, role in items) <= {a.NORMAL, a.SELECTED, a.DIM}
+
+
+def test_an_unselected_box_dims_its_border_and_body_but_not_its_gutter():
+    """The regression this pins: an UNSELECTED worker's box dims its BORDER and
+    BODY and leaves the GUTTER — the rail, the node, the status glyph — at full
+    brightness, because that is what the operator reports being unable to read.
+
+    The exemption is a property of the span's ROLE (`undim:`), not of where the
+    span sits, so it is asserted by role here and the gutter is picked out by what
+    it draws rather than by index. The SELECTED box is unchanged by the fix: its
+    gutter carries the same exempt roles and NORMAL is what its line already
+    painted at, so nothing on that row differs.
+    """
+    rows = [header(), rail("working"), worker("w1", "working", text="one",
+                                              meta="2m14s")]
+
+    def gutter_of(spans):
+        """The spans that make up the GUTTER — the first `GUTTER` columns of the
+        line — picked out by what the gutter IS, not by where its spans sit in the
+        list."""
+        out, used = [], 0
+        for text, role in spans:
+            if used >= a.GUTTER:
+                break
+            out.append((text, role))
+            used += len(text)
+        return out
+
+    def is_box_span(role):
+        return not role.startswith(a.UNDIM)
+
+    unselected = a._pane(a.Frame(rows=rows, selected=1), 48).items
+    content_spans, brightness = unselected[5]
+    assert brightness == a.DIM, "the unselected box still dims"
+    # The gutter is exempt: the NODE on the content row, and the WORKING spinner.
+    gutter = gutter_of(content_spans)
+    assert {text.strip() for text, _role in gutter} == {a.NODE, a.SPIN_FRAMES[0]}
+    assert all(role.startswith(a.UNDIM) for _text, role in gutter), gutter
+    # The BOX is what still dims: every span past the gutter — the box edge, the
+    # mark, the title, the meta — carries a role that takes the line's brightness,
+    # border and body alike.
+    assert all(is_box_span(role)
+               for _text, role in content_spans[len(gutter):]), content_spans
+    assert any(text.startswith("╭") and is_box_span(role)
+               for text, role in unselected[4][0]), "the border dims"
+    assert any("2m14s" in text and is_box_span(role)
+               for text, role in content_spans), "the meta dims"
+    # EVERY row of the box is exempted in its gutter, not just the content row:
+    # the top and bottom borders carry the rail at full brightness too.
+    border_gutter = gutter_of(unselected[4][0])
+    assert [text for text, _role in border_gutter] == [a.RAIL + " ", "  "], \
+        border_gutter
+    assert all(role.startswith(a.UNDIM)
+               for item in unselected[4:7] for _text, role in gutter_of(item[0]))
+
+    # The SELECTED box is UNCHANGED by the fix: the same spans with the same
+    # exempt roles, on a line that already painted NORMAL, so nothing on that row
+    # moves — it was bright before and it is bright now.
+    selected = a._pane(a.Frame(rows=rows, selected=2), 48).items[5]
+    assert selected[0] == content_spans, "the spans do not depend on the selection"
+    assert selected[1] == a.NORMAL, "and its line was already at full brightness"
 
 
 def test_selection_is_brightness_and_moves_with_the_selection():
@@ -838,8 +908,9 @@ def test_multiple_roots_each_get_their_own_box():
     assert all(line.index("╭") == 0 for line in roots)
     assert any("first conv" in line and line.endswith("Claude Code│") for line in lines)
     assert any("second conv" in line and line.endswith("Cline│") for line in lines)
-    # No gauge and no heavy bar anywhere.
-    assert "done" not in joined and "━" not in joined
+    # No gauge and no heavy bar anywhere. (`done` is a worker's meta now, so the
+    # bar glyphs, not the word, mark the gauge's absence.)
+    assert "━" not in joined
 
 
 def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
@@ -1996,9 +2067,10 @@ def test_the_meta_line_says_what_the_timestamps_can_support():
     assert a.worker_meta(working, "working", NOW) == "2m14s"
     assert a.worker_meta({"status": "running", "created_at": NOW - 41},
                          "working", NOW) == "41s"
-    # updated_at IS when an idle worker stopped, so "done N ago" is exact.
+    # A stopped worker says a bare `done`: the age it used to carry (`done 6m
+    # ago`) was noise next to the name, so `updated_at` is no longer read here.
     assert a.worker_meta({"status": "idle", "updated_at": NOW - 360},
-                         "idle", NOW) == "done 6m ago"
+                         "idle", NOW) == "done"
     assert a.worker_meta({}, "blocked", NOW) == "waiting on you"
     # A failure reason is used when the row carries one, and is never invented.
     assert a.worker_meta({"status": "failed"}, "failed", NOW) == "failed"
@@ -2006,7 +2078,22 @@ def test_the_meta_line_says_what_the_timestamps_can_support():
                          "failed", NOW) == "boot failed"
     # No timestamp: a word, not a figure derived from the epoch.
     assert a.worker_meta({}, "working", NOW) == "working"
-    assert a.worker_meta({}, "idle", NOW) == "idle"
+    assert a.worker_meta({}, "idle", NOW) == "done"
+
+
+def test_a_finished_worker_says_done_with_no_elapsed_suffix():
+    # The reported regression: a stopped worker read `done 6m ago`. It must now
+    # read exactly `done`, however long ago it stopped.
+    assert a.worker_meta({"status": "idle", "updated_at": NOW - 360},
+                         "idle", NOW) == "done"
+    assert a.worker_meta({"status": "idle", "updated_at": NOW - 90_000},
+                         "idle", NOW) == "done"
+
+
+def test_a_working_worker_still_counts_up():
+    # The live count-up is untouched: a running worker's meta is still its age.
+    assert a.worker_meta({"status": "running", "created_at": NOW - 134},
+                         "working", NOW) == "2m14s"
 
 
 # ---------------------------------------------------------------------------
@@ -3144,6 +3231,166 @@ def test_the_mark_span_carries_its_vendors_brand_colour_role():
         assert a._VENDOR_COLOURS[vendor], vendor
 
 
+def _ansi_rgb(index):
+    """The sRGB triple xterm paints for ANSI-256 `index`."""
+    if index < 232:
+        levels = (0, 95, 135, 175, 215, 255)
+        n = index - 16
+        return tuple(levels[d] for d in (n // 36, (n // 6) % 6, n % 6))
+    step = 8 + 10 * (index - 232)
+    return (step, step, step)
+
+
+def _relative_luminance(rgb):
+    """WCAG relative luminance, 0 (black) to 1 (white)."""
+    lin = [c / 12.92 if c / 255 <= 0.04045 else ((c / 255 + 0.055) / 1.055) ** 2.4
+           for c in rgb]
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+def _oklab_gap(x, y):
+    """How far apart two palette indices read, in OKLab.
+
+    OKLab rather than sRGB because sRGB distance is the thing that goes wrong
+    here: openai 36 against goose 37 are (0,175,135) and (0,175,175), 40 of blue
+    and nothing else, which sounds like almost nothing and is why the pair was
+    always shipped unremarked. OKLab counts that the difference is barely
+    visible at all.
+
+    Scaled by 100 only so the numbers it returns are the ones the table's
+    comment block already quotes — 8.234, 5.969 — instead of decimals nobody
+    reading that comment would recognise.
+    """
+    def to_oklab(rgb):
+        def linear(channel):
+            channel /= 255
+            return (channel / 12.92 if channel <= 0.04045
+                    else ((channel + 0.055) / 1.055) ** 2.4)
+        r, g, b = map(linear, rgb)
+        # The cone response, then its cube root: the step that makes OKLab's
+        # distances match what the eye reports. Cbrt of a negative is undefined,
+        # and all three of these are sums of positive terms, so `** (1/3)` is
+        # the same value without the domain check.
+        long_ = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+        medium = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+        short = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+        return (0.2104542553 * long_ + 0.7936177850 * medium - 0.0040720468 * short,
+                1.9779984951 * long_ - 2.4285922050 * medium + 0.4505937099 * short,
+                0.0259040371 * long_ + 0.7827717662 * medium - 0.8086757660 * short)
+    left, right = to_oklab(_ansi_rgb(x)), to_oklab(_ansi_rgb(y))
+    return 100 * math.dist(left, right)
+
+
+def test_every_vendor_colour_is_readable_on_a_dark_pane_and_not_a_repeat():
+    # The rule the table's comment block records as TWO REAL FAILURES: a brand
+    # colour that is converted correctly but is too dark is invisible on a dark
+    # pane, which is why moonshotai is held at 252 and not its true 234. Nothing
+    # enforced that, so a future straight conversion could reintroduce it. The
+    # floor sits ABOVE both recorded failures (234 -> luminance 0.012, 237 ->
+    # 0.058) and BELOW the darkest colour the table still ships (hermes 130 ->
+    # 0.173), so it costs no existing entry and rejects any brand that would
+    # vanish. z-ai used to hold that spot at 26 -> 0.131; it is 108 now, at 0.376,
+    # which leaves hermes 130 -> 0.173 as the darkest shipped and the nearest
+    # thing to the floor, by 0.073.
+    for vendor, colour in sorted(a._VENDOR_COLOURS.items()):
+        assert _relative_luminance(_ansi_rgb(colour)) > 0.10, (
+            vendor, colour, "too dark to read on a dark pane")
+    # And no two vendors share a colour: a repeat means one brand is painted in
+    # another's identity, which is as much a lie as a colour that is too dark.
+    assert len(set(a._VENDOR_COLOURS.values())) == len(a._VENDOR_COLOURS)
+    # Which is the WEAKEST form of "no two read alike". Two marks a hair apart
+    # are the same failure as two identical ones — one brand drawn in another's
+    # identity — and nothing measured that, so z-ai's own placement claim ("108
+    # also clears the tightest pair in this table") was unfalsifiable.
+    #
+    # The floor is set from the table's own geometry, not chosen. The tightest
+    # pair that ships is openai 36 against goose 37 at 5.969, and that has always
+    # been accepted; the pair this rule exists to reject is z-ai at its NEAREST
+    # index 144 against opencode-zen 145 at 5.578. THE CUBE GEOMETRY IS THE SAME
+    # IN BOTH — 36/37 are (0,175,135) and (0,175,175), 144/145 are (175,175,135)
+    # and (175,175,175): one channel, blue alone, 40 units of it. Neither pair
+    # is the wider one, and OKLab scores them 0.391 apart. What separates them is
+    # the NEIGHBOURHOOD, which is the part the table's own block leans on: 145 is
+    # exactly neutral at chroma 0.0000 where 144 carries 5.4816, and neither 36
+    # nor 37 is near neutral (13.4085, 11.6533) because both are saturated
+    # against a zero red. So the line goes in the one window that separates the
+    # two numbers: above 5.578, at or below 5.969.
+    #
+    # OVER THE VENDOR TABLE ONLY, and that is a deliberate limit rather than an
+    # oversight: the colours that share a worker row with these and do NOT
+    # clear it are adjacent by design. Kilo's 227 against the spinner's 226 is
+    # 3.478 and is argued in the table's own comment block (bold versus not, a
+    # different column, blue alone between them); opencode-zen 145 and z-ai 108
+    # sit 5.197 and 5.733 off META_COLOR 109, which is one step on the same rung
+    # and is meant to read as a quiet grey beside the mark.
+    for (left, x), (right, y) in itertools.combinations(
+            sorted(a._VENDOR_COLOURS.items()), 2):
+        gap = _oklab_gap(x, y)
+        assert gap > 5.6, (
+            left, x, right, y, round(gap, 3),
+            "two marks close enough to read as one another")
+
+
+def test_the_kilo_mark_paints_kilos_brand_lemon(monkeypatch):
+    # Kilo's brand is #F3EF4E. It was painted 99 — a blue-violet belonging to no
+    # part of Kilo — so this is a brand-accuracy pin, not a preference. 227 is
+    # (255,255,95): the cube's top rung is the only one that can hold a red of
+    # 243 and a green of 239, and 78 has no blue rung nearer than 95, so the whole
+    # of the conversion error is that one channel.
+    assert a._VENDOR_COLOURS["kilo"] == 227
+    assert _ansi_rgb(227) == (255, 255, 95)
+    # ...and the mark really spends that pair, rather than resolving the role to
+    # None and painting the default foreground.
+    harness = _harness_for_vendor()["kilo"]
+    spans = a.worker_box(worker("w", "idle", text="t", harness=harness),
+                         60, False)[0][1]
+    assert (a.harness_mark(harness), a.mark_role("kilo")) in spans
+    frame = a.Frame(rows=[worker("w1", "idle", harness=harness, meta="12s")],
+                    selected=0)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=256)
+    # On the colour, not the pair NUMBER: pairs are spent on first use, so the
+    # index depends on what else the frame happened to paint first (here the idle
+    # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
+        (a._STATE_COLOURS["idle"], -1), (227, -1), (a.META_COLOR, -1)]
+    mark = _writes_for(writes, a.harness_mark(harness))
+    assert mark, writes
+    for attr in mark:
+        assert attr & fake.A_BOLD and attr & 0xFF00
+
+
+def test_the_freebuff_mark_paints_freebuffs_brand_sage(monkeypatch):
+    # Freebuff's brand is #A4BA96, a muted sage. This row is keyed `z-ai`, which
+    # names the MODEL PROVIDER while the glyph and the colour are FREEBUFF's, the
+    # harness the registry files under that vendor — so it was painted 26, a
+    # saturated blue belonging to nothing here, by a reader who took the key at
+    # face value. Read the table's comment block before "correcting" this.
+    # 108 is (135,175,135): the cube takes the brand's red 164 DOWN to the 135
+    # rung, green 186 to 175 and blue 150 to 135. It is deliberately NOT the
+    # nearest index — see the distance rule in the table-wide test above for why 144
+    # was rejected.
+    assert a._VENDOR_COLOURS["z-ai"] == 108
+    assert _ansi_rgb(108) == (135, 175, 135)
+    # ...and the mark really spends that pair, rather than resolving the role to
+    # None and painting the default foreground.
+    harness = _harness_for_vendor()["z-ai"]
+    spans = a.worker_box(worker("w", "idle", text="t", harness=harness),
+                         60, False)[0][1]
+    assert (a.harness_mark(harness), a.mark_role("z-ai")) in spans
+    frame = a.Frame(rows=[worker("w1", "idle", harness=harness, meta="12s")],
+                    selected=0)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=256)
+    # On the colour, not the pair NUMBER: pairs are spent on first use, so the
+    # index depends on what else the frame happened to paint first (here the idle
+    # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
+        (a._STATE_COLOURS["idle"], -1), (108, -1), (a.META_COLOR, -1)]
+    mark = _writes_for(writes, a.harness_mark(harness))
+    assert mark, writes
+    for attr in mark:
+        assert attr & fake.A_BOLD and attr & 0xFF00
+
+
 def test_the_atom_and_blank_mark_spans_carry_plain(monkeypatch):
     # A named agent whose harness cannot be resolved draws the ATOM, and the atom
     # has no vendor: PLAIN, no brand colour, no bold. A row with no identity at
@@ -3269,7 +3516,88 @@ def test_the_meta_write_carries_the_meta_colour_and_is_not_bold(monkeypatch):
     for attr in meta:
         assert attr & 0xFF00, "META is coloured"
         assert not attr & fake.A_BOLD, "META is not bold"
-    assert (1, a.META_COLOR, -1) in fake.init_pair_calls
+    # The PAIR NUMBER is incidental — it is spent in paint order, and the status
+    # glyph now spends one of its own from the gutter, before this row's meta. What
+    # is pinned is the colour itself, on a `-1` (terminal-owned) background.
+    assert any(fg == a.META_COLOR and bg == -1
+               for _pair, fg, bg in fake.init_pair_calls), fake.init_pair_calls
+
+
+def test_the_status_glyph_spans_carry_their_neon_colours():
+    """THE SECOND REPORTED DEFECT: the status glyph had NO colour at all. It sat in
+    a PLAIN span, so `✓` and `⠋` painted in the terminal's default foreground and
+    only the dim ever varied — four workers running read as four identical grey
+    glyphs. The check mark is NEON GREEN and the spinner NEON YELLOW.
+
+    Only those two states: `⏸` blocked, `✗` failed and `?` unknown are PLAIN, as
+    they were before, because nothing was asked of them.
+    """
+    for state, colour in (("idle", 46), ("working", 226)):
+        glyph = a.state_glyph(state, 0)
+        spans = a.worker_box(worker("w", state, text="t"), 60, False)[0][1]
+        roles = [role for text, role in spans if glyph in text]
+        assert roles == [a.undim(a.state_role(state))], (state, spans)
+        assert a._role_colour(roles[0]) == colour, state
+        assert a._STATE_COLOURS[state] == colour, state
+    for state in ("blocked", "failed", "unknown"):
+        assert a.state_role(state) == a.PLAIN, state
+        assert a._role_colour(a.undim(a.state_role(state))) is None, state
+
+
+def test_a_status_glyph_is_neon_and_undimmed_on_an_unselected_row(monkeypatch):
+    """BOTH fixes at once, on the row that used to be the unreadable one: the glyph
+    of an UNSELECTED worker's box paints its neon colour AND carries no A_DIM,
+    while the box drawn beside it still dims.
+
+    This is the interaction the two defects share — the glyph is exempt from the
+    dim and coloured by the same span role — and the reason a colour alone would
+    not have answered the report: neon yellow at half brightness is still dim.
+    """
+    for state, glyph in (("idle", "✓"), ("working", a.SPIN_FRAMES[0])):
+        # w1 is SELECTED and w2 carries the state under test, so w2's box is the
+        # unselected one. A frame with a single worker cannot say: the view snaps
+        # the selection onto the first worker box, so that box is always selected.
+        frame = a.Frame(rows=[header(),
+                              worker("w1", "blocked", text="one"),
+                              worker("w2", state, text="two", meta="12s")],
+                        selected=1)
+        fake, writes = _colour_paint(monkeypatch, frame, colors=256)
+        painted = [(row, attr) for row, _col, text, attr in writes
+                   if text == glyph + " "]
+        assert painted, (state, writes)
+        row, attrs = zip(*painted)
+        assert len(set(row)) == 1, (state, painted)
+        for attr in attrs:
+            assert not attr & fake.A_DIM, f"{state}: the glyph is exempt from the dim"
+            assert attr & 0xFF00, f"{state}: and still wears its neon colour"
+        assert any(fg == a._STATE_COLOURS[state] and bg == -1
+                   for _pair, fg, bg in fake.init_pair_calls), \
+            (state, fake.init_pair_calls)
+        # The box beside it is still the dim one: the fix is the BOX that dims. Its
+        # top border is the `╭` written at the gutter's right edge, on the row above
+        # the content row the glyph shares.
+        borders = [attr for border_row, col, text, attr in writes
+                   if border_row == row[0] - 1 and col == a.GUTTER and "╭" in text]
+        assert borders and all(attr & fake.A_DIM for attr in borders), (state, borders)
+
+
+def test_a_terminal_that_cannot_hold_the_neon_leaves_the_glyph_uncoloured(monkeypatch):
+    """Both neon indices are > 16, so a terminal reporting fewer colours cannot
+    hold them. The glyph falls back to the default foreground exactly as every
+    other colour in this module does — uncoloured, and still EXEMPT from the dim,
+    which is a brightness and not a colour and so survives a terminal with no
+    colour at all. It must never raise, and never paint a wrong colour.
+    """
+    for colors in (0, 8, 16, 32):
+        for state, glyph in (("idle", "✓"), ("working", a.SPIN_FRAMES[0])):
+            frame = a.Frame(rows=[header(), worker("w1", state)], selected=0)
+            fake, writes = _colour_paint(monkeypatch, frame, colors=colors)
+            assert fake.init_pair_calls == [], (colors, state)
+            painted = _writes_for(writes, glyph + " ")
+            assert painted, (colors, state, writes)
+            for attr in painted:
+                assert not attr & 0xFF00, (colors, state, "painted a wrong colour")
+                assert not attr & fake.A_DIM, (colors, state, "dimmed a bare glyph")
 
 
 def test_bold_roles_still_bold_on_a_monochrome_terminal(monkeypatch):
@@ -3335,10 +3663,13 @@ class _KeyScreen(FakeScreen):
 
 
 def _rows_with_attr(writes):
-    """Reassemble rows from span writes: {row: (text, first_span_attr)}.
+    """Reassemble rows from span writes: {row: (text, line_attr)}.
 
-    All spans of a line share the line's brightness, so the FIRST span's attribute
-    carries it — enough for a test to tell a bright box from a dim one.
+    `line_attr` is the LAST span's attribute, which is the LINE's brightness: a
+    span may be exempt from it (the worker's gutter and status glyph are `undim:`
+    and paint NORMAL beside a DIM box), and the box's own spans — which end every
+    row — always take the line's value. Reading the first span instead would
+    report every worker row as bright.
     """
     by_row: dict[int, list] = {}
     for row, col, text, attr in writes:
@@ -3347,7 +3678,7 @@ def _rows_with_attr(writes):
     for row, parts in by_row.items():
         parts.sort()
         out[row] = ("".join(text for _col, text, _attr in parts),
-                    parts[0][2])
+                    parts[-1][2])
     return out
 
 
@@ -3398,7 +3729,14 @@ def _run_tui_capture(monkeypatch, keys, model=None):
     return screens[0]
 
 
-def test_enter_focuses_the_selected_worker_with_that_rows_session_id(monkeypatch):
+def test_enter_on_a_sub_agent_row_focuses_its_root_session(monkeypatch):
+    """REGRESSION: the reported bug was `agent_not_found` for every worker.
+
+    `w1` is a SUB-AGENT of `root` (`parent_session_id == "root"`), and only the
+    root has a herdr pane record for `agent.focus` to match. So Enter must send
+    the ROOT's id, `root` — not w1's own, which is what used to go on the wire
+    and matched no record.
+    """
     monkeypatch.setenv("HERDR_ENV", "1")
     calls = _fake_herdr_client(monkeypatch)
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
@@ -3406,15 +3744,67 @@ def test_enter_focuses_the_selected_worker_with_that_rows_session_id(monkeypatch
 
     screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=model)
 
-    # Row 1 is the first worker (row 0 is the group header), so w1 was selected
-    # and its session id is what went on the wire.
-    assert calls == [("agent.focus", {"target": "w1"})], calls
+    # w1, the first worker, is the selected row, so the RESOLVED target — its
+    # root — is what went on the wire.
+    assert calls == [("agent.focus", {"target": "root"})], calls
     # Focus is not a reason to refetch: exactly the one listing walk for the
     # first paint, and none from the keypress.
     assert len(opener.listing_requests) == 1, "Enter must not trigger a refetch"
     # A successful focus leaves no notice behind.
     assert screen.painted, "the pane was painted"
     assert not any("focus:" in text for text in screen.painted)
+
+
+def test_focus_target_climbs_to_the_root_not_the_immediate_parent():
+    """A worker nested two deep resolves to the TOP root — the pane that exists —
+    not its immediate parent, which is itself a pane-less sub-agent."""
+    sessions = [
+        listed("root", status="running", title="conversation"),
+        listed("w1", parent="root", status="running", title="coder_zen:worker"),
+        listed("g1", parent="w1", status="running", title="coder_zen:grandchild"),
+    ]
+    rows = a.build_rows(sessions, ["root"], now=NOW)
+    by_sid = {row.session_id: row for row in rows}
+    assert a.focus_target(by_sid["w1"]) == "root"
+    assert a.focus_target(by_sid["g1"]) == "root"
+
+
+def test_focus_target_of_a_root_row_is_its_own_session_id():
+    """A root owns its own herdr pane and targets itself — unchanged."""
+    assert a.focus_target(header(sid="root")) == "root"
+    assert a.focus_target(header(sid="abc123")) == "abc123"
+
+
+def test_a_row_whose_root_cannot_be_resolved_declines_and_does_not_call_out(
+        monkeypatch):
+    """No root to resolve -> decline in one line, never send a doomed target.
+
+    A worker row carrying no `root_session_id` (a malformed listing, say)
+    resolves to nothing; focusing must not guess an id herdr would only answer
+    `agent_not_found` for. It declines locally and calls out not at all.
+    """
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = _fake_herdr_client(monkeypatch)
+    # `worker()` leaves `root_session_id` empty: a Box with no root.
+    orphan = worker("w1", "idle", text="one")
+    assert a._is_box(orphan), "the row must be a selectable worker box"
+
+    class OneRow:
+        def refresh(self, **kwargs):
+            return a.Frame(rows=[orphan])
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=OneRow())
+
+    assert calls == [], "a row with no resolvable root must not call out"
+    assert any(a.NOTICE_FOCUS_NO_ROOT in text for text in screen.painted), \
+        screen.painted
+
+
+def test_focus_resolution_adds_no_call_beyond_agent_focus():
+    """The one-outbound-call guarantee survives the root resolution: resolving a
+    TARGET is not a second call, and this path adds none (see
+    `_assert_only_agent_focus`)."""
+    _assert_only_agent_focus(Path(a.__file__).read_text())
 
 
 def test_enter_outside_herdr_makes_no_call_and_shows_a_notice(monkeypatch):
@@ -3452,6 +3842,60 @@ def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(
     # the loop is still taking keys after the first failure.
     assert [method for method, _params in calls] == ["agent.focus", "agent.focus"]
     assert any("focus: " in text for text in screen.painted), screen.painted
+
+
+# ---- the focus notice takes the FOOTER row (see `_pane`) -------------------
+
+def _notice_frame(notice=None, truncated=False):
+    rows = [header(), rail(), worker("w1", "working", text="one")]
+    return a.Frame(rows=rows, notice=notice, truncated=truncated)
+
+
+def test_a_notice_takes_the_bottom_row_in_place_of_the_footer():
+    lines = a.render(_notice_frame(a.NOTICE_FOCUS_OUTSIDE_HERDR), width=80)
+    assert lines[-1] == a.NOTICE_FOCUS_OUTSIDE_HERDR
+    assert a._footer(80) not in lines, "the footer gives its row to the notice"
+
+
+def test_without_a_notice_the_bottom_row_is_still_the_footer():
+    lines = a.render(_notice_frame(), width=80)
+    assert lines[-1] == a._footer(80)
+
+
+def test_a_notice_longer_than_the_pane_is_clipped_not_overflowed():
+    long = "focus: " + "x" * 200
+    lines = a.render(_notice_frame(long), width=20)
+    assert lines[-1] == a._clip(long, 20)
+    assert len(lines[-1]) <= 20, "the row is cut to the pane, never run past it"
+
+
+def test_the_pane_is_the_same_height_with_and_without_a_notice():
+    without = a.render(_notice_frame(), width=80)
+    with_notice = a.render(_notice_frame(a.NOTICE_FOCUS_UNAVAILABLE), width=80)
+    assert len(without) == len(with_notice)
+
+
+def test_a_notice_paints_bright_where_the_footer_paints_dim():
+    # An error painted DIM is easy to miss: the footer is chrome and dim, the
+    # notice reports a failure and is painted at NORMAL brightness.
+    with_notice = a._pane(_notice_frame(a.NOTICE_FOCUS_UNAVAILABLE), 80)
+    assert with_notice.items[-1][1] == a.NORMAL
+    assert a._pane(_notice_frame(), 80).items[-1][1] == a.DIM
+
+
+def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
+    # End to end through the loop: after a failed Enter the notice IS the pane's
+    # last row and the footer's line is gone from that frame.
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    _fake_herdr_client(monkeypatch)
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT])
+
+    rows = _rows_with_attr(screen.frame_writes[-1])
+    bottom = rows[max(rows)][0]
+    assert bottom == a.NOTICE_FOCUS_OUTSIDE_HERDR, rows
+    assert a._footer(80) not in [text for text, _attr in rows.values()], \
+        "the footer does not share the pane with the notice"
 
 
 def test_space_expands_and_collapses_the_selected_snippet(monkeypatch):
