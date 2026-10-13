@@ -119,7 +119,7 @@ SPIN_TICK = 0.12
 # points OUT of the box rather than sitting inside it. The root is a box in
 # column 0, so the rail drops out of its own bottom-left corner.
 #
-# WIDTH IS COMPOSED WITH ONE RULER: the len-based one (`_clip`/`_pad`, the
+# WIDTH IS COMPOSED WITH ONE RULER: the len-based one (`_clip`, the
 # `_visible_width` notion). Every box-drawing glyph here is East Asian AMBIGUOUS,
 # so a whole box line measured with `_display_width` (Ambiguous charged two) would
 # double its borders and overflow the pane — exactly why the two rulers exist.
@@ -258,6 +258,27 @@ TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
 # There is no TITLE/A_REVERSE role any more: the root is a rounded box like a
 # worker's, not a reverse-video bar, so the pane spends no A_REVERSE at all.
 NORMAL, SELECTED, DIM = "normal", "selected", "dim"
+
+# COLOUR IS ITS OWN AXIS, orthogonal to brightness. A line is a sequence of
+# SPANS — each a run of text with ONE colour role — plus the brightness to paint
+# them at, so a DIM box still shows its mark's brand colour, merely dimmed. That
+# is why colour is not just more brightness values: the mark, the title and the
+# meta share ONE line and each wants a different look, so one paint role per LINE
+# (`Pane.items` used to be `(text, role)`) could not express them. The role is a
+# plain string so the composer stays pure and testable without curses; `_run_tui`
+# maps it to a curses attribute.
+#
+#   PLAIN      no colour, the default foreground — everything not named below.
+#   META       the worker's meta (`12s`, `done 2h ago`, `failed`, `waiting on
+#              you`): ONE colour for every meta, not bold.
+#   ORCH       the ROOT box's NAME: bold, no colour.
+#   mark:<v>   a harness brand mark: bold, plus vendor `v`'s brand colour.
+PLAIN, META, ORCH = "plain", "meta", "orch"
+
+# (text, colour_role) — one run of a line and the role it paints under.
+Span = tuple[str, str]
+# (spans, brightness) — a whole line: its spans and the brightness they share.
+Line = tuple[list[Span], str]
 
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
 # is `http://127.0.0.1:6767`.
@@ -691,15 +712,17 @@ class Frame:
 
 @dataclass
 class Pane:
-    """The composed view: every line with its paint role, and where the list ends.
+    """The composed view: every line with its spans and brightness, and where the
+    list ends.
 
-    `items` is parallel with itself — `items[i] == (text, role)` — and
-    `list_rows` counts the lines above the tail, so the TUI can scroll the list
-    and pin the panel and the footer to the bottom of the pane without
-    re-deriving the layout that produced them.
+    `items` is parallel with itself — `items[i] == (spans, brightness)`, a list of
+    `(text, colour_role)` spans plus the brightness they share — and `list_rows`
+    counts the lines above the tail, so the TUI can scroll the list and pin the
+    panel and the footer to the bottom of the pane without re-deriving the layout
+    that produced them.
     """
 
-    items: list[tuple[str, str]] = field(default_factory=list)
+    items: list[Line] = field(default_factory=list)
     list_rows: int = 0
 
 
@@ -761,6 +784,44 @@ _HARNESS_MARKS = {
                                  #   It survives by luck, not design: keyed to a
                                  #   provider vendor, so do NOT "fix" it into a Moonshot logo.
 }
+
+# The ANSI-256 foreground each vendor's mark is painted in, derived from the
+# brand hex and checked for luminance against a dark pane. Keyed exactly like
+# `_HARNESS_MARKS` (a vendor with a mark has a colour, and vice versa — see the
+# catalog guard in the tests), so the two tables move together.
+#
+# TWO DELIBERATE SUBSTITUTIONS, and do NOT "correct" either back to the true
+# brand colour: a mark painted its real colour is a mark nobody can see, and an
+# invisible logo is worse than an uncoloured one.
+#   * moonshotai's brand is #1F1F1F -> ansi 234, luminance 31: correctly
+#     coloured and INVISIBLE on a dark pane. 252, a light neutral, is used.
+#   * cursor's is #3C3C3C -> ansi 237, luminance 60: the same problem, less
+#     severe. 244 is used.
+_VENDOR_COLOURS = {
+    "anthropic": 173,
+    "openai": 36,
+    "google": 69,
+    "kilo": 99,
+    "aws-kiro": 208,
+    "xai": 231,
+    "goose": 37,
+    "hermes": 130,
+    "cognition": 32,
+    "z-ai": 26,
+    "opencode-zen": 145,
+    "deepseek": 63,
+    "cursor": 244,
+    "moonshotai": 252,
+}
+
+# The one colour every worker META paints in (ansi 109, a light slate that reads
+# as secondary on a dark pane). Not bold — see `_role_bold`.
+META_COLOR = 109
+
+
+def mark_role(vendor: str) -> str:
+    """The colour role for a harness mark painted on `vendor`'s brand colour."""
+    return f"mark:{vendor}"
 
 # A mark is padded into a FIXED two display columns, not left as-is. Without the
 # slot, a Narrow mark (one cell) and a Wide or Ambiguous one (more) on
@@ -907,6 +968,38 @@ def worker_mark(harness: Any, agent: Any) -> str:
     if not declared:
         return _vendor_mark(None)
     return harness_mark(declared)
+
+
+def harness_vendor(harness: Any) -> Optional[str]:
+    """The vendor whose brand colour `harness`'s mark carries, or None.
+
+    The SAME harness -> vendor hop `harness_mark` makes, kept beside it so a
+    mark's GLYPH and its COLOUR can never come from two different vendors. None
+    is the honest "no brand colour": an absent harness draws the blank slot, and
+    one whose vendor the mark table does not carry draws the atom — both paint
+    PLAIN.
+    """
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    vendor = harness_vendors().get(harness)
+    return vendor if vendor in _HARNESS_MARKS else None
+
+
+def worker_vendor(harness: Any, agent: Any) -> Optional[str]:
+    """The vendor whose brand colour a WORKER row's mark carries, or None.
+
+    `worker_mark`'s resolution order, exactly — the row's own harness, then the
+    harness the agent's installed spec declares, then nothing (the atom or the
+    blank slot) — so the mark and its colour agree by construction.
+    """
+    if isinstance(harness, str) and harness.strip():
+        return harness_vendor(harness)
+    if not isinstance(agent, str) or not agent.strip():
+        return None
+    declared = agent_harness(agent)
+    if not declared:
+        return None
+    return harness_vendor(declared)
 
 
 def build_rows(
@@ -1062,11 +1155,6 @@ def _clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[:max(0, width - 1)] + "…"
 
 
-def _pad(text: str, width: int) -> str:
-    """`text` clipped to `width` and right-padded out to exactly `width`."""
-    return _clip(text, width).ljust(width)
-
-
 # SGR colour escapes: `\x1b[` … `m`. `qrencode -t ANSIUTF8` wraps every line in
 # one of these, and they must never reach `addnstr`: curses does not interpret
 # escapes, it PRINTS them, which is how the operator's pane came to show
@@ -1169,28 +1257,96 @@ def access_lines(access: Access, width: int) -> list[str]:
     return _boxed(content, width)
 
 
-def _two_col(left: str, right: str, width: int) -> str:
-    """`left` flush left, `right` flush right, exactly `width` columns.
+# --- span composition --------------------------------------------------------
+#
+# Spans only PARTITION a line; they never change its text. Every helper here
+# reproduces, on a span list, exactly what the old whole-string layout did on the
+# JOIN — `_clip_spans` cuts and ellipsises like `_clip`, `_pad_spans` ljusts the
+# same way — so `"".join(text for text, _ in spans)` still equals the line the
+# layout has always produced. That invariant is the whole reason the pane's text
+# and its paint are separable, and a test pins it.
 
-    The right part never loses its last column to the left part: when `left` has
-    more to say than there is room for, the RIGHT part is what is drawn and the
-    left is ellipsised into the columns that remain. The right side is the short,
-    fixed thing the row is really about, so it is worth keeping whole while the
-    elastic left gives way. Both callers rely on this: the worker row hands it
-    the meta — `2m14s`, `failed`, `waiting on you`, `done 6m ago`, the thing being
-    waited on — and the root box's content row the harness label (`Claude Code`).
-    Only when `right` alone is wider than `width` is it clipped itself.
+def _spans_width(spans: list[Span]) -> int:
+    """The columns of a span list, under the layout's `len` ruler (`_clip`)."""
+    return sum(len(text) for text, _role in spans)
+
+
+def _clip_spans(spans: list[Span], width: int) -> list[Span]:
+    """`spans` cut to `width` columns with an ellipsis, exactly as `_clip` on the
+    join.
+
+    The ellipsis rides on the LAST KEPT span's role, so a cut inside a run keeps
+    that run's colour, and a cut with nothing kept falls back to PLAIN. The ruler
+    is `len`, matching `_clip`, so the join is byte-for-byte the old clip.
     """
     if width <= 0:
-        return ""
-    right = _clip(right, width)
-    room = width - len(right)
+        return []
+    if _spans_width(spans) <= width:
+        return list(spans)
+    keep = width - 1
+    out: list[Span] = []
+    used = 0
+    for text, role in spans:
+        if used >= keep:
+            break
+        take = text[:keep - used]
+        out.append((take, role))
+        used += len(take)
+    out.append(("…", out[-1][1] if out else PLAIN))
+    return out
+
+
+def _pad_spans(spans: list[Span], width: int) -> list[Span]:
+    """`spans` clipped to `width` columns and right-padded out to exactly `width`."""
+    clipped = _clip_spans(spans, width)
+    gap = width - _spans_width(clipped)
+    if gap > 0:
+        clipped = clipped + [(" " * gap, PLAIN)]
+    return clipped
+
+
+def _two_col(left: list[Span], right: list[Span], width: int) -> list[Span]:
+    """`left` flush left, `right` flush right, exactly `width` columns.
+
+    The span twin of the string `_two_col`, and the same rule: the right part
+    never loses its last column to the left part. When `left` has more to say
+    than there is room for, the RIGHT part is what is drawn and the left is
+    ellipsised into the columns that remain. The right side is the short, fixed
+    thing the row is really about, so it is worth keeping whole while the elastic
+    left gives way — which is also what preserves its COLOUR ROLE: a tight line
+    loses the title, never the meta's META. Both callers rely on this: the worker
+    row hands it the meta — `2m14s`, `failed`, `waiting on you`, `done 6m ago` —
+    and the root box's content row the harness label (`Claude Code`). Only when
+    `right` alone is wider than `width` is it clipped itself.
+    """
+    if width <= 0:
+        return []
+    right = _clip_spans(right, width)
+    room = width - _spans_width(right)
     if room <= 0:
-        return _clip(right, width)
-    return _pad(left, room) + right
+        return _clip_spans(right, width)
+    return _pad_spans(left, room) + right
 
 
-def _root_lines(row: Row, width: int) -> list[tuple[str, str]]:
+def _round_box_lines(inner_lines: list[list[Span]], width: int) -> list[list[Span]]:
+    """`inner_lines` in a rounded box EXACTLY `width` columns wide (len ruler).
+
+    The span twin of the old string `_round_box`, and its output joins to the
+    same line: light `─` under curved `╭╮╰╯`, the borders PLAIN, each body line
+    padded to the box's inner width. Both the root (drawn at column 0) and each
+    worker box (behind the gutter) are rounded, and the weight contrast is the
+    interest.
+    """
+    width = max(BOX_MIN, width)
+    tl, hz, tr, vt, bl, br = ROUND_CORNERS
+    out = [[(tl + hz * (width - 2) + tr, PLAIN)]]
+    out += [[(vt, PLAIN)] + _pad_spans(line, width - 2) + [(vt, PLAIN)]
+            for line in inner_lines]
+    out.append([(bl + hz * (width - 2) + br, PLAIN)])
+    return out
+
+
+def _root_lines(row: Row, width: int) -> list[list[Span]]:
     """A root as a rounded box drawn at column 0: name left, harness right.
 
     OUTDENTED relative to its workers, which sit at column `GUTTER`: the root is
@@ -1199,39 +1355,29 @@ def _root_lines(row: Row, width: int) -> list[tuple[str, str]]:
     This replaces the heavy `━` title bar and its done-gauge; the harness LABEL is
     kept, moved to the box's right edge, and no line of the pane spends A_REVERSE.
 
+    The NAME is `ORCH` (the bold the operator asked for) and the mark carries its
+    vendor's brand colour; the label and the borders stay PLAIN.
+
     Below `BOX_MIN` a one- or two-column "box" would be a lie, so the root
     degrades to a single clipped line, exactly as `worker_box`'s ladder does.
     """
     if width < BOX_MIN:
-        return [(_clip(row.text, width), NORMAL)]
-    content = _two_col(" " + harness_mark(row.harness) + " " + row.text,
-                       harness_label(row.harness), width - 2)
-    return [(line, NORMAL) for line in _round_box([content], width)]
-
-
-def _round_box(inner_lines: list[str], width: int) -> list[str]:
-    """`inner_lines` in a rounded box EXACTLY `width` columns wide (len ruler).
-
-    Both the root (drawn at column 0) and each worker box (behind the gutter) are
-    rounded: light `─` under curved `╭╮╰╯`, and the weight contrast is the
-    interest.
-    """
-    width = max(BOX_MIN, width)
-    tl, hz, tr, vt, bl, br = ROUND_CORNERS
-    out = [tl + hz * (width - 2) + tr]
-    out += [vt + _pad(line, width - 2) + vt for line in inner_lines]
-    out.append(bl + hz * (width - 2) + br)
-    return out
+        return [[(_clip(row.text, width), ORCH)]]
+    vendor = harness_vendor(row.harness)
+    left = [(" ", PLAIN),
+            (harness_mark(row.harness), mark_role(vendor) if vendor else PLAIN),
+            (" ", PLAIN),
+            (row.text, ORCH)]
+    content = _two_col(left, [(harness_label(row.harness), PLAIN)], width - 2)
+    return _round_box_lines([content], width)
 
 
 def worker_box(row: Row, width: int, selected: bool,
-               spin: int = 0) -> tuple[list[str], int]:
+               spin: int = 0) -> tuple[list[list[Span]], int]:
     """One worker as a guttered, rounded box, and the index of its SELECTED row.
 
-    The box starts AFTER the `GUTTER`-column gutter (the node column, a space, the
-    state glyph column, a space), so its own left edge sits at column 4 and one
-    unbroken rail runs down the group at column 0 — the shape the operator asked
-    for. Every returned line is exactly `width` columns: the four-column gutter
+    Each returned line is a list of SPANS (the caller hangs the brightness on it);
+    joined, a returned line is exactly `width` columns: the four-column gutter
     plus a box `width - GUTTER` wide.
 
     The gutter's NODE column carries `⦿` on the box's CONTENT row — the point
@@ -1301,8 +1447,8 @@ def worker_box(row: Row, width: int, selected: bool,
         # columns left after the glyph; width 1 leaves none, and the glyph stands
         # alone. Width <= 0 has no column at all; `_clip`'s own floor.
         if width < 1:
-            return [""], 0
-        return [glyph + _clip(" " + row.text, width - 1)], 0
+            return [[]], 0
+        return [[(glyph + _clip(" " + row.text, width - 1), PLAIN)]], 0
 
     if width >= GUTTER + BOX_MIN:
         box_width, node_column, glyph_column = width - GUTTER, True, True
@@ -1315,8 +1461,10 @@ def worker_box(row: Row, width: int, selected: bool,
     # The row's own harness wins; a worker carries none, so its mark comes from
     # the harness its SPEC declares (found by the agent name the title gave) —
     # only when BOTH the harness and the name are absent is the slot blank (see
-    # `worker_mark`).
+    # `worker_mark`). The mark paints its VENDOR's brand colour (`worker_vendor`),
+    # the meta its one META colour, the title plain.
     mark = worker_mark(row.harness, row.agent)
+    vendor = worker_vendor(row.harness, row.agent)
     # ONE content row. The mark and the task sit flush left, the meta flush right
     # on the SAME line; the state glyph is in the gutter, not here. The agent name
     # is DROPPED: the mark already names the harness the name did, and the meta is
@@ -1324,14 +1472,18 @@ def worker_box(row: Row, width: int, selected: bool,
     # the line is tight (`_two_col` clips the LEFT part with `_clip`, so it is
     # ellipsised, not cut blank), and the meta keeps its columns — it is the thing
     # being waited on.
-    content = _two_col(" " + mark + " " + row.text, row.meta, inner)
+    left = [(" ", PLAIN),
+            (mark, mark_role(vendor) if vendor else PLAIN),
+            (" ", PLAIN),
+            (row.text, PLAIN)]
+    content = _two_col(left, [(row.meta, META)], inner)
     lines = [content]
     if row.expanded and row.snippet:
-        lines.append("  " + _clip(_oneline(row.snippet), inner - 2))
-    boxed = _round_box(lines, box_width)
+        lines.append([("  " + _clip(_oneline(row.snippet), inner - 2), PLAIN)])
+    boxed = _round_box_lines(lines, box_width)
 
-    out: list[str] = []
-    for index, line in enumerate(boxed):
+    out: list[list[Span]] = []
+    for index, spans in enumerate(boxed):
         # The CONTENT row is the box's first inner row, just below the top border.
         # The node and the state glyph ride on that row alone; the rail and a space
         # fill every other row, so the line down column 0 is unbroken.
@@ -1341,7 +1493,7 @@ def worker_box(row: Row, width: int, selected: bool,
             prefix += (NODE if on_content else RAIL) + " "
         if glyph_column:
             prefix += (glyph if on_content else " ") + " "
-        out.append(prefix + line)
+        out.append([(prefix, PLAIN)] + spans if prefix else spans)
     return out, 0
 
 
@@ -1429,8 +1581,8 @@ def _footer(width: int) -> str:
     return FOOTER_KEYS
 
 
-def _blocks(frame: Frame, width: int) -> list[list[tuple[str, str]]]:
-    """The frame's rows as atomic BLOCKS, in display order, composed to text.
+def _blocks(frame: Frame, width: int) -> list[list[Line]]:
+    """The frame's rows as atomic BLOCKS, in display order, composed to spans.
 
     A block is one ROOT (its outdented box) or one GROUP (its breathing rail and
     all of the group's boxes). Grouping into blocks is what keeps `_pane`'s
@@ -1439,9 +1591,12 @@ def _blocks(frame: Frame, width: int) -> list[list[tuple[str, str]]]:
 
     A new block starts at a root row or a rail row (a rail row is emitted by
     `build_rows` at the head of every group, so it is the group's opening brace).
+
+    This is ALSO where BRIGHTNESS is hung: the layout functions return spans with
+    colour roles only, and the selection axis is decided here (see below).
     """
-    blocks: list[list[tuple[str, str]]] = []
-    unit: Optional[list[tuple[str, str]]] = None
+    blocks: list[list[Line]] = []
+    unit: Optional[list[Line]] = None
     for index, row in enumerate(frame.rows):
         if (row.is_root or row.rail) and unit is not None:
             blocks.append(unit)
@@ -1449,26 +1604,28 @@ def _blocks(frame: Frame, width: int) -> list[list[tuple[str, str]]]:
         if unit is None:
             unit = []
         if row.is_root:
-            unit.extend(_root_lines(row, width))
+            unit.extend((spans, NORMAL) for spans in _root_lines(row, width))
         elif row.rail:
-            unit.append((RAIL, NORMAL))
+            unit.append(([(RAIL, PLAIN)], NORMAL))
         else:
             on_selected = index == frame.selected
             lines, selected_row = worker_box(row, width, on_selected, frame.spin)
-            for position, line in enumerate(lines):
-                # SELECTION IS BRIGHTNESS. Every line of an UNSELECTED worker's
-                # box is DIM; the SELECTED worker's box is NORMAL, so it reads as
-                # white against the dimmed others. SELECTED still rides on ONE
-                # line — the selected box's first row — because that is the row
-                # `_run_tui` scrolls to keep visible; it maps to the same attribute
-                # as NORMAL, so the box reads uniformly white.
+            for position, spans in enumerate(lines):
+                # SELECTION IS BRIGHTNESS, and it is ORTHOGONAL to colour: a DIM
+                # box still shows its mark's brand colour, merely dimmed. Every
+                # line of an UNSELECTED worker's box is DIM; the SELECTED worker's
+                # box is NORMAL, so it reads as white against the dimmed others.
+                # SELECTED still rides on ONE line — the selected box's first row
+                # — because that is the row `_run_tui` scrolls to keep visible; it
+                # maps to the same attribute as NORMAL, so the box reads uniformly
+                # white.
                 if not on_selected:
-                    role = DIM
+                    brightness = DIM
                 elif position == selected_row:
-                    role = SELECTED
+                    brightness = SELECTED
                 else:
-                    role = NORMAL
-                unit.append((line, role))
+                    brightness = NORMAL
+                unit.append((spans, brightness))
     if unit is not None:
         blocks.append(unit)
     return blocks
@@ -1476,35 +1633,36 @@ def _blocks(frame: Frame, width: int) -> list[list[tuple[str, str]]]:
 
 def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
           height: Optional[int] = None) -> Pane:
-    """The frame composed into lines with their paint roles. Pure.
+    """The frame composed into lines — each a span list plus its brightness. Pure.
 
-    The single place the view is put together: `render` returns just the text,
-    and the TUI paints these same lines with the attributes their roles name.
-    `height`, when given, is the pane's content height — the tail (panel and
-    footer) is kept whole and the list above it is trimmed to fit, never below
-    ACCESS_LIST_FLOOR rows, never by cutting a box in half, and never by dropping
-    a group's rail away from its boxes (the trimmer works in whole blocks; see
-    `_blocks`).
+    The single place the view is put together: `render` returns just the text, and
+    the TUI paints these same lines with the attributes their spans' roles and
+    their brightness name. `height`, when given, is the pane's content height —
+    the tail (panel and footer) is kept whole and the list above it is trimmed to
+    fit, never below ACCESS_LIST_FLOOR rows, never by cutting a box in half, and
+    never by dropping a group's rail away from its boxes (the trimmer works in
+    whole blocks; see `_blocks`).
 
     An unselected worker's box is DIM, the selected worker's box NORMAL except its
     first line, which carries SELECTED: selection is brightness, not a glyph.
     """
-    items: list[tuple[str, str]] = []
+    items: list[Line] = []
     if frame.notice:
-        items.append((_clip(frame.notice, width), NORMAL))
+        items.append(([(_clip(frame.notice, width), PLAIN)], NORMAL))
     elif frame.truncated:
-        items.append((_clip(TRUNCATED_NOTICE, width), NORMAL))
+        items.append(([(_clip(TRUNCATED_NOTICE, width), PLAIN)], NORMAL))
 
     blocks = _blocks(frame, width)
 
-    tail: list[tuple[str, str]] = [("", NORMAL)]
+    tail: list[Line] = [([("", PLAIN)], NORMAL)]
     if frame.access is not None:
-        tail.extend((line, DIM) for line in access_lines(frame.access, width))
-        tail.append(("", NORMAL))
-    tail.append((_clip(_footer(width), width), DIM))
+        tail.extend(([(line, PLAIN)], DIM)
+                    for line in access_lines(frame.access, width))
+        tail.append(([("", PLAIN)], NORMAL))
+    tail.append(([(_clip(_footer(width), width), PLAIN)], DIM))
 
     room = None if height is None else max(ACCESS_LIST_FLOOR, height - len(tail))
-    kept: list[list[tuple[str, str]]] = []
+    kept: list[list[Line]] = []
     used = 0
     for block in blocks:
         # THE FIRST BLOCK IS KEPT EVEN WHEN IT EXCEEDS `room`, deliberately: one
@@ -1526,6 +1684,17 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     return Pane(items=items + tail, list_rows=len(items))
 
 
+def line_text(line: Line) -> str:
+    """The composed text of one line: its spans joined back together.
+
+    The ONE place a line's paint is dropped for its text, used by `render`. Colour
+    is a paint attribute and never reaches the text, so `--once` stays byte-for-
+    byte what it always was.
+    """
+    spans, _brightness = line
+    return "".join(text for text, _role in spans)
+
+
 def render(frame: Frame, width: int = DEFAULT_WIDTH,
            height: Optional[int] = None) -> list[str]:
     """A frame as a list of plain-text lines. Pure; no terminal, no clock.
@@ -1539,7 +1708,7 @@ def render(frame: Frame, width: int = DEFAULT_WIDTH,
     height: the tail is reserved and the list is trimmed above it. `--once` and
     the tests pass height=None, meaning "show everything".
     """
-    return [text for text, _role in _pane(frame, width, height).items]
+    return [line_text(line) for line in _pane(frame, width, height).items]
 
 
 def frame_working(frame: Frame) -> bool:
@@ -1554,8 +1723,8 @@ def frame_working(frame: Frame) -> bool:
     return any(_is_box(row) and row.state == "working" for row in frame.rows)
 
 
-def paint_needed(items: list[tuple[str, str]],
-                 painted: Optional[list[tuple[str, str]]]) -> bool:
+def paint_needed(items: list[Line],
+                 painted: Optional[list[Line]]) -> bool:
     """Whether these lines have to be written to the screen.
 
     Nothing is repainted unless the composed view actually changed: a new data
@@ -1565,6 +1734,10 @@ def paint_needed(items: list[tuple[str, str]],
     itself forever — with nothing working there is no spinner to advance, the
     render is identical, this is False, and the loop blocks on the keyboard
     instead of repainting.
+
+    The comparison is over `(spans, brightness)`, so a move of the SELECTION alone
+    — which changes no text, only which line is bright — still counts as a change
+    and repaints. A quiet pane re-composes to an equal item list, so it does not.
     """
     return painted is None or items != painted
 
@@ -1586,9 +1759,9 @@ def next_wait(now: float, poll_due: float, working: bool,
 # the painter: which rows get which line, and the one write itself
 # ---------------------------------------------------------------------------
 
-def paint_plan(items: list[tuple[str, str]], list_rows: int, offset: int,
-               list_view: int, height: int) -> list[tuple[int, str, str]]:
-    """The `(row, text, role)` triples a paint writes, top to bottom. Pure.
+def paint_plan(items: list[Line], list_rows: int, offset: int,
+               list_view: int, height: int) -> list[tuple[int, list[Span], str]]:
+    """The `(row, spans, brightness)` triples a paint writes, top to bottom. Pure.
 
     The scrolling window covers the LIST only — `items[:list_rows]` — so it can
     never reach into the tail. The tail (blank, optional access panel, footer)
@@ -1597,36 +1770,163 @@ def paint_plan(items: list[tuple[str, str]], list_rows: int, offset: int,
     a window taller than the list ran past `list_rows` into the very footer the
     second loop was about to draw at the bottom.
     """
-    plan: list[tuple[int, str, str]] = []
-    for i, (text, role) in enumerate(
+    plan: list[tuple[int, list[Span], str]] = []
+    for i, (spans, brightness) in enumerate(
             items[offset:min(offset + list_view, list_rows)]):
-        plan.append((i, text, role))
+        plan.append((i, spans, brightness))
     tail_top = max(0, height - (len(items) - list_rows))
-    for i, (text, role) in enumerate(items[list_rows:]):
-        plan.append((tail_top + i, text, role))
+    for i, (spans, brightness) in enumerate(items[list_rows:]):
+        plan.append((tail_top + i, spans, brightness))
     return plan
 
 
-def paint_line(stdscr, row: int, text: str, width: int, height: int,
-               attr: int) -> None:
-    """One `addnstr` at the full `width`, tolerant of the window's last cell.
+def _coalesce(spans: list[Span]) -> list[Span]:
+    """Merge ADJACENT spans that share a colour role into one.
 
-    A box closes its border in the pane's rightmost column, so the write has to
-    be `width` wide or every box renders open on the right. The one cell curses
-    refuses is the window's bottom-right — the last line's last column — so the
-    exception is swallowed there instead of narrowing every other line to dodge
-    it. The old `width - 1` paid that cost on every row; the docstring it had
-    claimed the dropped column was "already on screen", which is false for a
-    border that lives in that column.
+    A plain line is mostly PLAIN runs — the gutter, the box border, the padding —
+    so coalescing makes a border row ONE write of the full width, exactly as the
+    old whole-line writer did, rather than one tiny write per logical span.
+    """
+    out: list[Span] = []
+    for text, role in spans:
+        if out and out[-1][1] == role:
+            out[-1] = (out[-1][0] + text, role)
+        else:
+            out.append((text, role))
+    return out
+
+
+def _clip_columns(text: str, width: int) -> str:
+    """`text` cut to at most `width` DISPLAY columns (`_visible_width`), no ellipsis.
+
+    The layout has already ellipsised; the painter only guarantees the write never
+    runs past the pane. A wide glyph that would straddle the edge is dropped whole
+    rather than half-written — the pessimistic rule, the same one `_display_width`
+    keeps, so a CJK-locale glyph cannot overflow the pane.
+    """
+    if width <= 0:
+        return ""
+    if _visible_width(text) <= width:
+        return text
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        w = _visible_width(ch)
+        if used + w > width:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out)
+
+
+def _role_colour(role: str) -> Optional[int]:
+    """The ANSI-256 foreground a colour role names, or None for the default.
+
+    PLAIN and ORCH carry no colour (ORCH is bold only); META has its one slate;
+    a `mark:<vendor>` names its vendor's brand colour, or None when that vendor
+    has none (which cannot happen for a vendor with a mark, but keeps the table
+    the single source).
+    """
+    if role == META:
+        return META_COLOR
+    if role.startswith("mark:"):
+        return _VENDOR_COLOURS.get(role[len("mark:"):])
+    return None
+
+
+def _role_bold(role: str) -> bool:
+    """Whether a colour role is BOLD.
+
+    Bold is a WEIGHT, not a colour, so it applies whether or not the terminal can
+    colour: the root's name (ORCH) and every harness mark are bold even on a
+    monochrome terminal. The unknown-harness atom is PLAIN, so it is not.
+    """
+    return role == ORCH or role.startswith("mark:")
+
+
+class _Colours:
+    """Lazily allocates ONE curses colour pair per colour role, cached.
+
+    `init_pair(n, fg, -1)` paints a coloured FOREGROUND on the TERMINAL'S OWN
+    BACKGROUND (curses' `-1`), which is the non-obvious part and what lets colour
+    and the pane's transparency coexist: `use_default_colors()` has already made
+    pair 0 the terminal's own colours and cleared the default background, so every
+    pair allocated here leaves the background untouched and only tints the glyphs.
+
+    Pairs are spent on FIRST USE and cached, so a terminal that never shows a
+    vendor mark never spends a pair on it, and a colour is never re-initialised.
+
+    Degrades rather than crashes, in this order: no colour support (`has_colors()`
+    false) -> every role paints uncoloured; a terminal with fewer colours than a
+    role needs (the vendor brand colours want 256) -> that role paints uncoloured;
+    the pair table exhausted -> the roles that could not be allocated paint
+    uncoloured. NEVER a wrong colour and never an exception: a terminal that
+    cannot colour still has to show the pane, and a bare-but-correct pane beats a
+    crash. A bold role still bolds (see `_role_bold`) — bold is not a colour.
+    """
+
+    def __init__(self, curses: Any):
+        self._curses = curses
+        self._pairs: dict[int, int] = {}
+        self._next = 1
+        try:
+            self._enabled = bool(curses.has_colors())
+        except Exception:
+            self._enabled = False
+
+    def attr(self, colour: int) -> int:
+        """The curses attribute for foreground `colour`, or 0 when unavailable."""
+        if not self._enabled:
+            return 0
+        if colour in self._pairs:
+            return self._pairs[colour]
+        attr = 0
+        try:
+            if colour < self._curses.COLORS \
+                    and self._next < self._curses.COLOR_PAIRS:
+                self._curses.init_pair(self._next, colour, -1)
+                attr = self._curses.color_pair(self._next)
+                self._next += 1
+        except Exception:
+            attr = 0
+        # Cached either way: a colour that could not be allocated this once is not
+        # retried on every paint, and never painted as a DIFFERENT colour.
+        self._pairs[colour] = attr
+        return attr
+
+
+def paint_line(stdscr, row: int, spans: list[Span], width: int, height: int,
+               attr_for) -> None:
+    """One `addnstr` PER SPAN, each at its cumulative column, tolerant of the last
+    cell.
+
+    A box closes its border in the pane's rightmost column, so a line has to be
+    written out to `width` or every box renders open on the right. The one cell
+    curses refuses is the window's bottom-right — the last line's last column — so
+    the exception is swallowed there, per write, instead of narrowing every other
+    line to dodge it.
+
+    Spans are clipped by COLUMN as they are written (`_visible_width`, the layout's
+    ruler): a span that would start at or past `width` is skipped entirely, so
+    nothing written ever exceeds `width` at ANY width >= 1 — the pane's standing
+    invariant, enforced here as a backstop the layout already satisfies. Adjacent
+    spans with the same role are coalesced first (see `_coalesce`).
     """
     import curses
 
     if not 0 <= row < height or width < 1:
         return
-    try:
-        stdscr.addnstr(row, 0, text, width, attr)
-    except curses.error:
-        pass
+    col = 0
+    for text, role in _coalesce(spans):
+        if col >= width:
+            break
+        chunk = _clip_columns(text, width - col)
+        if chunk:
+            try:
+                stdscr.addnstr(row, col, chunk, width - col, attr_for(role))
+            except curses.error:
+                pass
+        col += _visible_width(chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -2221,15 +2521,25 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # is the curses implementation's default white-on-black rather than the
         # terminal's: every cell the view touches — including the spaces
         # `stdscr.erase()` writes — then paints an opaque black background over
-        # the operator's theme and transparency. Nothing here sets a colour
-        # pair, so with the default in place the pane has no background of its
-        # own and matches every other native CLI in the window. The call raises
-        # `curses.error` on a terminal that cannot do it; the view still has to
-        # paint there, so it runs uncoloured rather than dying at startup.
+        # the operator's theme and transparency. With the default taken here the
+        # pane has no background of its own and matches every other native CLI in
+        # the window. The call raises `curses.error` on a terminal that cannot do
+        # it; the view still has to paint there, so it runs uncoloured rather
+        # than dying at startup.
+        #
+        # COLOUR AND TRANSPARENCY COEXIST BECAUSE OF THIS CALL. Every colour pair
+        # this view spends is allocated with a `-1` BACKGROUND — see `_Colours`
+        # — which paints the glyph on whatever pair 0 now is, i.e. the terminal's
+        # own background. So the marks tint and the pane stays transparent at the
+        # same time.
         try:
             curses.use_default_colors()
         except curses.error:
             pass
+        # The colour pairs, allocated lazily on first use and cached. Guarded by
+        # `has_colors()` inside, so no-colour terminals fall back to no colour
+        # and the pane renders exactly as it did before colour existed.
+        colours = _Colours(curses)
         stdscr.keypad(True)
         selected = 0
         offset = 0
@@ -2255,21 +2565,32 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         spin = 0
         next_spin = 0.0
         next_poll = 0.0
-        painted: Optional[list[tuple[str, str]]] = None
+        painted: Optional[list[Line]] = None
 
-        def put(row: int, text: str, role: str) -> None:
-            """One `addnstr` at the pane's full width (see `paint_line`).
+        def put(row: int, spans: list[Span], brightness: str) -> None:
+            """One span-aware write per line (see `paint_line`).
 
-            The attr map is the redesign's: DIM for an unselected worker's box,
-            NORMAL for the selected one, so the selection is brightness and the
-            pane spends no A_REVERSE at all. SELECTED maps to A_NORMAL on purpose
-            — it is a role the composer hangs on the selected box's first row so
-            the scroll target survives, not a look of its own; the box reads as
-            one brightness.
+            The attribute is composed from TWO ORTHOGONAL axes: the BRIGHTNESS —
+            DIM for an unselected worker's box, NORMAL for the selected one, so
+            the selection is brightness and the pane spends no A_REVERSE at all
+            (SELECTED maps to A_NORMAL on purpose: it is a role the composer hangs
+            on the selected box's first row so the scroll target survives, not a
+            look of its own) — and each span's COLOUR ROLE, its brand colour
+            and/or bold. A dim box still shows its mark's colour, merely dimmed.
             """
-            attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_NORMAL,
-                    DIM: curses.A_DIM}[role]
-            paint_line(stdscr, row, text, width, height, attr)
+            base = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_NORMAL,
+                    DIM: curses.A_DIM}[brightness]
+
+            def attr_for(role: str) -> int:
+                attr = base
+                colour = _role_colour(role)
+                if colour is not None:
+                    attr |= colours.attr(colour)
+                if _role_bold(role):
+                    attr |= curses.A_BOLD
+                return attr
+
+            paint_line(stdscr, row, spans, width, height, attr_for)
 
         while True:
             height, width = stdscr.getmaxyx()
@@ -2314,8 +2635,8 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             # Keep the selected box on screen: the list scrolls, the tail stays
             # pinned to the bottom of the pane.
             list_view = max(1, height - tail_len)
-            first_selected = next((i for i, (_, role) in enumerate(items)
-                                   if role == SELECTED), None)
+            first_selected = next((i for i, (_spans, brightness) in enumerate(items)
+                                   if brightness == SELECTED), None)
             if first_selected is not None:
                 if first_selected < offset:
                     offset = first_selected
@@ -2326,9 +2647,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             if paint_needed(items, painted):
                 painted = items
                 stdscr.erase()
-                for row, text, role in paint_plan(items, pane.list_rows,
-                                                  offset, list_view, height):
-                    put(row, text, role)
+                for row, spans, brightness in paint_plan(items, pane.list_rows,
+                                                         offset, list_view, height):
+                    put(row, spans, brightness)
                 stdscr.refresh()
 
             # Two clocks, and the wait is whichever comes first: the next data
