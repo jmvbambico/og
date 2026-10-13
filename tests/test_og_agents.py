@@ -697,11 +697,16 @@ def test_the_selection_follows_its_session_across_a_state_change_reorder():
     assert a.snap_selection(after, None, 0) == 2
 
 
-def test_the_selected_box_is_normal_and_every_other_box_is_dim():
+def test_the_selected_box_is_normal_and_every_other_box_is_dim_but_its_gutter():
     """SELECTION IS BRIGHTNESS. The selected worker's box paints NORMAL — it reads
     white against the dimmed others — and every line of an UNSELECTED box paints
     DIM. SELECTED still rides on exactly ONE line (the selected box's first row),
     because `_run_tui` scans for it to find the block to scroll to.
+
+    DIM IS THE BOX, NOT THE ROW: the reported fix. An operator could not tell
+    which workers were running, because the unselected box's gutter — the rail,
+    the node, the status glyph — dimmed with it. Those spans are `undim:` and so
+    paint NORMAL regardless; the box's border and body still take the line's DIM.
     """
     rows = [header(),
             rail("idle"),
@@ -719,6 +724,67 @@ def test_the_selected_box_is_normal_and_every_other_box_is_dim():
     assert sum(1 for _t, role in items if role == a.SELECTED) == 1
     # Only the three roles survive: no TITLE/A_REVERSE any more.
     assert set(role for _t, role in items) <= {a.NORMAL, a.SELECTED, a.DIM}
+
+
+def test_an_unselected_box_dims_its_border_and_body_but_not_its_gutter():
+    """The regression this pins: an UNSELECTED worker's box dims its BORDER and
+    BODY and leaves the GUTTER — the rail, the node, the status glyph — at full
+    brightness, because that is what the operator reports being unable to read.
+
+    The exemption is a property of the span's ROLE (`undim:`), not of where the
+    span sits, so it is asserted by role here and the gutter is picked out by what
+    it draws rather than by index. The SELECTED box is unchanged by the fix: its
+    gutter carries the same exempt roles and NORMAL is what its line already
+    painted at, so nothing on that row differs.
+    """
+    rows = [header(), rail("working"), worker("w1", "working", text="one",
+                                              meta="2m14s")]
+
+    def gutter_of(spans):
+        """The spans that make up the GUTTER — the first `GUTTER` columns of the
+        line — picked out by what the gutter IS, not by where its spans sit in the
+        list."""
+        out, used = [], 0
+        for text, role in spans:
+            if used >= a.GUTTER:
+                break
+            out.append((text, role))
+            used += len(text)
+        return out
+
+    def is_box_span(role):
+        return not role.startswith(a.UNDIM)
+
+    unselected = a._pane(a.Frame(rows=rows, selected=1), 48).items
+    content_spans, brightness = unselected[5]
+    assert brightness == a.DIM, "the unselected box still dims"
+    # The gutter is exempt: the NODE on the content row, and the WORKING spinner.
+    gutter = gutter_of(content_spans)
+    assert {text.strip() for text, _role in gutter} == {a.NODE, a.SPIN_FRAMES[0]}
+    assert all(role.startswith(a.UNDIM) for _text, role in gutter), gutter
+    # The BOX is what still dims: every span past the gutter — the box edge, the
+    # mark, the title, the meta — carries a role that takes the line's brightness,
+    # border and body alike.
+    assert all(is_box_span(role)
+               for _text, role in content_spans[len(gutter):]), content_spans
+    assert any(text.startswith("╭") and is_box_span(role)
+               for text, role in unselected[4][0]), "the border dims"
+    assert any("2m14s" in text and is_box_span(role)
+               for text, role in content_spans), "the meta dims"
+    # EVERY row of the box is exempted in its gutter, not just the content row:
+    # the top and bottom borders carry the rail at full brightness too.
+    border_gutter = gutter_of(unselected[4][0])
+    assert [text for text, _role in border_gutter] == [a.RAIL + " ", "  "], \
+        border_gutter
+    assert all(role.startswith(a.UNDIM)
+               for item in unselected[4:7] for _text, role in gutter_of(item[0]))
+
+    # The SELECTED box is UNCHANGED by the fix: the same spans with the same
+    # exempt roles, on a line that already painted NORMAL, so nothing on that row
+    # moves — it was bright before and it is bright now.
+    selected = a._pane(a.Frame(rows=rows, selected=2), 48).items[5]
+    assert selected[0] == content_spans, "the spans do not depend on the selection"
+    assert selected[1] == a.NORMAL, "and its line was already at full brightness"
 
 
 def test_selection_is_brightness_and_moves_with_the_selection():
@@ -3269,7 +3335,88 @@ def test_the_meta_write_carries_the_meta_colour_and_is_not_bold(monkeypatch):
     for attr in meta:
         assert attr & 0xFF00, "META is coloured"
         assert not attr & fake.A_BOLD, "META is not bold"
-    assert (1, a.META_COLOR, -1) in fake.init_pair_calls
+    # The PAIR NUMBER is incidental — it is spent in paint order, and the status
+    # glyph now spends one of its own from the gutter, before this row's meta. What
+    # is pinned is the colour itself, on a `-1` (terminal-owned) background.
+    assert any(fg == a.META_COLOR and bg == -1
+               for _pair, fg, bg in fake.init_pair_calls), fake.init_pair_calls
+
+
+def test_the_status_glyph_spans_carry_their_neon_colours():
+    """THE SECOND REPORTED DEFECT: the status glyph had NO colour at all. It sat in
+    a PLAIN span, so `✓` and `⠋` painted in the terminal's default foreground and
+    only the dim ever varied — four workers running read as four identical grey
+    glyphs. The check mark is NEON GREEN and the spinner NEON YELLOW.
+
+    Only those two states: `⏸` blocked, `✗` failed and `?` unknown are PLAIN, as
+    they were before, because nothing was asked of them.
+    """
+    for state, colour in (("idle", 46), ("working", 226)):
+        glyph = a.state_glyph(state, 0)
+        spans = a.worker_box(worker("w", state, text="t"), 60, False)[0][1]
+        roles = [role for text, role in spans if glyph in text]
+        assert roles == [a.undim(a.state_role(state))], (state, spans)
+        assert a._role_colour(roles[0]) == colour, state
+        assert a._STATE_COLOURS[state] == colour, state
+    for state in ("blocked", "failed", "unknown"):
+        assert a.state_role(state) == a.PLAIN, state
+        assert a._role_colour(a.undim(a.state_role(state))) is None, state
+
+
+def test_a_status_glyph_is_neon_and_undimmed_on_an_unselected_row(monkeypatch):
+    """BOTH fixes at once, on the row that used to be the unreadable one: the glyph
+    of an UNSELECTED worker's box paints its neon colour AND carries no A_DIM,
+    while the box drawn beside it still dims.
+
+    This is the interaction the two defects share — the glyph is exempt from the
+    dim and coloured by the same span role — and the reason a colour alone would
+    not have answered the report: neon yellow at half brightness is still dim.
+    """
+    for state, glyph in (("idle", "✓"), ("working", a.SPIN_FRAMES[0])):
+        # w1 is SELECTED and w2 carries the state under test, so w2's box is the
+        # unselected one. A frame with a single worker cannot say: the view snaps
+        # the selection onto the first worker box, so that box is always selected.
+        frame = a.Frame(rows=[header(),
+                              worker("w1", "blocked", text="one"),
+                              worker("w2", state, text="two", meta="12s")],
+                        selected=1)
+        fake, writes = _colour_paint(monkeypatch, frame, colors=256)
+        painted = [(row, attr) for row, _col, text, attr in writes
+                   if text == glyph + " "]
+        assert painted, (state, writes)
+        row, attrs = zip(*painted)
+        assert len(set(row)) == 1, (state, painted)
+        for attr in attrs:
+            assert not attr & fake.A_DIM, f"{state}: the glyph is exempt from the dim"
+            assert attr & 0xFF00, f"{state}: and still wears its neon colour"
+        assert any(fg == a._STATE_COLOURS[state] and bg == -1
+                   for _pair, fg, bg in fake.init_pair_calls), \
+            (state, fake.init_pair_calls)
+        # The box beside it is still the dim one: the fix is the BOX that dims. Its
+        # top border is the `╭` written at the gutter's right edge, on the row above
+        # the content row the glyph shares.
+        borders = [attr for border_row, col, text, attr in writes
+                   if border_row == row[0] - 1 and col == a.GUTTER and "╭" in text]
+        assert borders and all(attr & fake.A_DIM for attr in borders), (state, borders)
+
+
+def test_a_terminal_that_cannot_hold_the_neon_leaves_the_glyph_uncoloured(monkeypatch):
+    """Both neon indices are > 16, so a terminal reporting fewer colours cannot
+    hold them. The glyph falls back to the default foreground exactly as every
+    other colour in this module does — uncoloured, and still EXEMPT from the dim,
+    which is a brightness and not a colour and so survives a terminal with no
+    colour at all. It must never raise, and never paint a wrong colour.
+    """
+    for colors in (0, 8, 16, 32):
+        for state, glyph in (("idle", "✓"), ("working", a.SPIN_FRAMES[0])):
+            frame = a.Frame(rows=[header(), worker("w1", state)], selected=0)
+            fake, writes = _colour_paint(monkeypatch, frame, colors=colors)
+            assert fake.init_pair_calls == [], (colors, state)
+            painted = _writes_for(writes, glyph + " ")
+            assert painted, (colors, state, writes)
+            for attr in painted:
+                assert not attr & 0xFF00, (colors, state, "painted a wrong colour")
+                assert not attr & fake.A_DIM, (colors, state, "dimmed a bare glyph")
 
 
 def test_bold_roles_still_bold_on_a_monochrome_terminal(monkeypatch):
@@ -3335,10 +3482,13 @@ class _KeyScreen(FakeScreen):
 
 
 def _rows_with_attr(writes):
-    """Reassemble rows from span writes: {row: (text, first_span_attr)}.
+    """Reassemble rows from span writes: {row: (text, line_attr)}.
 
-    All spans of a line share the line's brightness, so the FIRST span's attribute
-    carries it — enough for a test to tell a bright box from a dim one.
+    `line_attr` is the LAST span's attribute, which is the LINE's brightness: a
+    span may be exempt from it (the worker's gutter and status glyph are `undim:`
+    and paint NORMAL beside a DIM box), and the box's own spans — which end every
+    row — always take the line's value. Reading the first span instead would
+    report every worker row as bright.
     """
     by_row: dict[int, list] = {}
     for row, col, text, attr in writes:
@@ -3347,7 +3497,7 @@ def _rows_with_attr(writes):
     for row, parts in by_row.items():
         parts.sort()
         out[row] = ("".join(text for _col, text, _attr in parts),
-                    parts[0][2])
+                    parts[-1][2])
     return out
 
 

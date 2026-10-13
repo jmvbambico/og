@@ -255,6 +255,11 @@ TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
 # block to scroll to. Lose it and scroll-to-selection breaks silently, with no
 # symptom until the list outgrows the pane.
 #
+# THE BRIGHTNESS A LINE HANGS IS A DEFAULT, NOT A VERDICT: a span carrying the
+# `undim:` role prefix paints NORMAL whatever its line says (see below). That is
+# what keeps the gutter and the status glyph full-brightness on an unselected
+# box — reported as "I cannot tell which workers are running at a glance".
+#
 # There is no TITLE/A_REVERSE role any more: the root is a rounded box like a
 # worker's, not a reverse-video bar, so the pane spends no A_REVERSE at all.
 NORMAL, SELECTED, DIM = "normal", "selected", "dim"
@@ -273,11 +278,37 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              you`): ONE colour for every meta, not bold.
 #   ORCH       the ROOT box's NAME: bold, no colour.
 #   mark:<v>   a harness brand mark: bold, plus vendor `v`'s brand colour.
+#   state:<s>  a worker's STATUS GLYPH, in that state's colour (see
+#              `_STATE_COLOURS`); PLAIN for the states that have none.
+#   undim:<r>  NOT A COLOUR: a prefix that exempts a span from its line's DIM and
+#              hands it back `r` as its colour role (see `_bare_role`). This is
+#              how brightness became a PER-SPAN axis — the gutter and the status
+#              glyph are exempt on every row, selected or not.
 PLAIN, META, ORCH = "plain", "meta", "orch"
+UNDIM = "undim:"
+
+
+def undim(role: str) -> str:
+    """`role`, EXEMPT from the brightness its line would otherwise paint at.
+
+    DIM is a per-LINE default (`_blocks`), so before this a segment that had to
+    stay bright regardless was unreachable: the operator reporting "the dim
+    swallows the gutter and the status glyph" could not tell which workers were
+    running, because the rail, the node and the spinner dimmed WITH the box
+    drawn around them. Naming the exemption on the span is what makes it
+    explicit at the site that composes it, rather than inferred from its
+    position in the line.
+
+    Exempt means NORMAL, never BOLD: a status glyph at full brightness is the
+    whole point, and there is no brighter axis to spend.
+    """
+    return UNDIM + role
+
 
 # (text, colour_role) — one run of a line and the role it paints under.
 Span = tuple[str, str]
-# (spans, brightness) — a whole line: its spans and the brightness they share.
+# (spans, brightness) — a whole line: the brightness its spans paint at BY
+# DEFAULT. A span whose role carries the `undim:` prefix is exempt (see `undim`).
 Line = tuple[list[Span], str]
 
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
@@ -818,10 +849,41 @@ _VENDOR_COLOURS = {
 # as secondary on a dark pane). Not bold — see `_role_bold`.
 META_COLOR = 109
 
+# THE STATUS GLYPH's colours, asked for by name: the check mark NEON GREEN and the
+# spinner NEON YELLOW, so a pane with four workers running reads as four lit
+# glyphs down the gutter rather than four identical grey ⠋ braille cells at two
+# brightnesses. Only these two states are coloured — `⏸` blocked, `✗` failed and
+# `?` unknown stay PLAIN, because a red `✗` and a grey `⏸` are taste as much as
+# they are meaning and nobody asked for them; the table is the whole of it, and a
+# state absent here paints uncoloured.
+#
+# BOTH INDICES ARE PURE HUE AT FULL VALUE ON THE 6x6x6 CUBE, not a pale tint of
+# one: 46 is (0,255,0) and 226 is (255,255,0), the two cells in the cube that are
+# a neon green and a neon yellow with nothing shaded out of them. The cells beside
+# them shade toward white (118, 190, 229) and read as a pastel, which on a gutter
+# reads as "secondary"; the named 8 are duller still. Both indices are > 16, so
+# like every vendor colour here they want a 256-colour terminal and fall back to
+# uncoloured below that (`_Colours.attr`).
+_STATE_COLOURS = {
+    "idle": 46,
+    "working": 226,
+}
+
 
 def mark_role(vendor: str) -> str:
     """The colour role for a harness mark painted on `vendor`'s brand colour."""
     return f"mark:{vendor}"
+
+
+def state_role(state: str) -> str:
+    """The colour role for `state`'s status glyph: `state:<state>`, or PLAIN.
+
+    The same shape as `mark_role`, and for the same reason — the ROLE is the
+    colour's NAME and the colour is looked up in one table (`_STATE_COLOURS`), so
+    the layout composes glyph and state and never a palette.
+    """
+    return f"state:{state}" if state in _STATE_COLOURS else PLAIN
+
 
 # A mark is padded into a FIXED two display columns, not left as-is. Without the
 # slot, a Narrow mark (one cell) and a Wide or Ambiguous one (more) on
@@ -1376,9 +1438,11 @@ def worker_box(row: Row, width: int, selected: bool,
                spin: int = 0) -> tuple[list[list[Span]], int]:
     """One worker as a guttered, rounded box, and the index of its SELECTED row.
 
-    Each returned line is a list of SPANS (the caller hangs the brightness on it);
-    joined, a returned line is exactly `width` columns: the four-column gutter
-    plus a box `width - GUTTER` wide.
+    Each returned line is a list of SPANS; joined, a returned line is exactly
+    `width` columns: the four-column gutter plus a box `width - GUTTER` wide. The
+    caller hangs the line's DEFAULT brightness on it — everything here paints at
+    that brightness except a span whose role carries the `undim:` prefix, which is
+    exempt from it (see `undim`).
 
     The gutter's NODE column carries `⦿` on the box's CONTENT row — the point
     where this agent's box hangs off the rail — and the rail `│` on every other
@@ -1392,6 +1456,15 @@ def worker_box(row: Row, width: int, selected: bool,
     the caller hangs on `selected_row`, never a glyph. So `--once`, which has no
     attributes, cannot show which worker is selected — a one-shot dump carries no
     selection signal at all (see `main`).
+
+    THE GUTTER IS EXEMPT FROM DIM, ON EVERY ROW. The user reported that the dim
+    swallowed it: an unselected worker's rail, node and status glyph dimmed with
+    the box, and "which workers are running at a glance" — the one thing the
+    gutter exists to answer — became unreadable. Every gutter span is hung through
+    `undim`, so it paints at full brightness whatever the box around it does,
+    while the box's border and body still take the line's brightness. Selection is
+    unaffected: the selected box was already at full brightness, so it renders
+    exactly as before.
 
     The box is THREE rows — top border, ONE content row, bottom border — and FOUR
     when the report is expanded (the extra row is the dimmed snippet, INSIDE the
@@ -1446,9 +1519,15 @@ def worker_box(row: Row, width: int, selected: bool,
         # promises the state. So only the trailing task is clipped, into the
         # columns left after the glyph; width 1 leaves none, and the glyph stands
         # alone. Width <= 0 has no column at all; `_clip`'s own floor.
+        #
+        # Two spans, not one concatenated string, and for the same reason the
+        # guttered row splits them: there is no box here, but the GLYPH is still
+        # the status and is still exempt from the line's DIM and still wears its
+        # state's colour, while the task beside it takes the line's brightness.
         if width < 1:
             return [[]], 0
-        return [[(glyph + _clip(" " + row.text, width - 1), PLAIN)]], 0
+        return [[(glyph, undim(state_role(row.state))),
+                 (_clip(" " + row.text, width - 1), PLAIN)]], 0
 
     if width >= GUTTER + BOX_MIN:
         box_width, node_column, glyph_column = width - GUTTER, True, True
@@ -1488,12 +1567,21 @@ def worker_box(row: Row, width: int, selected: bool,
         # The node and the state glyph ride on that row alone; the rail and a space
         # fill every other row, so the line down column 0 is unbroken.
         on_content = index == 1
-        prefix = ""
+        # THE GUTTER IS NOT PART OF THE BOX, so it does not paint like it. Both of
+        # its spans go through `undim` and the glyph's through `state_role`, which
+        # is the whole of the reported "the dim swallows the gutter and the status
+        # glyph": the rail, the node and the `⠋`/`✓` used to dim with the box they
+        # sit beside, so a pane could not be read for what was RUNNING. Exempt from
+        # brightness and coloured are ORTHOGONAL — the glyph is `undim:` AND
+        # `state:working`, and paints neon yellow at full brightness on an
+        # unselected row while the box around it stays DIM.
+        gutter: list[Span] = []
         if node_column:
-            prefix += (NODE if on_content else RAIL) + " "
+            gutter.append(((NODE if on_content else RAIL) + " ", undim(PLAIN)))
         if glyph_column:
-            prefix += (glyph if on_content else " ") + " "
-        out.append([(prefix, PLAIN)] + spans if prefix else spans)
+            glyph_role = state_role(row.state) if on_content else PLAIN
+            gutter.append(((glyph if on_content else " ") + " ", undim(glyph_role)))
+        out.append(gutter + spans if gutter else spans)
     return out, 0
 
 
@@ -1593,7 +1681,11 @@ def _blocks(frame: Frame, width: int) -> list[list[Line]]:
     `build_rows` at the head of every group, so it is the group's opening brace).
 
     This is ALSO where BRIGHTNESS is hung: the layout functions return spans with
-    colour roles only, and the selection axis is decided here (see below).
+    colour roles only, and the selection axis is decided here (see below). What
+    is hung here is the LINE'S DEFAULT: a span whose role carries the `undim:`
+    prefix paints NORMAL whatever this decides, which is how the gutter and the
+    status glyph stay bright on an unselected box without this function needing
+    to know which spans they are.
     """
     blocks: list[list[Line]] = []
     unit: Optional[list[Line]] = None
@@ -1619,6 +1711,12 @@ def _blocks(frame: Frame, width: int) -> list[list[Line]]:
                 # — because that is the row `_run_tui` scrolls to keep visible; it
                 # maps to the same attribute as NORMAL, so the box reads uniformly
                 # white.
+                #
+                # DIM IS THE BOX, NOT THE ROW: `worker_box` marks its gutter and
+                # status glyph `undim:`, so this value is what the BOX paints at
+                # and those segments override it. That exemption is the reported
+                # fix, and it lives in the spans rather than here so that this
+                # function keeps one rule for every line it composes.
                 if not on_selected:
                     brightness = DIM
                 elif position == selected_row:
@@ -1644,7 +1742,9 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     whole blocks; see `_blocks`).
 
     An unselected worker's box is DIM, the selected worker's box NORMAL except its
-    first line, which carries SELECTED: selection is brightness, not a glyph.
+    first line, which carries SELECTED: selection is brightness, not a glyph. A
+    line's brightness is the DEFAULT its spans paint at — a span hung through
+    `undim` (the worker's gutter and status glyph) ignores it and stays bright.
     """
     items: list[Line] = []
     if frame.notice:
@@ -1819,18 +1919,44 @@ def _clip_columns(text: str, width: int) -> str:
     return "".join(out)
 
 
+def _bare_role(role: str) -> str:
+    """`role` with any `undim:` exemption prefix stripped — its colour role proper.
+
+    The prefix is a modifier on the other axis, so colour and bold both have to
+    look past it: `undim:mark:anthropic` is still anthropic's brand colour and
+    still bold, and `undim:state:idle` is still the neon green of `✓`.
+    """
+    return role[len(UNDIM):] if role.startswith(UNDIM) else role
+
+
+def _role_brightness(role: str) -> Optional[str]:
+    """The BRIGHTNESS `role` paints at, or None to inherit its line's.
+
+    Only the `undim:` prefix sets one, and it sets NORMAL. Colour and brightness
+    stay independent exactly as they were: a vendor mark is still its brand
+    colour merely dimmed, and an exempt span is at full brightness while keeping
+    whichever colour role it carries.
+    """
+    return NORMAL if role.startswith(UNDIM) else None
+
+
 def _role_colour(role: str) -> Optional[int]:
     """The ANSI-256 foreground a colour role names, or None for the default.
 
     PLAIN and ORCH carry no colour (ORCH is bold only); META has its one slate;
     a `mark:<vendor>` names its vendor's brand colour, or None when that vendor
     has none (which cannot happen for a vendor with a mark, but keeps the table
-    the single source).
+    the single source); a `state:<state>` names the STATUS GLYPH's colour for
+    that state, or None for the states that have none. Any `undim:` prefix is
+    not a colour and is stripped first (see `_bare_role`).
     """
+    role = _bare_role(role)
     if role == META:
         return META_COLOR
     if role.startswith("mark:"):
         return _VENDOR_COLOURS.get(role[len("mark:"):])
+    if role.startswith("state:"):
+        return _STATE_COLOURS.get(role[len("state:"):])
     return None
 
 
@@ -1839,8 +1965,10 @@ def _role_bold(role: str) -> bool:
 
     Bold is a WEIGHT, not a colour, so it applies whether or not the terminal can
     colour: the root's name (ORCH) and every harness mark are bold even on a
-    monochrome terminal. The unknown-harness atom is PLAIN, so it is not.
+    monochrome terminal. The unknown-harness atom is PLAIN, so it is not. An
+    `undim:` prefix is not a weight either, so it is stripped first.
     """
+    role = _bare_role(role)
     return role == ORCH or role.startswith("mark:")
 
 
@@ -1858,11 +1986,15 @@ class _Colours:
 
     Degrades rather than crashes, in this order: no colour support (`has_colors()`
     false) -> every role paints uncoloured; a terminal with fewer colours than a
-    role needs (the vendor brand colours want 256) -> that role paints uncoloured;
+    role needs (the vendor brand colours and the status glyph's neon green and
+    yellow want 256) -> that role paints uncoloured, the glyph falling back to the
+    default foreground exactly as every other colour here does;
     the pair table exhausted -> the roles that could not be allocated paint
     uncoloured. NEVER a wrong colour and never an exception: a terminal that
     cannot colour still has to show the pane, and a bare-but-correct pane beats a
-    crash. A bold role still bolds (see `_role_bold`) — bold is not a colour.
+    crash. A bold role still bolds (see `_role_bold`) — bold is not a colour, and
+    neither is the `undim:` exemption, so it survives a terminal with no colour at
+    all.
     """
 
     def __init__(self, curses: Any):
@@ -2577,12 +2709,22 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             on the selected box's first row so the scroll target survives, not a
             look of its own) — and each span's COLOUR ROLE, its brand colour
             and/or bold. A dim box still shows its mark's colour, merely dimmed.
+
+            The line's brightness is the DEFAULT, not a per-line verdict: a span
+            whose role carries `undim:` (the worker gutter and status glyph, which
+            dimmed with the box until the operator reported that a pane could not
+            be read for what was RUNNING) overrides it with NORMAL. Because that
+            is a property of the ROLE and not of its position, colour and
+            brightness stay independent — the exempt glyph paints its neon colour
+            at full brightness on an unselected row, and a dim vendor mark keeps
+            its brand colour.
             """
-            base = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_NORMAL,
-                    DIM: curses.A_DIM}[brightness]
+            attr_of = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_NORMAL,
+                       DIM: curses.A_DIM}
 
             def attr_for(role: str) -> int:
-                attr = base
+                own = _role_brightness(role) or brightness
+                attr = attr_of[own]
                 colour = _role_colour(role)
                 if colour is not None:
                     attr |= colours.attr(colour)
