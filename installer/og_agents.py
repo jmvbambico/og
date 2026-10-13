@@ -20,7 +20,7 @@ to its workers), then the root's workers GROUPED BY STATE, each group opened by 
 breathing rail row and each worker a rounded box indented behind a four-column
 gutter. There are NO worded group labels: the animated glyph in the gutter says
 the state, and the breathing rail alone marks where one group ends and the next
-begins. The gutter is the rail's own column (`⊙` where an agent's box hangs off
+begins. The gutter is the rail's own column (`⦿` where an agent's box hangs off
 it, `│` on every other row), a space, the state glyph's column, and a space — so
 one unbroken line runs down the pane's left edge, with a node at each agent, out
 of the root box's own bottom-left corner and across the breathing rows.
@@ -111,7 +111,7 @@ SPIN_TICK = 0.12
 
 # --- the C2 pane geometry (docs/proto/tui_chosen.py, variant C2) ---------------
 #
-# A GUTTER runs down the pane's left edge: the NODE column (the rail `│`, or `⊙`
+# A GUTTER runs down the pane's left edge: the NODE column (the rail `│`, or `⦿`
 # where an agent's box hangs off it), a space, the STATE glyph column, a space —
 # and the worker's rounded box starts AFTER it. So the rail carries the unbroken
 # vertical line down a group alone, with a node at each agent (the box no longer
@@ -125,23 +125,27 @@ SPIN_TICK = 0.12
 # double its borders and overflow the pane — exactly why the two rulers exist.
 # The len ruler charges Ambiguous one, which is what a western terminal paints,
 # and it matches the approved prototype line for line. The MARK SLOT was once the
-# one place that charged Ambiguous two, and it sheared every ambiguous mark's
-# title; it now measures with its own western ruler (`_slot_width`), which
-# charges Ambiguous one and Wide/Fullwidth two. `_display_width` itself survives
+# one place that charged Ambiguous two, and it sheared the titles of the marks
+# then Ambiguous (kilo, cognition, z-ai — since swapped for Narrow glyphs); it
+# measures with its own western ruler (`_slot_width`), which charges Ambiguous
+# one and Wide/Fullwidth two. `_display_width` itself survives
 # solely as `_footer`'s backstop — the footer must not overflow under EITHER
 # locale, and carries no Ambiguous glyph for it to bite on.
 ROUND_CORNERS = ("\u256d", "\u2500", "\u256e", "\u2502", "\u2570", "\u256f")
 RAIL = "\u2502"          # U+2502, the group rail, its own column at the left edge
-# ⊙ (U+2299) is the NODE: the point on the rail where one agent's box branches
-# off it, drawn in the rail's column on that box's content row. U+2299 is East
-# Asian AMBIGUOUS — the same class as `│` and every box glyph this pane already
-# draws — so the len-based layout ruler charges it one column exactly as it does
-# the rail, and this adds no new width risk. Its box-drawing siblings are all
-# Ambiguous too, so the node sits in the same column as the line it rides.
-NODE = "\u2299"
+# ⦿ (U+29BF) is the NODE: the point on the rail where one agent's box branches
+# off it, drawn in the rail's column on that box's content row. U+29BF CIRCLED
+# BULLET is East Asian NARROW — the box-drawing glyphs it rides between (`│`,
+# the corners) stay Ambiguous, but the node's width is now unconditional. It was
+# ⊙ (U+2299, Ambiguous), which paints TWO columns in a CJK-locale terminal and
+# would leave the node wider than the content column it sits beside; Narrow paints
+# one column in every locale. The len-based layout ruler charges it one column
+# exactly as it does the rail, so the node still sits in the same column in the
+# western terminal the operator runs.
+NODE = "\u29bf"
 
 # The four columns a box spends BEFORE its rounded border: the NODE column (the
-# rail, or `⊙` where the box hangs off it), a space, the STATE glyph column, a
+# rail, or `⦿` where the box hangs off it), a space, the STATE glyph column, a
 # space. The node and the state glyph are drawn on the box's CONTENT row alone
 # and blank on its border and snippet rows, so the rail reads as one unbroken
 # line with a node at each agent — the rule the pre-C2 renderer already followed
@@ -726,22 +730,25 @@ def harness_label(harness: Any) -> str:
 # through `og_herdr.harness_vendors`, so renaming or re-vendoring a harness in
 # the catalog moves its mark without an edit here.
 #
-# Three picks (kilo, cognition, z-ai) are East Asian AMBIGUOUS; the rest are
-# Narrow. That split is the whole reason for the slot below — see `_mark_slot`.
+# Every pick is East Asian NARROW, so no mark's width depends on the locale.
+# Three of them (kilo, cognition, z-ai) were once AMBIGUOUS; the operator replaced
+# them with Narrow glyphs so each paints one column in a CJK-locale terminal too.
+# The slot below still pads every mark to the same two columns — see `_mark_slot`.
 _HARNESS_MARKS = {
     "anthropic": "\u2733",       # ✳ eight-spoked asterisk
     "opencode-zen": "\u25AF",    # ▯ white vertical rectangle
     "google": "\u2726",          # ✦ black four-pointed star
     "openai": "\u2B21",          # ⬡ white hexagon
     "deepseek": "\U0001319E",    # 𓆞 Egyptian hieroglyph
-    "kilo": "\U0001F13A",        # 🄺 squared letter (AMBIGUOUS)
+    "kilo": "\U0001D5DE",        # 𝗞 mathematical sans-serif bold K (was 🄺, Ambiguous)
     "aws-kiro": "\U0001680C",    # 𖠌 Bamum letter
     "cursor": "\u21D7",          # ⇗ north-east double arrow
     "goose": "\U0001316F",       # 𓅯 Egyptian hieroglyph
     "hermes": "\u2624",          # ☤ caduceus
     "xai": "\U0001D54F",         # 𝕏 double-struck X
-    "cognition": "\u26EF",       # ⛯ lighthouse (AMBIGUOUS)
-    "z-ai": "\u2554",            # ╔ box-drawing corner (AMBIGUOUS)
+    "cognition": "\u2316",       # ⌖ position indicator (was ⛯, Ambiguous)
+    "z-ai": "\U0001D5ED",        # 𝗭 mathematical sans-serif bold Z (was ╔, Ambiguous;
+                                 #   a box-drawing corner read as frame damage here)
     "moonshotai": "\u2318",      # ⌘ place-of-interest sign
 }
 
@@ -752,17 +759,17 @@ _HARNESS_MARKS = {
 # Padding each mark to the same column removes it.
 #
 # THE SLOT MEASURES WITH THE WESTERN RULE (`_slot_width`): an Ambiguous glyph is
-# charged ONE column and padded exactly like a Narrow one. The three Ambiguous
-# picks (kilo, cognition, z-ai) thus fill two WESTERN cells — glyph plus one
-# space — and the title starts in the same column on every row. This was once
-# the other way round: the slot charged Ambiguous two and so left those three
-# UNPADDED, which in a western terminal draws them one cell wide and shears their
-# titles one column LEFT of every other row. That is the locale the operator
-# actually runs, so it was the wrong rule kept for the wrong terminal. A
-# CJK-locale terminal now shears those three rows one column RIGHT instead — the
-# same magnitude of error, on far fewer users — and that is the deliberate trade.
-# Do NOT "fix" it back: see `_slot_width` for why the slot and `_display_width`
-# disagree.
+# charged ONE column and padded exactly like a Narrow one. Every mark ships Narrow
+# now, so today that is simply glyph plus one space for all fourteen and the title
+# starts in the same column on every row; the Ambiguous branch is HYPOTHETICAL,
+# kept for a future mark rather than any that ships. It was once the live case:
+# the three then-Ambiguous picks (kilo, cognition, z-ai, since replaced with
+# Narrow glyphs) were charged one under this rule — but an earlier slot charged
+# Ambiguous two and so left them UNPADDED, which in a western terminal draws them
+# one cell wide and shears their titles one column LEFT of every other row. That
+# is the locale the operator actually runs, so it was the wrong rule kept for the
+# wrong terminal. Do NOT "fix" it back: see `_slot_width` for why the slot and
+# `_display_width` disagree.
 MARK_SLOT = 2
 
 
@@ -773,23 +780,24 @@ def _slot_width(text: str) -> int:
     same column on every row in the terminal the operator actually runs, so it
     measures what a WESTERN terminal paints: Wide and Fullwidth glyphs really do
     spend two cells there, an Ambiguous one spends one. Charging Ambiguous two —
-    the pessimistic rule `_display_width` keeps for the footer — is what left the
-    three Ambiguous marks (kilo, cognition, z-ai) unpadded and sheared their
-    titles one column left.
+    the pessimistic rule `_display_width` keeps for the footer — is what once left
+    the then-Ambiguous marks (kilo, cognition, z-ai) unpadded and sheared their
+    titles one column left. Those three are Narrow now, so no shipped mark takes
+    the Ambiguous branch; it is kept so a future one is still charged correctly.
 
     Deliberately NOT `len`: a future Wide mark is one python character that
     paints two cells, and `len` would pad it as if it were one — the same shear,
     in the other direction. Deliberately NOT `_display_width`: that rule is
     correct for the footer, which must not overflow in ANY locale, and wrong
-    here, where the whole pane already assumes the western paint rule (the rail,
-    the corners and the gauge are all Ambiguous and all composed as one column —
-    see ROUND_CORNERS). The slot is now consistent with them.
+    here, where the whole pane already assumes the western paint rule (the rail
+    and the corners are Ambiguous and composed as one column — see ROUND_CORNERS;
+    the node was too until it became Narrow). The slot stays consistent with them.
 
     CJK TRADE-OFF: in a CJK-locale terminal an Ambiguous mark paints two columns,
     so a row here composes one column narrower than it paints and shears right by
-    one. Accepted: the error is the same size as the one it replaces, it falls on
-    the far smaller set of terminals, and it is confined to three vendor marks
-    rather than every row of the pane.
+    one. That trade is HYPOTHETICAL today — no shipped mark is Ambiguous, so no
+    current row takes it. It is kept, not removed, so a future Ambiguous mark is
+    charged by the same one-column rule the rest of the pane composes under.
     """
     return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
                for ch in text)
@@ -810,14 +818,15 @@ def _mark_slot(mark: str) -> str:
 
     A mark that names no agent fills the slot with spaces; every other is padded
     with the difference between its `_slot_width` and `MARK_SLOT` — one trailing
-    space for a Narrow mark AND for an Ambiguous one, because in the western
-    terminal this pane is composed for both spend one cell and need the same pad
-    to spend two layout columns. A Wide or Fullwidth mark fills the slot on its
-    own and gets no pad.
+    space for a Narrow mark (and, hypothetically, for an Ambiguous one, which the
+    western rule also charges one cell), because in the western terminal this pane
+    is composed for both spend one cell and need the same pad to spend two layout
+    columns. A Wide or Fullwidth mark fills the slot on its own and gets no pad.
+    Every mark shipped today is Narrow, so the first case is the only one taken.
 
     The ruler is `_slot_width`, never `len` and never `_display_width`: see that
-    function for the western rule and the CJK trade-off this slot deliberately
-    makes, and for why the two rulers disagree.
+    function for the western rule and the (now hypothetical) CJK trade-off this
+    slot would make for an Ambiguous mark, and for why the two rulers disagree.
     """
     if not mark or mark == " ":
         return " " * MARK_SLOT
@@ -1215,7 +1224,7 @@ def worker_box(row: Row, width: int, selected: bool,
     for. Every returned line is exactly `width` columns: the four-column gutter
     plus a box `width - GUTTER` wide.
 
-    The gutter's NODE column carries `⊙` on the box's CONTENT row — the point
+    The gutter's NODE column carries `⦿` on the box's CONTENT row — the point
     where this agent's box hangs off the rail — and the rail `│` on every other
     row of the box; the STATE glyph column carries `state_glyph` on that same
     content row and a space elsewhere. So the state glyph has LEFT the box: the
