@@ -4,10 +4,15 @@
 #   og start [local]    start on the LAN: server on 0.0.0.0, QR of your LAN IP
 #   og start tunneled [domain] [--use ngrok|tunnl]
 #                       start the tunnel first, then the server behind that origin
-#   og start [<mux>] …  the same start, inside a terminal multiplexer: `herdr` opens
+#   og start [<mux>] … [--once] [--socket PATH] [--bin PATH]
+#                       the same start, inside a terminal multiplexer: `herdr` opens
 #                       the session as a herdr space. The word may appear anywhere;
 #                       an ngrok domain NAMED after a multiplexer is unreachable
 #                       positionally — say OG_NGROK_DOMAIN=<domain> og start tunneled.
+#                       A flag alongside the multiplexer goes to the launcher, which
+#                       execs the multiplexer TUI: --once does the work, prints it and
+#                       does NOT attach — the diagnostic for a space or pane that did
+#                       not come up.
 #   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
 #   og restart [mode]   og stop, then og start with the same arguments
@@ -21,6 +26,7 @@
 #   og audit [id]       what happened in the latest run: per-worker tools, stalls, reports
 #   og stats            per-agent quota/capacity: remaining, reset, tier, source
 #   og agents [options] the live session tree in this terminal (not herdr-specific)
+#   og sessions [opts] list sessions; --archive <id> hides one, --delete <id> destroys it
 #   og herdr [options]  project live omnigent sessions into herdr panes
 #   og update           pull the checkout and re-apply the install
 #   og version          print the installed version
@@ -1229,7 +1235,8 @@ export_worker_scoping() {
   fi
 }
 
-# Turn `og start`'s arguments into OG_START_MODE / _DOMAIN / _PROVIDER / _MUX.
+# Turn `og start`'s arguments into OG_START_MODE / _DOMAIN / _PROVIDER / _MUX /
+# _MUX_ARGS.
 # Split out of cmd_start so the parsing — which is where the multiplexer keyword
 # has to be intercepted BEFORE the bare-argument case arm — is one function a
 # test can call without starting a server.
@@ -1238,7 +1245,7 @@ parse_start_args() {
   # be one more positional case arm (see docs/TUNNEL-PROVIDERS.md): collect
   # positionals and flags in one pass.
   local use="" provider mux="" mode="" domain="" ids a
-  local -a pos=() rest=()
+  local -a pos=() rest=() mux_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --use)
@@ -1246,6 +1253,27 @@ parse_start_args() {
         use="$2"; shift 2 ;;
       --use=*)
         use="${1#--use=}"; shift ;;
+      # The multiplexer LAUNCHER's own flags (installer/og_herdr_launch.py),
+      # which `og start` used to swallow. It exec'd the launcher with a fixed
+      # argv, so `og start herdr --once` died here as an unknown option even
+      # though --once is in the launcher's --help — a documented command that
+      # could not be typed. Collected verbatim and forwarded; the launcher has
+      # the only parser that can validate them.
+      --once)  mux_args+=("$1"); shift ;;
+      --socket|--bin)
+        [[ -n "${2:-}" ]] || die "$1 needs a value"
+        mux_args+=("$1" "$2"); shift 2 ;;
+      --socket=*|--bin=*)
+        # Same guard, same words as the separate form above -- an empty
+        # --socket= is not a socket path, and two spellings of the same flag
+        # disagreeing about emptiness would hand the launcher an argument it
+        # cannot use while `--socket` alone is fatal here.
+        [[ -n "${1#*=}" ]] || die "${1%%=*} needs a value"
+        mux_args+=("${1%%=*}" "${1#*=}"); shift ;;
+      # NOT --mux / --server: bin/og derives both (from the mux id and $PORT)
+      # and putting them on the command line is how a pane would be pointed at
+      # another space or another server with nothing else to show for it. They
+      # die here as unknown options, which is the honest answer.
       -*) die "unknown option: $1  (try: og help)" ;;
       *) pos+=("$1"); shift ;;
     esac
@@ -1291,6 +1319,17 @@ parse_start_args() {
   esac
   OG_START_MODE="$mode" OG_START_DOMAIN="$domain"
   OG_START_PROVIDER="$provider" OG_START_MUX="$mux"
+  # A launcher flag with no multiplexer has nothing to be forwarded to, and
+  # accepting it silently would be the same defect this forwarding exists to fix
+  # (a flag the operator typed that nothing acts on). The mux id is known here;
+  # whether its binary exists on PATH is not, and that one is cmd_start's to
+  # report — a missing multiplexer is never fatal, and a missing one must not
+  # turn a working `og start` into a failure.
+  if [[ ${#mux_args[@]} -gt 0 && -z "$mux" ]]; then
+    die "${mux_args[0]} is a flag of 'og start <mux>' (the multiplexer launcher); this command names no multiplexer.
+    Run 'og start herdr ${mux_args[0]}' for it to apply."
+  fi
+  OG_START_MUX_ARGS=("${mux_args[@]+"${mux_args[@]}"}")
   return 0
 }
 
@@ -1371,9 +1410,14 @@ mux_homepage() {
 #   2. `og chat` -> `omnigent run` opens the live conversation in the browser for
 #      an interactive launch (cli.py: auto_open_conversation defaults to
 #      `prompt is None`). This is the open that actually fired, and it is shut
-#      at the PANE, not here: the launcher passes BROWSER=true in herdr's pane
-#      env (og_herdr_launch.pane_env_for). An export from this shell would never
-#      reach it — the pane runs `og chat` in a fresh shell.
+#      at the PANE, not here: og_herdr.pane_env_for builds {BROWSER: true} and
+#      BOTH pane-creating modules — this launcher's own launcher AND the herdr
+#      bridge, which opens spaces and tabs of its own — pass it as herdr's pane
+#      env. An export from this shell would never reach it: the pane runs
+#      `og chat` in a fresh shell. Measured limit (omnigent 0.17.0
+#      conversation_browser.open_conversation_url): on macOS that open shells
+#      out to `open <url>` rather than going through `webbrowser`, so it ignores
+#      BROWSER there; og_herdr.pane_env_for says so in full.
 #   3. og's OWN opener: the needs_setup create-admin path in cmd_start. That one
 #      asks og_browser_suppressed below.
 #
@@ -1416,6 +1460,11 @@ cmd_start() {
   parse_start_args "$@"
   local mode="$OG_START_MODE" domain="$OG_START_DOMAIN" provider="$OG_START_PROVIDER"
   local mux="$OG_START_MUX"
+  # Flags for the multiplexer launcher itself, parsed out of this same argv
+  # (parse_start_args) and used at the exec below. ${arr[@]+...}: an empty array
+  # is "unbound" under set -u on bash 3.2, which is the oldest shell this
+  # script claims to work.
+  local -a mux_args=("${OG_START_MUX_ARGS[@]+"${OG_START_MUX_ARGS[@]}"}")
 
   # A missing multiplexer is never an error: og is fully usable without one.
   # Checked HERE, before anything is started, rather than at the launcher call
@@ -1430,6 +1479,12 @@ cmd_start() {
       echo "  Install it from $(mux_homepage "$mux" 2>/dev/null || echo "$mux") and re-run to use spaces."
       mux=""
     fi
+  fi
+  # The launcher did not run, so its flags did not apply. Said rather than
+  # dropped: the warning above is about the multiplexer, and "…and the --once you
+  # asked for did nothing either" is the part that explains an unexpected start.
+  if [[ ${#mux_args[@]} -gt 0 && -z "$mux" ]]; then
+    info "${mux_args[0]} did not apply: there is no multiplexer to run it against"
   fi
 
   # Only for a launch that is actually going into a multiplexer (see
@@ -1791,7 +1846,11 @@ cmd_start() {
     # record for the directory before `og chat` can have minted a session, so the
     # bridge CLAIMS the launcher's space rather than racing to make a second one.
     start_herdr_bridge
-    exec python3 "$launcher" --mux "$mux" --server "http://127.0.0.1:$PORT"
+    # The operator's own launcher flags go last so they cannot displace the
+    # --mux/--server this command derived. Unquoted-empty-safe for the reason
+    # named where the array is read.
+    exec python3 "$launcher" --mux "$mux" --server "http://127.0.0.1:$PORT" \
+      ${mux_args[@]+"${mux_args[@]}"}
   fi
 }
 
@@ -2022,6 +2081,24 @@ cmd_agents() {
     exit 2
   }
   exec python3 "$viewer" "$@"
+}
+
+# `og sessions` — the terminal's answer to the web UI's session "..." menu.
+# Its own verb, never a flag on `og chat`: `og chat` starts and resumes
+# conversations, and a mistyped `og chat` must not be able to destroy one. The
+# herdr per-space command has a clean thing to call here.
+cmd_sessions() {
+  local repo; repo="$(og_repo_dir)" || die "cannot find the og checkout.
+    Set OG_REPO=/path/to/og in $CONF_FILE, or run installer/og_sessions.py directly."
+  command -v python3 >/dev/null || die "python3 is required"
+  local cli="$repo/installer/og_sessions.py"
+  [[ -f "$cli" ]] || {
+    printf '\033[0;31merror:\033[0m og sessions is not installed (missing %s); re-run og setup\n' "$cli" >&2
+    exit 2
+  }
+  # --server so an install whose og.env moved the server off 6767 still talks
+  # to its own server, exactly as the herdr bridge is launched.
+  exec python3 "$cli" --server "http://127.0.0.1:$PORT" "$@"
 }
 
 # The herdr bridge ships on its own branch, so an install that predates it has
@@ -2360,17 +2437,18 @@ case "${1:-}" in
   audit)  shift; cmd_audit "$@" ;;
   stats)  shift; cmd_stats "$@" ;;
   agents) shift; cmd_agents "$@" ;;
+  sessions) shift; cmd_sessions "$@" ;;
   herdr)  shift; cmd_herdr "$@" ;;
   update) shift; cmd_update ;;
   version|--version|-V) cmd_version ;;
   ""|-h|--help|help)
     # The usage block is the comment header, so the RANGE has to track it: every
     # command added above without widening this quietly drops off the end of
-    # `og help`, which is how `og version` went missing once already. 2,26 is the
+    # `og help`, which is how `og version` went missing once already. 2,32 is the
     # last line of the command list (the prose below it is not help).
     # tests/test_og_start_mux.py::test_help_block_lists_every_dispatched_command
     # is the guard that cannot rot the way a number does.
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

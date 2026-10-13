@@ -234,8 +234,19 @@ Projecting every live session would mean ~100 tabs, nearly all dead. So:
 - a **root** session is projected while it is listed and not archived — it
   reads `idle` the whole time it waits for the human to type, so retiring it on
   idle would close the pane they are typing into;
+- a **dead root** — one whose detail row reports `runner_online: false` — is
+  projected too, but as a **history space**: a plain shell (one
+  `workspace.create`, which makes the space and its first tab together) holding
+  `og chat --resume <id>` as UNSENT text, so a past conversation is visible and
+  resumable without resurrecting it. There is NO cap by default — every
+  non-archived root is listed and the operator prunes by hand — though a positive
+  `herdr_session_space_cap` in the install caps them, newest-first so the recent
+  conversations survive. A root whose workspace directory is gone is skipped
+  entirely (a shell whose cwd does not exist is broken), and a live root is never
+  subject to the cap;
 - a **sub-agent** is projected only while `running` or holding a pending
-  elicitation, and its pane retires when it goes idle or fails.
+  elicitation AND with a live runner, and its pane retires when it goes idle or
+  fails. A dead worker is noise, so the runner refusal stays in force for it.
 
 ### One consequence worth generalising
 
@@ -393,6 +404,53 @@ The REPL does not prompt for complex free-form elicitation schemas — it
 declines them with a "use the web UI" message (`repl/_repl.py:2631-2647`).
 Those specific approvals always need the browser. This is the one place where
 "purely herdr, no browser" is literally false.
+
+### Nobody asked for a browser
+
+A mux launch asked for a terminal, so every pane og opens carries
+`BROWSER=true` in herdr's pane environment (`og_herdr.pane_env_for` — one rule,
+one implementation; both `og_herdr_launch` and the bridge use it, because the
+bridge opens spaces and tabs of its own and once used no rule at all). It has to
+be the *pane* env rather than an `export`: a pane runs its command in a fresh
+shell, and herdr only takes an env map on the creating calls (`workspace.create`,
+`tab.create`, `pane.split` — never `pane.send_text`, so there is nowhere else it
+could go). An operator who has set `$BROWSER` keeps it; only an unset one is
+defaulted.
+
+**Measured limit.** In omnigent 0.17.0 the conversation open does not go through
+`webbrowser` on macOS at all: `conversation_browser.open_conversation_url`
+shells out to `subprocess.run(["open", url])`. So `BROWSER=true` silences the
+`webbrowser` openers (and is the whole answer off macOS), but on macOS it does
+**not** stop `og chat` or `og chat --resume` from opening a browser. Closing
+that gap needs either omnigent routing through `webbrowser`, or
+`auto_open_conversation: false` — and the only way to set that globally from og
+is the machine-wide config write that commit `ef2bdd9` deliberately removed. It
+is recorded here rather than worked around.
+
+**What a macOS operator should do about it.** Set the key by hand, once:
+
+```yaml
+# ~/.omnigent/config.yaml
+auto_open_conversation: false
+```
+
+`omnigent run` resolves an explicit setting before falling back to its
+interactive default (`cli.py`, `_resolve_auto_open_conversation_setting` — the
+tri-state exists precisely so an opt-out is honoured), so this silences the
+pane. Note the scope: it is omnigent's global config, so plain `omnigent run`
+outside herdr stops opening a browser too. That is the trade, and it is the
+operator's to make — which is why og does not write this key for them. Remove
+the line to get the browser back.
+
+Which panes can fire it, on omnigent 0.17.0:
+
+| Pane | Command | Opens a browser? |
+|---|---|---|
+| Launcher's space (case A/D) | `og chat` | **Yes**, at session creation — and `BROWSER` does not stop it on macOS |
+| Bridge's space for a live root (`_add_space`) | `omnigent attach …` | No — `attach` resolves `auto_open_conversation` to `False` unless the operator configured it |
+| Bridge's tab for a sub-agent (`_add_tab`) | `omnigent attach …` | Same as above |
+| Bridge's history space (`_add_history_space`) | `og chat --resume <id>`, **unsubmitted** | Nothing runs until the operator presses Enter; then **yes**, same as the launcher's pane |
+| The `og agents` split | `og agents` | No |
 
 ---
 

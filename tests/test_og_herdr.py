@@ -73,10 +73,15 @@ class RecordingClient:
         self._seq += 1
         return self._seq
 
-    def workspace_create(self, label, cwd, focus=False):
+    def workspace_create(self, label, cwd, focus=False, env=None):
         """The MEASURED workspace.create reply: workspace, tab AND root_pane, all
-        three in one call — the schema's own result listing is lossy."""
-        self._call("workspace_create", label, cwd=cwd, focus=focus)
+        three in one call — the schema's own result listing is lossy.
+
+        `env` is recorded, not sent: it is the pane-shell environment map
+        `og_herdr_client.HerdrClient.workspace_create` takes, so a test can see
+        what the bridge installed in the pane it just asked for.
+        """
+        self._call("workspace_create", label, cwd=cwd, focus=focus, env=env)
         if self.create_results:
             return self.create_results.pop(0)
         n = self._next()
@@ -91,8 +96,8 @@ class RecordingClient:
         self._call("workspace_close", workspace_id)
         self._live.pop(workspace_id, None)
 
-    def tab_create(self, workspace_id, cwd, label, focus=False):
-        self._call("tab_create", workspace_id, cwd=cwd, label=label)
+    def tab_create(self, workspace_id, cwd, label, focus=False, env=None):
+        self._call("tab_create", workspace_id, cwd=cwd, label=label, env=env)
         if self.create_results:
             return self.create_results.pop(0)
         n = self._next()
@@ -105,6 +110,15 @@ class RecordingClient:
 
     def pane_run(self, pane_id, command):
         self._call("pane_run", pane_id, command)
+
+    def pane_send_text(self, pane_id, text):
+        """The unsubmitted sibling of `pane_run`: same wire method, no newline.
+
+        A history space's pane is given this — the resume line left as text, not
+        run — so no session is resurrected. Kept separate from `pane_run` here
+        so a test can tell the two apart by the recorded method name.
+        """
+        self._call("pane_send_text", pane_id, text)
 
     def pane_close(self, pane_id):
         self._call("pane_close", pane_id)
@@ -122,6 +136,17 @@ class RecordingClient:
         rather than something a test reaches into `_live` to do.
         """
         self._live.pop(workspace_id, None)
+
+    def operator_renamed(self, workspace_id, label):
+        """The operator renames a space by hand, in their own herdr window.
+
+        No call is recorded — the bridge did not do it — but the new label is
+        what `workspace.list` reports from here on, which is exactly what the
+        bridge compares against when Omnigent's session title changes. Like
+        `operator_closed`, this is a first-class way to set up the operator's
+        own action rather than a test reaching into `_live` directly.
+        """
+        self._live[workspace_id]["label"] = label
 
     def report_agent(self, pane_id, source, agent, state, message=None,
                      seq=None, agent_session_id=None):
@@ -141,6 +166,13 @@ class RecordingClient:
         through it, so the frame is covered by the introspection guard in
         tests/test_og_herdr_client.py rather than by the generic `call`."""
         self._call("workspace_rename", workspace_id, label)
+
+    def tab_rename(self, tab_id, label):
+        """The client's NAMED `tab.rename` wrapper, matching
+        `og_herdr_client.HerdrClient`. The bridge routes the first-tab label
+        through it, so the frame is covered by the introspection guard in
+        tests/test_og_herdr_client.py rather than by the generic `call`."""
+        self._call("tab_rename", tab_id, label)
 
 
 class FakeWatcher:
@@ -218,8 +250,8 @@ def test_added_sequence(seams):
 
     # A ROOT opens a workspace, and the one call brings the space, its first tab
     # and that tab's root pane back together.
-    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
-                              "report_metadata"]
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
     wc = _call(client, "workspace_create")
     assert wc[1] == ("Fix bug",)
     assert wc[2]["cwd"] == "/tmp/ws"
@@ -231,6 +263,10 @@ def test_added_sequence(seams):
     assert ra[2] == {"agent": "Claude Code", "state": "working",
                      "agent_session_id": "s1"}
     assert _call(client, "report_metadata")[2]["title"] == "Fix bug"
+    # The space's first tab is labelled with the space's own title:
+    # `workspace.create` cannot label the tab it makes, so without this it shows
+    # herdr's tab number.
+    assert _call(client, "tab_rename")[1] == ("tab1", "Fix bug")
     assert len(lines) == 1 and "add s1" in lines[0]
 
 
@@ -252,6 +288,10 @@ def test_added_defaults_cwd_to_process_cwd_and_label_to_session_id(seams):
     # wreck the one display they asked for.
     assert _call(client, "workspace_create")[1] == ("abcdef12",)
     assert len(lines) == 1
+    # ...and the space's first tab is labelled the SAME way, so a space opened
+    # before its title exists does not show herdr's bare tab number in the
+    # meantime — the `1` the operator was looking at.
+    assert _call(client, "tab_rename")[1] == ("tab1", "abcdef12")
 
 
 def test_realistic_listing_row_without_workspace_key_uses_bridge_cwd(seams):
@@ -679,13 +719,24 @@ def test_changed_sequence_reports_state_and_title(seams):
         Ev("changed", "s1", root_session("New", state="working"),
            previous=root_session("Old", state="idle"))])
 
-    assert _names(client) == ["report_agent", "report_metadata"]
+    # The title change also renames the SPACE, not just the pane's metadata — a
+    # space opened before the conversation had a name would otherwise keep its
+    # `sid[:8]` label for good (see `_rename_own_space`). The label to compare
+    # against comes from the per-pass listing, hence the one `workspace_list`.
+    assert _names(client) == ["report_agent", "report_metadata",
+                              "workspace_list", "workspace_rename",
+                              "tab_rename"]
     assert _call(client, "report_agent")[2]["state"] == "working"
     # The STORED label, not one re-derived from this event: a `changed` carries
     # the listing row, which has no `harness` to derive from, and reporting a
     # different agent string would make herdr show two markers for one pane.
     assert _call(client, "report_agent")[2]["agent"] == "Claude Code"
     assert _call(client, "report_metadata")[2]["title"] == "New"
+    assert _call(client, "workspace_rename")[1] == ("ws1", "New")
+    # ...and the space's FIRST TAB follows the space. The root's tab was labelled
+    # `Old` at creation; it must converge onto `New` here, or the operator is left
+    # with a correctly-named space holding a tab still called by the old label.
+    assert _call(client, "tab_rename")[1] == ("tab1", "New")
     assert "update s1" in lines[0]
 
 
@@ -974,6 +1025,396 @@ def test_a_nested_worker_lands_beside_its_own_parent(seams):
         Ev("added", "g1", sub_session("w1", "coder_zen:sub-task"))])
     tabs = [c for c in client.calls if c[0] == "tab_create"]
     assert [t[1] for t in tabs] == [("ws1",), ("ws1",)]
+
+
+# ---------------------------------------------------------------------------
+# PAST conversations: every non-archived ROOT gets a space, live or not.
+#
+# The web sidebar lists every conversation the operator has had; this is the
+# herdr half. A root whose runner is gone gets a space labelled with its title
+# and a pane holding the resume line UNSENT — visible and resumable, with
+# nothing running. A sub-agent is NOT extended this (a dead worker is noise),
+# and a live root is unchanged.
+# ---------------------------------------------------------------------------
+
+def test_a_dead_root_gets_a_space_labelled_with_its_title(seams, tmp_path):
+    # The title plumbing is the same one a live root uses: the space is labelled
+    # with the session's own title, so the operator sees the conversation's name
+    # exactly as Omnigent auto-named it.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
+
+    wc = _call(client, "workspace_create")
+    assert wc[1] == ("Fix issue 502",)
+    assert wc[2]["cwd"] == str(tmp_path)
+    assert wc[2]["focus"] is False
+    assert _names(client).count("workspace_create") == 1
+
+
+def test_a_dead_roots_pane_holds_the_resume_line_unsubmitted(seams, tmp_path):
+    # THE HARD CONSTRAINT. A space for a past conversation must not resurrect it.
+    # The pane is a plain shell — one `workspace.create` — holding the resume line
+    # as UNSENT text: `pane_send_text` with no trailing newline, and NOT
+    # `pane_run`, which would append the newline that starts it.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "New Alignment", runner_online=False, workspace=str(tmp_path)))])
+
+    assert "pane_run" not in _names(client)
+    _name, args, _kwargs = _call(client, "pane_send_text")
+    assert args == ("pane1", "og chat --resume dead1")
+    assert not args[1].endswith("\n"), "the resume line must not be submitted"
+
+
+def test_a_history_spaces_first_tab_is_labelled_too(seams, tmp_path):
+    # A history space is opened by the SAME `workspace.create` as a live one, so
+    # it starts with the same unlabelled first tab. It is given the space's label
+    # — the past conversation's title — for the same reason.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "New Alignment", runner_online=False, workspace=str(tmp_path)))])
+
+    assert _call(client, "workspace_create")[1] == ("New Alignment",)
+    assert _call(client, "tab_rename")[1] == ("tab1", "New Alignment")
+
+
+def test_a_live_root_still_gets_todays_exact_treatment(seams):
+    # No regression, and the sharpest form of it: a root with a live runner takes
+    # the path it always did — a SUBMITTED attach, the agent marker, the title
+    # metadata — and never the unsubmitted resume line.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "Live", runner_online=True, workspace="/repo/og"))])
+
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
+    assert "pane_send_text" not in _names(client)
+
+
+def test_a_root_with_no_runner_key_is_treated_as_live(seams):
+    # Backwards compatibility, and the direction that matters: only an explicit
+    # `runner_online: False` means "past conversation". A session dict from any
+    # other source — an old event, a detail fetch that failed — has no such key
+    # and must keep taking today's path rather than becoming a history space.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "s1", root_session("Live"))])
+
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
+
+
+def test_a_dead_root_whose_workspace_is_gone_gets_no_space(seams, tmp_path):
+    # A space is a shell in a directory, and a shell whose cwd does not exist is
+    # broken. A past conversation whose checkout was a temporary worktree — which
+    # is deleted when it finishes — names a directory that is simply not there,
+    # so it gets nothing rather than a dead shell.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    gone = tmp_path / "deleted-worktree"
+    lines = bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(gone)))])
+
+    assert client.calls == []
+    assert any("dead1" in ln and "gone" in ln for ln in lines), lines
+
+
+def test_a_sub_agent_is_never_given_a_history_space(seams):
+    # Sub-agent behaviour is unchanged: a dead worker is not a conversation, and
+    # the watcher does not even emit one. If one reaches the bridge anyway (a
+    # `runner_online: False` on a session that has a parent), the parent check
+    # keeps the history path to roots.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    session = sub_session("root", "coder_zen:fix", runner_online=False,
+                          workspace="/repo/og")
+    bridge.reconcile([Ev("added", "w1", session)])
+
+    # It is NOT a history space (no unsubmitted resume line); it falls to the
+    # ordinary sub-agent path, which opens a space when the parent has none.
+    assert "pane_send_text" not in _names(client)
+    assert _names(client).count("workspace_create") == 1
+
+
+def test_every_non_archived_root_gets_a_space_by_default(seams, tmp_path):
+    # NO CAP BY DEFAULT: the operator wants the web sidebar's contents, all of
+    # it, and prunes by hand. So a Bridge built with no explicit cap (the
+    # shipping default, 0) opens a space for every root it is handed.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    assert bridge.space_cap == 0
+    events = [Ev("added", f"d{i}", root_session(
+        f"past-{i}", runner_online=False, workspace=str(tmp_path)))
+        for i in range(5)]
+
+    bridge.reconcile(events)
+
+    titles = [c[1][0] for c in client.calls if c[0] == "workspace_create"]
+    assert titles == [f"past-{i}" for i in range(5)]
+
+
+def test_the_history_space_cap_is_honoured_when_one_is_set(seams, tmp_path):
+    # A cap that IS set is still honoured: the listing is NEWEST-FIRST, so the
+    # roots arrive newest-first and the cap keeps the ones that arrive FIRST —
+    # the recent conversations — and leaves the rest alone, with a line saying why.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=2)
+    events = [Ev("added", f"d{i}", root_session(
+        f"past-{i}", runner_online=False, workspace=str(tmp_path)))
+        for i in range(3)]
+
+    lines = bridge.reconcile(events)
+
+    titles = [c[1][0] for c in client.calls if c[0] == "workspace_create"]
+    assert titles == ["past-0", "past-1"]
+    assert any("past-2" in ln and "cap" in ln for ln in lines), lines
+
+
+def test_lowering_the_cap_governs_new_spaces_and_closes_none_that_are_open(seams,
+                                                                        tmp_path):
+    # Lowering `herdr_session_space_cap` in og-install.json does NOT retroactively
+    # close the history spaces already on screen. It says what may open from here
+    # on, and nothing here reaches for a live herdr space to enforce the number:
+    # a space the operator may be reading a past conversation in is not ours to
+    # close behind their back. Deliberate, and pinned here so the next reader
+    # does not have to guess whether it was an oversight.
+    client = RecordingClient()
+    first = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=5)
+    first.reconcile([Ev("added", f"d{i}", root_session(
+        f"past-{i}", runner_online=False, workspace=str(tmp_path)))
+        for i in range(2)])
+    assert _names(client).count("workspace_create") == 2
+    client.calls.clear()
+
+    # The restart a lowered config actually produces: same state file, same
+    # herdr, a lower cap.
+    second = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=1)
+    lines = second.reconcile([Ev("added", "d2", root_session(
+        "past-2", runner_online=False, workspace=str(tmp_path)))])
+
+    # The two already-open spaces are untouched and still counted…
+    assert not {"workspace_close", "tab_close", "pane_close"} & set(_names(client))
+    assert second._history_space_count() == 2
+    # …and the new one is refused, because the cap governs what opens next.
+    assert any("past-2" in ln and "cap" in ln for ln in lines), lines
+    assert _names(client).count("workspace_create") == 0
+
+
+def test_a_live_root_is_never_subject_to_the_history_cap(seams, tmp_path):
+    # The cap is on PAST conversations only: a live session always gets its
+    # space, even when the cap is already full — otherwise a machine at its cap
+    # would stop showing the conversation someone is actually driving.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path), space_cap=1)
+    bridge.reconcile([Ev("added", "d0", root_session(
+        "past-0", runner_online=False, workspace=str(tmp_path)))])
+    bridge.reconcile([Ev("added", "live1", root_session(
+        "Live", runner_online=True, workspace=str(tmp_path)))])
+
+    assert _names(client).count("workspace_create") == 2
+    assert "pane_run" in _names(client)
+
+
+def test_a_dead_root_does_not_get_a_second_space_on_a_later_pass(seams,
+                                                                 tmp_path):
+    # "One pane per session" holds for history spaces too: a redelivered `added`
+    # for a root that already has one is a no-op, not a second space.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    session = root_session("New Alignment", runner_online=False,
+                           workspace=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", session)])
+    bridge.reconcile([Ev("added", "dead1", session)])
+
+    assert _names(client).count("workspace_create") == 1
+
+
+def test_a_dead_root_adopts_its_recorded_space_after_a_restart(seams, tmp_path):
+    # The other half of "no second space": a NEW process (empty `_recs`, same
+    # state file and same herdr) adopts the recorded space instead of opening
+    # another. This is also what keeps the cap stable across a restart — the
+    # adopted spaces are counted, not re-created.
+    session = root_session("New Alignment", runner_online=False,
+                           workspace=str(tmp_path))
+    client = RecordingClient()
+    m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path)).reconcile(
+        [Ev("added", "dead1", session)])
+    client.calls.clear()
+
+    m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path)).reconcile(
+        [Ev("added", "dead1", session)])
+
+    assert "workspace_create" not in _names(client)
+
+
+def test_a_repaired_history_space_still_leaves_its_resume_line_unsubmitted(
+        seams, tmp_path):
+    # The REPAIR path must not quietly undo the constraint. A dead root whose
+    # space the operator closed is re-projected — and re-projected as a HISTORY
+    # space, with the resume line UNSENT — not as a live one that submits an
+    # attach on a session nobody is watching.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "New Alignment", state="idle", runner_online=False,
+        workspace=str(tmp_path)))])
+    client.operator_closed("ws1")
+    client.calls.clear()
+    # Only the pane is reported gone; the space is gone too, so the repair has to
+    # open a fresh one (the `_reproject` create branch, not the `_add_tab` one).
+    client.fail = {"report_agent": FakeHerdrError(
+        "pane_not_found", "pane ws1:p1 not found")}
+
+    bridge.reconcile([Ev("changed", "dead1", root_session(
+        "New Alignment", state="idle"), previous=root_session(
+            "New Alignment", state="idle"))])
+
+    assert "pane_run" not in _names(client), (
+        "a repaired history space must never submit a runner")
+    _name, args, _kwargs = _call(client, "pane_send_text")
+    assert args == ("pane2", "og chat --resume dead1")
+    assert not args[1].endswith("\n")
+    # ...and it is still recorded as a history space the cap counts.
+    assert bridge._recs["dead1"]["owns_space"] is True
+
+
+# ---------------------------------------------------------------------------
+# the pane's environment: how a BRIDGE pane keeps the browser shut
+# ---------------------------------------------------------------------------
+# The same rule og_herdr_launch applies, and now stated ONCE in this module so
+# the two cannot drift: a pane og opens under a multiplexer runs an omnigent
+# command that can open the live conversation in a browser, and the only place
+# the suppression can be installed is the pane's own shell. herdr takes an env
+# map on the CREATING calls (`workspace.create`, `tab.create`, `pane.split`)
+# and not on `pane.send_text` — see pane_env_for.
+#
+# The bridge had none of it, so every space and tab it created started with
+# $BROWSER unset. The launcher threaded `ctx.pane_env` through all three of its
+# own creates and the bridge threaded nothing through any of its three, which is
+# how a `og start herdr` could leave a pane that opens a browser.
+
+def test_a_space_the_bridge_opens_carries_the_browser_suppression(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws",
+                      pane_env={"BROWSER": "true"})
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {"BROWSER": "true"}
+
+
+def test_a_sub_agents_tab_carries_the_browser_suppression(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws",
+                      pane_env={"BROWSER": "true"})
+
+    bridge.reconcile([Ev("added", "root", root_session("Fix bug")),
+                      Ev("added", "w1", sub_session("root", "coder:task"))])
+
+    assert _call(client, "tab_create")[2]["env"] == {"BROWSER": "true"}
+
+
+def test_a_history_space_carries_the_browser_suppression(seams, tmp_path):
+    """The one case where the bug is INVISIBLE until a human acts.
+
+    A history space's pane holds `og chat --resume <id>` as unsubmitted text:
+    nothing runs, so nothing opens a browser, and the pane looks identical to a
+    suppressed one. The moment the operator presses Enter — which is the entire
+    point of the space — an unsuppressed pane runs it and a browser opens. So
+    the create is asserted here rather than inferred from the live cases.
+    """
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      pane_env={"BROWSER": "true"})
+
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {"BROWSER": "true"}
+    assert _call(client, "pane_send_text")[1] == ("pane1",
+                                                  "og chat --resume dead1")
+
+
+def test_the_bridge_defaults_an_unset_browser_rather_than_opening_one(
+        seams, monkeypatch):
+    """`pane_env` left out means "derive it from this process", NOT "send none".
+
+    The bug being fixed was a path that FORGOT the map, so the default has to be
+    the safe one: a Bridge built by anything — `og herdr`, `--once`, a caller
+    that never heard of pane_env — suppresses unless it is told otherwise.
+    """
+    monkeypatch.delenv("BROWSER", raising=False)
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {"BROWSER": "true"}
+
+
+def test_an_operator_browser_setting_reaches_a_bridge_pane(seams, monkeypatch):
+    """`$BROWSER` is a PREFERENCE, so the bridge passes it through, not over it.
+
+    Measured rather than assumed: bin/og starts the bridge as
+    `nohup env PYTHONUNBUFFERED=1 python3 og_herdr.py ...`, and `env` without
+    `-i` passes the caller's environment through with one variable added. So the
+    daemon does inherit an exported `$BROWSER` — and must honour it, exactly as
+    the launcher does, rather than silently replacing it with `true`.
+    """
+    monkeypatch.setenv("BROWSER", "/usr/bin/firefox")
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert _call(client, "workspace_create")[2]["env"] == {
+        "BROWSER": "/usr/bin/firefox"}
+
+
+def test_the_suppression_is_installed_at_creation_and_never_typed_after(
+        seams, tmp_path):
+    """herdr has no per-send env, so creation is the ONLY place it can go.
+
+    `pane.send_text` carries `pane_id` and `text` and nothing else (herdr's
+    published PaneSendTextParams), so a line typed into an existing pane cannot
+    carry an environment: it runs in the shell herdr started when the pane was
+    created. That is why every create is covered above and nothing is done about
+    `pane_run`/`pane_send_text` — asserted here so the next reader does not go
+    looking for an env to add to a send.
+    """
+    monkeypatched = {"env": {"BROWSER": "true"}}
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      pane_env=monkeypatched["env"])
+
+    bridge.reconcile([Ev("added", "s1", root_session("Live"))])
+
+    # The fake client accepts only what the real one does: `pane_run` and
+    # `pane_send_text` take (pane_id, command) — a third argument would be a
+    # TypeError, which is the assertion.
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
+    assert "env" not in _call(client, "pane_run")[2]
+
+
+def test_the_launcher_and_the_bridge_share_one_pane_env_rule():
+    """One statement of the rule, one implementation, no second copy.
+
+    `og_herdr_launch` imports `pane_env_for` from here; it must be the SAME
+    object, not a re-spelling that happens to agree today. Two copies of a
+    suppression rule is how this bug comes back: the bridge's panes opened
+    browsers for exactly as long as nobody checked the other module.
+    """
+    import og_herdr_launch
+
+    assert og_herdr_launch.pane_env_for is m.pane_env_for
 
 
 # ---------------------------------------------------------------------------
@@ -1442,8 +1883,8 @@ def test_blocked_is_reported_not_resolved(seams, monkeypatch):
     ra = _call(client, "report_agent")
     assert ra[2]["state"] == "blocked"
     # only reporting calls happened; nothing that could resolve an elicitation
-    assert _names(client) == ["workspace_create", "pane_run", "report_agent",
-                              "report_metadata"]
+    assert _names(client) == ["workspace_create", "tab_rename", "pane_run",
+                              "report_agent", "report_metadata"]
 
 
 def test_source_never_calls_an_elicitation_resolver():
@@ -2126,6 +2567,215 @@ def test_the_workspace_rename_frame_matches_herdrs_schema(seams):
     # The negative control: a param herdr does not have must be caught by the
     # comparison above, or every assertion here could pass for a typo'd key.
     assert set(allowed["properties"]) != {"workspace_id", "name"}
+
+
+# ---------------------------------------------------------------------------
+# the space label follows the title when it ARRIVES, not only at adoption
+#
+# A fresh `og chat` conversation has no title until its first message, so a
+# space opened for it is labelled `sid[:8]` — the "hash id" the operator saw —
+# and, before this, kept that string for the life of the session. The title
+# arrives on the `changed` event after that first message, and THAT is where the
+# space has to be renamed. Not a race, and not the adoption path: the ordinary
+# path for every new session.
+# ---------------------------------------------------------------------------
+
+def test_a_titleless_space_is_renamed_when_the_session_title_arrives(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    # No title yet: the space is opened as the first eight characters of the id.
+    bridge.reconcile([Ev("added", "abcd1234efgh", root_session(
+        None, state="idle"))])
+    assert _call(client, "workspace_create")[1] == ("abcd1234",)
+    client.calls.clear()
+
+    # The first message gives the conversation a name; the space follows it.
+    bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+
+    assert _call(client, "workspace_rename")[1] == ("ws1", "First question")
+
+
+def test_a_second_title_change_renames_the_space_again(seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "abcd1234efgh", root_session(
+        None, state="idle"))])
+    bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "A better name", state="working"), previous=root_session(
+            "First question", state="working"))])
+
+    assert [c[1] for c in client.calls if c[0] == "workspace_rename"] == \
+        [("ws1", "A better name")]
+
+
+def test_a_batch_of_title_changes_lists_the_workspaces_once(seams):
+    # The listing is a per-PASS cost, not a per-event one: `workspace.list` is
+    # fetched once and reused for every title change in the batch, which is the
+    # constraint `_workspace_index` exists to hold. Two title changes in one
+    # pass must not mean two listings.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "aaaa1111bb", root_session(None, state="idle")),
+        Ev("added", "cccc2222dd", root_session(None, state="idle")),
+    ])
+    client.calls.clear()
+
+    bridge.reconcile([
+        Ev("changed", "aaaa1111bb", root_session("First", state="working"),
+           previous=root_session(None, state="idle")),
+        Ev("changed", "cccc2222dd", root_session("Second", state="working"),
+           previous=root_session(None, state="idle")),
+    ])
+
+    assert _names(client).count("workspace_list") == 1, _names(client)
+    assert [c[1] for c in client.calls if c[0] == "workspace_rename"] == \
+        [("ws1", "First"), ("ws2", "Second")]
+
+
+def test_a_workers_title_change_never_renames_the_space_or_tab_it_sits_in(seams):
+    # A sub-agent gets a TAB in its parent's space, and its record names the
+    # PARENT's workspace. Renaming that to the worker's title would rename the
+    # operator's whole conversation to `fix-space-rename` every time a worker
+    # spawned — and relabelling the parent's FIRST TAB would be the same mistake
+    # one level down. The positive control — the ROOT's own title DOES rename the
+    # space AND its first tab — is in the same test, because the negative alone
+    # is satisfied by a module that renames nothing at all.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
+    bridge.reconcile([Ev("added", "root", root_session("Old name"))])
+    bridge.reconcile([Ev("added", "w1", sub_session("root", "coder_zen:fix"))])
+
+    # The worker's tab was created WITH its own title, and is never the root's.
+    assert _call(client, "tab_create")[2]["label"] == "coder_zen:fix"
+
+    # The ROOT's title arriving renames its own space AND its first tab...
+    bridge.reconcile([Ev("changed", "root", root_session("New name"),
+                         previous=root_session("Old name"))])
+    assert _call(client, "workspace_rename")[1] == ("ws1", "New name")
+    assert [c[1] for c in client.calls if c[0] == "tab_rename"] == \
+        [("tab1", "Old name"), ("tab1", "New name")], client.calls
+
+    # ...but the WORKER's never touches that space or that tab.
+    client.calls.clear()
+    bridge.reconcile([Ev("changed", "w1", sub_session("root", "coder_zen:v2"),
+                         previous=sub_session("root", "coder_zen:fix"))])
+    assert "workspace_rename" not in _names(client), _names(client)
+    assert "tab_rename" not in _names(client), _names(client)
+
+
+def test_a_failed_space_rename_leaves_the_pass_intact_and_the_metadata_reported(
+        seams):
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session(None, state="idle"))])
+    client.calls.clear()
+    client.fail = {"workspace_rename": FakeHerdrError(
+        "invalid_label", "label must not be empty")}
+
+    lines = bridge.reconcile([
+        Ev("changed", "s1", root_session("First question", state="working"),
+           previous=root_session(None, state="idle")),
+        Ev("added", "s2", root_session("Second", state="idle")),
+    ])
+
+    # The metadata report is made BEFORE the rename, so a rename that fails
+    # cannot lose it.
+    assert _call(client, "report_metadata")[2]["title"] == "First question"
+    # The failure is absorbed LOCALLY as an ordinary `error:` line: the rename is
+    # an addition to `_changed`'s work, so it must not discard the bookkeeping of
+    # the work that already succeeded. That bookkeeping is `rec["title"]` —
+    # persisted and read back across a restart — and the event's own audit line.
+    assert any("error s1" in ln and "invalid_label" in ln for ln in lines), lines
+    assert bridge._recs["s1"]["title"] == "First question"
+    assert "update s1 → state=working (title)" in lines, lines
+    # ...and the batch carries on: one bad space rename aborts nothing.
+    assert any("add s2" in ln for ln in lines), lines
+
+
+def test_a_failed_tab_rename_is_absorbed_like_the_space_rename(seams):
+    # A cosmetic label must not fail the event or drive a repair. The SPACE
+    # rename already absorbs this way (the test above); the tab rename keeps the
+    # SAME shape, so a `tab_not_found` — the failure mode when the operator has
+    # closed the space's first tab — is a recorded line, never a raised error that
+    # `reconcile` would read as a stale record and repair by re-opening a pane.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("Old", state="idle"))])
+    client.calls.clear()
+    client.fail["tab_rename"] = FakeHerdrError("tab_not_found", "gone")
+
+    lines = bridge.reconcile([
+        Ev("changed", "s1", root_session("New", state="working"),
+           previous=root_session("Old", state="idle"))])
+
+    # The space rename still went through and the title bookkeeping still landed.
+    assert _call(client, "workspace_rename")[1] == ("ws1", "New")
+    assert bridge._recs["s1"]["title"] == "New"
+    # The tab failure is an ordinary `error:` line, and no repair was driven by
+    # it — the record is untouched.
+    assert any("error s1" in ln and "tab_not_found" in ln for ln in lines), lines
+    assert _names(client).count("workspace_create") == 0, _names(client)
+    assert not any("re-project" in ln for ln in lines), lines
+
+
+def test_a_failed_space_rename_is_not_retried_on_a_later_poll(seams):
+    # ONE attempt, never a retry — and this is the test a reader needs, because
+    # the property is easy to misread. `title_changed` comes from the watcher's
+    # `previous`, not from `rec`, so once the watcher has seen the new title the
+    # event does not recur: a failed rename is reported once and then the space
+    # simply keeps its `sid[:8]` label for the life of the session, rather than
+    # the bridge repeating the same failing `workspace.rename` on every poll
+    # forever (the lesson the dead-workspace repair already learned).
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "abcd1234efgh", root_session(
+        None, state="idle"))])
+    client.calls.clear()
+    client.fail_always = {"workspace_rename": FakeHerdrError(
+        "invalid_label", "nope")}
+
+    first = bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+    assert sum("invalid_label" in ln for ln in first) == 1, first
+
+    # The next poll carries no title change, so the rename is not re-attempted.
+    client.calls.clear()
+    second = bridge.reconcile([Ev("changed", "abcd1234efgh", root_session(
+        "First question", state="working"), previous=root_session(
+            "First question", state="working"))])
+    assert "workspace_rename" not in _names(client), _names(client)
+    assert not any("invalid_label" in ln for ln in second), second
+
+
+def test_a_hand_renamed_space_is_renamed_back_to_the_session_title(seams):
+    # The judgement call, pinned. The operator renames a space BY HAND; Omnigent
+    # then names the conversation, and the TITLE wins — the same rule the
+    # adoption path already applies to a manual label. The space is a projection
+    # of the conversation and the conversation's name is authoritative, and
+    # across a restart the bridge cannot tell a hand-set label from its own
+    # stale one, so honouring it would make the space's name depend on the order
+    # events happened to arrive in.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "abcd1234ef", root_session(
+        None, state="idle"))])
+    client.operator_renamed("ws1", "My Own Name")
+    client.calls.clear()
+
+    bridge.reconcile([Ev("changed", "abcd1234ef", root_session(
+        "First question", state="working"), previous=root_session(
+            None, state="idle"))])
+
+    assert _call(client, "workspace_rename")[1] == ("ws1", "First question")
 
 
 # --- 6. pending records are pruned by EXISTENCE, not by a clock ----------------

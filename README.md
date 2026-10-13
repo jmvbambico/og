@@ -318,6 +318,15 @@ Without a multiplexer installed, `og start herdr` warns and starts normally:
   Install it from https://herdr.dev/ and re-run to use spaces.
 ```
 
+If a space or a pane does not come up, the launch says so and waits a few seconds
+before the multiplexer takes the terminal, and the reason is appended to
+`~/.omnigent/logs/herdr-launch.log`. `og start herdr --once` runs the same launch
+without attaching at all, which is the fastest way to see what it did:
+
+```
+og start herdr --once
+```
+
 See [docs/HERDR.md](docs/HERDR.md) for what the herdr backend does and the
 measured limits it works within, and [docs/MUX-LAUNCHER.md](docs/MUX-LAUNCHER.md)
 for the launcher and `og agents`.
@@ -423,6 +432,7 @@ og chat             open an orchestrator session in this terminal
 og url              print the URL (pipe-friendly)
 og logs [-f]        tail the server log
 og audit [id]       what happened in the latest run — per worker: tools, stalls, report
+og sessions         list sessions; --archive <id> hides one, --delete <id> destroys it
 og login            store server credentials (Keychain / keyring / 0600 file), once
 og update           pull the checkout and re-apply the install
 og version          print the installed version

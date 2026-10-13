@@ -91,14 +91,39 @@ STATE_VERSION = 2
 # leaves the operator closing spaces by hand, one per conversation.
 STATE_VERSION_V1 = 1
 
-# Who opened the space. Recorded, not enforced: the two sides differ in where a
+# Who opened the space. Recorded, not enforced: the sides differ in where a
 # session's pane comes from (the bridge types `omnigent attach` into a pane it
-# created; the launcher types `og chat` into one it created) but agree that a
-# space either of them opened is cleaned up the same way, so nothing branches on
-# this yet. It is here so the file can answer the question later without a
-# format change.
+# created for a LIVE session; the launcher types `og chat` into one it created;
+# the bridge types the resume line, unsubmitted, into one it created for a
+# HISTORY session) but agree that a space any of them opened is cleaned up the
+# same way.
+#
+# `history` is the one value that is READ rather than merely recorded: it marks
+# a space opened for a past conversation (see `_add_history_space`), and those
+# are the spaces the configurable cap counts (`_history_space_count`). It lives
+# in this field rather than a new one because `owner` already round-trips
+# through the state file (`_read_spaces`), and a new key would have had to be
+# added to the on-disk format for no other reason.
 OWNER_BRIDGE = "bridge"
 OWNER_LAUNCHER = "launcher"
+OWNER_HISTORY = "history"
+
+# The owners that mean "the BRIDGE created this workspace", so a removal closes
+# the whole space rather than one tab of it. The launcher's spaces are excluded
+# on purpose: closing those is the launcher's business, and for a launcher space
+# the bridge closes only the tab it adopted (see `_adopt`).
+BRIDGE_OWNED = frozenset({OWNER_BRIDGE, OWNER_HISTORY})
+
+# How many past-conversation ("history") spaces the bridge keeps on screen.
+# ZERO MEANS NO LIMIT, and zero is the default: the point of the feature is to
+# see EVERY non-archived root the way the web sidebar does, and the operator
+# prunes by hand rather than being handed an arbitrary cut. A POSITIVE value
+# caps how many such spaces are open at once, and the cap trims the OLDEST —
+# the listing is newest-first, so the recent conversations are the ones kept.
+# Only history spaces are subject to it: a LIVE session always gets its space,
+# whatever this is set to. Set through the install's `herdr_session_space_cap`
+# key; see `main` and og_herdr_launch.session_space_cap.
+DEFAULT_SPACE_CAP = 0
 
 
 def attach_command(server: str, session_id: str) -> str:
@@ -129,6 +154,105 @@ def attach_command(server: str, session_id: str) -> str:
     """
     return " ".join(shlex.quote(part) for part in
                     ("omnigent", "attach", "--server", server, session_id))
+
+
+def resume_command(session_id: str) -> str:
+    """The line a HISTORY space's pane is given — typed but NOT submitted.
+
+    A live session's pane is handed `attach_command` and submitted, because a
+    runner is up and there is a conversation to join. A past conversation has no
+    runner, and starting one is the one thing this must not do: a space for a
+    dead session must not resurrect it. So its pane gets this line left in the
+    shell UNSUBMITTED — the operator presses Enter to resume, and until they do
+    nothing runs (see `pane_send_text`).
+
+    `og chat --resume <id>` and not a bare `omnigent run`, because `og chat` is
+    what brings the local server and the agent bundle with it, exactly as it does
+    for a fresh session in a launcher pane. `og chat` forwards its arguments to
+    `omnigent run` verbatim (`bin/og`: `exec omnigent run "$AGENT_DIR" --server
+    ... "$@"`), and `omnigent run -r/--resume <conversation id>` is documented
+    to attach to a prior conversation — so this is a supported invocation and
+    not a hopeful one.
+
+    It names no `--server`, unlike `attach_command`, and that is deliberate:
+    `og chat` has no such flag — it always drives the LOCAL og server on
+    `$PORT`. That is right for a bridge on the same machine and is the honest
+    limit of the line; a bridge pointed at a remote `--server` cannot resume
+    through `og chat`, and the pane says so rather than attaching elsewhere.
+
+    Quoted per part for the same reason `attach_command` is: the string is
+    TYPED INTO A SHELL, so a session id is operator input and must not be able
+    to break the line or run anything.
+    """
+    return " ".join(shlex.quote(part) for part in
+                    ("og", "chat", "--resume", session_id))
+
+
+# ---------------------------------------------------------------------------
+# the pane's environment: how a pane og opens keeps the browser shut
+# ---------------------------------------------------------------------------
+#
+# ONE statement of the rule, shared by the two things that open panes. The
+# launcher had it first and got it right; the bridge never learned it, and a
+# `og start herdr` left panes on the operator's screen that would open a browser
+# the moment something in them ran. So the rule lives HERE, next to the pane
+# commands it is about, and `og_herdr_launch` imports it — one direction still,
+# as for `space_status`/`workspace_index`. A second copy is how this came back.
+
+def pane_env_for(environ: dict) -> dict:
+    """The environment every pane og opens is started with.
+
+    A mux launch asked for a TERMINAL interface, so the panes must not steal
+    focus with a browser. A pane runs an omnigent command that can open the live
+    conversation — `og chat` (-> `omnigent run`) opens it by default
+    (cli.py: `auto_open_conversation` defaults to `prompt is None`), and
+    `og chat --resume <id>` in a history space does the same the moment the
+    operator presses Enter. `omnigent run` has no --no-open and no env var for
+    it, but `webbrowser` — what it calls — honours `$BROWSER`, and pointing that
+    at `true(1)` makes `webbrowser.open()` run `/usr/bin/true <url>`: it succeeds
+    and opens nothing. Measured, not assumed: with `BROWSER=true`,
+    `webbrowser._tryorder` comes back `['true', 'MacOSX', 'chrome', 'firefox',
+    'safari']` and `open()` returns True, so `true` is tried first and the
+    platform openers never run. So the suppression is this one variable.
+
+    IT HAS TO TRAVEL TO THE PANE, not to the process that asks for the pane: a
+    pane runs its command in a fresh shell, so an export in the launcher or the
+    bridge reaches neither. herdr takes an env map on the CREATING calls and
+    installs it in that pane's shell — `workspace.create`, `tab.create`,
+    `pane.split`, and nothing else (see herdr's own request schema:
+    `PaneSendTextParams` is `pane_id` + `text` and has no `env`). That is why
+    every create in both modules threads this map and nothing is done about
+    `pane_run`/`pane_send_text`: a line typed into an existing pane runs in the
+    shell herdr started when the pane was created, so it inherits what that
+    create installed. Creation is the only place the value can go.
+
+    An operator who already set `$BROWSER` has expressed a preference — a real
+    browser — so it is passed through untouched; only an unset `$BROWSER` is
+    defaulted. Same rule the accounts auto-open guard in bin/og follows.
+
+    The bridge is a DAEMON, so `environ` here is whatever environment it was
+    started in — not the operator's shell as it is now. Measured, not assumed:
+    bin/og starts it `nohup env PYTHONUNBUFFERED=1 python3 og_herdr.py ...`, and
+    `env` without `-i` passes the caller's environment through with one variable
+    added, so an exported `$BROWSER` does reach the bridge — the same answer the
+    launcher gets, because both are children of the same `og start`. The one
+    honest limit is that a bridge already running keeps the value it started
+    with: `og start herdr` is idempotent about the daemon (a live pidfile
+    means it is not restarted), so a `$BROWSER` the operator changes afterwards
+    reaches a fresh launcher's panes and not the running bridge's. That is a
+    staleness, not a divergence — same rule, read once, per process.
+
+    KNOWN LIMIT, measured in omnigent 0.17.0 (conversation_browser.py:
+    `open_conversation_url`): on macOS that helper does NOT go through
+    `webbrowser` — it runs `subprocess.run(["open", url])` directly, so a
+    `BROWSER=true` pane does not shut THAT open. So this map does what it can do
+    from here (it silences the `webbrowser` openers, and on every non-darwin
+    platform it is the whole answer), but on macOS the conversation open needs
+    omnigent to route through `webbrowser`, or `auto_open_conversation: false`.
+    Fixing that from og means the global config write this code deliberately
+    replaced (commit ef2bdd9) — so it is written down here rather than done.
+    """
+    return {"BROWSER": environ["BROWSER"] if "BROWSER" in environ else "true"}
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +721,8 @@ class Bridge:
     """
 
     def __init__(self, watcher, client, dry_run=False, source=DEFAULT_SOURCE,
-                 cwd=None, server=DEFAULT_SERVER, state_path=None, filer=None):
+                 cwd=None, server=DEFAULT_SERVER, state_path=None, filer=None,
+                 space_cap=DEFAULT_SPACE_CAP, pane_env=None):
         self.watcher = watcher
         self.client = client
         self.dry_run = dry_run
@@ -613,6 +738,17 @@ class Bridge:
         # never once per session — a daemon that logs a line per new root for the
         # life of the process is the noise this flag exists to prevent.
         self._file_warned = False
+        # How many history spaces (past conversations) this bridge may keep on
+        # screen; see DEFAULT_SPACE_CAP. A live session is never subject to it.
+        self.space_cap = space_cap
+        # The pane-shell environment installed into every pane this bridge asks
+        # herdr to create, so none of them can open a browser (see
+        # `pane_env_for`). DERIVED from this process when not given, rather than
+        # defaulting to "send no env": the bug this fixes was a path that forgot
+        # the map, so the default has to be the safe one — a Bridge built by
+        # anything at all suppresses unless it is explicitly told otherwise.
+        self.pane_env = pane_env_for(dict(os.environ)) if pane_env is None \
+            else pane_env
         # The directory new panes open in when the session does not name one of
         # its own (see `_added`). It comes from THIS process, so with no
         # explicit --cwd it is the bridge's own cwd.
@@ -883,15 +1019,16 @@ class Bridge:
     # -- the state file: which workspaces are ours ---------------------------
 
     def _remember(self, sid: str, ws_id: str, tab_id=None, pane_id=None,
-                  cwd=None) -> None:
+                  cwd=None, owner: str = OWNER_BRIDGE) -> None:
         """Record a space as this session's, so `--cleanup` can close it later.
 
-        `owner` is `bridge` unconditionally: this is only reached from a create
-        the bridge itself just made. A space the launcher opened keeps
+        `owner` is `bridge` unless a caller says otherwise — a history space
+        passes `OWNER_HISTORY` so the cap can count it (see
+        `_history_space_count`). A space the launcher opened keeps
         `owner: "launcher"` all the way through a claim (see `_claim_pending`),
         because the owner records who opened it, not who is looking at it now.
         """
-        self._spaces[sid] = {"workspace_id": ws_id, "owner": OWNER_BRIDGE,
+        self._spaces[sid] = {"workspace_id": ws_id, "owner": owner,
                              **({"tab_id": tab_id} if tab_id else {}),
                              **({"pane_id": pane_id} if pane_id else {}),
                              **({"cwd": cwd} if cwd else {})}
@@ -1038,6 +1175,18 @@ class Bridge:
         if space is None:
             space = self._space_of(parent)
 
+        # A ROOT with no live runner is a PAST conversation, and it gets a space
+        # too — a history one, a plain shell holding the resume line unsubmitted
+        # — rather than a live pane. Checked AFTER `_existing_space`, so a space
+        # already recorded for this session (written by this process or an
+        # earlier one) is adopted rather than duplicated. See `_history_root`.
+        #
+        # `filed` is folded in here like every other return below, not dropped:
+        # a dead root is filed the same as a live one, and a filing failure (or
+        # its once-per-bridge warning) must still reach the operator for it.
+        if space is None and self._is_history_root(session):
+            return filed + self._history_root(sid, title, cwd, agent, state)
+
         if self.dry_run:
             # A dry run creates nothing, so a root's space id does not exist
             # either. A placeholder is still recorded, and it has to be
@@ -1059,6 +1208,158 @@ class Bridge:
                                            command, parent)
         return filed + self._add_tab(sid, title, space, cwd, agent, state,
                                      command, parent)
+
+    # -- past conversations: a space for every non-archived ROOT -------------
+    #
+    # The web sidebar lists every conversation the operator has had; this is the
+    # herdr half of that. A root whose runner is gone gets a space labelled with
+    # its title and a pane holding the resume line, unsubmitted — visible and
+    # resumable, with nothing running. A sub-agent is deliberately NOT extended
+    # this treatment (see `_is_history_root` and og_herdr_watch._projectable):
+    # a dead worker is noise.
+
+    @staticmethod
+    def _is_history_root(session: dict) -> bool:
+        """Whether this event is a ROOT with no live runner — a past conversation.
+
+        `runner_online is False` is the one signal that tells a dead root from a
+        live one, and the watcher forwards it on the event for exactly that
+        reason (og_herdr_watch._enrich). It is only ever an explicit boolean
+        false: a missing key — an unreadable detail row, or a session dict from
+        any other source — reads as LIVE and takes today's path, word for word.
+
+        The parent check is what keeps this to roots. A sub-agent's behaviour is
+        unchanged, and giving a dead worker a space of its own would be the one
+        thing the layout exists to prevent.
+        """
+        if not isinstance(session, dict):
+            return False
+        if session.get("runner_online") is not False:
+            return False
+        return _parent_of(session) is None
+
+    def _history_space_count(self) -> int:
+        """How many spaces this bridge has open for past conversations.
+
+        Counted from the RECORDS rather than kept as a running tally, so the cap
+        holds across a restart. The 20 newest roots are given spaces and written
+        to the state file; the next process adopts those (no new open, so no new
+        record) and refuses the older ones on the same count. A plain counter
+        would reset with the process and open 20 more on every restart until the
+        whole history was on screen — the mess the cap exists to prevent,
+        arriving 20 at a time.
+
+        `owner == OWNER_HISTORY` is what marks a record as one of these; see the
+        constant for why the marker lives in that field.
+
+        A LOWERED cap governs new spaces only: it does not retroactively close
+        the ones already open. The count above decides what opens next, and
+        nothing here reaches for a live herdr space to enforce the number — a
+        space the operator may be reading a past conversation in is not ours to
+        close behind their back, and lowering a cap in og-install.json is a
+        statement about the future.
+        """
+        return sum(1 for rec in self._spaces.values()
+                   if rec.get("owner") == OWNER_HISTORY)
+
+    def _history_root(self, sid: str, title, cwd: str, agent: str,
+                      state: str) -> list:
+        """Project a past conversation, or say why it is skipped.
+
+        Three gates, in order, and each one is a real machine's state rather
+        than a hypothetical:
+
+        * a DRY RUN records the placeholder a real run would mint (so a worker
+          later in the same batch resolves its parent consistently) and prints
+          the line, without touching herdr;
+        * a workspace DIRECTORY that is gone gets no space. A space's pane is a
+          shell whose cwd has to exist — herdr would open it and immediately
+          have it die — and a past session whose checkout was a temporary
+          worktree (the common case: a delegated worker's tree is deleted when it
+          finishes) names a directory that is simply not there. Checked here
+          rather than in `_add_space`, because a LIVE session must keep today's
+          exact behaviour, broken cwd and all.
+        * the CAP: `space_cap` 0 (the default) means NO cap — every non-archived
+          root gets a space, as the operator asked. When a positive cap is set,
+          the listing is newest-first, so the roots that arrive FIRST are the
+          most recent and the ones past the cap are left alone. The cap governs
+          what opens from here on; it never closes a space already open, however
+          low it is set afterwards (see `_history_space_count`).
+        """
+        if self.dry_run:
+            self._recs[sid] = {
+                "workspace_id": f"{DRY_RUN_SPACE}{sid}",
+                "tab_id": None, "pane_id": None, "title": title,
+                "agent": agent, "parent": None, "owns_space": False,
+                "step": 3, "ready": True, "history": True,
+            }
+            return [f"dry-run: add '{title}' → history space ({cwd}) → "
+                    f"{resume_command(sid)} (unsubmitted, resume by hand) "
+                    f"[{state}]"]
+        if not os.path.isdir(cwd):
+            return [f"skip {sid}: no space for '{title}' — its directory {cwd} "
+                    f"is gone, so the pane would be a shell with nowhere to "
+                    f"open"]
+        if self.space_cap and self._history_space_count() >= self.space_cap:
+            return [f"skip {sid}: no space for '{title}' — {self.space_cap} "
+                    f"past-conversation spaces are already open, and the cap "
+                    f"keeps the newest"]
+        return self._add_history_space(sid, title, cwd, agent, state)
+
+    def _add_history_space(self, sid: str, title, cwd: str, agent: str,
+                           state: str) -> list:
+        """Open a space for a past conversation, holding the resume line typed
+        but UNSENT.
+
+        The space and its shell come from one `workspace.create`, exactly as a
+        live root's do — the only difference is what is put INTO the pane. A
+        live root gets `attach_command` SUBMITTED (`pane_run` appends the
+        newline that submits it); a history root gets `resume_command` typed
+        UNSENT (`pane_send_text` adds no newline), so the pane sits at a shell
+        prompt with the line to resume sitting on it. Nothing runs, and the
+        session is not resurrected, until the operator presses Enter — which is
+        the whole point, and why `pane_run` must not be used here.
+
+        The record carries `history: True` (for `_setup_pane`) and is remembered
+        with `owner: OWNER_HISTORY` (for the cap, and so `--cleanup` still closes
+        it). `owns_space` is True: this bridge created the space, so a removal
+        closes the whole thing rather than one tab of it.
+
+        Everything after the pane text — the agent marker and the pane's title
+        metadata — is the SAME as a live root's (see `_setup_pane`), so the space
+        reads like a conversation in the list rather than a nameless shell, and
+        a title change, an adoption or a removal all take the ordinary path.
+
+        `env` is `self.pane_env`, and this is the create that needs it most: the
+        space is silent until the operator presses Enter — which is the whole
+        design — so an unsuppressed pane here is indistinguishable from a
+        suppressed one until the one keystroke that is the point of the feature
+        runs `og chat --resume`, which opens a browser. Nothing about the day it
+        goes wrong looks like anything on screen; see `pane_env_for`.
+        """
+        label = title or sid[:8]
+        result = self.client.workspace_create(
+            label=label, cwd=cwd, focus=False, env=self.pane_env)
+        ws_id = _id_of(result.get("workspace"), "workspace_id")
+        tab_id = _id_of(result.get("tab"), "tab_id")
+        pane_id = _id_of(result.get("root_pane"), "pane_id")
+        if ws_id is None or tab_id is None or pane_id is None:
+            return self._reject_partial_create(sid, ws_id, tab_id, pane_id)
+        rec = {"workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
+               "title": title, "agent": agent, "parent": None,
+               "owns_space": True, "step": 0, "ready": False, "cwd": cwd,
+               "history": True}
+        self._recs[sid] = rec
+        self._remember(sid, ws_id, tab_id=tab_id, pane_id=pane_id, cwd=cwd,
+                       owner=OWNER_HISTORY)
+        # Same reason `_add_space` drops it: this pass's listing predates the
+        # space, and a later lookup in the same batch must not read it as gone.
+        self._ws_index = None
+        labelled = self._rename_first_tab(sid, tab_id, label)
+        self._setup_pane(sid, rec, state)
+        return [f"add {sid} → history space {ws_id} tab {tab_id} pane {pane_id} "
+                f"'{title}' '{resume_command(sid)}' (unsubmitted) [{state}]"] \
+            + labelled
 
     # -- adopting a space that is already on screen --------------------------
     #
@@ -1142,6 +1443,17 @@ class Bridge:
             bool((info or {}).get("pane_count"))
         if info is not None:
             self._rename_space(ws_id, title, info)
+            # The space's first tab follows it onto the title too — but ONLY when
+            # the space itself was relabelled (the same `label != title` test
+            # `_rename_space` skips on), so an adoption of an already-correct
+            # space does not fire a redundant `tab.rename` every time. This is
+            # the adoption path for a space the launcher made: it labels the tab
+            # from the directory, and an already-titled session may never produce
+            # the `title_changed` that `_rename_own_space` needs, so the tab would
+            # otherwise keep the directory name for the life of the session.
+            if title and info.get("label") != title:
+                self._pass_notes.extend(
+                    self._rename_first_tab(sid, record.get("tab_id"), title))
         # NOT in a dry run, and that is the whole reason this save is guarded
         # rather than left to `_save_state`: a dry run that claimed and wrote
         # would consume the pending record and leave the NEXT REAL RUN with
@@ -1175,7 +1487,7 @@ class Bridge:
         self._recs[sid] = {
             "workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
             "title": title, "agent": agent, "parent": None,
-            "owns_space": record.get("owner") == OWNER_BRIDGE,
+            "owns_space": record.get("owner") in BRIDGE_OWNED,
             "step": 3, "ready": True,
             "cwd": record.get("cwd") or self.cwd}
         return [f"{action} {sid} → space {ws_id} tab {tab_id} pane "
@@ -1208,19 +1520,138 @@ class Bridge:
         self._spaces[sid] = record
         return record
 
+    def _rename_own_space(self, sid: str, rec: dict, title: str) -> list:
+        """Rename the space a session is NAMED FOR when its title arrives.
+
+        The gap `_rename_space`'s old docstring denied. A space this bridge
+        CREATES is labelled `title or sid[:8]` (`_add_space`), and Omnigent
+        titles a conversation only once it has a first message — so a space
+        opened for a brand-new session is created with the first eight
+        characters of the session id, and, before this, kept that string for the
+        life of the session. The title arrives on the `changed` event that
+        follows, and this brings the space's label up to it then. It is not a
+        race and not an adoption-only concern: it is the ordinary path for every
+        new session.
+
+        Only a space this session is the SUBJECT of is renamed — never the space
+        a worker's tab lives in. The test is the same one `_removed` uses for
+        whose space a record names: `spaces[sid]` has to point at this record's
+        workspace. A sub-agent's record names its PARENT's workspace (`_add_tab`)
+        and has no `spaces` entry of its own, so without that test a worker's
+        title arriving would rename the operator's whole conversation to
+        `fix-space-rename`.
+
+        The label to compare against comes from the per-PASS workspace listing
+        (`_workspace_index`, cached for the whole pass), never a fresh listing
+        per event. When that listing could not be read there is no label to
+        compare against, and the rename is attempted anyway rather than skipped:
+        the title does not arrive twice (`title_changed` is a one-shot on the
+        event that carries it), so a skipped rename here is exactly the `sid[:8]`
+        label surviving — the bug this exists to fix.
+
+        Returns the lines to ADD to the event's own — empty unless the rename
+        failed, and the failure is RECORDED here rather than raised, as
+        `_reject_partial_create` does for its cleanup. The rename is an ADDITION
+        to `_changed`'s work: `report_agent` and `report_metadata` ARE that work
+        and are allowed to fail the event, but a cosmetic space label is not, so
+        an addition failing must not discard the bookkeeping of the work that
+        already succeeded. That bookkeeping is `rec["title"]` — persisted and
+        read back across a restart, so leaving it stale makes the record
+        disagree with the session it names, past the life of the process — and
+        the event's own `update …` line, this bridge's audit trail.
+
+        ONE attempt, never a retry, and that is by construction rather than
+        oversight: `title_changed` is derived from the watcher's `previous`, not
+        from `rec`, so once the watcher has seen the new title the event does
+        not recur and a failed rename is not re-attempted — the space keeps its
+        `sid[:8]` label for the life of the session. Repeating a failing call on
+        every poll is the shape the dead-workspace repair already had to stop
+        (see `_reproject`), and a label is not worth re-earning that lesson for.
+        Absorbing it hides nothing about a dead space either: a workspace that
+        is gone took its panes with it, so `report_agent` above — which runs
+        first and DOES propagate — is what reports it and drives the repair.
+
+        The space's first TAB is relabelled in the same breath and with the same
+        absorb-and-record shape (see `_rename_first_tab`): `workspace.create`
+        cannot label the tab it makes, so the root's tab carries the space's own
+        label from `_add_space`/the launcher and must move onto the title here
+        with the space. A tab rename that fails is a second line in the same
+        return, never a second failure mode.
+        """
+        ws_id = rec.get("workspace_id")
+        own = self._spaces.get(sid)
+        if not own or own.get("workspace_id") != ws_id:
+            return []
+        index = self._workspace_index()
+        info = index.get(ws_id) if index is not None else None
+        lines: list[str] = []
+        try:
+            self._rename_space(ws_id, title, info or {})
+        except _error_cls() as exc:
+            lines.append(_error_line(sid, exc))
+        # ...and the space's FIRST TAB follows it. `workspace.create` labels only
+        # the space, so the root's tab was opened unlabelled (herdr shows its tab
+        # number) and the launcher's own create labels it from the directory —
+        # either way it must converge onto the title here, or the operator is left
+        # with a correctly-named space holding a tab still called `1`.
+        lines.extend(self._rename_first_tab(sid, rec.get("tab_id"), title))
+        return lines
+
+    def _rename_first_tab(self, sid: str, tab_id, label) -> list:
+        """Give a space's first tab the space's own label, absorbing failure.
+
+        herdr's `workspace.create` labels the WORKSPACE only — its `label` is the
+        workspace's, and it has no field for the tab's — so the first tab a create
+        makes implicitly is UNLABELLED and herdr falls back to the tab number:
+        the bare `1` the operator sees. `tab.create` carries its own `label`,
+        which is why a worker's tab already reads a real name. This is the call
+        that closes the gap for the root tab.
+
+        Renamed by the id that came back from the create (`_add_space`,
+        `_add_history_space`, and the launcher's own record carried through
+        `_adopt`) or the id the record already carries (`_rename_own_space`) —
+        never by position. herdr tab ids are stable across a reorder, so the
+        session's own tab is relabelled wherever the operator has dragged it and
+        the WRONG tab is never touched. A tab the operator has since CLOSED
+        answers `tab_not_found`, which is ABSORBED here rather than raised: the
+        label is cosmetic, and `reconcile` treats a raised `*_not_found` as a
+        stale record and repairs the session — a repair driven by a tab label
+        would re-open a pane over a cosmetic failure, which is a far worse
+        outcome than a tab that keeps its number. The same absorb-and-record
+        shape `_rename_own_space` chose for the space label, kept consistent.
+
+        Returns the lines to add — empty on success. A missing `tab_id` (an
+        upgraded v1 record carries none) or a missing label is a no-op: there is
+        nothing named to rename.
+        """
+        if not tab_id or not label:
+            return []
+        try:
+            self.client.tab_rename(tab_id, label)
+        except _error_cls() as exc:
+            return [_error_line(sid, exc)]
+        return []
+
     def _rename_space(self, ws_id: str, title, info: dict) -> None:
-        """Rename a taken-over space to the session title, when it differs.
+        """Rename a space to the session title, when the label differs.
 
-        The launcher's whole reason for labelling a space from the DIRECTORY is
-        that no session existed when it made one — there was no title to use.
-        Once the conversation has a name, the space is renamed to it, and that
-        rename IS the handoff. Skipped when the label already matches (the
-        common case for a bridge-created space, so a `workspace.rename` on
-        every adoption would be noise) and when there is no title yet.
+        The launcher labels a space from the DIRECTORY because no session
+        existed when it made one — there was no title to use — and the rename IS
+        that handoff. A space this bridge CREATES is labelled `title or sid[:8]`
+        (`_add_space`) for the same reason: a conversation is titled only once
+        it has a message, so a space opened for a brand-new session starts as
+        the id prefix and wants the identical rename the moment Omnigent names
+        the conversation. So this is called for a taken-over space AND for one
+        this process opened — see `_rename_own_space`, which is how.
 
-        Only ever called for a space being taken over, never for one this
-        process created — a bridge-created space is labelled with the title at
-        creation and never needs it back.
+        Skipped when the label already matches (so a re-delivered title is not a
+        `workspace.rename` of pure noise) and when there is no title yet. A
+        label that DIFFERS is replaced, including one the operator set by hand:
+        the space is a projection of the conversation and the conversation's
+        name is authoritative, which is already the rule on the adoption path —
+        and across a restart the bridge cannot tell a hand-set label from its
+        own stale one, so honouring it would make the space's name depend on the
+        order events happened to arrive in.
         """
         if not title or info.get("label") == title:
             return
@@ -1436,6 +1867,14 @@ class Bridge:
         cwd = session.get("workspace") or (rec or {}).get("cwd") or self.cwd
         state = _state(session)
         command = attach_command(self.server, sid)
+        # A HISTORY space keeps its treatment through a repair: its pane must
+        # still be handed the resume line UNSENT, never a submitted attach (which
+        # would run on a session nobody is watching). Read from the RECORD, not
+        # from `session`: the event that triggers a repair is usually a `changed`,
+        # whose LISTING row carries no `runner_online` — the one signal
+        # `_is_history_root` needs — so the record's own flag is the only reliable
+        # source here.
+        history = bool((rec or {}).get("history"))
 
         if parent is None:
             recorded_ws = rec.get("workspace_id") if rec else None
@@ -1455,15 +1894,17 @@ class Bridge:
 
         # The old pane is gone either way, so setup restarts from the beginning
         # on the new one rather than resuming onto a pane herdr has closed.
-        if space is None:
+        if history and space is None:
+            lines = self._add_history_space(sid, title, cwd, agent, state)
+        elif space is None:
             lines = self._add_space(sid, title, cwd, agent, state, command,
                                     parent)
         else:
             lines = self._add_tab(sid, title, space, cwd, agent, state, command,
-                                  parent)
+                                  parent, history=history)
             owned = self._spaces.get(sid) or {}
             if owned.get("workspace_id") == space and \
-                    owned.get("owner") == OWNER_BRIDGE:
+                    owned.get("owner") in BRIDGE_OWNED:
                 # A root put back into its OWN space still owns it: `_add_tab`
                 # cannot know that, and a root that forgets it would close its
                 # tab instead of its space on removal and leave the space
@@ -1506,9 +1947,14 @@ class Bridge:
         in a single poll, and each of them asking for focus would rip the
         operator out of whatever they were typing, once per session, forever.
         The bridge reports; it does not take over the screen.
+
+        `env` is `self.pane_env` for the same reason `focus` is False: the pane
+        this creates is the operator's to work in, and a browser opening out of
+        it takes the screen away from them (see `pane_env_for`).
         """
+        label = title or sid[:8]
         result = self.client.workspace_create(
-            label=title or sid[:8], cwd=cwd, focus=False)
+            label=label, cwd=cwd, focus=False, env=self.pane_env)
         ws_id = _id_of(result.get("workspace"), "workspace_id")
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
@@ -1529,28 +1975,44 @@ class Bridge:
         # here is unknown (`pane_count` decides whether an adopted record's pane
         # can be resumed on) and guessing it would be inventing a fact.
         self._ws_index = None
+        labelled = self._rename_first_tab(sid, tab_id, label)
         self._setup_pane(sid, rec, state)
         return [f"add {sid} → space {ws_id} tab {tab_id} pane {pane_id} "
-                f"'{title}' '{command}' [{state}]"]
+                f"'{title}' '{command}' [{state}]"] + labelled
 
     def _add_tab(self, sid: str, title, space: str, cwd: str, agent: str,
-                 state: str, command: str, parent: str | None) -> list:
+                 state: str, command: str, parent: str | None,
+                 history: bool = False) -> list:
         """Put a sub-agent's pane in a TAB inside its parent's space.
 
         This is the whole point of the layout: the operator clicks one space and
         sees that conversation's own agent plus every worker it delegated. A
         sub-agent with a space of its own would only be correct when its parent
         has none, and then it is `_add_space`'s job, not this one's.
+
+        `history` is False for every ordinary sub-agent and True only for a
+        HISTORY root being repaired back into its own surviving space (see
+        `_reproject`): it is carried onto the record so `_setup_pane` hands the
+        pane the resume line unsubmitted rather than a submitted attach.
+
+        A sub-agent's worker pane is the operator's window onto that worker, and
+        it is opened exactly like a root's — so it carries `self.pane_env` too,
+        from the same `pane_env_for`. It used not to: the launcher threaded the
+        map through all three of its own creates and this one threaded nothing,
+        which is how a fan-out of workers put panes on the screen that would
+        open a browser.
         """
         result = self.client.tab_create(space, cwd=cwd,
-                                        label=title or sid[:8], focus=False)
+                                        label=title or sid[:8], focus=False,
+                                        env=self.pane_env)
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
         if tab_id is None or pane_id is None:
             return self._reject_partial_create(sid, None, tab_id, pane_id)
         rec = {"workspace_id": space, "tab_id": tab_id, "pane_id": pane_id,
                "title": title, "agent": agent, "parent": parent,
-               "owns_space": False, "step": 0, "ready": False, "cwd": cwd}
+               "owns_space": False, "step": 0, "ready": False, "cwd": cwd,
+               **({"history": True} if history else {})}
         self._recs[sid] = rec
         # A tab created INSIDE an adopted space: the space was already recorded
         # against this session, and it now names a pane of its own, so the
@@ -1581,10 +2043,29 @@ class Bridge:
         three steps are identical for both, and that is deliberate — they are
         what makes the agent column read "Claude Code" and the title beside it
         read which worker and which task, whichever kind of session this is.
+
+        NOTHING here carries a pane environment, and that is not an omission:
+        herdr's `pane.send_text` has no `env` to carry (see `pane_env_for`), and
+        the pane these type into was created with the map already installed, so
+        the command runs in a shell that already has it.
+
+        The one other variation is step 0 for a HISTORY space: its pane is handed
+        the resume line UNSUBMITTED rather than a submitted attach, so a past
+        conversation is not resurrected (see `_add_history_space`). Steps 1 and 2
+        are the same, so a history space's record is an ordinary one and title
+        changes, adoption and removal all take the ordinary path.
         """
         pane_id = rec["pane_id"]
         if rec["step"] <= 0:
-            self.client.pane_run(pane_id, attach_command(self.server, sid))
+            if rec.get("history"):
+                # A past conversation's pane gets the resume line UNSENT: typed
+                # into the shell, no trailing newline, so nothing runs and the
+                # session is not resurrected until the operator presses Enter.
+                # `pane_run` would append that newline and start it (see
+                # `_add_history_space`).
+                self.client.pane_send_text(pane_id, resume_command(sid))
+            else:
+                self.client.pane_run(pane_id, attach_command(self.server, sid))
             rec["step"] = 1
         if rec["step"] <= 1:
             # The agent label is the session's harness product name ("Claude
@@ -1690,6 +2171,7 @@ class Bridge:
         self.client.report_agent(rec["pane_id"], self.source,
                                  agent=rec["agent"], state=state,
                                  agent_session_id=sid)
+        renamed: list[str] = []
         if title_changed:
             # A title that is None is a title that cannot be reported: see
             # `_setup_pane` for the measured refusal herdr answers with a frame
@@ -1699,9 +2181,16 @@ class Bridge:
             if title:
                 self.client.report_metadata(rec["pane_id"], self.source,
                                            title=title)
+                # ...and the SPACE's label follows the title too, not just the
+                # pane's metadata: a space opened before the conversation had a
+                # name is labelled with `sid[:8]` and was left that way for the
+                # life of the session. The rename is absorbed rather than
+                # raised (see `_rename_own_space`), so neither the metadata call
+                # above nor the bookkeeping below depends on it succeeding.
+                renamed = self._rename_own_space(sid, rec, title)
         rec["title"] = title
         return [f"update {sid} → state={state}" + (" (title)" if title_changed
-                                                   else "")]
+                                                   else "")] + renamed
 
     def _drop_children(self, sid: str, lines: list[str]) -> None:
         """Forget the records of sessions whose pane just went with the space.
@@ -2084,6 +2573,18 @@ def main(argv=None) -> int:
 
     from og_herdr_watch import SessionWatcher
 
+    # How many past-conversation spaces to keep open, from the install's
+    # `herdr_session_space_cap` (the same og-install.json the launcher reads
+    # `herdr_agents_pane` from), defaulting to DEFAULT_SPACE_CAP. Imported HERE,
+    # not at module load: this module must import without the launcher — the
+    # launcher imports THIS one — and `session_space_cap`/`install_config` live
+    # beside the other config readers in og_herdr_launch.
+    from og_herdr_launch import install_config, session_space_cap
+
+    space_cap = session_space_cap(install_config())
+
+    # Read once and shared: the filer below files against the same server and
+    # token the watcher polls, so `_load_token` must not be called twice.
     token = _load_token(args.server)
     watcher = SessionWatcher(base_url=args.server, token=token)
     client = None
@@ -2104,7 +2605,7 @@ def main(argv=None) -> int:
                     # The same URL the watcher polls, and the one the pane's
                     # `omnigent attach --server` has to name: the pane cannot
                     # discover it (see attach_command).
-                    server=args.server, filer=filer)
+                    server=args.server, filer=filer, space_cap=space_cap)
 
     if args.once:
         for line in bridge.run_once():

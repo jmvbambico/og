@@ -1492,15 +1492,18 @@ def test_an_enriched_session_still_diffs_and_still_projects_correctly():
 # listing rows alone.
 # --------------------------------------------------------------------------
 
-def test_a_session_with_an_offline_runner_is_not_projected():
-    # The defect, in its smallest form: the offline session is dropped from the
-    # event stream, so no pane is ever opened for a command that can only fail.
+def test_a_sub_agent_with_an_offline_runner_is_not_projected():
+    # The refusal, now scoped to WORKERS. A delegated worker whose runner is gone
+    # is unattachable and a dead end — it shows nothing worth a pane — so it stays
+    # out of the event stream. A ROOT is the exception (see the next test): a past
+    # CONVERSATION is worth a space even with nothing running.
     opener = RoutingOpener(
-        [envelope([session("offline"), session("online")])],
+        [envelope([session("offline", parent="root"),
+                   session("online", parent="root")])],
         details={"offline": detail("offline", workspace="/repo/og",
-                                   runner_online=False),
+                                   parent="root", runner_online=False),
                  "online": detail("online", workspace="/repo/og",
-                                  runner_online=True)},
+                                  parent="root", runner_online=True)},
     )
     watcher = w.SessionWatcher(opener=opener)
 
@@ -1510,6 +1513,51 @@ def test_a_session_with_an_offline_runner_is_not_projected():
     # Both details really were fetched: otherwise this would pass on a module
     # that never asks, which is a different (and already-fixed) defect.
     assert len(opener.detail_requests) == 2
+
+
+def test_a_dead_root_is_projected_as_a_history_space():
+    # THE FEATURE. The same offline runner that refuses a worker does not refuse a
+    # ROOT: a past conversation still gets a space — the bridge opens a plain
+    # shell for it and leaves the resume line unsubmitted, so nothing runs (see
+    # test_og_herdr). The runner answer travels WITH the event, because that is
+    # the one thing the bridge needed and did not have: it is what tells a live
+    # root (submit an `attach`) from a dead one (leave the line unsent).
+    opener = RoutingOpener(
+        [envelope([session("dead")])],
+        details={"dead": detail("dead", workspace="/repo/og",
+                                runner_online=False)},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("added", "dead")]
+    assert events[0].session["workspace"] == "/repo/og"
+    assert events[0].session["runner_online"] is False
+    # Projected, so it is a normal session from here on: it enters `_seen` and
+    # will retire with a `removed` like anything else.
+    assert set(watcher._seen) == {"dead"}
+
+
+def test_poll_once_still_emits_a_dead_root_for_the_launcher_to_reject():
+    """THE BOUNDARY CONTRACT WITH `og_herdr_launch.live_session`.
+
+    A dead root must keep flowing OUT of poll_once, because the BRIDGE turns it
+    into a history space — the spaces feature. The launcher is the one that has to
+    REJECT it (it re-applies `runner_is_offline` itself; the event is not a session
+    to attach to). So a future reader must not "fix" the launcher-attaches-to-a-
+    dead-root regression by narrowing `_projectable` back to kind-blind: that would
+    empty the history spaces this feature exists to show. This test fails the
+    moment someone tries, and it pins the PREDICATE, not just the outcome."""
+    dead = detail("dead", workspace="/repo/og", runner_online=False)
+    opener = RoutingOpener([envelope([session("dead")])], details={"dead": dead})
+    watcher = w.SessionWatcher(opener=opener)
+
+    # The predicate itself keeps a dead root...
+    assert w.SessionWatcher._projectable(session("dead"), dead) is True
+    # ...and that is what poll_once acts on, so the event reaches the consumer.
+    events = watcher.poll_once()
+    assert [(e.kind, e.session_id) for e in events] == [("added", "dead")]
+    assert events[0].session["runner_online"] is False
 
 
 def test_a_session_with_an_online_runner_is_still_projected():
@@ -1526,13 +1574,20 @@ def test_a_session_with_an_online_runner_is_still_projected():
     assert event.session["id"] == "s1"
     # One fetch still bought both answers.
     assert event.session["workspace"] == "/repo/og"
+    # ...and the runner answer is forwarded both ways, so a live root carries a
+    # real True (the bridge reads anything but an explicit False as live).
+    assert event.session["runner_online"] is True
     assert len(opener.detail_requests) == 1
 
 
-def test_the_runner_rule_does_not_depend_on_the_session_kind():
-    # Both of the measured offline sessions were roots, but `attach` refuses by
-    # runner, not by kind: a worker whose runner died is equally unattachable.
-    # Pinning it both ways stops the rule from being quietly narrowed to roots.
+def test_the_runner_rule_now_depends_on_the_session_kind():
+    # INVERTED ON PURPOSE, and the inversion IS this feature. The rule used to be
+    # kind-blind — an offline runner refused a root and a worker alike — and the
+    # old pin said so. A dead ROOT is now kept, as a history space, because a past
+    # conversation is something the operator wants to find again; a dead WORKER is
+    # still dropped, because a finished worker is noise. Pinning it both ways
+    # stops the split from drifting back to kind-blind (which would empty the
+    # history) or from swallowing every dead worker (which would flood it).
     rows = [session("root-off", parent=None),
             session("root-on", parent=None),
             session("w-off", status="running", parent="root-on"),
@@ -1543,43 +1598,48 @@ def test_the_runner_rule_does_not_depend_on_the_session_kind():
             "root-off": detail("root-off", workspace="/repo/og",
                                runner_online=False),
             "root-on": detail("root-on", workspace="/repo/og", runner_online=True),
-            "w-off": detail("w-off", workspace=None, parent="root-on",
+            "w-off": detail("w-off", workspace="/repo/og", parent="root-on",
                             runner_online=False),
-            "w-on": detail("w-on", workspace=None, parent="root-on",
+            "w-on": detail("w-on", workspace="/repo/og", parent="root-on",
                            runner_online=True),
         },
     )
 
     assert [e.session_id for e in w.SessionWatcher(opener=opener).poll_once()] == [
-        "root-on", "w-on"]
+        "root-off", "root-on", "w-on"]
 
 
-def test_a_session_whose_runner_comes_back_is_projected_on_a_later_poll():
-    # No permanent negative. A refused session must never be remembered as
-    # unattachable, because a runner CAN come back — and a refusal cached for the
-    # life of the process would strand that session's pane for good, invisibly.
-    row = session("s1")
+def test_a_worker_whose_runner_comes_back_is_projected_on_a_later_poll():
+    # No permanent negative, stated for the kind that still keeps the refusal: a
+    # refused WORKER must never be remembered as unattachable, because its runner
+    # CAN come back — and a cached "no" would strand its pane for the life of the
+    # process. (A dead root is projected on the first poll now, so this case only
+    # exists for workers.)
+    row = session("w1", status="running", parent="root")
     opener = RoutingOpener(
         [envelope([row]), envelope([row])],
-        details={"s1": detail("s1", workspace="/repo/og", runner_online=False)},
+        details={"w1": detail("w1", workspace="/repo/og", parent="root",
+                              runner_online=False)},
     )
     watcher = w.SessionWatcher(opener=opener)
     assert watcher.poll_once() == []
 
     # The runner comes back up; nothing about the refusal was sticky.
-    opener.details["s1"] = detail("s1", workspace="/repo/og", runner_online=True)
+    opener.details["w1"] = detail("w1", workspace="/repo/og", parent="root",
+                                  runner_online=True)
     events = watcher.poll_once()
-    assert [(e.kind, e.session_id) for e in events] == [("added", "s1")]
+    assert [(e.kind, e.session_id) for e in events] == [("added", "w1")]
     assert events[0].session["workspace"] == "/repo/og"
 
 
-def test_a_session_refused_for_an_offline_runner_never_enters_seen():
+def test_a_worker_refused_for_an_offline_runner_never_enters_seen():
     # `_seen` is what "removed" is derived from, so staying out of it is what
-    # keeps a never-projected session from manufacturing the removal of a pane
+    # keeps a never-projected worker from manufacturing the removal of a pane
     # that was never opened. It is also what makes the refusal re-checkable.
     opener = RoutingOpener(
-        [envelope([session("s1")])],
-        details={"s1": detail("s1", workspace="/repo/og", runner_online=False)},
+        [envelope([session("w1", status="running", parent="root")])],
+        details={"w1": detail("w1", workspace="/repo/og", parent="root",
+                              runner_online=False)},
     )
     watcher = w.SessionWatcher(opener=opener)
 
@@ -1587,21 +1647,22 @@ def test_a_session_refused_for_an_offline_runner_never_enters_seen():
         assert watcher.poll_once() == [], (
             f"poll {poll} produced an event for a session with no pane")
 
-    assert "s1" not in watcher._seen
+    assert "w1" not in watcher._seen
     # Re-asked on every poll — the cost is one detail fetch per such session per
     # poll, bounded by how many there are (measured: 2 of 7), and never a
     # cached "no".
     assert len(opener.detail_requests) == 3
 
 
-def test_a_never_projected_session_that_vanishes_reports_no_removal():
-    # The absence case, which is where a `_seen` mistake would show: the session
+def test_a_never_projected_worker_that_vanishes_reports_no_removal():
+    # The absence case, which is where a `_seen` mistake would show: the worker
     # leaves the listing entirely having never been projected. There is nothing
-    # to release and nothing to close, and a `removed` here would have the
-    # bridge closing a tab handle that was never issued.
+    # to release and nothing to close, and a `removed` here would have the bridge
+    # closing a tab handle that was never issued.
     opener = RoutingOpener(
-        [envelope([session("s1")]), envelope([])],
-        details={"s1": detail("s1", workspace="/repo/og", runner_online=False)},
+        [envelope([session("w1", status="running", parent="root")]), envelope([])],
+        details={"w1": detail("w1", workspace="/repo/og", parent="root",
+                              runner_online=False)},
     )
     watcher = w.SessionWatcher(opener=opener)
 
