@@ -142,13 +142,6 @@ CARET = "\u25b8"         # ▸ the selection marker; the caret row is the SELECT
 # group.
 GUTTER = 4
 
-# The six columns a box's first CONTENT row spends before the title, now the caret
-# has left it: leading space, state glyph, space, the two-column mark slot, space.
-# The slot is two WHATEVER it draws as, so the glyph and the mark line up down the
-# list — the point of the slot — and the title starts in the same place on every
-# row.
-ROW_PREFIX = 6
-
 # The narrowest box there is: two corners and two rules is the smallest rectangle
 # `_round_box` can draw. It is also the floor of `worker_box`'s degradation ladder
 # — the point below which no box is drawn at all, because a one- or two-column
@@ -352,9 +345,10 @@ def split_title(title: Any) -> tuple[Optional[str], str]:
     """(`zen`, `stock-concurrency-lock`) from `coder_zen:stock-concurrency-lock`.
 
     A delegated worker's title is `<role>_<agent>:<task>`. The ROLE is dropped
-    because it says who dispatched, not what is running; the agent name is what
-    tells two workers running side by side apart, and the task is what the
-    operator is actually looking for.
+    because it says who dispatched, not what is running; the TASK is what the
+    operator reads on the row, and the agent name is kept because it is the key
+    that resolves the row's harness MARK (`worker_mark` looks it up in the
+    installed specs). The name is no longer DRAWN — the mark carries it.
 
     `sub_agent_name` would name the agent too, but it is NOT on the listing row
     (measured: it is a detail field), so reading it would cost a 121 KB fetch per
@@ -362,8 +356,8 @@ def split_title(title: Any) -> tuple[Optional[str], str]:
 
     A title with no colon yields `(None, title)`: an older session or one the
     server titled plainly still has to render as a row. A role prefix other than
-    `coder_` is kept whole rather than guessed at — the box has room for it, and
-    inventing a second parse rule would mislabel more titles than it fixes.
+    `coder_` is kept whole rather than guessed at: it is the mark's lookup key,
+    and inventing a second parse rule would mislabel more titles than it fixes.
     """
     text = title if isinstance(title, str) else ""
     prefix, sep, task = text.partition(":")
@@ -437,7 +431,7 @@ def _failure_reason(session: dict) -> Optional[str]:
 
 
 def worker_meta(session: dict, state: str, now: float) -> str:
-    """The right half of a worker's second line: `2m14s`, `waiting on you`, …
+    """The right half of a worker's content row: `2m14s`, `waiting on you`, …
 
     The clock is honest about what it actually knows. BOTH timestamps come off
     the LISTING row (so no detail fetch buys a clock on every row), and neither
@@ -1196,10 +1190,15 @@ def worker_box(row: Row, width: int, selected: bool,
     sitting inside it. The returned index is 0 — the caller hangs the SELECTED
     role there, which is the row the live view scrolls to keep visible.
 
-    Inside the box, content line 1 carries the state glyph and the harness mark in
-    its fixed two-column slot, then the title (the caret has left this row); line 2
-    the agent name flush left and the clock flush right. An expanded report is a
-    third row INSIDE the box — never a loose line that would break the rectangle.
+    The box is THREE rows — top border, ONE content row, bottom border — and FOUR
+    when the report is expanded (the extra row is the dimmed snippet, INSIDE the
+    box, never a loose line that would break the rectangle). The single content
+    row carries the state glyph, the harness mark in its fixed two-column slot and
+    the title flush left, with the meta (`2m14s`, `failed`, `waiting on you`) flush
+    right on the SAME row. The AGENT NAME is gone: the mark already names the
+    harness the name did, so the meta — the one thing on the row the mark does not
+    say — is all that is left to draw. `_two_col` keeps the meta's columns and
+    clips the TITLE first when the line is tight.
 
     `spin` is the frame counter `state_glyph` turns into a glyph, and it animates
     the WORKING row alone: a blocked or finished box renders identically at every
@@ -1260,9 +1259,15 @@ def worker_box(row: Row, width: int, selected: bool,
     # only when BOTH the harness and the name are absent is the slot blank (see
     # `worker_mark`).
     mark = worker_mark(row.harness, row.agent)
-    line1 = (" " + glyph + " " + mark + " "
-             + _clip(row.text, inner - ROW_PREFIX))
-    lines = [line1, _two_col(" " + (row.agent or "role"), row.meta, inner)]
+    # ONE content row. The state glyph, the mark and the task sit flush left, the
+    # meta flush right on the SAME line. The agent name is DROPPED: the mark
+    # already names the harness the name did, and the meta is the only thing on
+    # the row the mark does not say. The title yields first when the line is tight
+    # (`_two_col` clips the LEFT part with `_clip`, so it is ellipsised, not cut
+    # blank), and the meta keeps its columns — it is the thing being waited on.
+    content = _two_col(" " + glyph + " " + mark + " " + row.text,
+                       row.meta, inner)
+    lines = [content]
     if row.expanded and row.snippet:
         lines.append("  " + _clip(_oneline(row.snippet), inner - 2))
     boxed = _round_box(lines, box_width)
