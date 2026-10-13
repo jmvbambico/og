@@ -1,0 +1,358 @@
+{
+  "$comment": [
+    "Colour catalog for the `og agents` pane. A theme entry is a row here, not",
+    "code -- same rule as registry.json.",
+    "",
+    "  label    what the picker shows (exact display name)",
+    "  order    picker's sort key; the row order the operator's reference site",
+    "           (ansicolor.com) lists its 25 themes in",
+    "  colors   seven roles, lowercase #rrggbb, no shorthand, no alpha:",
+    "    bg       pane background",
+    "    text     dominant body text -- agent and worker names",
+    "    meta     secondary text -- model ids, timestamps, status detail",
+    "    sel_bg   background of the SELECTED row",
+    "    idle     idle status glyph (check mark)",
+    "    working  working status glyph (spinner)",
+    "    rail     group rails and box-drawing borders",
+    "",
+    "Every value is the theme's own published colour (upstream theme file or",
+    "terminal port), NOT generated from one formula -- Nord reads as Nord,",
+    "Gruvbox as Gruvbox. tests/test_og_themes_catalog.py recomputes WCAG",
+    "contrast over all 25 and fails the build if the pane is unreadable, so a",
+    "new row added here must clear: text/bg >= 4.5, text/sel_bg >= 4.5,",
+    "meta/bg, idle/bg, working/bg >= 3.0, rail/bg >= 1.5.",
+    "",
+    "Where a theme's published foreground cannot reach its target, that single",
+    "value is nudged in LIGHTNESS ONLY (hue and saturation untouched), by the",
+    "minimum amount that clears the target. Nudges are listed in the test file."
+  ],
+  "version": 1,
+  "themes": {
+    "andromeda": {
+      "label": "Andromeda",
+      "order": 1,
+      "colors": {
+        "bg": "#1a1d23",
+        "text": "#fefefe",
+        "meta": "#746f77",
+        "sel_bg": "#1e252c",
+        "idle": "#96e072",
+        "working": "#f3d56e",
+        "rail": "#3a3f4c"
+      }
+    },
+    "ayu-dark": {
+      "label": "Ayu Dark",
+      "order": 2,
+      "colors": {
+        "bg": "#0f1419",
+        "text": "#e6e1cf",
+        "meta": "#5c6773",
+        "sel_bg": "#253340",
+        "idle": "#aad94c",
+        "working": "#ffb454",
+        "rail": "#2e3741"
+      }
+    },
+    "ayu-light": {
+      "label": "Ayu Light",
+      "order": 3,
+      "colors": {
+        "bg": "#fafafa",
+        "text": "#5c6773",
+        "meta": "#899099",
+        "sel_bg": "#f0eee4",
+        "idle": "#749c00",
+        "working": "#bf8500",
+        "rail": "#cecccb"
+      }
+    },
+    "bearded-dark": {
+      "label": "Bearded Dark",
+      "order": 4,
+      "colors": {
+        "bg": "#181a1f",
+        "text": "#c8cbd4",
+        "meta": "#61677a",
+        "sel_bg": "#34373d",
+        "idle": "#37ae6f",
+        "working": "#c9a022",
+        "rail": "#363b44"
+      }
+    },
+    "bearded-light": {
+      "label": "Bearded Light",
+      "order": 5,
+      "colors": {
+        "bg": "#f3f4f5",
+        "text": "#0a1315",
+        "meta": "#68909c",
+        "sel_bg": "#c9e4ec",
+        "idle": "#189433",
+        "working": "#aa8800",
+        "rail": "#c3c8cd"
+      }
+    },
+    "catppuccin-frappe": {
+      "label": "Catppuccin Frappe",
+      "order": 6,
+      "colors": {
+        "bg": "#303446",
+        "text": "#c6d0f5",
+        "meta": "#787e98",
+        "sel_bg": "#414559",
+        "idle": "#a6d189",
+        "working": "#e5c890",
+        "rail": "#51576d"
+      }
+    },
+    "catppuccin-latte": {
+      "label": "Catppuccin Latte",
+      "order": 7,
+      "colors": {
+        "bg": "#eff1f5",
+        "text": "#4c4f69",
+        "meta": "#84899d",
+        "sel_bg": "#ccd0da",
+        "idle": "#3f9d2a",
+        "working": "#c07a19",
+        "rail": "#bcc0cc"
+      }
+    },
+    "catppuccin-macchiato": {
+      "label": "Catppuccin Macchiato",
+      "order": 8,
+      "colors": {
+        "bg": "#24273a",
+        "text": "#cad3f5",
+        "meta": "#8087a2",
+        "sel_bg": "#363a4f",
+        "idle": "#a6da95",
+        "working": "#eed49f",
+        "rail": "#414559"
+      }
+    },
+    "catppuccin-mocha": {
+      "label": "Catppuccin Mocha",
+      "order": 9,
+      "colors": {
+        "bg": "#1e1e2e",
+        "text": "#cdd6f4",
+        "meta": "#7f849c",
+        "sel_bg": "#313244",
+        "idle": "#a6e3a1",
+        "working": "#f9e2af",
+        "rail": "#393d53"
+      }
+    },
+    "dracula": {
+      "label": "Dracula",
+      "order": 10,
+      "colors": {
+        "bg": "#282a36",
+        "text": "#f0e6d2",
+        "meta": "#6272a4",
+        "sel_bg": "#44475a",
+        "idle": "#50fa7b",
+        "working": "#f1fa8c",
+        "rail": "#44475a"
+      },
+      "_note": "text is the operator's warm parchment #f0e6d2, deliberately NOT Dracula's own Parchment #f8f8f2. Do not 'correct' it: the operator asked for parchment as the dominant text colour and dracula is the default theme."
+    },
+    "github-dark": {
+      "label": "GitHub Dark",
+      "order": 11,
+      "colors": {
+        "bg": "#0d1117",
+        "text": "#c9d1d9",
+        "meta": "#8b949e",
+        "sel_bg": "#163356",
+        "idle": "#238636",
+        "working": "#fcb32c",
+        "rail": "#30363d"
+      }
+    },
+    "gruvbox": {
+      "label": "Gruvbox",
+      "order": 12,
+      "colors": {
+        "bg": "#282828",
+        "text": "#ebdbb2",
+        "meta": "#928374",
+        "sel_bg": "#504945",
+        "idle": "#b8bb26",
+        "working": "#fabd2f",
+        "rail": "#494442"
+      }
+    },
+    "monokai-dark": {
+      "label": "Monokai Dark",
+      "order": 13,
+      "colors": {
+        "bg": "#272822",
+        "text": "#fcfcfa",
+        "meta": "#737173",
+        "sel_bg": "#49483e",
+        "idle": "#a8dc76",
+        "working": "#ffd966",
+        "rail": "#464538"
+      }
+    },
+    "monokai-light": {
+      "label": "Monokai Light",
+      "order": 14,
+      "colors": {
+        "bg": "#faf4f2",
+        "text": "#29242a",
+        "meta": "#928b8c",
+        "sel_bg": "#eee5de",
+        "idle": "#269d69",
+        "working": "#cb790a",
+        "rail": "#d3c5bd"
+      }
+    },
+    "nord": {
+      "label": "Nord",
+      "order": 15,
+      "colors": {
+        "bg": "#2e3440",
+        "text": "#d8dee9",
+        "meta": "#717f9a",
+        "sel_bg": "#3b4252",
+        "idle": "#a3be8c",
+        "working": "#ebcb8b",
+        "rail": "#4c566a"
+      }
+    },
+    "one-dark": {
+      "label": "One Dark",
+      "order": 16,
+      "colors": {
+        "bg": "#282c34",
+        "text": "#acb3bf",
+        "meta": "#6e7686",
+        "sel_bg": "#3e4451",
+        "idle": "#98c379",
+        "working": "#d19a66",
+        "rail": "#495162"
+      }
+    },
+    "one-light": {
+      "label": "One Light",
+      "order": 17,
+      "colors": {
+        "bg": "#fafafa",
+        "text": "#2a2b33",
+        "meta": "#8e8f96",
+        "sel_bg": "#d0d0d0",
+        "idle": "#3e953a",
+        "working": "#af8a3c",
+        "rail": "#cccccc"
+      }
+    },
+    "palenight": {
+      "label": "Palenight",
+      "order": 18,
+      "colors": {
+        "bg": "#292d3e",
+        "text": "#bfc7d5",
+        "meta": "#6f769c",
+        "sel_bg": "#32374c",
+        "idle": "#a9c77d",
+        "working": "#ffcb6b",
+        "rail": "#676e95"
+      }
+    },
+    "panda": {
+      "label": "Panda",
+      "order": 19,
+      "colors": {
+        "bg": "#292a2b",
+        "text": "#e6e6e6",
+        "meta": "#757575",
+        "sel_bg": "#31353a",
+        "idle": "#19f9d8",
+        "working": "#ffb86c",
+        "rail": "#424655"
+      }
+    },
+    "solarized-dark": {
+      "label": "Solarized Dark",
+      "order": 20,
+      "colors": {
+        "bg": "#002b36",
+        "text": "#93a1a1",
+        "meta": "#5d757c",
+        "sel_bg": "#073642",
+        "idle": "#859900",
+        "working": "#b58900",
+        "rail": "#0a4a5b"
+      }
+    },
+    "solarized-light": {
+      "label": "Solarized Light",
+      "order": 21,
+      "colors": {
+        "bg": "#fdf6e3",
+        "text": "#586a72",
+        "meta": "#809090",
+        "sel_bg": "#eee8d5",
+        "idle": "#829600",
+        "working": "#b28700",
+        "rail": "#d7c99c"
+      }
+    },
+    "synthwave-84": {
+      "label": "Synthwave 84",
+      "order": 22,
+      "colors": {
+        "bg": "#262335",
+        "text": "#f2f2f2",
+        "meta": "#848bbd",
+        "sel_bg": "#34294f",
+        "idle": "#72f1b8",
+        "working": "#f3e70f",
+        "rail": "#3e3e6d"
+      }
+    },
+    "tailwind": {
+      "label": "Tailwind",
+      "order": 23,
+      "colors": {
+        "bg": "#0f172a",
+        "text": "#e2e8f0",
+        "meta": "#64748b",
+        "sel_bg": "#1e293b",
+        "idle": "#22c55e",
+        "working": "#eab308",
+        "rail": "#334155"
+      }
+    },
+    "tokyo-night": {
+      "label": "Tokyo Night",
+      "order": 24,
+      "colors": {
+        "bg": "#1a1b26",
+        "text": "#afb7d9",
+        "meta": "#5c6692",
+        "sel_bg": "#33467c",
+        "idle": "#9ece6a",
+        "working": "#e0af68",
+        "rail": "#363a53"
+      }
+    },
+    "tokyo-night-light": {
+      "label": "Tokyo Night Light",
+      "order": 25,
+      "colors": {
+        "bg": "#e6e7ed",
+        "text": "#343b59",
+        "meta": "#7881ae",
+        "sel_bg": "#dcdee3",
+        "idle": "#385f0d",
+        "working": "#8f5e15",
+        "rail": "#bbbcc2"
+      }
+    }
+  }
+}
