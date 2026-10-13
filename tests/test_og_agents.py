@@ -302,6 +302,10 @@ def test_c2_shape_is_verbatim_title_gauge_rails_and_rounded_boxes():
 
     lines = a.render(a.Frame(rows=rows, selected=2), width=C2_WIDTH)
 
+    # NOTE the two spaces after ╔ (w3's Ambiguous z-ai mark) and after every
+    # Narrow mark: the slot pads them all to the same two WESTERN columns, which
+    # is what starts every title in the same column. One space would be the
+    # sheared-title bug this pins against.
     assert lines == [
         "━━ Project Status Review ━━━━━━━━━━━━━━━━━━━━━",
         "██░░░░░░░░  1/4 done               Claude Code",
@@ -317,7 +321,7 @@ def test_c2_shape_is_verbatim_title_gauge_rails_and_rounded_boxes():
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "│   │ ✗ ╔ scouts                             │",
+        "│   │ ✗ ╔  scouts                            │",
         "│   │ freebuff                         failed│",
         "│   ╰────────────────────────────────────────╯",
         "│",
@@ -488,9 +492,9 @@ def test_the_caret_moves_between_workers_in_the_order_they_are_displayed():
             rail("idle"),
             worker("w2", "idle", text="two"),
             worker("w3", "idle", text="three")]
-    assert a.snap_selection(rows, 0) == 2, \
+    assert a.snap_selection(rows, None, 0) == 2, \
         "the view opens on the first WORKER, not the title bar or a rail"
-    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, 0))
+    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, None, 0))
     worker_text = {i: row.text for i, row in enumerate(rows) if a._is_box(row)}
 
     seen = []
@@ -503,7 +507,51 @@ def test_the_caret_moves_between_workers_in_the_order_they_are_displayed():
 
     # No workers at all: the caret has nowhere to go and must not crash.
     assert a.move_selection([header()], 0, 1) == 0
-    assert a.snap_selection([header()], 3) == 0
+    assert a.snap_selection([header()], None, 3) == 0
+
+
+def test_the_caret_follows_its_session_across_a_state_change_reorder():
+    """THE HAZARD THE GROUPING CREATES, and why the caret tracks an id.
+
+    A selected worker that changes state moves from one group to another, so the
+    rows reorder underneath it. Holding the INDEX across that refresh lands the
+    caret on whichever worker now occupies it — here `w2`, selected at index 4 in
+    the idle group, becomes `working` and moves to index 2, while index 4 in the
+    new rows is its sibling `w3`. The id is what survives the move.
+    """
+    before = [header(), rail("working"),
+              worker("w1", "working", text="one"),
+              rail("idle"),
+              worker("w2", "idle", text="two"),
+              worker("w3", "idle", text="three")]
+    after = [header(), rail("working"),
+             worker("w2", "working", text="two"),
+             worker("w1", "working", text="one"),
+             worker("w3", "working", text="three")]
+
+    # w2 was selected at index 4 in `before`; index 4 in `after` is w3's box
+    # instead, so holding the index lands the caret on the wrong worker — and
+    # Enter would focus w3's session.
+    assert before[4].session_id == "w2"
+    assert after[4].session_id == "w3" and a._is_box(after[4])
+    assert a.snap_selection(after, "w2", 4) == 2, "the caret follows w2, not index 4"
+
+    # The session GONE (it fell off the listing or the scope moved) falls back to
+    # the box NEAREST the old index — so the caret stays where the operator's eye
+    # is, rather than teleporting to the top of the pane.
+    assert a.snap_selection(after, "no-such-session", 4) == 4
+    assert a.snap_selection(after, "no-such-session", 9) == 4, "clamped, not off the end"
+    assert a.snap_selection(after, "no-such-session", 0) == 2, "the first worker"
+    # A tie between the box above and the box below goes to the UPPER one: index 3
+    # in `before` sits between w1 (2) and w2 (4).
+    assert a.snap_selection(before, "no-such-session", 3) == 2
+    # An id that IS on screen but is not a BOX never captures the caret — not the
+    # root's (the initial selection is index 0, the title bar) and not a rail's,
+    # which is the empty string.
+    assert a.snap_selection(before, before[0].session_id, 0) == 2
+    assert a.snap_selection(before, "", 3) == 2
+    # The no-id first frame still opens on the first worker, never the title bar.
+    assert a.snap_selection(after, None, 0) == 2
 
 
 def test_only_the_caret_row_of_the_selected_box_carries_the_selected_role():
@@ -568,7 +616,7 @@ def test_a_selection_move_still_repaints_the_pane():
             rail("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, 0))   # w1
+    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, None, 0))   # w1
     before = a._pane(frame, 48).items
 
     frame.selected = a.move_selection(rows, frame.selected, 1)       # w2
@@ -580,27 +628,38 @@ def test_a_selection_move_still_repaints_the_pane():
     assert "▸" in after[7][0] and "▸" not in after[3][0]
 
 
-def test_every_harness_mark_fills_the_slot_and_narrow_marks_align_the_title():
+def test_every_harness_mark_fills_the_slot_and_every_title_starts_in_one_column():
     """The box's content row carries the harness mark, and every mark spends the
-    SAME two display columns, so the glyph and the title line up down the list."""
-    harnesses = ("claude-native", "acp:cline", "acp:command-code",
-                 "opencode-native", "acp:freebuff", "totally-unknown", "")
+    SAME two WESTERN display columns, so the glyph and the title line up down the
+    list.
+
+    THE THREE AMBIGUOUS MARKS ARE IN HERE ON PURPOSE. kilo, cognition and z-ai are
+    East Asian AMBIGUOUS — a western terminal paints them ONE cell wide — and the
+    slot once charged them two and left them unpadded, so their titles started one
+    column LEFT of every Narrow row's. That is the shear this pins shut: one title
+    column for all fourteen vendors, ambiguous or not, in the locale the operator
+    runs. (Under a CJK locale those three rows shear right by one instead; that is
+    the documented trade in `_slot_width`.)
+    """
+    harnesses = _harness_for_vendor()
+    ambiguous = [harnesses[vendor] for vendor in sorted(AMBIGUOUS)]
+    narrow = [harnesses[vendor] for vendor in sorted(set(MARK) - AMBIGUOUS)]
+    assert len(ambiguous) == 3 and len(narrow) == 11, (ambiguous, narrow)
+
     title_col = {}
-    for harness in harnesses:
+    for harness in narrow + ambiguous + ["totally-unknown", ""]:
         slot = a.harness_mark(harness)
-        assert a._display_width(slot) == 2, (harness, slot)
+        assert a._slot_width(slot) == 2, (harness, slot)
         line = a.render(a.Frame(rows=[worker("w", "working", text="ZX",
                                              harness=harness)]), 48)[1]
         assert "ZX" in line, (harness, line)
         title_col[harness] = line.index("ZX")
 
-    # A blank slot and a NARROW mark both spend two LAYOUT columns, so the title
-    # starts in one column for all of them. (An Ambiguous mark is charged two for
-    # the slot but one for the layout, so it lands one column early — deliberate,
-    # see `_mark_slot`.)
-    two = [h for h in harnesses if len(a.harness_mark(h)) == 2]
-    assert len(two) >= 5, "the narrow/blank marks must dominate the table"
-    assert len(set(title_col[h] for h in two)) == 1
+    assert len(set(title_col.values())) == 1, title_col
+    # And the ambiguous marks are padded exactly like the Narrow ones: glyph plus
+    # one space, not glyph alone.
+    for vendor in AMBIGUOUS:
+        assert a.harness_mark(harnesses[vendor]) == MARK[vendor] + " ", vendor
 
 
 def test_a_breathing_rail_row_separates_one_state_group_from_the_next():
@@ -669,6 +728,68 @@ def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
     # And no label word is left behind anywhere.
     for word in OLD_GROUP_LABELS:
         assert word not in short_joined, word
+
+
+def test_a_worker_row_never_exceeds_the_pane_at_any_width():
+    """The renderer must never EMIT an over-wide line, at any width >= 1.
+
+    A line that does not fit is WRAPPED by the terminal, not clipped, and a
+    wrapped row in this layout is the failure the operator reports as "the pane
+    is broken". The gutter is four columns and a box was forced to a minimum of
+    four, so a worker row cost at least EIGHT columns whatever the pane: at
+    widths below eight it overflowed by construction. It now degrades (the ladder
+    in `worker_box`) and this is the invariant the ladder buys.
+    """
+    for width in range(1, 41):
+        for state in ("working", "blocked", "failed", "idle"):
+            for selected in (False, True):
+                lines, caret_row = a.worker_box(
+                    worker("w", state, text="a title long enough to clip",
+                           agent="zen", meta="2m14s"),
+                    width, selected)
+                assert lines, (width, state)
+                assert all(len(line) <= width for line in lines), (width, lines)
+                assert caret_row == 0, (width, state)
+
+
+def test_the_worker_row_degrades_in_the_documented_order():
+    """The ladder: the caret column goes first, then the rail/gutter, then the
+    box — the box carries the content, so it is the last thing to give up. Below
+    even a minimal box, the row is one honest short line rather than a broken
+    box."""
+    row = worker("w", "idle", text="zx")
+
+    # 8 and up: the shipped shape — rail, space, caret column, space, box.
+    full, _ = a.worker_box(row, 8, selected=True)
+    assert full[0].startswith("│ ▸ ╭"), full[0]
+    assert all(len(line) == 8 for line in full)
+
+    # 6 and 7: the caret column AND its space are gone; the rail is not.
+    slim, _ = a.worker_box(row, 7, selected=True)
+    assert slim[0].startswith("│ ╭"), slim[0]
+    assert all(len(line) == 7 for line in slim)
+    assert "▸" not in "".join(slim), "no caret column below the full gutter"
+
+    # 4 and 5: the rail goes too; the box is the whole row.
+    bare, _ = a.worker_box(row, 5, selected=True)
+    assert bare[0].startswith("╭"), bare[0]
+    assert all(len(line) == 5 for line in bare)
+
+    # 1-3: no box can be drawn at all, so one honest line, state then task.
+    tiny, caret_row = a.worker_box(row, 3, selected=True)
+    assert len(tiny) == 1 and tiny[0] == "○ …", tiny
+    assert caret_row == 0, "the SELECTED role still has a row to sit on"
+
+
+def test_a_whole_rendered_frame_fits_any_pane_at_least_one_column_wide():
+    # The end-to-end ladder check: title bar, gauge, rails, boxes and footer all
+    # fit at every width from 1 up. A wrapped pane is what this rules out.
+    rows = [header(), rail("idle"),
+            worker("w1", "idle", text="one", agent="zen", meta="2m14s")]
+    for width in range(1, 47):
+        lines = a.render(a.Frame(rows=rows, selected=2), width=width)
+        assert lines, width
+        assert all(len(line) <= width for line in lines), (width, lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1041,24 +1162,27 @@ def test_every_vendor_resolves_to_its_mark_in_a_two_column_slot():
         got = a.harness_mark(harnesses[vendor])
         # The glyph is the operator's pick, not something the slot invented.
         assert got.strip() == mark, (vendor, got)
-        # ...and whatever its own width, the slot is exactly two columns.
-        assert a._display_width(got) == 2, (vendor, got)
+        # ...and whatever its own width, the slot is exactly two columns. Measured
+        # with the SLOT's ruler: the general `_display_width` would charge the
+        # three Ambiguous marks an extra column and so disagree with the slot's
+        # contract on purpose (see `_slot_width`).
+        assert a._slot_width(got) == 2, (vendor, got)
 
 
-def test_ambiguous_marks_are_not_padded_but_narrow_ones_are():
-    # The pessimistic ruler charges Ambiguous two cells, so those three fill the
-    # slot unpadded; a Narrow mark gets the single trailing space that brings it
-    # to two. This IS the slot's contract — assert it on both sides.
+def test_ambiguous_marks_are_padded_like_narrow_ones():
+    # The slot's western ruler charges Ambiguous ONE cell, so those three are
+    # padded exactly like a Narrow mark — glyph plus one space — and their titles
+    # therefore start in the same column. This was the other way round (pessimistic
+    # charge, no pad, sheared titles) and must not go back: see `_slot_width`.
     harnesses = _harness_for_vendor()
     for vendor, mark in MARK.items():
         got = a.harness_mark(harnesses[vendor])
-        if vendor in AMBIGUOUS:
-            assert got == mark, (vendor, repr(got))
-        else:
-            assert got == mark + " ", (vendor, repr(got))
+        assert got == mark + " ", (vendor, repr(got))
     # And the classes are what the test claims them to be, not assumed.
     for vendor in AMBIGUOUS:
         assert unicodedata.east_asian_width(MARK[vendor]) == "A", vendor
+    for vendor in set(MARK) - AMBIGUOUS:
+        assert unicodedata.east_asian_width(MARK[vendor]) == "N", vendor
 
 
 def test_the_blank_slot_is_exactly_two_spaces(monkeypatch):
@@ -1071,14 +1195,17 @@ def test_the_blank_slot_is_exactly_two_spaces(monkeypatch):
     assert a.worker_mark("", None) == "  "
     assert a.worker_mark("", "") == "  "
     assert a.worker_mark(None, "   ") == "  "
-    assert a._display_width(a.harness_mark(None)) == 2
+    assert a._slot_width(a.harness_mark(None)) == 2
 
 
-def test_every_return_is_exactly_two_columns_including_the_blank():
+def test_every_return_is_exactly_two_slot_columns_including_the_blank():
+    # Measured with the SLOT's ruler, not `_display_width`: the slot's contract is
+    # two WESTERN columns, and a general-ruler check would reject the three
+    # Ambiguous marks the slot deliberately pads.
     for row in _catalog()["agents"]:
-        assert a._display_width(a.harness_mark(row["harness"])) == 2, row["id"]
+        assert a._slot_width(a.harness_mark(row["harness"])) == 2, row["id"]
     for degenerate in ("brand-new-native", "", None, 7, "  "):
-        assert a._display_width(a.harness_mark(degenerate)) == 2, degenerate
+        assert a._slot_width(a.harness_mark(degenerate)) == 2, degenerate
 
 
 def test_every_worker_mark_return_is_two_columns(monkeypatch):
@@ -1672,7 +1799,7 @@ def test_main_once_prints_exactly_what_render_returns(monkeypatch, tmp_path, cap
     expected_frame = _model(opener).refresh()
     # The caret opens on the first WORKER: rows 0-1 are the title bar and gauge
     # and row 2 is the group's breathing rail, none of which draw a box.
-    expected_frame.selected = a.snap_selection(expected_frame.rows, 0)
+    expected_frame.selected = a.snap_selection(expected_frame.rows, None, 0)
     expected = a.render(expected_frame)
 
     rc = a.main(["--once", "--all", "--server", "http://x"], opener=opener)
@@ -2386,6 +2513,57 @@ def test_space_expands_and_collapses_the_selected_snippet(monkeypatch):
         "the first space expanded the snippet"
     assert not any(report in text for text in collapsed.frames[-1]), \
         "the second space collapsed it"
+
+
+def test_the_caret_follows_a_selected_worker_that_changes_group_across_a_refresh(
+        monkeypatch):
+    """THE REGRESSION the reviewer caught, driven through the real loop.
+
+    A selected worker changes state, so it moves to another STATE GROUP and the
+    rows reorder underneath the caret. The view used to hold the INDEX across the
+    refresh, so the poll after the move left the caret on whichever worker now
+    occupied it — a different session, and Enter would have focused that one.
+
+    Here `w2` is selected at index 4 in the idle group, turns `working`, and its
+    box moves to index 3 in the working group while its sibling `w1` takes index
+    4. The caret follows the SESSION, so it lands on `w2`.
+    """
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+    before = [
+        listed("root", status="running", title="conversation"),
+        listed("w1", parent="root", status="running", title="coder_zen:one"),
+        listed("w2", parent="root", status="idle", title="coder_zen:two"),
+    ]
+    after = [
+        listed("root", status="running", title="conversation"),
+        listed("w1", parent="root", status="running", title="coder_zen:one"),
+        listed("w2", parent="root", status="running", title="coder_zen:two"),
+    ]
+    opener = RoutingOpener([before, after],
+                           details={"root": ROOT_DETAIL,
+                                    "w1": detail("w1"), "w2": detail("w2")})
+    inner = _model(opener)
+    seen: list = []
+
+    class Recording:
+        def refresh(self, **kwargs):
+            seen.append(kwargs.get("selected_id"))
+            return inner.refresh(**kwargs)
+
+    # `j` moves the caret down onto w2; `r` forces the refresh that reorders the
+    # rows; `q` ends the loop after that frame is painted.
+    screen = _run_tui_capture(monkeypatch, [ord("j"), ord("r"), ord("q")],
+                              model=Recording())
+
+    # The refresh was handed the SESSION under the caret, not an index.
+    assert seen == [None, "w2"], seen
+    # And the caret it resolved points at w2's box — its task says "two" — not at
+    # w1's, which is what the old index-preserving snap would have chosen.
+    final = screen.frames[-1]
+    caret = [i for i, text in enumerate(final) if "▸" in text]
+    assert len(caret) == 1, final
+    box = "\n".join(final[caret[0]:caret[0] + 3])
+    assert "two" in box and "one" not in box, box
 
 
 def test_the_footer_names_the_focus_and_expand_bindings():

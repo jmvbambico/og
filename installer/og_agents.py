@@ -88,7 +88,8 @@ DEFAULT_INTERVAL = 3.0
 #
 # ○ is East Asian AMBIGUOUS. It is composed as ONE layout column, which is what a
 # western terminal paints — the same Ambiguous-charged-one rule the boxes use (see
-# ROUND_CORNERS). Only the MARK SLOT charges Ambiguous two, on purpose.
+# ROUND_CORNERS) and the mark slot's own western ruler applies too (see
+# `_slot_width`, and the CJK trade-off it documents).
 STATE_GLYPH = {
     "blocked": "\u23f8",   # ⏸
     "failed": "\u2717",    # ✗
@@ -119,9 +120,12 @@ SPIN_TICK = 0.12
 # so a whole box line measured with `_display_width` (Ambiguous charged two) would
 # double its borders and overflow the pane — exactly why the two rulers exist.
 # The len ruler charges Ambiguous one, which is what a western terminal paints,
-# and it matches the approved prototype line for line. `_display_width` (Ambiguous
-# two) is used in exactly ONE place, the MARK SLOT, because the slot's whole job
-# is to survive a font that draws an Ambiguous mark wide; see `_mark_slot`.
+# and it matches the approved prototype line for line. The MARK SLOT was once the
+# one place that charged Ambiguous two, and it sheared every ambiguous mark's
+# title; it now measures with its own western ruler (`_slot_width`), which
+# charges Ambiguous one and Wide/Fullwidth two. `_display_width` itself survives
+# solely as `_footer`'s backstop — the footer must not overflow under EITHER
+# locale, and carries no Ambiguous glyph for it to bite on.
 ROUND_CORNERS = ("\u256d", "\u2500", "\u256e", "\u2502", "\u2570", "\u256f")
 RAIL = "\u2502"          # U+2502, the group rail, its own column at the left edge
 TITLE_RULE = "\u2501"    # U+2501 heavy horizontal: the root's title bar
@@ -144,6 +148,12 @@ GUTTER = 4
 # list — the point of the slot — and the title starts in the same place on every
 # row.
 ROW_PREFIX = 6
+
+# The narrowest box there is: two corners and two rules is the smallest rectangle
+# `_round_box` can draw. It is also the floor of `worker_box`'s degradation ladder
+# — the point below which no box is drawn at all, because a one- or two-column
+# "box" would be a lie.
+BOX_MIN = 4
 
 # The state groups, in the order they are DRAWN: what needs attention first.
 # `unknown` (a status `display_state` could not name) is its own group rather than
@@ -699,11 +709,54 @@ _HARNESS_MARKS = {
 }
 
 # A mark is padded into a FIXED two display columns, not left as-is. Without the
-# slot, a Narrow mark (one cell) and an Ambiguous one (two cells in a CJK-locale
-# terminal) on consecutive rows start the column after them at two different
-# offsets, and every box edge, rule and right-aligned clock downstream shears by
-# that difference. Padding each mark to the same column removes it.
+# slot, a Narrow mark (one cell) and a Wide or Ambiguous one (more) on
+# consecutive rows start the column after them at different offsets, and every
+# box edge, rule and right-aligned clock downstream shears by that difference.
+# Padding each mark to the same column removes it.
+#
+# THE SLOT MEASURES WITH THE WESTERN RULE (`_slot_width`): an Ambiguous glyph is
+# charged ONE column and padded exactly like a Narrow one. The three Ambiguous
+# picks (kilo, cognition, z-ai) thus fill two WESTERN cells — glyph plus one
+# space — and the title starts in the same column on every row. This was once
+# the other way round: the slot charged Ambiguous two and so left those three
+# UNPADDED, which in a western terminal draws them one cell wide and shears their
+# titles one column LEFT of every other row. That is the locale the operator
+# actually runs, so it was the wrong rule kept for the wrong terminal. A
+# CJK-locale terminal now shears those three rows one column RIGHT instead — the
+# same magnitude of error, on far fewer users — and that is the deliberate trade.
+# Do NOT "fix" it back: see `_slot_width` for why the slot and `_display_width`
+# disagree.
 MARK_SLOT = 2
+
+
+def _slot_width(text: str) -> int:
+    """The columns the SLOT charges `text`: Wide/Fullwidth two, AMBIGUOUS one.
+
+    The slot's ruler, and only the slot's. Its job is to start the title in the
+    same column on every row in the terminal the operator actually runs, so it
+    measures what a WESTERN terminal paints: Wide and Fullwidth glyphs really do
+    spend two cells there, an Ambiguous one spends one. Charging Ambiguous two —
+    the pessimistic rule `_display_width` keeps for the footer — is what left the
+    three Ambiguous marks (kilo, cognition, z-ai) unpadded and sheared their
+    titles one column left.
+
+    Deliberately NOT `len`: a future Wide mark is one python character that
+    paints two cells, and `len` would pad it as if it were one — the same shear,
+    in the other direction. Deliberately NOT `_display_width`: that rule is
+    correct for the footer, which must not overflow in ANY locale, and wrong
+    here, where the whole pane already assumes the western paint rule (the rail,
+    the corners and the gauge are all Ambiguous and all composed as one column —
+    see ROUND_CORNERS). The slot is now consistent with them.
+
+    CJK TRADE-OFF: in a CJK-locale terminal an Ambiguous mark paints two columns,
+    so a row here composes one column narrower than it paints and shears right by
+    one. Accepted: the error is the same size as the one it replaces, it falls on
+    the far smaller set of terminals, and it is confined to three vendor marks
+    rather than every row of the pane.
+    """
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in text)
+
 
 # The mark for an agent whose VENDOR could not be identified — U+269B ATOM SYMBOL.
 # It is East Asian NARROW (measured: `east_asian_width("\u269b") == "N"`), so its
@@ -718,24 +771,20 @@ ATOM = "\u269b"
 def _mark_slot(mark: str) -> str:
     """`mark` padded to exactly `MARK_SLOT` display columns. THE slot.
 
-    A mark the terminal draws in two cells fills the slot on its own; a mark it
-    draws in one gets a single trailing space; no mark at all is two spaces.
-    Width is measured with `_display_width`, never `len`: every glyph in the
-    table is ONE python character whatever it draws as, so `len` is exactly the
-    ruler that cannot see the shear this exists to prevent.
+    A mark that names no agent fills the slot with spaces; every other is padded
+    with the difference between its `_slot_width` and `MARK_SLOT` — one trailing
+    space for a Narrow mark AND for an Ambiguous one, because in the western
+    terminal this pane is composed for both spend one cell and need the same pad
+    to spend two layout columns. A Wide or Fullwidth mark fills the slot on its
+    own and gets no pad.
 
-    AMBIGUOUS marks are charged TWO cells and so are NOT padded. Ambiguous has
-    no single true width — one cell in a western locale, two in a CJK one — and
-    the only assumption that holds in both is the pessimistic one: a slot one
-    column NARROW on the ambiguous row (visible, cosmetic, one row) beats a slot
-    one column WIDE under a CJK locale, which pushes the row past the pane's
-    right edge and is read as "the pane is broken". So the three Ambiguous marks
-    stand one column short of the slot in a western terminal, deliberately; the
-    other eleven are exact.
+    The ruler is `_slot_width`, never `len` and never `_display_width`: see that
+    function for the western rule and the CJK trade-off this slot deliberately
+    makes, and for why the two rulers disagree.
     """
     if not mark or mark == " ":
         return " " * MARK_SLOT
-    return mark + " " * max(0, MARK_SLOT - _display_width(mark))
+    return mark + " " * max(0, MARK_SLOT - _slot_width(mark))
 
 
 def _vendor_mark(vendor: Any) -> str:
@@ -820,10 +869,12 @@ def build_rows(
 
     THE GROUPING HAPPENS HERE, not in `_pane`, and that is load-bearing. If the
     view grouped the workers while `Frame.rows` stayed in tree order, the arrow
-    keys — `move_selection`, `snap_selection`, `_run_tui`'s scroll — would walk
-    the rows in tree order while the eye read state order, and the caret would
-    appear to jump around at random. Sorting the ROWS themselves keeps every
-    index-based helper correct without a change.
+    keys — `move_selection` and `_run_tui`'s scroll — would walk the rows in
+    tree order while the eye read state order, and the caret would appear to jump
+    around at random. Sorting the ROWS themselves keeps every index-based helper
+    correct without a change; the SELECTION follows its session across this
+    reorder, because a held index would land on whichever worker now sits there
+    (see `snap_selection`).
 
     The sort is STABLE (`_grouped`), so two polls that brought the same set of
     workers produce byte-identical rows; an unstable order would make otherwise
@@ -1003,6 +1054,11 @@ def _display_width(text: str) -> int:
     Ambiguous glyph, so this backstop does not move any current threshold: it only
     bites a future edit that adds one. See the footer comment.
 
+    NOT the mark slot's ruler: `_slot_width` measures that column, because a
+    title has to line up in the locale the operator RUNS, not in both. Do not
+    "unify" the two by pointing `_mark_slot` back here — that re-creates the
+    sheared-title bug the slot exists to prevent.
+
     No ANSI stripping: the footer is plain text. A line that may carry escapes is
     measured through `_visible_width` instead.
     """
@@ -1118,7 +1174,7 @@ def _round_box(inner_lines: list[str], width: int) -> list[str]:
     The corners are the operator's one addition against the heavy title bar:
     light `─` under curved `╭╮╰╯`, and the weight contrast is the interest.
     """
-    width = max(4, width)
+    width = max(BOX_MIN, width)
     tl, hz, tr, vt, bl, br = ROUND_CORNERS
     out = [tl + hz * (width - 2) + tr]
     out += [vt + _pad(line, width - 2) + vt for line in inner_lines]
@@ -1149,25 +1205,65 @@ def worker_box(row: Row, width: int, selected: bool,
     the WORKING row alone: a blocked or finished box renders identically at every
     value, which is what keeps a pane with nothing working byte-identical between
     polls.
+
+    NARROW PANES DEGRADE IN A FIXED ORDER (the ladder below), and the one
+    invariant they never break is this: at ANY width >= 1, no line returned here
+    is longer than `width`. An over-wide line is WRAPPED by the terminal, not
+    clipped, and a wrapped row in this layout is the failure the operator reports
+    as "the agents pane is broken".
     """
-    box_width = max(4, width - GUTTER)
+    glyph = state_glyph(row.state, spin)
+
+    # THE DEGRADATION LADDER. A worker line is gutter + box, and below some width
+    # they stop fitting together. They give up in this order — the caret column
+    # and the gutter BEFORE the box, because the box is what carries the content:
+    #
+    #   1. width >= GUTTER + BOX_MIN (8): the shipped shape — `│`, space, caret
+    #      column, space, then a box of width - GUTTER.
+    #   2. width >= 2 + BOX_MIN (6): the caret column and its space are dropped,
+    #      there being no room for them, leaving `│` + one space before the box.
+    #      No `▸` is drawn here: the caret is the selection MARKER, and below
+    #      eight columns there is no column to point from. The row keeps the
+    #      SELECTED role (bold), so the selection is still findable.
+    #   3. width >= BOX_MIN (4): the rail goes too; the box is the whole row.
+    #   4. width < 4: no box is possible at all — the smallest is `╭─╮` — so the
+    #      row degrades to ONE clipped line naming the state and the task:
+    #      honest and short rather than a broken box.
+    #
+    # Below step 1 the pane is absurd in practice; the invariant is not. `_clip`
+    # is the only thing between a composed line and a wrapped pane, and it cannot
+    # rescue a line built longer than the pane in the first place.
+    if width < BOX_MIN:
+        return [_clip(glyph + " " + row.text, width)], 0
+
+    if width >= GUTTER + BOX_MIN:
+        box_width, gutter, caret_column = width - GUTTER, RAIL + " ", True
+    elif width >= 2 + BOX_MIN:
+        box_width, gutter, caret_column = width - 2, RAIL + " ", False
+    else:
+        box_width, gutter, caret_column = width, "", False
+
     inner = max(0, box_width - 2)
     # The row's own harness wins; a worker carries none, so its mark comes from
     # the harness its SPEC declares (found by the agent name the title gave) —
     # only when BOTH the harness and the name are absent is the slot blank (see
     # `worker_mark`).
     mark = worker_mark(row.harness, row.agent)
-    line1 = (" " + state_glyph(row.state, spin) + " " + mark + " "
+    line1 = (" " + glyph + " " + mark + " "
              + _clip(row.text, inner - ROW_PREFIX))
     lines = [line1, _two_col(" " + (row.agent or "role"), row.meta, inner)]
     if row.expanded and row.snippet:
         lines.append("  " + _clip(_oneline(row.snippet), inner - 2))
     boxed = _round_box(lines, box_width)
-    caret = CARET if selected else " "
-    return [
-        RAIL + " " + (caret if index == 0 else " ") + " " + line
-        for index, line in enumerate(boxed)
-    ], 0
+
+    out: list[str] = []
+    for index, line in enumerate(boxed):
+        if caret_column:
+            caret = CARET if (selected and index == 0) else " "
+            out.append(gutter + caret + " " + line)
+        else:
+            out.append(gutter + line)
+    return out, 0
 
 
 def _is_box(row: Row) -> bool:
@@ -1184,18 +1280,37 @@ def _workers(rows: list[Row]) -> list[int]:
     return [i for i, row in enumerate(rows) if _is_box(row)]
 
 
-def snap_selection(rows: list[Row], selected: int) -> int:
-    """`selected` if it still names a worker row, else the first one.
+def snap_selection(rows: list[Row], selected_id: Optional[str] = None,
+                   selected: int = 0) -> int:
+    """The index the caret takes after a refresh: the row whose SESSION was selected.
 
     Run after every refresh, when the row list has just changed underneath the
-    caret. The fallback is the first WORKER rather than row 0 because row 0 is
-    the root's title bar, which draws no box and therefore no caret: a view that
-    opened on it would look like it had no selection at all.
+    caret. The caret follows the SESSION, not the index it used to sit at, and
+    that is the whole point: a selected worker that changes state moves to
+    another group, the rows REORDER (`build_rows` puts them in display order),
+    and an index held across that refresh lands on a DIFFERENT worker — the
+    operator presses Enter and focuses the wrong session. `selected_id` is the
+    session id of the row that was selected; when that session is still on screen
+    as a BOX the caret returns to it wherever the reorder moved it.
+
+    When that session is GONE — it fell off the listing, or the scope moved to
+    another tree — the fallback is the box NEAREST the old index (`selected`),
+    never the top of the list: the operator's eye stays where it was instead of
+    the caret teleporting to a part of the pane they were not reading. A tie goes
+    to the upper box. The old index is also the whole story when the caller has no
+    session id at all (the first frame of a view that opens on the first WORKER);
+    nearest to index 0 finds that first worker rather than row 0, which is the
+    root's title bar and draws no box, so a view that opened there would look
+    like it had no selection at all.
     """
     workers = _workers(rows)
     if not workers:
         return 0
-    return selected if selected in workers else workers[0]
+    if selected_id:
+        for index in workers:
+            if rows[index].session_id == selected_id:
+                return index
+    return min(workers, key=lambda index: (abs(index - selected), index))
 
 
 def move_selection(rows: list[Row], selected: int, delta: int) -> int:
@@ -1310,6 +1425,15 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     kept: list[list[tuple[str, str]]] = []
     used = 0
     for block in blocks:
+        # THE FIRST BLOCK IS KEPT EVEN WHEN IT EXCEEDS `room`, deliberately: one
+        # whole box reads as a list where none reads as an empty pane, and a box
+        # cut in half is the failure this whole-block trimmer exists to prevent.
+        # The cost is that `list_rows` can exceed `room` when the pane is shorter
+        # than even one block — and that is safe because the LIVE VIEW SCROLLS
+        # the list (`_run_tui` paints `height - tail_len` of its rows and pins
+        # the tail below) rather than trusting it to fit. Only a caller of
+        # `render(height=...)` can see the overrun, and it sees a longer list,
+        # never an overflowing window.
         if room is not None and kept and used + len(block) > room:
             break
         kept.append(block)
@@ -2000,11 +2124,16 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             now = time.monotonic()
 
             if poll or now >= next_poll:
+                # The SESSION under the caret, read BEFORE the refresh: the rows
+                # about to be replaced are the only place the caret's session id
+                # exists, and the id is what survives the reorder a state change
+                # causes. A row that is not a box (a rail carries "") reads as no
+                # id at all, and `snap_selection` falls back to the old index.
                 ids = [row.session_id for row in frame.rows]
                 sel_id = ids[selected] if 0 <= selected < len(ids) else None
                 frame = model.refresh(selected_id=sel_id,
                                       expanded_ids=expanded, force=force)
-                selected = snap_selection(frame.rows, selected)
+                selected = snap_selection(frame.rows, sel_id, selected)
                 next_poll = now + interval
                 poll = False
                 force = False
@@ -2162,7 +2291,9 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
         # where the live view opens it — on the first worker. A working row still
         # draws its spinner, frozen on the first frame.
         frame.spin = 0
-        frame.selected = snap_selection(frame.rows, frame.selected)
+        # No previous frame, so no session to follow: this snaps to the first
+        # worker, which is where the live view opens too.
+        frame.selected = snap_selection(frame.rows, None, frame.selected)
         # The real pane width drives the QR fit; off a tty there is none, so
         # fall back to the classic 80 columns.
         width = shutil.get_terminal_size((DEFAULT_WIDTH, 24)).columns
