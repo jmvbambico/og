@@ -3612,7 +3612,14 @@ def _run_tui_capture(monkeypatch, keys, model=None):
     return screens[0]
 
 
-def test_enter_focuses_the_selected_worker_with_that_rows_session_id(monkeypatch):
+def test_enter_on_a_sub_agent_row_focuses_its_root_session(monkeypatch):
+    """REGRESSION: the reported bug was `agent_not_found` for every worker.
+
+    `w1` is a SUB-AGENT of `root` (`parent_session_id == "root"`), and only the
+    root has a herdr pane record for `agent.focus` to match. So Enter must send
+    the ROOT's id, `root` — not w1's own, which is what used to go on the wire
+    and matched no record.
+    """
     monkeypatch.setenv("HERDR_ENV", "1")
     calls = _fake_herdr_client(monkeypatch)
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
@@ -3620,15 +3627,67 @@ def test_enter_focuses_the_selected_worker_with_that_rows_session_id(monkeypatch
 
     screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=model)
 
-    # Row 1 is the first worker (row 0 is the group header), so w1 was selected
-    # and its session id is what went on the wire.
-    assert calls == [("agent.focus", {"target": "w1"})], calls
+    # w1, the first worker, is the selected row, so the RESOLVED target — its
+    # root — is what went on the wire.
+    assert calls == [("agent.focus", {"target": "root"})], calls
     # Focus is not a reason to refetch: exactly the one listing walk for the
     # first paint, and none from the keypress.
     assert len(opener.listing_requests) == 1, "Enter must not trigger a refetch"
     # A successful focus leaves no notice behind.
     assert screen.painted, "the pane was painted"
     assert not any("focus:" in text for text in screen.painted)
+
+
+def test_focus_target_climbs_to_the_root_not_the_immediate_parent():
+    """A worker nested two deep resolves to the TOP root — the pane that exists —
+    not its immediate parent, which is itself a pane-less sub-agent."""
+    sessions = [
+        listed("root", status="running", title="conversation"),
+        listed("w1", parent="root", status="running", title="coder_zen:worker"),
+        listed("g1", parent="w1", status="running", title="coder_zen:grandchild"),
+    ]
+    rows = a.build_rows(sessions, ["root"], now=NOW)
+    by_sid = {row.session_id: row for row in rows}
+    assert a.focus_target(by_sid["w1"]) == "root"
+    assert a.focus_target(by_sid["g1"]) == "root"
+
+
+def test_focus_target_of_a_root_row_is_its_own_session_id():
+    """A root owns its own herdr pane and targets itself — unchanged."""
+    assert a.focus_target(header(sid="root")) == "root"
+    assert a.focus_target(header(sid="abc123")) == "abc123"
+
+
+def test_a_row_whose_root_cannot_be_resolved_declines_and_does_not_call_out(
+        monkeypatch):
+    """No root to resolve -> decline in one line, never send a doomed target.
+
+    A worker row carrying no `root_session_id` (a malformed listing, say)
+    resolves to nothing; focusing must not guess an id herdr would only answer
+    `agent_not_found` for. It declines locally and calls out not at all.
+    """
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = _fake_herdr_client(monkeypatch)
+    # `worker()` leaves `root_session_id` empty: a Box with no root.
+    orphan = worker("w1", "idle", text="one")
+    assert a._is_box(orphan), "the row must be a selectable worker box"
+
+    class OneRow:
+        def refresh(self, **kwargs):
+            return a.Frame(rows=[orphan])
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=OneRow())
+
+    assert calls == [], "a row with no resolvable root must not call out"
+    assert any(a.NOTICE_FOCUS_NO_ROOT in text for text in screen.painted), \
+        screen.painted
+
+
+def test_focus_resolution_adds_no_call_beyond_agent_focus():
+    """The one-outbound-call guarantee survives the root resolution: resolving a
+    TARGET is not a second call, and this path adds none (see
+    `_assert_only_agent_focus`)."""
+    _assert_only_agent_focus(Path(a.__file__).read_text())
 
 
 def test_enter_outside_herdr_makes_no_call_and_shows_a_notice(monkeypatch):
