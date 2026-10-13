@@ -677,6 +677,20 @@ def test_report_agent_passes_optional_params_when_given(fake):
     stateful.close()
 
 
+def test_report_agent_without_session_id_omits_the_key(fake):
+    # Backwards compatibility: the id exists so the record can be focused later,
+    # but a caller that has none must keep working — and the key must be ABSENT,
+    # not null, so a herdr server that does not know it never sees it at all.
+    server = fake()
+    stateful = herdr.HerdrClient(socket_path=server.path, timeout=5.0)
+    stateful.report_agent("pane_1", "og", "coder", "working",
+                          message="no id here")
+    params = server.requests[0]["params"]
+    assert "agent_session_id" not in params
+    assert params["message"] == "no id here"
+    stateful.close()
+
+
 # --------------------------------------------------------------------------
 # happy path per convenience wrapper
 # --------------------------------------------------------------------------

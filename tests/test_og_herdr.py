@@ -150,7 +150,8 @@ class RecordingClient:
 
     def report_agent(self, pane_id, source, agent, state, message=None,
                      seq=None, agent_session_id=None):
-        self._call("report_agent", pane_id, source, agent=agent, state=state)
+        self._call("report_agent", pane_id, source, agent=agent, state=state,
+                   agent_session_id=agent_session_id)
 
     def release_agent(self, pane_id, source, agent, seq=None):
         self._call("release_agent", pane_id, source, agent=agent)
@@ -259,7 +260,8 @@ def test_added_sequence(seams):
         "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
     ra = _call(client, "report_agent")
     assert ra[1] == ("pane1", "og-bridge")
-    assert ra[2] == {"agent": "Claude Code", "state": "working"}
+    assert ra[2] == {"agent": "Claude Code", "state": "working",
+                     "agent_session_id": "s1"}
     assert _call(client, "report_metadata")[2]["title"] == "Fix bug"
     # The space's first tab is labelled with the space's own title:
     # `workspace.create` cannot label the tab it makes, so without this it shows
@@ -736,6 +738,46 @@ def test_changed_sequence_reports_state_and_title(seams):
     # with a correctly-named space holding a tab still called by the old label.
     assert _call(client, "tab_rename")[1] == ("tab1", "New")
     assert "update s1" in lines[0]
+
+
+def test_report_agent_carries_the_omnigent_session_id(seams):
+    """A create's report names the OMNIGENT session id, not a pane or tab id.
+
+    The point of sending it is that `agent.focus {target}` can later match this
+    record back to the session, and the `og agents` pane aims its target at
+    `Row.session_id` — the event's `sid`, the same value that keys every record
+    in the bridge. A pane id here would focus nothing.
+    """
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, source="og-bridge",
+                      cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+    assert _call(client, "report_agent")[2]["agent_session_id"] == "s1"
+
+
+def test_changed_report_repeats_the_same_session_id(seams):
+    """A `changed` re-sends the id, so the record keeps the handle `agent.focus`
+    matches on across every state update, not just the create."""
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session("T", state="idle"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("changed", "s1", root_session("T", state="working"),
+                         previous=root_session("T", state="idle"))])
+    assert _call(client, "report_agent")[2]["agent_session_id"] == "s1"
+
+
+def test_sub_agent_report_carries_its_own_session_id(seams):
+    """A worker's pane reports the WORKER's id, not its root's — focus must
+    reach the worker's tab, and the two sessions are matched by their own ids."""
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("R", state="idle")),
+        Ev("added", "worker", sub_session("root", state="idle"))])
+    reports = [c for c in client.calls if c[0] == "report_agent"]
+    assert [r[2]["agent_session_id"] for r in reports] == ["root", "worker"]
 
 
 def test_changed_without_title_change_skips_metadata(seams):
