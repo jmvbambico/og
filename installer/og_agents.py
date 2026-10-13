@@ -1227,14 +1227,25 @@ def worker_box(row: Row, width: int, selected: bool,
     #      SELECTED role (bold), so the selection is still findable.
     #   3. width >= BOX_MIN (4): the rail goes too; the box is the whole row.
     #   4. width < 4: no box is possible at all — the smallest is `╭─╮` — so the
-    #      row degrades to ONE clipped line naming the state and the task:
-    #      honest and short rather than a broken box.
+    #      row degrades to ONE clipped line: the state glyph FIRST, then as much
+    #      of the task as fits. The glyph is the one column worth keeping — it is
+    #      the status — so it is composed before the clip and never lost: at
+    #      width 1 it IS the row, at 2 and 3 it is followed by the clipped task.
+    #      Honest and short rather than a broken box.
     #
     # Below step 1 the pane is absurd in practice; the invariant is not. `_clip`
     # is the only thing between a composed line and a wrapped pane, and it cannot
     # rescue a line built longer than the pane in the first place.
     if width < BOX_MIN:
-        return [_clip(glyph + " " + row.text, width)], 0
+        # The glyph is composed FIRST because `_clip` does not keep it: handed
+        # the whole line at width 1 it spends that one column on its own ellipsis
+        # (`…`) and the state is gone — a bare `…` where the comment above
+        # promises the state. So only the trailing task is clipped, into the
+        # columns left after the glyph; width 1 leaves none, and the glyph stands
+        # alone. Width <= 0 has no column at all; `_clip`'s own floor.
+        if width < 1:
+            return [""], 0
+        return [glyph + _clip(" " + row.text, width - 1)], 0
 
     if width >= GUTTER + BOX_MIN:
         box_width, gutter, caret_column = width - GUTTER, RAIL + " ", True

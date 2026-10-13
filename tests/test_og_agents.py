@@ -781,6 +781,33 @@ def test_the_worker_row_degrades_in_the_documented_order():
     assert caret_row == 0, "the SELECTED role still has a row to sit on"
 
 
+def test_the_narrowest_worker_row_keeps_the_state_glyph():
+    """Below a box the STATE is what survives — never a bare ellipsis.
+
+    Rung 4 of the ladder promises one honest clipped line that still carries the
+    state glyph, because the state is the one column worth keeping. `_clip`
+    alone breaks that promise at width 1: handed the whole line it spends the
+    single column on its own ellipsis (`…`) and the state is gone. Composing the
+    glyph FIRST is what makes the promise true at 1, 2 and 3.
+    """
+    cases = (("working", a.SPIN_FRAMES[2]), ("blocked", "⏸"),
+             ("failed", "✗"), ("idle", "○"))
+    for state, glyph in cases:
+        for width in (1, 2, 3):
+            lines, caret_row = a.worker_box(
+                worker("w", state, text="a title long enough to clip"),
+                width, selected=False, spin=2)
+            assert len(lines) == 1, (state, width, lines)
+            assert glyph in lines[0], (state, width, lines)
+            assert len(lines[0]) <= width, (state, width, lines)
+            assert caret_row == 0, (state, width)
+    # Width 1 is the glyph ALONE: there is no column left for the task.
+    assert a.worker_box(worker("w", "idle", text="zx"), 1, True)[0] == ["○"]
+    # 2 and 3 follow the glyph with as much of the clipped task as fits.
+    assert a.worker_box(worker("w", "idle", text="zx"), 2, True)[0] == ["○…"]
+    assert a.worker_box(worker("w", "idle", text="zx"), 3, True)[0] == ["○ …"]
+
+
 def test_a_whole_rendered_frame_fits_any_pane_at_least_one_column_wide():
     # The end-to-end ladder check: title bar, gauge, rails, boxes and footer all
     # fit at every width from 1 up. A wrapped pane is what this rules out.
