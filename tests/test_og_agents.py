@@ -316,7 +316,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
 
     lines = a.render(a.Frame(rows=rows, selected=2), width=C2_WIDTH)
 
-    # NOTE the two spaces after 𝗭 (w3's z-ai mark) and after every other mark:
+    # NOTE the two spaces after 𝗙 (w3's z-ai mark — Freebuff, the TOOL) and after every other mark:
     # the slot pads them all to the same two columns, which is what starts every
     # title in the same column. One space would be the sheared-title bug this pins
     # against.
@@ -334,7 +334,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⦿ ✗ │ 𝗭  scouts                        failed│",
+        "⦿ ✗ │ 𝗙  scouts                        failed│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
@@ -1579,7 +1579,7 @@ MARK = {
     "opencode-zen": "\u25AF",
     "google": "\u2726",
     "openai": "\u2B21",
-    "deepseek": "\U0001319E",
+    "deepseek": "\U0001D5D6",
     "kilo": "\U0001D5DE",
     "aws-kiro": "\U0001680C",
     "cursor": "\u21D7",
@@ -1587,7 +1587,7 @@ MARK = {
     "hermes": "\u2624",
     "xai": "\U0001D54F",
     "cognition": "\u2316",
-    "z-ai": "\U0001D5ED",
+    "z-ai": "\U0001D5D9",
     "moonshotai": "\u2318",
 }
 
@@ -1664,18 +1664,23 @@ def test_every_mark_and_the_node_are_narrow():
 
 
 def test_the_narrow_swaps_resolve_to_the_chosen_codepoints():
-    # The operator's four explicit replacements, spelled as codepoints so a stray
-    # edit to a look-alike glyph is caught: node ⦿ U+29BF, kilo 𝗞 U+1D5DE,
-    # cognition ⌖ U+2316, z-ai 𝗭 U+1D5ED. 𝗞 and 𝗭 are outside the BMP, like the
-    # existing 𝕏 (xai) and the hieroglyph marks.
+    # The explicit replacements, spelled as codepoints so a stray edit to a
+    # look-alike glyph is caught: node ⦿ U+29BF, kilo 𝗞 U+1D5DE, cognition ⌖ U+2316.
+    # 𝗖 (vendor `deepseek` -> CLINE) and 𝗙 (vendor `z-ai` -> FREEBUFF) joined them:
+    # the mark names the TOOL, so the old whale (the MODEL's logo) is gone.
+    # 𝗖, 𝗙 and 𝗞 are outside the BMP, like the existing 𝕏 (xai) and the two
+    # surviving historic glyphs, 𓅯 goose and 𖠌 aws-kiro.
     assert a.NODE == "\u29bf"
     assert a._HARNESS_MARKS["kilo"] == "\U0001D5DE"
     assert a._HARNESS_MARKS["cognition"] == "\u2316"
-    assert a._HARNESS_MARKS["z-ai"] == "\U0001D5ED"
+    assert a._HARNESS_MARKS["z-ai"] == "\U0001D5D9"
+    assert a._HARNESS_MARKS["deepseek"] == "\U0001D5D6"
     # The z-ai swap also fixes a second defect: U+2554 was a BOX-DRAWING corner
     # sitting inside a pane built from box-drawing, so it read as frame damage
-    # beside a real corner. The replacement is unmistakably a Z.
+    # beside a real corner.
     assert a._HARNESS_MARKS["z-ai"] != "\u2554"
+    # The whale named the MODEL (DeepSeek), never the harness — that is why it left.
+    assert a._HARNESS_MARKS["deepseek"] != "\U0001319E"
 
 
 def test_the_blank_slot_is_exactly_two_spaces(monkeypatch):

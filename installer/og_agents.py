@@ -739,7 +739,10 @@ _HARNESS_MARKS = {
     "opencode-zen": "\u25AF",    # ▯ white vertical rectangle
     "google": "\u2726",          # ✦ black four-pointed star
     "openai": "\u2B21",          # ⬡ white hexagon
-    "deepseek": "\U0001319E",    # 𓆞 Egyptian hieroglyph
+    "deepseek": "\U0001D5D6",    # 𝗖 mathematical sans-serif bold C, for CLINE, the
+                                 #   harness. This row's vendor names the MODEL
+                                 #   (DeepSeek); the mark names the TOOL, so the old
+                                 #   whale (DeepSeek's logo) was wrong. Do NOT put it back.
     "kilo": "\U0001D5DE",        # 𝗞 mathematical sans-serif bold K (was 🄺, Ambiguous)
     "aws-kiro": "\U0001680C",    # 𖠌 Bamum letter
     "cursor": "\u21D7",          # ⇗ north-east double arrow
@@ -747,9 +750,16 @@ _HARNESS_MARKS = {
     "hermes": "\u2624",          # ☤ caduceus
     "xai": "\U0001D54F",         # 𝕏 double-struck X
     "cognition": "\u2316",       # ⌖ position indicator (was ⛯, Ambiguous)
-    "z-ai": "\U0001D5ED",        # 𝗭 mathematical sans-serif bold Z (was ╔, Ambiguous;
-                                 #   a box-drawing corner read as frame damage here)
-    "moonshotai": "\u2318",      # ⌘ place-of-interest sign
+    "z-ai": "\U0001D5D9",        # 𝗙 mathematical sans-serif bold F, for FREEBUFF, the
+                                 #   harness. This row's vendor names the MODEL provider
+                                 #   (z-ai); the mark names the TOOL, so an F, not a Z.
+                                 #   (was ╔, Ambiguous — a box-drawing corner read as
+                                 #   frame damage here)
+    "moonshotai": "\u2318",      # ⌘ place-of-interest sign. This row's vendor names the
+                                 #   MODEL provider (Moonshot), but the mark happens to
+                                 #   name the TOOL — `⌘` reads "Command" for acp:command-code.
+                                 #   It survives by luck, not design: keyed to a
+                                 #   provider vendor, so do NOT "fix" it into a Moonshot logo.
 }
 
 # A mark is padded into a FIXED two display columns, not left as-is. Without the
