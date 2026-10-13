@@ -3233,9 +3233,11 @@ def test_every_vendor_colour_is_readable_on_a_dark_pane_and_not_a_repeat():
     # pane, which is why moonshotai is held at 252 and not its true 234. Nothing
     # enforced that, so a future straight conversion could reintroduce it. The
     # floor sits ABOVE both recorded failures (234 -> luminance 0.012, 237 ->
-    # 0.058) and BELOW the darkest colour the table still ships (z-ai 26 ->
-    # 0.131), so it costs no existing entry and rejects any brand that would
-    # vanish.
+    # 0.058) and BELOW the darkest colour the table still ships (hermes 130 ->
+    # 0.173), so it costs no existing entry and rejects any brand that would
+    # vanish. z-ai used to hold that spot at 26 -> 0.131; it is 108 now, at 0.376,
+    # which leaves hermes 130 -> 0.173 as the darkest shipped and the nearest
+    # thing to the floor, by 0.073.
     for vendor, colour in sorted(a._VENDOR_COLOURS.items()):
         assert _relative_luminance(_ansi_rgb(colour)) > 0.10, (
             vendor, colour, "too dark to read on a dark pane")

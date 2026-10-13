@@ -850,6 +850,57 @@ _HARNESS_MARKS = {
 # spinner is `undim`-exempt, and the glyphs are different shapes in different
 # columns. Worth re-checking rather than assuming the index alone separates them.
 #
+# FREEBUFF IS THE THIRD NON-SUBSTITUTION, AND THE ROW THAT MISLED: the key is
+# `z-ai`, which names z.ai the MODEL PROVIDER, but the glyph and this colour are
+# FREEBUFF'S, the harness the registry files under that vendor — which is exactly
+# what `_HARNESS_MARKS` says on this very key ("the mark names the TOOL, so an F,
+# not a Z"). A logo here is the HARNESS's, glyph AND colour; the tables are keyed
+# by vendor only as STORAGE, and the harness -> vendor hop is the registry's job.
+# So a reader who takes the key at face value converts a model provider's brand
+# instead of the tool's, which is how a sage green mark came to be painted 26 — a
+# saturated blue belonging to nothing in this table. Read `_HARNESS_MARKS` before
+# converting a colour; `deepseek` and `moonshotai` are the same trap, already
+# flagged on their marks.
+#   * the brand is #A4BA96, a muted sage. The NEAREST index in the whole palette is
+#     144, (175,175,135), at OKLab 3.087 and sRGB 21.6 — but 108, (135,175,135), is
+#     shipped instead, at 5.274 and 34.45. It is deliberately NOT the nearest, and it
+#     is the next-nearest of all 240. The cube takes the brand's red 164 DOWN to the
+#     135 rung (29, where the next rung 95 is 69 away), green 186 down to 175 (11,
+#     next 29 away) and blue 150 down to 135 (15, against 25 for 175), so the whole
+#     of the conversion error is 29, 11 and 15. The greyscale ramp is still not a
+#     candidate: its best is 249, a pure neutral, at 5.567.
+#
+# Two things pay for the 2.187 of OKLab the second-nearest costs, and both were
+# decided rather than drifted into:
+#
+# HUE IS THE CHANNEL A BRAND MARK IS RECOGNISED BY. The brand's OKLab hue is 133
+#     degrees; 144 sits at 108 and reads OLIVE, 108 at 145 and reads green. For a
+#     logo that is the error that shows — a sage gone olive is simply the wrong
+#     colour — and 2.187 of total distance is a fair price for keeping the hue.
+#
+# 108 ALSO CLEARS THE TIGHTEST PAIR IN THIS TABLE. At 144 the mark would have sat
+#     5.578 from 145, `opencode-zen`'s mark: red and green EQUAL at 175 each and
+#     OKLab lightness barely separating them (0.744 against 0.754), so the whole of
+#     the difference is 40 of blue — 145 exactly NEUTRAL (chroma 0.000) where 144
+#     carries 0.055. That is closer than openai 36 against goose 37 at 5.969, which
+#     has the SAME one-channel geometry and has always shipped unremarked. 108 puts
+#     the pair at 8.234, clear of it. So the row that moved is not the one whose
+#     brand colour was closest; it is the one that sat next to a neutral.
+#
+# 145 IS NOT A BRAND COLOUR AT ALL, which is worth having on the record before
+#     anyone reads the 108/145 distance as a collision between two brands.
+#     `opencode-zen`'s glyph is ▯, U+25AF WHITE VERTICAL RECTANGLE, and "white"
+#     there is the Unicode naming convention for HOLLOW — unfilled — not a colour.
+#     The operator confirmed the mark carries no brand colour, so 145 is a flat
+#     neutral standing in for no identity. That row had nothing to preserve and
+#     COULD have been the one to move; it did not have to be, because 108 is
+#     independently the better sage. Written down so the next person to sit with
+#     this pair does not re-run the investigation from scratch.
+#
+# Luminance falls from 0.415 to 0.376 — far above the dark-pane floor, and still NOT
+#     the darkest colour the table ships: hermes 130 at 0.173 keeps that slot, which
+#     is why the floor test still names hermes rather than this row.
+#
 # THE FLOOR ABOVE IS A DARK-PANE FLOOR, and it is an ASSUMPTION, not an enforced
 # one: `_Colours.attr` colours a FOREGROUND on the TERMINAL'S OWN background (the
 # `-1` in `init_pair`), so on a light terminal every entry here inverts into the
@@ -866,7 +917,7 @@ _VENDOR_COLOURS = {
     "goose": 37,
     "hermes": 130,
     "cognition": 32,
-    "z-ai": 26,
+    "z-ai": 108,
     "opencode-zen": 145,
     "deepseek": 63,
     "cursor": 244,
