@@ -350,6 +350,213 @@ def harness_labels() -> dict[str, str]:
     return labels
 
 
+# The sibling of `_REGISTRY_LABELS`, read from the same catalog for the same
+# reason: `vendor` is a registry fact (it drives the cross-vendor review check),
+# so the view that draws a per-vendor mark reads it from here rather than
+# keeping a second harness->vendor table that could drift from the catalog.
+_REGISTRY_VENDORS: dict[str, str] | None = None
+
+
+def harness_vendors() -> dict[str, str]:
+    """`{harness id: vendor}` from installer/registry.json, cached.
+
+    The same degradation contract as `harness_labels`, and for the same reason:
+    never raises and never returns a half-read table. A missing, unreadable or
+    malformed catalog yields `{}`, and a harness that is absent falls back to no
+    vendor — the caller (a mark, a review check) then renders nothing rather
+    than guessing a vendor the registry does not name. A broken catalog must
+    cost a cosmetic detail, never a pane.
+    """
+    global _REGISTRY_VENDORS
+    if _REGISTRY_VENDORS is not None:
+        return _REGISTRY_VENDORS
+    vendors: dict[str, str] = {}
+    try:
+        catalog = json.loads(REGISTRY_PATH.read_text())
+    except (OSError, ValueError):
+        catalog = None
+    rows = catalog.get("agents") if isinstance(catalog, dict) else None
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        harness, vendor = row.get("harness"), row.get("vendor")
+        if isinstance(harness, str) and harness and \
+                isinstance(vendor, str) and vendor:
+            vendors[harness] = vendor
+    _REGISTRY_VENDORS = vendors
+    return vendors
+
+
+# The harness an installed sub-agent ACTUALLY runs on, read from the spec
+# Omnigent installed for it — the one honest answer a WORKER row can give.
+#
+# A worker's LISTING row carries no `harness` (only a root's detail fetch does),
+# so a mark resolved from the row alone drew a blank for every worker. The fix is
+# NOT to guess a vendor from the agent's NAME: a name that merely resembles a
+# registry id says nothing about which harness ran, and a plausible wrong mark is
+# worse than an honest atom because nothing on screen flags the guess. The name
+# is still the KEY we look up by — but the VALUE comes from the spec, whose
+# `executor.harness` is the harness the session was dispatched on. Layout:
+#
+#     <home>/agents/<Bundle>/agents/<name>/config.yaml
+#
+# There can be more than one bundle directory; see `_scan_agent_harnesses` for
+# how a collision is resolved deterministically.
+_REGISTRY_AGENT_HARNESSES: dict[str, str] | None = None
+
+# The prefix the orchestrator puts on a worker name in a session title
+# (`coder_zen:task`). The installed spec is named/`dir`'d `coder_zen` while the
+# row's title, through `split_title`, hands over `zen` — so both spellings are
+# indexed and either resolves.
+_WORKER_PREFIX = "coder_"
+
+# The two directory levels under the home, and the spec's filename:
+#   <home>/agents/<Bundle>/agents/<name>/config.yaml
+AGENTS_DIRNAME = "agents"
+SPEC_FILENAME = "config.yaml"
+
+try:
+    import yaml as _yaml
+except Exception:  # pragma: no cover - the "no PyYAML" test drives this path
+    # PyYAML is NOT a dependency of `og agents` — the module docstring insists it
+    # must run in any terminal — so its absence has to degrade to "no worker
+    # harness known" (every worker falls to the atom) rather than stop the pane
+    # from starting. The spec scan below is the only reader of YAML here, and it
+    # is the only thing this guard protects.
+    _yaml = None
+
+
+def default_home() -> Path:
+    """The Omnigent home directory, read from the environment NOW.
+
+    `$OMNIGENT_HOME`, else `~/.omnigent`. Deliberately a function and not a
+    module-level constant, for the same reason `default_state_path` is: the value
+    depends on the environment, and a test (or an operator running against a
+    sandbox home) must be able to redirect it without editing a constant frozen
+    at import time.
+    """
+    return Path(os.environ.get("OMNIGENT_HOME") or Path.home() / ".omnigent")
+
+
+def agent_harnesses() -> dict[str, str]:
+    """`{agent name: harness id}` from the installed agent specs, cached.
+
+    The WORKER counterpart of `harness_labels` / `harness_vendors`, and the one
+    input `og agents` needs to mark a row by the harness it ran on rather than by
+    what its name resembles.
+
+    Cached on ONE scan of the specs, not a filesystem walk per call: the pane
+    polls every few seconds and re-scans on every row, so after the first call
+    this must cost nothing. A test redirecting the home (or making PyYAML
+    disappear) resets `_REGISTRY_AGENT_HARNESSES` to force a fresh scan.
+
+    The same degradation contract as its two siblings, and for the same reason:
+    never raises and never returns a half-read table. A missing home, a missing
+    agents directory, an unreadable or malformed spec or the absence of PyYAML
+    all yield `{}` (or omit that one agent) — the caller then draws the atom,
+    which is a cosmetic loss, never a pane that fails to render.
+    """
+    global _REGISTRY_AGENT_HARNESSES
+    if _REGISTRY_AGENT_HARNESSES is not None:
+        return _REGISTRY_AGENT_HARNESSES
+    _REGISTRY_AGENT_HARNESSES = _scan_agent_harnesses(default_home())
+    return _REGISTRY_AGENT_HARNESSES
+
+
+def _scan_agent_harnesses(home: Path) -> dict[str, str]:
+    """One walk of `<home>/agents/*/agents/*/config.yaml` -> `{alias: harness}`.
+
+    DETERMINISTIC across bundles: the bundle directories are sorted by name and
+    the FIRST spec that names a given alias wins (`setdefault`). A mark that
+    changed between runs because a directory listing happened to come back in a
+    different order would be a bug, so the order is fixed here rather than left
+    to the filesystem. (There is normally one bundle — the one `og install.sh`
+    wrote — so this only matters if a machine carries several.)
+
+    Both the spec's own `name:` field and its DIRECTORY name are indexed, and each
+    is indexed with the `coder_` prefix stripped as well: the row's agent name is
+    the title's `<role>_<agent>` prefix with `coder_` removed (see `split_title`),
+    while the installed spec is spelled `coder_zen`.
+
+    Never raises: a missing/unreadable `agents` directory, or an unreadable
+    bundle, contributes nothing. See `_read_spec` for the per-file contract.
+    """
+    out: dict[str, str] = {}
+    try:
+        bundles = sorted(p for p in (home / AGENTS_DIRNAME).iterdir()
+                         if p.is_dir())
+    except OSError:
+        return out
+    for bundle in bundles:
+        try:
+            specs = sorted(p for p in (bundle / AGENTS_DIRNAME).iterdir()
+                           if p.is_dir())
+        except OSError:
+            continue
+        for spec_dir in specs:
+            name, harness = _read_spec(spec_dir / SPEC_FILENAME)
+            if not harness:
+                continue
+            for alias in (name, spec_dir.name):
+                if not alias:
+                    continue
+                if alias.startswith(_WORKER_PREFIX):
+                    out.setdefault(alias[len(_WORKER_PREFIX):], harness)
+                out.setdefault(alias, harness)
+    return out
+
+
+def _read_spec(path: Path) -> tuple:
+    """`(name, harness)` from one spec's `config.yaml`, or `(None, None)`.
+
+    Never raises. A missing file, unreadable bytes, malformed YAML, a spec that
+    is not a mapping, an `executor` that is not one, or an executor with no
+    harness all read as "no harness known": the caller draws the atom, which is a
+    cosmetic loss and never a pane that fails to render.
+
+    The harness is read from `executor.harness`, and from `executor.config.harness`
+    where the installer actually writes it (see templates/coder.yaml.tmpl) — the
+    two are checked so a spec in either shape resolves.
+    """
+    if _yaml is None:
+        return None, None
+    try:
+        data = _yaml.safe_load(path.read_text())
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    name = data.get("name")
+    name = name if isinstance(name, str) and name else None
+    executor = data.get("executor")
+    if not isinstance(executor, dict):
+        return name, None
+    harness = executor.get("harness")
+    if not isinstance(harness, str) or not harness:
+        config = executor.get("config")
+        harness = config.get("harness") if isinstance(config, dict) else None
+    if not isinstance(harness, str) or not harness:
+        harness = None
+    return name, harness
+
+
+def agent_harness(agent: object) -> str | None:
+    """The harness id the agent NAME's installed spec declares, or None.
+
+    The lookup is EXACT (case-sensitive): the names come from `split_title`,
+    which strips `coder_` from the title's prefix, and the scan indexes both the
+    `coder_`-prefixed and bare spellings — so `zen` and `coder_zen` both resolve
+    and no case-folding is needed for the names this view actually sees (verified
+    against a live listing: every worker name is lowercase).
+
+    Never raises: a non-string or empty name resolves to None, exactly as a name
+    with no installed spec does, and the caller then draws the atom.
+    """
+    if not isinstance(agent, str) or not agent.strip():
+        return None
+    return agent_harnesses().get(agent.strip())
+
+
 def agent_label(session: dict) -> str:
     """The name herdr shows in a pane's agent column for this session.
 
@@ -1385,8 +1592,15 @@ class Bridge:
             # the release on removal matches exactly what was reported. herdr
             # matches the two by that string; a release naming something else
             # would leave the marker up.
+            #
+            # `agent_session_id` is the Omnigent session id, and it is sent so
+            # the record can be focused later: `agent.focus {target}` resolves a
+            # target against a record's id, and the `og agents` pane aims focus
+            # at `Row.session_id` — the very id passed here. Without it the
+            # record carries no id for a target to match, so that pane could
+            # never bring this agent's space forward.
             self.client.report_agent(pane_id, self.source, agent=rec["agent"],
-                                     state=state)
+                                     state=state, agent_session_id=sid)
             rec["step"] = 2
         if rec["step"] <= 2:
             # `pane.report_metadata` with NOTHING to set is refused by herdr:
@@ -1469,8 +1683,13 @@ class Bridge:
         # carries the LISTING row, which has no `harness` to derive from, and
         # reporting a different agent string than the one we claimed would make
         # herdr show two markers for one pane.
+        #
+        # Re-sent every time so the record keeps the id that `agent.focus` matches
+        # on — the same Omnigent session id the `og agents` pane holds in
+        # `Row.session_id` and would send as the target.
         self.client.report_agent(rec["pane_id"], self.source,
-                                 agent=rec["agent"], state=state)
+                                 agent=rec["agent"], state=state,
+                                 agent_session_id=sid)
         if title_changed:
             # A title that is None is a title that cannot be reported: see
             # `_setup_pane` for the measured refusal herdr answers with a frame
@@ -1627,11 +1846,11 @@ def default_state_path() -> Path:
     Deliberately not a module-level constant: the value depends on
     $OMNIGENT_HOME, and a test (or an operator running against a sandbox home)
     must be able to redirect it by setting the variable, not by editing a
-    constant that was frozen when the module happened to be imported. Same
-    resolution as every other module here: $OMNIGENT_HOME, else ~/.omnigent.
+    constant that was frozen when the module happened to be imported. The home
+    itself is resolved by `default_home`, so this and the agent-spec scan cannot
+    disagree about which home they are reading.
     """
-    return Path(os.environ.get("OMNIGENT_HOME") or Path.home() / ".omnigent") \
-        / STATE_FILENAME
+    return default_home() / STATE_FILENAME
 
 
 def load_state(path: Path, note: list[str] | None = None) -> dict:
