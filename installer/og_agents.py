@@ -14,23 +14,24 @@ The listing is cheap and drives the live view; the detail row is 121 KB and is
 fetched as little as possible. See `AgentModel.refresh` for the budget and why a
 per-row-per-poll fetch is a defect rather than a slow path.
 
-The shape of the view is the operator's chosen C2 template (rendered three ways
-in docs/proto/tui_chosen.py, C2 approved): a heavy `━` title bar per root with the
-root's name inlaid, a `█/░` done-gauge under it, then the root's workers GROUPED
-BY STATE, each group opened by a breathing rail row and each worker a rounded
-box. There are NO worded group labels: the animated glyph inside each box says
+The shape of the view is the operator's C2 template, iterated against the pane's
+measured feedback: a rounded box per root drawn at column 0 (OUTDENTED relative
+to its workers), then the root's workers GROUPED BY STATE, each group opened by a
+breathing rail row and each worker a rounded box indented behind a four-column
+gutter. There are NO worded group labels: the animated glyph in the gutter says
 the state, and the breathing rail alone marks where one group ends and the next
-begins. A GUTTER runs down the left of a group — its own `│` rail, then the caret
-column, then the box — so the rail is a column of its own at the pane's left edge,
-unbroken across the breathing rows and EVERY row of every box, and the caret `▸`
-sits between the rail and the box, on the box's first row alone, pointing AT it
-from outside. A per-state glyph and the harness brand mark sit in fixed columns
-left of the title inside the box; the WORKING glyph is a braille spinner (see
-SPIN_FRAMES), so a live row visibly animates while blocked, failed and finished
-rows stay static. A boxed access panel sized to its own content and a one-line
-footer pin to the bottom. `render` is a pure function from state to a list of
-lines and curses only paints them; that separation is what lets the view be
-tested with `--once`, with no tty in sight.
+begins. The gutter is the rail's own column (`⊙` where an agent's box hangs off
+it, `│` on every other row), a space, the state glyph's column, and a space — so
+one unbroken line runs down the pane's left edge, with a node at each agent, out
+of the root box's own bottom-left corner and across the breathing rows.
+SELECTION IS BRIGHTNESS: the selected worker's box paints normal while every
+other box paints dim — there is no caret glyph. Inside the box the harness brand
+mark and the title sit flush left with the meta flush right; the WORKING glyph is
+a braille spinner (see SPIN_FRAMES), so a live row visibly animates while
+blocked, failed and finished rows stay static. A boxed access panel sized to its
+own content and a one-line footer pin to the bottom. `render` is a pure function
+from state to a list of lines and curses only paints them; that separation is
+what lets the view be tested with `--once`, with no tty in sight.
 
 This module is deliberately NOT herdr-specific: it reads Omnigent's HTTP API and
 must run in any terminal. It sends NOTHING to a session — no prompting, no
@@ -76,25 +77,26 @@ from og_herdr_watch import (
 
 DEFAULT_INTERVAL = 3.0
 
-# The static per-state glyph shown beside a worker, the operator's chosen TUI
-# vocabulary: ⏸ blocked, ✗ failed, ○ finished. `working` has NO entry here — it
-# gets the SPINNER (see SPIN_FRAMES), because the operator's rule is "the spinner
-# before the agent logo is the status": a live row has to visibly animate, and a
-# moving dot is the one glyph that says "this is running" without a legend. The
-# three glyphs here stay STATIC on purpose — a paused or finished thing must not
-# look busy. This replaces the ASCII `+ ! x ?` the pane used to draw, and keeps
-# the six-dot braille spinner it also already had for working; `?` stays the one
-# honest glyph for a status `display_state` could not name (-> "unknown").
+# The static per-state glyph shown in a worker's gutter, the operator's chosen
+# TUI vocabulary: ⏸ blocked, ✗ failed, ✓ finished. `working` has NO entry here —
+# it gets the SPINNER (see SPIN_FRAMES), because the operator's rule is "the
+# spinner before the agent logo is the status": a live row has to visibly
+# animate, and a moving dot is the one glyph that says "this is running" without
+# a legend. The three glyphs here stay STATIC on purpose — a paused or finished
+# thing must not look busy. This replaces the ASCII `+ ! x ?` the pane used to
+# draw, and keeps the six-dot braille spinner it also already had for working;
+# `?` stays the one honest glyph for a status `display_state` could not name
+# (-> "unknown"). `✓` finished pairs with `✗` failed: same Dingbats block, same
+# weight, and it reads as done rather than merely not-running.
 #
-# ○ is East Asian AMBIGUOUS. It is composed as ONE layout column, which is what a
-# western terminal paints — the same Ambiguous-charged-one rule the boxes use (see
-# ROUND_CORNERS) and the mark slot's own western ruler applies too (see
-# `_slot_width`, and the CJK trade-off it documents).
+# ✓ is East Asian NARROW (measured: `east_asian_width("\u2713") == "N"`), one
+# layout column. ○, the circle it replaced, was AMBIGUOUS and also composed as
+# one column under the len-based ruler, so the swap is width-neutral.
 STATE_GLYPH = {
     "blocked": "\u23f8",   # ⏸
     "failed": "\u2717",    # ✗
     "unknown": "?",
-    "idle": "\u25cb",      # ○
+    "idle": "\u2713",      # ✓
 }
 
 # The spinner that IS the working glyph: SIX braille dots, and only the top two
@@ -109,11 +111,13 @@ SPIN_TICK = 0.12
 
 # --- the C2 pane geometry (docs/proto/tui_chosen.py, variant C2) ---------------
 #
-# A GUTTER runs down the pane's left edge: the rail `│` in its OWN column, a
-# space, the caret column, a space — and the worker's rounded box starts AFTER
-# it. So the rail carries the unbroken vertical line down a group alone (the box
-# no longer does that job, because the box has moved right), and the caret points
-# AT the box from OUTSIDE it rather than sitting inside.
+# A GUTTER runs down the pane's left edge: the NODE column (the rail `│`, or `⊙`
+# where an agent's box hangs off it), a space, the STATE glyph column, a space —
+# and the worker's rounded box starts AFTER it. So the rail carries the unbroken
+# vertical line down a group alone, with a node at each agent (the box no longer
+# draws that line itself, because the box has moved right), and the state glyph
+# points OUT of the box rather than sitting inside it. The root is a box in
+# column 0, so the rail drops out of its own bottom-left corner.
 #
 # WIDTH IS COMPOSED WITH ONE RULER: the len-based one (`_clip`/`_pad`, the
 # `_visible_width` notion). Every box-drawing glyph here is East Asian AMBIGUOUS,
@@ -128,18 +132,21 @@ SPIN_TICK = 0.12
 # locale, and carries no Ambiguous glyph for it to bite on.
 ROUND_CORNERS = ("\u256d", "\u2500", "\u256e", "\u2502", "\u2570", "\u256f")
 RAIL = "\u2502"          # U+2502, the group rail, its own column at the left edge
-TITLE_RULE = "\u2501"    # U+2501 heavy horizontal: the root's title bar
-GAUGE_FULL = "\u2588"    # █
-GAUGE_EMPTY = "\u2591"   # ░
-GAUGE_CELLS = 10         # the done-gauge is a fixed ten-cell bar
-CARET = "\u25b8"         # ▸ the selection marker; the caret row is the SELECTED one
+# ⊙ (U+2299) is the NODE: the point on the rail where one agent's box branches
+# off it, drawn in the rail's column on that box's content row. U+2299 is East
+# Asian AMBIGUOUS — the same class as `│` and every box glyph this pane already
+# draws — so the len-based layout ruler charges it one column exactly as it does
+# the rail, and this adds no new width risk. Its box-drawing siblings are all
+# Ambiguous too, so the node sits in the same column as the line it rides.
+NODE = "\u2299"
 
-# The four columns a box spends BEFORE its rounded border: the rail, a space, the
-# caret column, a space. The caret is drawn on the box's first row only and blank
-# on every other row of the box (repeating it down the box reads as several
-# selected things — the rule the pre-C2 renderer already followed). The breathing
-# rails keep the rail in column 0 too, so one unbroken line runs down the whole
-# group.
+# The four columns a box spends BEFORE its rounded border: the NODE column (the
+# rail, or `⊙` where the box hangs off it), a space, the STATE glyph column, a
+# space. The node and the state glyph are drawn on the box's CONTENT row alone
+# and blank on its border and snippet rows, so the rail reads as one unbroken
+# line with a node at each agent — the rule the pre-C2 renderer already followed
+# for its caret. The breathing rails keep the rail in column 0 too, so the line
+# runs unbroken down the whole group.
 GUTTER = 4
 
 # The narrowest box there is: two corners and two rules is the smallest rectangle
@@ -152,9 +159,9 @@ BOX_MIN = 4
 # `unknown` (a status `display_state` could not name) is its own group rather than
 # folded into `failed`, so its row keeps its own `?` glyph. A state outside this
 # tuple still gets a group, sorted last (see `_grouped`), so no worker is dropped.
-# The groups carry NO worded label: the state glyph inside each box says it, and a
-# breathing rail row alone marks where one group ends and the next begins. Only
-# the ORDER survives, and it is still what puts what needs attention first.
+# The groups carry NO worded label: the state glyph in each box's gutter says it,
+# and a breathing rail row alone marks where one group ends and the next begins.
+# Only the ORDER survives, and it is still what puts what needs attention first.
 GROUP_ORDER = ("working", "blocked", "failed", "unknown", "idle")
 
 # The DISPLAY state `herdr_state` does not have. See `display_state` for why it
@@ -235,12 +242,18 @@ TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
 
 # The paint role of a line. Plain strings so the composer stays pure and
 # testable; the curses attributes that go with them live in `_run_tui`.
-# SELECTED belongs to the CARET ROW of the selected worker and no other line:
-# the rest of its box is NORMAL, so selecting a worker marks it with the caret
-# instead of reverse-videoing the whole block. TITLE is the ONE place the design
-# spends A_REVERSE — the root's heavy title bar; everything else earns its look
-# from glyphs and layout, and the pane carries no colour or background fill.
-NORMAL, SELECTED, DIM, TITLE = "normal", "selected", "dim", "title"
+#
+# SELECTION IS BRIGHTNESS. An UNSELECTED worker's box paints DIM on every line;
+# the SELECTED worker's box paints NORMAL, so it reads as white against the
+# dimmed others. SELECTED is a role of its own even though it maps to the same
+# attribute as NORMAL, because it is hung on exactly ONE line — the selected
+# box's first row — and `_run_tui` scans for `role == SELECTED` to find the
+# block to scroll to. Lose it and scroll-to-selection breaks silently, with no
+# symptom until the list outgrows the pane.
+#
+# There is no TITLE/A_REVERSE role any more: the root is a rounded box like a
+# worker's, not a reverse-video bar, so the pane spends no A_REVERSE at all.
+NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
 # is `http://127.0.0.1:6767`.
@@ -333,7 +346,7 @@ def state_glyph(state: str, spin: int) -> str:
     Pure in `spin`: the caller owns the frame counter, so render stays a function
     of its arguments and `--once` (which passes 0) has no animation to be
     inconsistent about. Only `working` animates — a paused or finished state must
-    not look busy — so `⏸ ✗ ○` come straight from `STATE_GLYPH` and a state the
+    not look busy — so `⏸ ✗ ✓` come straight from `STATE_GLYPH` and a state the
     vocabulary does not name draws `?` rather than nothing.
     """
     if state == "working":
@@ -602,13 +615,14 @@ class Row:
 
     THREE kinds, told apart by a flag, because C2 draws each differently:
 
-      * a ROOT row (`is_root`): the heavy title bar and its done-gauge. `text` is
-        the root's name, `harness` the label right of the gauge, and `done`/`total`
-        the gauge's numerator and denominator.
+      * a ROOT row (`is_root`): an outdented rounded box. `text` is the root's
+        name and `harness` the label flush right on its one content row. It draws
+        in column 0, OUTDENTED from its workers at column `GUTTER`, because it is
+        their parent; the group rail below it drops out of its bottom-left corner.
       * a RAIL row (`rail`): the blank breathing row above a group, drawn as the
         rail alone so the vertical line is unbroken between boxes. It carries the
         group's state, but no text — the worded group label is gone and the state
-        is read from the animated glyph inside each box.
+        is read from the animated glyph in each box's gutter.
       * a WORKER row (none of the above): a rounded box. `text` is the task (the
         title with its `<role>_<agent>:` prefix removed); `agent`, `meta` and
         `harness` are its identity; `depth` is how far below the root it sits.
@@ -619,8 +633,8 @@ class Row:
     the agent's installed spec declares, found by `agent` (see `worker_box` and
     `worker_mark`). "" is the honest blank, never a guessed vendor.
 
-    Only a WORKER row is selectable (see `_is_box`): the caret belongs to a box,
-    so the rails and the roots are stepped over by the selection.
+    Only a WORKER row is selectable (see `_is_box`): selection is a property of a
+    box, so the rails and the roots are stepped over by the selection.
     """
 
     session_id: str
@@ -634,8 +648,6 @@ class Row:
     agent: Optional[str] = None
     meta: str = ""
     harness: str = ""
-    done: int = 0
-    total: int = 0
 
 
 @dataclass
@@ -887,19 +899,19 @@ def build_rows(
 ) -> list[Row]:
     """The display rows for the selected roots' trees, in DISPLAY order (C2).
 
-    The order built here IS the order on screen, and it is what the caret indexes
-    into: per root a title-bar row, then for each state group a breathing rail
-    row and the group's worker boxes. So the whole view reads top to bottom the
-    way it is painted.
+    The order built here IS the order on screen, and it is what the selection
+    indexes into: per root an outdented box row, then for each state group a
+    breathing rail row and the group's worker boxes. So the whole view reads top
+    to bottom the way it is painted.
 
     THE GROUPING HAPPENS HERE, not in `_pane`, and that is load-bearing. If the
     view grouped the workers while `Frame.rows` stayed in tree order, the arrow
     keys — `move_selection` and `_run_tui`'s scroll — would walk the rows in
-    tree order while the eye read state order, and the caret would appear to jump
-    around at random. Sorting the ROWS themselves keeps every index-based helper
-    correct without a change; the SELECTION follows its session across this
-    reorder, because a held index would land on whichever worker now sits there
-    (see `snap_selection`).
+    tree order while the eye read state order, and the selection would appear to
+    jump around at random. Sorting the ROWS themselves keeps every index-based
+    helper correct without a change; the SELECTION follows its session across
+    this reorder, because a held index would land on whichever worker now sits
+    there (see `snap_selection`).
 
     The sort is STABLE (`_grouped`), so two polls that brought the same set of
     workers produce byte-identical rows; an unstable order would make otherwise
@@ -927,7 +939,7 @@ def build_rows(
         if root_id not in by_id:
             continue
         workers = _worker_rows(by_id, children, root_id, snippets, expanded, clock)
-        rows.append(_root_row(by_id[root_id], root_id, workers))
+        rows.append(_root_row(by_id[root_id], root_id))
         for state, group in _grouped(workers):
             # The rail row opens the group: the ONE thing that marks where one
             # group ends and the next begins, now the worded label is gone. It
@@ -938,12 +950,12 @@ def build_rows(
     return rows
 
 
-def _root_row(session: dict, root_id: str, workers: list[Row]) -> Row:
-    """The title-bar row for one root: its name, harness label and done-gauge.
+def _root_row(session: dict, root_id: str) -> Row:
+    """The row for one root: its name and harness, drawn as an outdented box.
 
-    `done` counts the workers in the `idle` group — the design's `finished` — and
-    `total` is every worker under the root, so a root with no workers draws an
-    empty `0/0` bar rather than a broken one (`_gauge` guards the divide).
+    The done-gauge that used to sit under the name is gone; the harness LABEL is
+    kept, moved to the box's right edge. `workers` was only ever read to count the
+    gauge's numerator and denominator, so the parameter is gone with it.
     """
     harness = session.get("harness")
     title = (session.get("title") or "").strip() or root_id
@@ -954,8 +966,6 @@ def _root_row(session: dict, root_id: str, workers: list[Row]) -> Row:
         depth=0,
         is_root=True,
         harness=harness if isinstance(harness, str) else "",
-        done=sum(1 for row in workers if row.state == "idle"),
-        total=len(workers),
     )
 
 
@@ -1140,19 +1150,6 @@ def access_lines(access: Access, width: int) -> list[str]:
     return _boxed(content, width)
 
 
-def _rule_label(label: str, width: int) -> str:
-    """A heavy rule with `label` inlaid near the left: the root's title bar.
-
-    `━━ name ━━━…` — two heavy horizontals, the name, then heavy fill to the pane
-    edge. When the label leaves no room for the leading rule the whole thing
-    degrades to the bare label, clipped, rather than an unreadable stub.
-    """
-    lab = f" {label} "
-    if len(lab) + 2 >= width:
-        return _clip(lab, width)
-    return _clip(TITLE_RULE * 2 + lab + TITLE_RULE * (width - 2 - len(lab)), width)
-
-
 def _two_col(left: str, right: str, width: int) -> str:
     """`left` flush left, `right` flush right, exactly `width` columns.
 
@@ -1162,8 +1159,8 @@ def _two_col(left: str, right: str, width: int) -> str:
     fixed thing the row is really about, so it is worth keeping whole while the
     elastic left gives way. Both callers rely on this: the worker row hands it
     the meta — `2m14s`, `failed`, `waiting on you`, `done 6m ago`, the thing being
-    waited on — and the root gauge row the harness label (`Claude Code`). Only
-    when `right` alone is wider than `width` is it clipped itself.
+    waited on — and the root box's content row the harness label (`Claude Code`).
+    Only when `right` alone is wider than `width` is it clipped itself.
     """
     if width <= 0:
         return ""
@@ -1174,35 +1171,31 @@ def _two_col(left: str, right: str, width: int) -> str:
     return _pad(left, room) + right
 
 
-def _gauge(done: int, total: int, cells: int) -> str:
-    """A `cells`-wide done bar: `█` for the fraction done, `░` for the rest.
-
-    A root with no workers has nothing to be a fraction OF, so `0/0` draws an
-    empty bar rather than dividing by zero.
-    """
-    filled = 0 if not total else int(round(done / total * cells))
-    return GAUGE_FULL * filled + GAUGE_EMPTY * (cells - filled)
-
-
 def _root_lines(row: Row, width: int) -> list[tuple[str, str]]:
-    """A root as its two header lines: the heavy title bar, then the done-gauge.
+    """A root as a rounded box drawn at column 0: name left, harness right.
 
-    This REPLACES the bare one-line root header the pane used to draw — the thing
-    the operator complained was "not boxed". The bar is the ONE line the design
-    spends A_REVERSE on; the gauge right-aligns the harness label.
+    OUTDENTED relative to its workers, which sit at column `GUTTER`: the root is
+    their parent, and the group rail below it drops out of its own bottom-left
+    corner `╰` — both in column 0 — so the rail visibly continues out of the box.
+    This replaces the heavy `━` title bar and its done-gauge; the harness LABEL is
+    kept, moved to the box's right edge, and no line of the pane spends A_REVERSE.
+
+    Below `BOX_MIN` a one- or two-column "box" would be a lie, so the root
+    degrades to a single clipped line, exactly as `worker_box`'s ladder does.
     """
-    bar = _rule_label(row.text, width)
-    gauge = _two_col(
-        f"{_gauge(row.done, row.total, GAUGE_CELLS)}  {row.done}/{row.total} done",
-        harness_label(row.harness), width)
-    return [(bar, TITLE), (gauge, NORMAL)]
+    if width < BOX_MIN:
+        return [(_clip(row.text, width), NORMAL)]
+    content = _two_col(" " + harness_mark(row.harness) + " " + row.text,
+                       harness_label(row.harness), width - 2)
+    return [(line, NORMAL) for line in _round_box([content], width)]
 
 
 def _round_box(inner_lines: list[str], width: int) -> list[str]:
     """`inner_lines` in a rounded box EXACTLY `width` columns wide (len ruler).
 
-    The corners are the operator's one addition against the heavy title bar:
-    light `─` under curved `╭╮╰╯`, and the weight contrast is the interest.
+    Both the root (drawn at column 0) and each worker box (behind the gutter) are
+    rounded: light `─` under curved `╭╮╰╯`, and the weight contrast is the
+    interest.
     """
     width = max(BOX_MIN, width)
     tl, hz, tr, vt, bl, br = ROUND_CORNERS
@@ -1214,27 +1207,36 @@ def _round_box(inner_lines: list[str], width: int) -> list[str]:
 
 def worker_box(row: Row, width: int, selected: bool,
                spin: int = 0) -> tuple[list[str], int]:
-    """One worker as a guttered, rounded box, and the index of its caret row.
+    """One worker as a guttered, rounded box, and the index of its SELECTED row.
 
-    The box starts AFTER the `GUTTER`-column gutter (`│`, space, caret, space), so
-    its own left edge sits at column 4 and one unbroken rail runs down the group
-    at column 0 — the shape the operator asked for. Every returned line is exactly
-    `width` columns: the four-column gutter plus a box `width - GUTTER` wide.
+    The box starts AFTER the `GUTTER`-column gutter (the node column, a space, the
+    state glyph column, a space), so its own left edge sits at column 4 and one
+    unbroken rail runs down the group at column 0 — the shape the operator asked
+    for. Every returned line is exactly `width` columns: the four-column gutter
+    plus a box `width - GUTTER` wide.
 
-    The caret `▸` is drawn on the box's FIRST row (the `╭` border) and blank on
-    every other row of the box, so it points AT the box from outside rather than
-    sitting inside it. The returned index is 0 — the caller hangs the SELECTED
-    role there, which is the row the live view scrolls to keep visible.
+    The gutter's NODE column carries `⊙` on the box's CONTENT row — the point
+    where this agent's box hangs off the rail — and the rail `│` on every other
+    row of the box; the STATE glyph column carries `state_glyph` on that same
+    content row and a space elsewhere. So the state glyph has LEFT the box: the
+    content row inside is just ` <mark>  <title>` flush left with the meta flush
+    right. The returned index is 0 — the caller hangs the SELECTED role there,
+    which is the row the live view scrolls to keep visible.
+
+    `selected` does NOT change the text this returns: selection is the paint role
+    the caller hangs on `selected_row`, never a glyph. So `--once`, which has no
+    attributes, cannot show which worker is selected — a one-shot dump carries no
+    selection signal at all (see `main`).
 
     The box is THREE rows — top border, ONE content row, bottom border — and FOUR
     when the report is expanded (the extra row is the dimmed snippet, INSIDE the
     box, never a loose line that would break the rectangle). The single content
-    row carries the state glyph, the harness mark in its fixed two-column slot and
-    the title flush left, with the meta (`2m14s`, `failed`, `waiting on you`) flush
-    right on the SAME row. The AGENT NAME is gone: the mark already names the
-    harness the name did, so the meta — the one thing on the row the mark does not
-    say — is all that is left to draw. `_two_col` keeps the meta's columns and
-    clips the TITLE first when the line is tight.
+    row carries the harness mark in its fixed two-column slot and the title flush
+    left, with the meta (`2m14s`, `failed`, `waiting on you`) flush right on the
+    SAME row. The AGENT NAME is gone: the mark already names the harness the name
+    did, so the meta — the one thing on the row the mark does not say — is all
+    that is left to draw. `_two_col` keeps the meta's columns and clips the TITLE
+    first when the line is tight.
 
     `spin` is the frame counter `state_glyph` turns into a glyph, and it animates
     the WORKING row alone: a blocked or finished box renders identically at every
@@ -1250,17 +1252,18 @@ def worker_box(row: Row, width: int, selected: bool,
     glyph = state_glyph(row.state, spin)
 
     # THE DEGRADATION LADDER. A worker line is gutter + box, and below some width
-    # they stop fitting together. They give up in this order — the caret column
-    # and the gutter BEFORE the box, because the box is what carries the content:
+    # they stop fitting together. The gutter's two named columns give up in this
+    # order — the STATE glyph column and its space BEFORE the box, and the NODE
+    # column before the box too, because the box is what carries the content:
     #
-    #   1. width >= GUTTER + BOX_MIN (8): the shipped shape — `│`, space, caret
-    #      column, space, then a box of width - GUTTER.
-    #   2. width >= 2 + BOX_MIN (6): the caret column and its space are dropped,
-    #      there being no room for them, leaving `│` + one space before the box.
-    #      No `▸` is drawn here: the caret is the selection MARKER, and below
-    #      eight columns there is no column to point from. The row keeps the
-    #      SELECTED role (bold), so the selection is still findable.
-    #   3. width >= BOX_MIN (4): the rail goes too; the box is the whole row.
+    #   1. width >= GUTTER + BOX_MIN (8): the shipped shape — the node column, a
+    #      space, the state glyph column, a space, then a box of width - GUTTER.
+    #   2. width >= 2 + BOX_MIN (6): the state glyph column and its space are
+    #      dropped, there being no room for them, leaving the node column + one
+    #      space before the box. The node stays: it is the column that still says
+    #      an agent's box hangs off the rail, and the row keeps its paint role, so
+    #      the selection is still findable.
+    #   3. width >= BOX_MIN (4): the node column goes too; the box is the row.
     #   4. width < 4: no box is possible at all — the smallest is `╭─╮` — so the
     #      row degrades to ONE clipped line: the state glyph FIRST, then as much
     #      of the task as fits. The glyph is the one column worth keeping — it is
@@ -1283,11 +1286,11 @@ def worker_box(row: Row, width: int, selected: bool,
         return [glyph + _clip(" " + row.text, width - 1)], 0
 
     if width >= GUTTER + BOX_MIN:
-        box_width, gutter, caret_column = width - GUTTER, RAIL + " ", True
+        box_width, node_column, glyph_column = width - GUTTER, True, True
     elif width >= 2 + BOX_MIN:
-        box_width, gutter, caret_column = width - 2, RAIL + " ", False
+        box_width, node_column, glyph_column = width - 2, True, False
     else:
-        box_width, gutter, caret_column = width, "", False
+        box_width, node_column, glyph_column = width, False, False
 
     inner = max(0, box_width - 2)
     # The row's own harness wins; a worker carries none, so its mark comes from
@@ -1295,14 +1298,14 @@ def worker_box(row: Row, width: int, selected: bool,
     # only when BOTH the harness and the name are absent is the slot blank (see
     # `worker_mark`).
     mark = worker_mark(row.harness, row.agent)
-    # ONE content row. The state glyph, the mark and the task sit flush left, the
-    # meta flush right on the SAME line. The agent name is DROPPED: the mark
-    # already names the harness the name did, and the meta is the only thing on
-    # the row the mark does not say. The title yields first when the line is tight
-    # (`_two_col` clips the LEFT part with `_clip`, so it is ellipsised, not cut
-    # blank), and the meta keeps its columns — it is the thing being waited on.
-    content = _two_col(" " + glyph + " " + mark + " " + row.text,
-                       row.meta, inner)
+    # ONE content row. The mark and the task sit flush left, the meta flush right
+    # on the SAME line; the state glyph is in the gutter, not here. The agent name
+    # is DROPPED: the mark already names the harness the name did, and the meta is
+    # the only thing on the row the mark does not say. The title yields first when
+    # the line is tight (`_two_col` clips the LEFT part with `_clip`, so it is
+    # ellipsised, not cut blank), and the meta keeps its columns — it is the thing
+    # being waited on.
+    content = _two_col(" " + mark + " " + row.text, row.meta, inner)
     lines = [content]
     if row.expanded and row.snippet:
         lines.append("  " + _clip(_oneline(row.snippet), inner - 2))
@@ -1310,19 +1313,24 @@ def worker_box(row: Row, width: int, selected: bool,
 
     out: list[str] = []
     for index, line in enumerate(boxed):
-        if caret_column:
-            caret = CARET if (selected and index == 0) else " "
-            out.append(gutter + caret + " " + line)
-        else:
-            out.append(gutter + line)
+        # The CONTENT row is the box's first inner row, just below the top border.
+        # The node and the state glyph ride on that row alone; the rail and a space
+        # fill every other row, so the line down column 0 is unbroken.
+        on_content = index == 1
+        prefix = ""
+        if node_column:
+            prefix += (NODE if on_content else RAIL) + " "
+        if glyph_column:
+            prefix += (glyph if on_content else " ") + " "
+        out.append(prefix + line)
     return out, 0
 
 
 def _is_box(row: Row) -> bool:
-    """Whether a row is a worker box — the only rows the caret can land on.
+    """Whether a row is a worker box — the only rows the selection can land on.
 
-    The roots and the breathing rails draw no box and so no caret; the selection
-    steps over them (`_workers`, `move_selection`).
+    The roots and the breathing rails draw no box of their own to select; the
+    selection steps over them (`_workers`, `move_selection`).
     """
     return not (row.is_root or row.rail)
 
@@ -1405,8 +1413,8 @@ def _footer(width: int) -> str:
 def _blocks(frame: Frame, width: int) -> list[list[tuple[str, str]]]:
     """The frame's rows as atomic BLOCKS, in display order, composed to text.
 
-    A block is one ROOT (its title bar and gauge) or one GROUP (its breathing rail
-    and all of the group's boxes). Grouping into blocks is what keeps `_pane`'s
+    A block is one ROOT (its outdented box) or one GROUP (its breathing rail and
+    all of the group's boxes). Grouping into blocks is what keeps `_pane`'s
     height trimming honest: the trimmer keeps or drops a whole block, so a box can
     never be cut in half and a rail can never be left without the group it opens.
 
@@ -1426,17 +1434,21 @@ def _blocks(frame: Frame, width: int) -> list[list[tuple[str, str]]]:
         elif row.rail:
             unit.append((RAIL, NORMAL))
         else:
-            on_caret = index == frame.selected
-            lines, caret_row = worker_box(row, width, on_caret, frame.spin)
+            on_selected = index == frame.selected
+            lines, selected_row = worker_box(row, width, on_selected, frame.spin)
             for position, line in enumerate(lines):
-                # Only the CARET row carries SELECTED; the body below it stays
-                # NORMAL. Tagging the whole block, as this once did, made the TUI
-                # reverse-video every row — the operator read that as several
-                # selected things and asked for the caret to be the marker. The
-                # role is kept on that one line rather than dropped because it is
-                # what the live view scrolls to keep visible (`_run_tui`), and it
-                # is painted bold there so the caret row stays findable.
-                role = SELECTED if (on_caret and position == caret_row) else NORMAL
+                # SELECTION IS BRIGHTNESS. Every line of an UNSELECTED worker's
+                # box is DIM; the SELECTED worker's box is NORMAL, so it reads as
+                # white against the dimmed others. SELECTED still rides on ONE
+                # line — the selected box's first row — because that is the row
+                # `_run_tui` scrolls to keep visible; it maps to the same attribute
+                # as NORMAL, so the box reads uniformly white.
+                if not on_selected:
+                    role = DIM
+                elif position == selected_row:
+                    role = SELECTED
+                else:
+                    role = NORMAL
                 unit.append((line, role))
     if unit is not None:
         blocks.append(unit)
@@ -1455,9 +1467,8 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     a group's rail away from its boxes (the trimmer works in whole blocks; see
     `_blocks`).
 
-    A selected worker's block is NORMAL except its first line, the caret row,
-    which carries SELECTED: the caret is the selection marker, not a reverse
-    block over the whole box.
+    An unselected worker's box is DIM, the selected worker's box NORMAL except its
+    first line, which carries SELECTED: selection is brightness, not a glyph.
     """
     items: list[tuple[str, str]] = []
     if frame.notice:
@@ -2230,13 +2241,15 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         def put(row: int, text: str, role: str) -> None:
             """One `addnstr` at the pane's full width (see `paint_line`).
 
-            The attr map is the redesign's: SELECTED is bold, not reverse, since
-            it lands on the caret row alone and reverse-videoing it would light a
-            full row of the box; TITLE is the one line the design spends
-            A_REVERSE on, the root's bar.
+            The attr map is the redesign's: DIM for an unselected worker's box,
+            NORMAL for the selected one, so the selection is brightness and the
+            pane spends no A_REVERSE at all. SELECTED maps to A_NORMAL on purpose
+            — it is a role the composer hangs on the selected box's first row so
+            the scroll target survives, not a look of its own; the box reads as
+            one brightness.
             """
-            attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_BOLD,
-                    DIM: curses.A_DIM, TITLE: curses.A_REVERSE}[role]
+            attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_NORMAL,
+                    DIM: curses.A_DIM}[role]
             paint_line(stdscr, row, text, width, height, attr)
 
         while True:
@@ -2404,13 +2417,18 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
         frame = model.refresh()
         if args.access:
             frame.access = access_info(args.server)
-        # No animation headless: one frame, at spinner frame 0, with the caret
-        # where the live view opens it — on the first worker. A working row still
-        # draws its spinner, frozen on the first frame.
+        # No animation headless: one frame, at spinner frame 0, with the
+        # selection where the live view opens it — on the first worker. A working
+        # row still draws its spinner, frozen on the first frame.
         frame.spin = 0
         # No previous frame, so no session to follow: this snaps to the first
         # worker, which is where the live view opens too.
         frame.selected = snap_selection(frame.rows, None, frame.selected)
+        # `--once` PRINTS TEXT ONLY, and selection is now a paint attribute (DIM
+        # vs NORMAL), never a glyph — so a one-shot dump shows NO selection at
+        # all. That is acceptable for a dump that is read once and not navigated,
+        # but it is a real difference from the live view: do not read a `--once`
+        # frame and expect to see which worker was selected.
         # The real pane width drives the QR fit; off a tty there is none, so
         # fall back to the classic 80 columns.
         width = shutil.get_terminal_size((DEFAULT_WIDTH, 24)).columns
