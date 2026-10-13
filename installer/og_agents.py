@@ -464,21 +464,6 @@ def _age(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
-def _ago(seconds: float) -> str:
-    """How long ago, coarse: `12s ago`, `6m ago`, `2h ago`.
-
-    "How long since" is read at a glance, so it drops to the largest unit that
-    still says something; `_age` is for the running figure, which is watched
-    ticking.
-    """
-    total = max(0, int(seconds))
-    if total < 60:
-        return f"{total}s ago"
-    if total < 3600:
-        return f"{total // 60}m ago"
-    return f"{total // 3600}h ago"
-
-
 # The listing row fields a failure reason might arrive in, if it ever does. The
 # listing carries none of them today (see og_herdr_watch's measured key list),
 # so `_failure_reason` normally finds nothing and the row reads plain `failed`.
@@ -1474,7 +1459,7 @@ def _two_col(left: list[Span], right: list[Span], width: int) -> list[Span]:
     thing the row is really about, so it is worth keeping whole while the elastic
     left gives way — which is also what preserves its COLOUR ROLE: a tight line
     loses the title, never the meta's META. Both callers rely on this: the worker
-    row hands it the meta — `2m14s`, `failed`, `waiting on you`, `done 6m ago` —
+    row hands it the meta — `2m14s`, `failed`, `waiting on you`, `done` —
     and the root box's content row the harness label (`Claude Code`). Only when
     `right` alone is wider than `width` is it clipped itself.
     """

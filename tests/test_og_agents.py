@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import ast
 import io
+import itertools
 import json
+import math
 import os
 import sys
 import types
@@ -3246,6 +3248,39 @@ def _relative_luminance(rgb):
     return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
 
 
+def _oklab_gap(x, y):
+    """How far apart two palette indices read, in OKLab.
+
+    OKLab rather than sRGB because sRGB distance is the thing that goes wrong
+    here: openai 36 against goose 37 are (0,175,135) and (0,175,175), 40 of blue
+    and nothing else, which sounds like almost nothing and is why the pair was
+    always shipped unremarked. OKLab counts that the difference is barely
+    visible at all.
+
+    Scaled by 100 only so the numbers it returns are the ones the table's
+    comment block already quotes — 8.234, 5.969 — instead of decimals nobody
+    reading that comment would recognise.
+    """
+    def to_oklab(rgb):
+        def linear(channel):
+            channel /= 255
+            return (channel / 12.92 if channel <= 0.04045
+                    else ((channel + 0.055) / 1.055) ** 2.4)
+        r, g, b = map(linear, rgb)
+        # The cone response, then its cube root: the step that makes OKLab's
+        # distances match what the eye reports. Cbrt of a negative is undefined,
+        # and all three of these are sums of positive terms, so `** (1/3)` is
+        # the same value without the domain check.
+        long_ = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+        medium = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+        short = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+        return (0.2104542553 * long_ + 0.7936177850 * medium - 0.0040720468 * short,
+                1.9779984951 * long_ - 2.4285922050 * medium + 0.4505937099 * short,
+                0.0259040371 * long_ + 0.7827717662 * medium - 0.8086757660 * short)
+    left, right = to_oklab(_ansi_rgb(x)), to_oklab(_ansi_rgb(y))
+    return 100 * math.dist(left, right)
+
+
 def test_every_vendor_colour_is_readable_on_a_dark_pane_and_not_a_repeat():
     # The rule the table's comment block records as TWO REAL FAILURES: a brand
     # colour that is converted correctly but is too dark is invisible on a dark
@@ -3263,6 +3298,37 @@ def test_every_vendor_colour_is_readable_on_a_dark_pane_and_not_a_repeat():
     # And no two vendors share a colour: a repeat means one brand is painted in
     # another's identity, which is as much a lie as a colour that is too dark.
     assert len(set(a._VENDOR_COLOURS.values())) == len(a._VENDOR_COLOURS)
+    # Which is the WEAKEST form of "no two read alike". Two marks a hair apart
+    # are the same failure as two identical ones — one brand drawn in another's
+    # identity — and nothing measured that, so z-ai's own placement claim ("108
+    # also clears the tightest pair in this table") was unfalsifiable.
+    #
+    # The floor is set from the table's own geometry, not chosen. The tightest
+    # pair that ships is openai 36 against goose 37 at 5.969, and that has always
+    # been accepted; the pair this rule exists to reject is z-ai at its NEAREST
+    # index 144 against opencode-zen 145 at 5.578. THE CUBE GEOMETRY IS THE SAME
+    # IN BOTH — 36/37 are (0,175,135) and (0,175,175), 144/145 are (175,175,135)
+    # and (175,175,175): one channel, blue alone, 40 units of it. Neither pair
+    # is the wider one, and OKLab scores them 0.391 apart. What separates them is
+    # the NEIGHBOURHOOD, which is the part the table's own block leans on: 145 is
+    # exactly neutral at chroma 0.0000 where 144 carries 5.4816, and neither 36
+    # nor 37 is near neutral (13.4085, 11.6533) because both are saturated
+    # against a zero red. So the line goes in the one window that separates the
+    # two numbers: above 5.578, at or below 5.969.
+    #
+    # OVER THE VENDOR TABLE ONLY, and that is a deliberate limit rather than an
+    # oversight: the colours that share a worker row with these and do NOT
+    # clear it are adjacent by design. Kilo's 227 against the spinner's 226 is
+    # 3.478 and is argued in the table's own comment block (bold versus not, a
+    # different column, blue alone between them); opencode-zen 145 and z-ai 108
+    # sit 5.197 and 5.733 off META_COLOR 109, which is one step on the same rung
+    # and is meant to read as a quiet grey beside the mark.
+    for (left, x), (right, y) in itertools.combinations(
+            sorted(a._VENDOR_COLOURS.items()), 2):
+        gap = _oklab_gap(x, y)
+        assert gap > 5.6, (
+            left, x, right, y, round(gap, 3),
+            "two marks close enough to read as one another")
 
 
 def test_the_kilo_mark_paints_kilos_brand_lemon(monkeypatch):
@@ -3287,6 +3353,38 @@ def test_the_kilo_mark_paints_kilos_brand_lemon(monkeypatch):
     # glyph takes pair 1) and is an allocation detail, not the claim under test.
     assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
         (a._STATE_COLOURS["idle"], -1), (227, -1), (a.META_COLOR, -1)]
+    mark = _writes_for(writes, a.harness_mark(harness))
+    assert mark, writes
+    for attr in mark:
+        assert attr & fake.A_BOLD and attr & 0xFF00
+
+
+def test_the_freebuff_mark_paints_freebuffs_brand_sage(monkeypatch):
+    # Freebuff's brand is #A4BA96, a muted sage. This row is keyed `z-ai`, which
+    # names the MODEL PROVIDER while the glyph and the colour are FREEBUFF's, the
+    # harness the registry files under that vendor — so it was painted 26, a
+    # saturated blue belonging to nothing here, by a reader who took the key at
+    # face value. Read the table's comment block before "correcting" this.
+    # 108 is (135,175,135): the cube takes the brand's red 164 DOWN to the 135
+    # rung, green 186 to 175 and blue 150 to 135. It is deliberately NOT the
+    # nearest index — see the distance rule in the table-wide test above for why 144
+    # was rejected.
+    assert a._VENDOR_COLOURS["z-ai"] == 108
+    assert _ansi_rgb(108) == (135, 175, 135)
+    # ...and the mark really spends that pair, rather than resolving the role to
+    # None and painting the default foreground.
+    harness = _harness_for_vendor()["z-ai"]
+    spans = a.worker_box(worker("w", "idle", text="t", harness=harness),
+                         60, False)[0][1]
+    assert (a.harness_mark(harness), a.mark_role("z-ai")) in spans
+    frame = a.Frame(rows=[worker("w1", "idle", harness=harness, meta="12s")],
+                    selected=0)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=256)
+    # On the colour, not the pair NUMBER: pairs are spent on first use, so the
+    # index depends on what else the frame happened to paint first (here the idle
+    # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
+        (a._STATE_COLOURS["idle"], -1), (108, -1), (a.META_COLOR, -1)]
     mark = _writes_for(writes, a.harness_mark(harness))
     assert mark, writes
     for attr in mark:
