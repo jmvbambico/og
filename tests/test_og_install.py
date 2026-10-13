@@ -1282,6 +1282,104 @@ def test_prereq_hints_are_apt_on_linux_and_wsl(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# terminal multiplexers -- catalog, detection, and the herdr pane question
+# --------------------------------------------------------------------------
+def test_registry_has_the_herdr_multiplexer_row():
+    mux = next(x for x in m.REGISTRY["multiplexers"] if x["id"] == "herdr")
+    for key in ("id", "label", "binary", "url", "session_unit", "worker_unit",
+                "capabilities", "verified"):
+        assert key in mux, f"herdr row is missing {key!r}"
+    assert mux["session_unit"] == "workspace"
+    assert mux["worker_unit"] == "tab"
+    # capabilities IS the contract. agent_status is the one herdr has and a
+    # future tmux backend would not, so it must be listed rather than assumed.
+    assert "agent_status" in mux["capabilities"]
+
+
+def test_registry_lists_no_tmux_multiplexer():
+    # There is no tmux backend and `og start tmux` does not exist: a row would
+    # claim a capability that is not there. The README names it as not-built.
+    assert [x["id"] for x in m.REGISTRY["multiplexers"]] == ["herdr"]
+
+
+def test_scan_multiplexers_reports_through_the_injected_seam():
+    # The real PATH is never consulted. This machine has herdr, so an
+    # un-injected test would pass here and fail in CI — the seam is the point.
+    found = m.scan_multiplexers(lambda b: "/opt/bin/herdr" if b == "herdr" else None)
+    assert found == {"herdr": "/opt/bin/herdr"}
+    assert m.scan_multiplexers(lambda b: None) == {}
+
+
+def test_check_missing_multiplexer_is_not_an_error(tmp_path):
+    # og is fully usable without a multiplexer, so --check must still exit 0 and
+    # report the absence the way it reports the optional per-workflow tools.
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name in ("omnigent", "tmux", "git", "claude"):
+        p = fake / name
+        p.write_text("#!/bin/sh\nexit 0\n")
+        p.chmod(0o755)
+    (fake / "python3").symlink_to(sys.executable)
+    env = {"OMNIGENT_HOME": str(tmp_path), "PATH": str(fake), "HOME": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, str(REPO / "installer" / "og_install.py"), "--check"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Terminal multiplexers" in result.stdout
+    assert "herdr" in result.stdout and "not found" in result.stdout
+
+
+def test_emit_questions_lists_the_herdr_agents_pane_default_true(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude"})
+    monkeypatch.setattr(m, "scan_multiplexers", lambda: {})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    item = next(x for x in q["questions"] if x["key"] == "herdr_agents_pane")
+    assert item["type"] == "bool"
+    assert item["default"] is True
+    # Asked always, noting it does not apply on a herdr-less machine.
+    assert "Ignored if herdr is not installed" in item["ask"]
+
+
+def test_emit_questions_surfaces_detected_multiplexers(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude"})
+    monkeypatch.setattr(m, "scan_multiplexers", lambda: {"herdr": "/bin/herdr"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    assert q["detected_multiplexers"] == {"herdr": "herdr"}
+    assert [x["id"] for x in q["multiplexers"]] == ["herdr"]
+
+
+def test_an_old_plan_without_the_key_gets_the_default(tmp_path, monkeypatch):
+    # The idempotence case, real on this machine: a live og-install.json written
+    # before this key existed must load, take the default, and re-apply without
+    # failing validation. `main()`'s --plan path is the seam `og update` uses.
+    old = _chain_plan()
+    assert "herdr_agents_pane" not in old
+    plan_file = tmp_path / "og-install.json"
+    plan_file.write_text(json.dumps(old))
+    captured = {}
+    monkeypatch.setattr(m, "apply", lambda plan, dry_run=False: captured.update(plan))
+    monkeypatch.setattr(sys, "argv", ["og-install", "--plan", str(plan_file)])
+    m.main()
+    assert captured["herdr_agents_pane"] is True
+    assert not any(level == "error" for level, _ in m.validate(captured))
+
+
+def test_the_herdr_agents_pane_key_round_trips_into_state(tmp_path, monkeypatch):
+    # A plan carrying the key lands in og-install.json unchanged, including an
+    # explicit False -- the value bin/og will read later.
+    _apply_into(tmp_path, monkeypatch, _chain_plan(herdr_agents_pane=False))
+    state = json.loads((tmp_path / "og-install.json").read_text())
+    assert state["herdr_agents_pane"] is False
+
+
+# --------------------------------------------------------------------------
 # bin/og credential store (the `file` backend is the cross-platform floor)
 # --------------------------------------------------------------------------
 OG = REPO / "bin" / "og"

@@ -153,6 +153,7 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 | `ngrok` | only for `og start tunneled` on the default provider: a public URL so you can drive a run from outside your network. A *reserved domain* keeps invite links and session cookies working across restarts. |
 | `ssh` | only for `og start tunneled --use tunnl.gg`: that provider *is* an ssh reverse tunnel, so there is nothing to install on macOS, Linux or Windows 10+. No account either. |
 | `qrencode` | prints the tunnel URL as a QR block |
+| `herdr` | only for `og start herdr`: runs the orchestrator inside [herdr](https://herdr.dev/), one space per session with each delegated worker as a tab. Without it `og start herdr` says so and starts normally; nothing else changes. |
 
 **At least one coding CLI.** Run `./install.sh --check` to see what you have.
 
@@ -276,6 +277,50 @@ poll that state file for `active_turn_id: null`, then read the result with
 load-bearing today — the cross-vendor review of the change that added them was
 recovered exactly that way. See
 [docs/ANTIGRAVITY-NATIVE-COMPLETION.md](docs/ANTIGRAVITY-NATIVE-COMPLETION.md).
+
+---
+
+## Supported terminal multiplexers
+
+`og start <mux>` runs the orchestrator inside a terminal multiplexer: one space
+per Omnigent session, each delegated worker a tab inside it, and — where the
+backend supports it — live agent-status badges. **og is fully usable without
+one.** The multiplexer is a view, never the runtime.
+
+`installer/registry.json` is the catalog here too, but be clear what a row
+buys: **detection and listing only.** The backend code still has to exist per
+multiplexer, exactly as an agent row needs a harness plugin behind it.
+
+| Multiplexer | Session → | Worker → | Agent status | Status |
+|---|---|---|---|---|
+| [herdr](https://herdr.dev/) | workspace ("space") | tab | **yes** — live badges | verified against 0.9.3 |
+| tmux | session | window | no — window names only | not built |
+
+The **Agent status** column is the honest part. The backend contract is
+capability-based, not lowest-common-denominator: *create, close, run, focus,
+rename* are required of every backend, and *report agent state* is optional.
+herdr has it, which is what puts `working` / `blocked` / `idle` beside each
+agent in its sidebar. tmux has no equivalent, so a tmux backend would give you
+named windows and nothing more — useful, materially less.
+
+> **A naming hazard, if tmux is ever built.** tmux is already a **required**
+> dependency (see [Requirements](#requirements)): Omnigent runs every native
+> agent terminal inside its own private tmux server. A user-facing `og start
+> tmux` would make the word mean two things in one tool — the invisible
+> substrate agents already run in, and a window manager you look at. There is no
+> technical conflict (separate servers, separate sockets), but it is a
+> documentation hazard exactly where a reader is most likely to be confused.
+
+Without a multiplexer installed, `og start herdr` warns and starts normally:
+
+```
+! herdr not found on PATH — starting without it.
+  Install it from https://herdr.dev/ and re-run to use spaces.
+```
+
+See [docs/HERDR.md](docs/HERDR.md) for what the herdr backend does and the
+measured limits it works within, and [docs/MUX-LAUNCHER.md](docs/MUX-LAUNCHER.md)
+for the launcher and `og agents`.
 
 ---
 
