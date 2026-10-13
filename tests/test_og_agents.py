@@ -3210,6 +3210,68 @@ def test_the_mark_span_carries_its_vendors_brand_colour_role():
         assert a._VENDOR_COLOURS[vendor], vendor
 
 
+def _ansi_rgb(index):
+    """The sRGB triple xterm paints for ANSI-256 `index`."""
+    if index < 232:
+        levels = (0, 95, 135, 175, 215, 255)
+        n = index - 16
+        return tuple(levels[d] for d in (n // 36, (n // 6) % 6, n % 6))
+    step = 8 + 10 * (index - 232)
+    return (step, step, step)
+
+
+def _relative_luminance(rgb):
+    """WCAG relative luminance, 0 (black) to 1 (white)."""
+    lin = [c / 12.92 if c / 255 <= 0.04045 else ((c / 255 + 0.055) / 1.055) ** 2.4
+           for c in rgb]
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+def test_every_vendor_colour_is_readable_on_a_dark_pane_and_not_a_repeat():
+    # The rule the table's comment block records as TWO REAL FAILURES: a brand
+    # colour that is converted correctly but is too dark is invisible on a dark
+    # pane, which is why moonshotai is held at 252 and not its true 234. Nothing
+    # enforced that, so a future straight conversion could reintroduce it. The
+    # floor sits ABOVE both recorded failures (234 -> luminance 0.012, 237 ->
+    # 0.058) and BELOW the darkest colour the table still ships (z-ai 26 ->
+    # 0.131), so it costs no existing entry and rejects any brand that would
+    # vanish.
+    for vendor, colour in sorted(a._VENDOR_COLOURS.items()):
+        assert _relative_luminance(_ansi_rgb(colour)) > 0.10, (
+            vendor, colour, "too dark to read on a dark pane")
+    # And no two vendors share a colour: a repeat means one brand is painted in
+    # another's identity, which is as much a lie as a colour that is too dark.
+    assert len(set(a._VENDOR_COLOURS.values())) == len(a._VENDOR_COLOURS)
+
+
+def test_the_kilo_mark_paints_kilos_brand_lemon(monkeypatch):
+    # Kilo's brand is #F3EF4E. It was painted 99 — a blue-violet belonging to no
+    # part of Kilo — so this is a brand-accuracy pin, not a preference. 227 is
+    # (255,255,95): the cube's top rung is the only one that can hold a red of
+    # 243 and a green of 239, and 78 has no blue rung nearer than 95, so the whole
+    # of the conversion error is that one channel.
+    assert a._VENDOR_COLOURS["kilo"] == 227
+    assert _ansi_rgb(227) == (255, 255, 95)
+    # ...and the mark really spends that pair, rather than resolving the role to
+    # None and painting the default foreground.
+    harness = _harness_for_vendor()["kilo"]
+    spans = a.worker_box(worker("w", "idle", text="t", harness=harness),
+                         60, False)[0][1]
+    assert (a.harness_mark(harness), a.mark_role("kilo")) in spans
+    frame = a.Frame(rows=[worker("w1", "idle", harness=harness, meta="12s")],
+                    selected=0)
+    fake, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=256)
+    # On the colour, not the pair NUMBER: pairs are spent on first use, so the
+    # index depends on what else the frame happened to paint first (here the idle
+    # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
+        (a._STATE_COLOURS["idle"], -1), (227, -1), (a.META_COLOR, -1)]
+    mark = _writes_for(writes, a.harness_mark(harness))
+    assert mark, writes
+    for attr in mark:
+        assert attr & fake.A_BOLD and attr & 0xFF00
+
+
 def test_the_atom_and_blank_mark_spans_carry_plain(monkeypatch):
     # A named agent whose harness cannot be resolved draws the ATOM, and the atom
     # has no vendor: PLAIN, no brand colour, no bold. A row with no identity at

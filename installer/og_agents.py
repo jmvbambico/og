@@ -828,11 +828,39 @@ _HARNESS_MARKS = {
 #     coloured and INVISIBLE on a dark pane. 252, a light neutral, is used.
 #   * cursor's is #3C3C3C -> ansi 237, luminance 60: the same problem, less
 #     severe. 244 is used.
+#
+# KILO IS NOT A SUBSTITUTION but its hex is recorded anyway, because its index is
+# not re-derivable by eye and 99 (135,135,255) was a blue-violet that matched
+# nothing about Kilo — the mark's colour simply did not correspond to its brand.
+#   * the brand is #F3EF4E, a bright lemon, and only the TOP rung of the 6x6x6
+#     cube can hold it: 243 and 239 are both above the 215 rung. Blue 78 has no
+#     rung nearer than the lowest non-zero one (95), so the whole of the
+#     conversion error is blue 78 -> 95 and the colour is 227 (255,255,95). Its
+#     two cube neighbours both read further from the hex — 221 (255,215,95) is
+#     orange, 191 (215,255,95) is green — and neither is nearer in sRGB either
+#     (1009 and 1329 against 689). The greyscale ramp is not a candidate at all:
+#     its closest rung is 26x further out than the winner.
+#
+# 227 IS ADJACENT TO 226, the spinner's neon yellow (`_STATE_COLOURS`), and both
+# paint on the same worker row — spinner in the gutter, mark in the box. They do
+# not smear, but not because the numbers do it: the ONLY channel between them is
+# blue, 0 against 95, so 226 is a saturated yellow and 227 a pale one. Three axes
+# carry the rest of the separation, and any of them can go: the mark is BOLD and
+# the spinner is not (`_role_bold`), the mark takes its line's brightness while the
+# spinner is `undim`-exempt, and the glyphs are different shapes in different
+# columns. Worth re-checking rather than assuming the index alone separates them.
+#
+# THE FLOOR ABOVE IS A DARK-PANE FLOOR, and it is an ASSUMPTION, not an enforced
+# one: `_Colours.attr` colours a FOREGROUND on the TERMINAL'S OWN background (the
+# `-1` in `init_pair`), so on a light terminal every entry here inverts into the
+# very problem the floor exists to prevent — 227 is the second-brightest mark in
+# the table (only xai's white is brighter) and would wash out against white. That
+# is a background decision, not a fourteen-colour retune, so it is not made here.
 _VENDOR_COLOURS = {
     "anthropic": 173,
     "openai": 36,
     "google": 69,
-    "kilo": 99,
+    "kilo": 227,
     "aws-kiro": 208,
     "xai": 231,
     "goose": 37,
