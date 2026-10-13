@@ -1061,35 +1061,47 @@ def test_ambiguous_marks_are_not_padded_but_narrow_ones_are():
         assert unicodedata.east_asian_width(MARK[vendor]) == "A", vendor
 
 
-def test_the_blank_slot_is_exactly_two_spaces():
+def test_the_blank_slot_is_exactly_two_spaces(monkeypatch):
     # A row that names NO agent identity draws the blank slot — a mark there would
     # be meaningless. This is the path the atom must never take.
+    monkeypatch.setattr(a, "agent_harness", lambda name: None)
     assert a.harness_mark(None) == "  "
     assert a.harness_mark("") == "  "
     assert a.harness_mark("   ") == "  "
-    assert a.agent_mark(None) == "  "
-    assert a.agent_mark("") == "  "
+    assert a.worker_mark("", None) == "  "
+    assert a.worker_mark("", "") == "  "
+    assert a.worker_mark(None, "   ") == "  "
     assert a._display_width(a.harness_mark(None)) == 2
 
 
 def test_every_return_is_exactly_two_columns_including_the_blank():
     for row in _catalog()["agents"]:
         assert a._display_width(a.harness_mark(row["harness"])) == 2, row["id"]
-        assert a._display_width(a.agent_mark(row["id"])) == 2, row["id"]
     for degenerate in ("brand-new-native", "", None, 7, "  "):
         assert a._display_width(a.harness_mark(degenerate)) == 2, degenerate
-        assert a._display_width(a.agent_mark(degenerate)) == 2, degenerate
 
 
-def test_an_unresolvable_agent_gets_the_atom_never_a_blank():
-    # A harness that NAMES an agent whose vendor we cannot resolve draws the atom
-    # — "an agent whose vendor I could not identify" — rather than a silent blank.
+def test_every_worker_mark_return_is_two_columns(monkeypatch):
+    # The worker path is two columns for a resolved spec harness, for the atom a
+    # named-but-unknown agent earns, and for the blank a nameless row draws.
+    monkeypatch.setattr(a, "agent_harness",
+                        lambda name: "opencode-native" if name == "zen" else None)
+    assert a._display_width(a.worker_mark("", "zen")) == 2
+    assert a._display_width(a.worker_mark("", "reviewer")) == 2
+    assert a._display_width(a.worker_mark("", None)) == 2
+    assert a._display_width(a.worker_mark(7, 7)) == 2
+
+
+def test_an_unresolvable_agent_gets_the_atom_never_a_blank(monkeypatch):
+    # An agent that IS named but whose harness we cannot find draws the atom —
+    # "an agent whose harness I could not identify" — rather than a silent blank.
     # It must not raise: a pane has to render with no marks rather than not render.
     assert a.harness_mark("brand-new-native") == a.ATOM + " "
-    assert a.agent_mark("reviewer") == a.ATOM + " "
+    monkeypatch.setattr(a, "agent_harness", lambda name: None)
+    assert a.worker_mark("", "reviewer") == a.ATOM + " "
     # A non-string is NO identity, not an unresolvable one: blank.
     assert a.harness_mark(7) == "  "
-    assert a.agent_mark(7) == "  "
+    assert a.worker_mark("", 7) == "  "
 
 
 def test_the_atom_is_east_asian_narrow_like_the_other_marks():
@@ -1119,73 +1131,178 @@ def test_a_broken_registry_blanks_no_harness_but_atoms_a_named_one(
                           ("wrong-shape.json", '{"agents": "nope"}'),
                           ("a-list.json", "[]")):
         monkeypatch.setattr(h, "_REGISTRY_VENDORS", None)
-        monkeypatch.setattr(h, "_REGISTRY_AGENT_VENDORS", None)
         path = tmp_path / name
         if content is not None:
             path.write_text(content)
         monkeypatch.setattr(h, "REGISTRY_PATH", path)
         assert h.harness_vendors() == {}, name
-        assert h.agent_vendors() == {}, name
         assert a.harness_mark("") == "  ", name
         assert a.harness_mark("claude-native") == a.ATOM + " ", name
-        assert a.agent_mark("zen") == a.ATOM + " ", name
 
 
 # ---------------------------------------------------------------------------
-# 8c. the agent NAME -> vendor hop (the fix for the blank worker marks)
+# 8c. the agent NAME -> the harness its SPEC declares (the fix for worker marks)
+#
+# A mark identifies THE HARNESS A SESSION ACTUALLY RAN ON. A worker's LISTING row
+# carries no `harness`, so the box resolves it from the spec Omnigent installed
+# for the agent the title names — NOT from a vendor guessed off the name. These
+# tests build a throwaway home so the resolution is exercised against known specs
+# rather than whatever the developer's ~/.omnigent happens to hold.
 # ---------------------------------------------------------------------------
 
-def test_the_agent_name_resolves_through_the_registry():
-    # A worker's LISTING row carries no `harness`; its mark comes from the agent
-    # name the title gave. The name -> vendor hop is a registry fact, read through
-    # the same catalog the labels and harness vendors come from.
-    assert h.agent_vendor("cmdcode") == "moonshotai"
-    assert h.agent_vendor("freebuff") == "z-ai"
-    assert h.agent_vendor("kilo") == "kilo"
-    assert h.agent_vendor("codex") == "openai"
-    assert h.agent_vendor("claude") == "anthropic"
+def _write_spec(home, bundle, name, harness):
+    """Write `<home>/agents/<bundle>/agents/<name>/config.yaml`.
+
+    The harness goes under `executor.config.harness` — where the installer writes
+    it (see templates/coder.yaml.tmpl) — so the test exercises the real shape.
+    """
+    spec_dir = Path(home) / "agents" / bundle / "agents" / name
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    (spec_dir / "config.yaml").write_text(
+        f"spec_version: 1\nname: {name}\nexecutor:\n  type: omnigent\n"
+        f"  config:\n    harness: {harness}\n")
+    return spec_dir
 
 
-def test_the_agent_name_resolution_tolerates_case_and_the_coder_prefix():
-    # The names arrive as `coder_zen` in a worker title (split_title strips the
-    # prefix) and may arrive in any case; both are absorbed.
-    for name in ("zen", "coder_zen", "Coder_Zen", "ZEN", "Coder_Zen"):
-        assert h.agent_vendor(name) == "opencode-zen", name
-    assert h.agent_vendor("coder_cmdcode") == "moonshotai"
-    for nothing in (None, "", "   ", 7):
-        assert h.agent_vendor(nothing) is None, nothing
+@pytest.fixture
+def spec_home(monkeypatch, tmp_path):
+    """Point $OMNIGENT_HOME at a scratch dir and reset the cached scan."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(h, "_REGISTRY_AGENT_HARNESSES", None)
+    return tmp_path
 
 
-def test_the_zen_alias_comes_from_the_registry_worker_field():
-    # `zen` is not an `id`; it is the opencode row's `worker: "coder_zen"` with the
-    # prefix stripped, so the alias is derivable from the catalog alone and NO
-    # hardcoded alias map was needed.
-    rows = _catalog()["agents"]
-    opencode = next(r for r in rows if r["id"] == "opencode")
-    assert opencode["worker"] == "coder_zen"
-    assert "zen" not in {r["id"] for r in rows}
-    assert h.agent_vendors()["zen"] == "opencode-zen"
+def test_a_declared_spec_harness_resolves_to_that_harness_mark(spec_home):
+    # The row's agent name is `zen` (split_title strips the `coder_` prefix) while
+    # the installed spec is `coder_zen`; both spellings resolve, and the mark is
+    # the harness's, not the name's.
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    assert h.agent_harness("zen") == "opencode-native"
+    assert h.agent_harness("coder_zen") == "opencode-native"
+    assert a.worker_mark("", "zen") == a._HARNESS_MARKS["opencode-zen"] + " "
 
 
-def test_a_worker_box_marks_by_agent_name_because_the_row_has_no_harness():
-    """The fix for the blank worker marks: a worker's LISTING row carries no
-    `harness`, so the box resolves its mark from the agent name the title gave."""
+def test_the_real_roster_specs_resolve_through_their_declared_harness(spec_home):
+    # The three roles whose NAMES are not registry ids — `reviewer`, `scout`,
+    # `integrator` — now mark from their specs instead of drawing an atom.
+    _write_spec(spec_home, "Hivemind", "reviewer", "codex-native")
+    _write_spec(spec_home, "Hivemind", "scout", "acp:command-code")
+    _write_spec(spec_home, "Hivemind", "integrator", "acp:command-code")
+    assert a.worker_mark("", "reviewer") == a._HARNESS_MARKS["openai"] + " "
+    assert a.worker_mark("", "scout") == a._HARNESS_MARKS["moonshotai"] + " "
+    assert a.worker_mark("", "integrator") == a._HARNESS_MARKS["moonshotai"] + " "
+
+
+def test_the_rows_own_harness_wins_over_the_spec_when_they_disagree(spec_home):
+    # THE PRINCIPLE. The row's own harness is what ACTUALLY ran, so it outranks
+    # whatever the agent's name would resolve to. Pin it: a spec that disagrees
+    # must not override the harness the row itself reports.
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    assert a.worker_mark("claude-native", "zen") == \
+        a._HARNESS_MARKS["anthropic"] + " "
+
+
+def test_an_agent_with_no_spec_and_no_harness_gets_the_atom(spec_home):
+    # An agent IS named, so there is something to mark; we just cannot find a
+    # harness for it — the atom, never a blank.
+    assert h.agent_harness("brandnew") is None
+    assert a.worker_mark("", "brandnew") == a.ATOM + " "
+
+
+def test_a_row_with_no_identity_at_all_gets_the_blank(spec_home):
+    # Neither a harness nor a name: nothing to mark. The genuinely-blank case,
+    # which the atom must never take.
+    assert a.worker_mark("", None) == "  "
+    assert a.worker_mark("", "") == "  "
+    assert a.worker_mark(None, "   ") == "  "
+
+
+def test_a_missing_omnigent_home_degrades_without_raising(monkeypatch, tmp_path):
+    monkeypatch.setattr(h, "_REGISTRY_AGENT_HARNESSES", None)
+    monkeypatch.setattr(h, "default_home", lambda: tmp_path / "nope")
+    assert h.agent_harnesses() == {}
+    assert h.agent_harness("zen") is None
+    assert a.worker_mark("", "zen") == a.ATOM + " "
+
+
+def test_an_unreadable_spec_degrades_without_raising(spec_home):
+    # `config.yaml` as a DIRECTORY: `read_text` raises OSError, which the scan
+    # must swallow. One bad spec costs that one agent's mark, nothing else.
+    spec_dir = Path(spec_home) / "agents" / "Hivemind" / "agents" / "coder_zen"
+    (spec_dir / "config.yaml").mkdir(parents=True)
+    assert h.agent_harnesses() == {}
+    assert a.worker_mark("", "zen") == a.ATOM + " "
+
+
+def test_a_malformed_spec_degrades_without_raising(spec_home):
+    spec_dir = Path(spec_home) / "agents" / "Hivemind" / "agents" / "coder_zen"
+    spec_dir.mkdir(parents=True)
+    (spec_dir / "config.yaml").write_text("executor: [unterminated\n")
+    assert h.agent_harnesses() == {}
+    assert a.worker_mark("", "zen") == a.ATOM + " "
+
+
+def test_an_absent_pyyaml_degrades_without_raising(spec_home, monkeypatch):
+    # PyYAML is not a dependency of `og agents`; if it is missing the scan must
+    # yield no harnesses rather than stop the pane from starting.
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    monkeypatch.setattr(h, "_yaml", None)
+    monkeypatch.setattr(h, "_REGISTRY_AGENT_HARNESSES", None)
+    assert h.agent_harnesses() == {}
+    assert h.agent_harness("zen") is None
+    assert a.worker_mark("", "zen") == a.ATOM + " "
+
+
+def test_the_spec_scan_runs_once_and_is_cached(spec_home, monkeypatch):
+    # The pane polls every few seconds; the scan must not walk the filesystem per
+    # call. One scan, then the cached table is served.
+    calls = []
+
+    def fake_scan(home):
+        calls.append(home)
+        return {"zen": "opencode-native"}
+
+    monkeypatch.setattr(h, "_scan_agent_harnesses", fake_scan)
+    monkeypatch.setattr(h, "_REGISTRY_AGENT_HARNESSES", None)
+    assert h.agent_harnesses() == {"zen": "opencode-native"}
+    assert h.agent_harnesses() == {"zen": "opencode-native"}
+    assert h.agent_harness("zen") == "opencode-native"
+    assert h.agent_harness("zen") == "opencode-native"
+    assert calls == [h.default_home()]
+
+
+def test_a_cross_bundle_name_collision_resolves_deterministically(spec_home):
+    # Two bundles can both install a `reviewer`. The scan sorts the bundle
+    # directories and the FIRST wins, so the answer is the same on every run
+    # rather than whatever order the filesystem yielded.
+    _write_spec(spec_home, "Bbb", "reviewer", "codex-native")
+    _write_spec(spec_home, "Aaa", "reviewer", "claude-native")
+    assert h.agent_harness("reviewer") == "claude-native"
+    # And again after a fresh scan, to prove the order is fixed, not incidental.
+    h._REGISTRY_AGENT_HARNESSES = None
+    assert h.agent_harness("reviewer") == "claude-native"
+
+
+def test_a_worker_box_marks_from_the_spec_because_the_row_has_no_harness(spec_home):
+    """A worker's LISTING row carries no `harness`, so the box resolves its mark
+    from the harness the agent's installed spec declares."""
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    _write_spec(spec_home, "Hivemind", "reviewer", "codex-native")
+
     def content_line(**row_kwargs):
         return a.render(a.Frame(rows=[worker("w", "working", text="ZX",
                                              **row_kwargs)]), 48)[1]
 
-    # `zen` (the opencode alias) and `cmdcode` resolve to their vendor's mark...
-    assert a.agent_mark("zen") == a._HARNESS_MARKS["opencode-zen"] + " "
+    # `zen` resolves through its spec to the opencode mark...
     assert a._HARNESS_MARKS["opencode-zen"] in content_line(agent="zen")
-    assert a._HARNESS_MARKS["moonshotai"] in content_line(agent="cmdcode")
-    # ...an unresolvable agent shows the atom, NOT a blank...
-    assert a.ATOM in content_line(agent="reviewer")
+    # ...an agent with no spec shows the atom, NOT a blank...
+    assert a.ATOM in content_line(agent="cmdcode")
     # ...and a row naming no agent at all is the genuinely-blank case.
-    assert a.agent_mark(None) == "  "
+    assert a.worker_mark("", None) == "  "
     assert a.ATOM not in content_line(agent=None)
-    # A real `harness` on the row still wins over the agent name.
+    # A real `harness` on the row still wins over the spec.
     assert a._HARNESS_MARKS["anthropic"] in content_line(
-        agent="cmdcode", harness="claude-native")
+        agent="zen", harness="claude-native")
 
 
 def test_harness_vendors_reads_this_repos_catalog():
