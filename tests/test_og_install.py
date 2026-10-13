@@ -1690,8 +1690,8 @@ def test_roster_skill_names_the_scout_chain_in_order_and_states_the_rule():
     # Each entry section carries its own harness, pin and quota shape.
     assert "harness `acp:command-code`" in skill
     assert "pinned `moonshotai/kimi-k3`" in skill
-    assert "`scout` -> `acp:command-code`" in skill
-    assert "`scout_2` -> `acp:kiro-aws`" in skill
+    assert "`scout` -> `acp`" in skill
+    assert "`scout_2` -> `acp`" in skill
 
 
 def test_roster_skill_has_no_scout_section_without_a_scout():
@@ -1873,8 +1873,8 @@ def test_roster_skill_names_the_integrator_chain_in_order_and_states_the_rules()
     # Each entry section carries its own harness, pin and quota shape.
     assert "harness `acp:command-code`" in skill
     assert "pinned `moonshotai/kimi-k3`" in skill
-    assert "`integrator` -> `acp:command-code`" in skill
-    assert "`integrator_2` -> `acp:kiro-aws`" in skill
+    assert "`integrator` -> `acp`" in skill
+    assert "`integrator_2` -> `acp`" in skill
 
 
 def test_roster_skill_has_no_integrator_section_without_one():
@@ -1971,25 +1971,95 @@ def test_roster_skill_carries_the_preflight_procedure_moved_out_of_the_prompt():
     for moved in ("## Preflight (FIRST turn, before any dispatch)",
                   "sys_session_get_info({})", "configured_harnesses",
                   "exactly `true`", "MISSING worker", "same turn you start planning",
-                  "`coder_cmdcode` -> `acp:command-code`",
+                  "`coder_cmdcode` -> `acp`",
                   "`coder_zen` -> `opencode-native`",
-                  "`coder_kilo` -> `acp:kilo-code`",
-                  "`coder_freebuff` -> `acp:freebuff`",
+                  "`coder_kilo` -> `acp`",
+                  "`coder_freebuff` -> `acp`",
                   "`reviewer` -> `codex-native`"):
         assert moved in skill, moved
 
 
 def test_roster_skill_preflight_mapping_is_generated_from_the_plan():
-    """The worker -> harness-id table is generated from the plan, so a
-    reconfigured roster produces a different table instead of a stale one."""
+    """The worker -> `configured_harnesses` key table is generated from the
+    plan, so a reconfigured roster produces a different table instead of a
+    stale one."""
     a = m.render_roster_skill(_base_plan(coders=[{"id": "cmdcode", "priority": 1,
                                                   "model": "moonshotai/kimi-k3"}]))
     b = m.render_roster_skill(_base_plan(coders=[{"id": "cline", "priority": 1,
                                                   "model": "deepseek/deepseek-v4-flash"}]))
-    assert "`coder_cmdcode` -> `acp:command-code`" in a
-    assert "`coder_cmdcode` -> `acp:command-code`" not in b
-    assert "`coder_cline` -> `acp:cline`" in b
-    assert "`coder_cline` -> `acp:cline`" not in a
+    assert "`coder_cmdcode` -> `acp`" in a
+    assert "`coder_cmdcode` -> `acp`" not in b
+    assert "`coder_cline` -> `acp`" in b
+    assert "`coder_cline` -> `acp`" not in a
+
+
+def test_preflight_key_derives_acp_from_the_harness_not_a_hardcoded_list():
+    """Every `acp:<slug>` harness maps to the ONE shared `acp` key that
+    `configured_harnesses` actually carries; a native harness keeps its own id.
+    Derived from the string form, so a new vendor needs no code change."""
+    assert m.preflight_key("acp:kilo-code") == "acp"
+    assert m.preflight_key("acp:new-vendor") == "acp"
+    assert m.preflight_key("opencode-native") == "opencode-native"
+    assert m.preflight_key("codex-native") == "codex-native"
+
+
+def test_preflight_map_keys_an_acp_worker_on_acp_and_names_the_phantom_key():
+    """The bug: the map told the orchestrator to look up `acp:kilo-code`, a key
+    that is not in `configured_harnesses`, so every ACP worker read as MISSING
+    and was silently dropped from the roster. The generated line must point at
+    the shared `acp` key AND name the phantom per-vendor key it must not use."""
+    plan = _base_plan(coders=[{"id": "kilo", "priority": 1,
+                               "model": "kilo/kilo-auto/free"}])
+    pre = m.render_preflight_map(plan)
+    assert "`coder_kilo` -> `acp`" in pre
+    assert "the map has no `acp:kilo-code`" in pre
+
+
+def test_preflight_map_keys_a_native_worker_on_its_own_harness_id():
+    """A native harness keeps today's rule: its own id IS the key."""
+    plan = _base_plan(coders=[{"id": "opencode", "priority": 1,
+                               "model": "opencode/mimo-v2.5-free"}])
+    pre = m.render_preflight_map(plan)
+    assert "`coder_zen` -> `opencode-native`" in pre
+    assert "`reviewer` -> `codex-native`" in pre
+
+
+def test_preflight_map_keys_a_new_acp_vendor_with_no_code_change(monkeypatch):
+    """AGENTS.md: adding a vendor is a registry row, not code. A brand-new
+    `acp:<slug>` row must get the shared `acp` key from the same derivation."""
+    row = {"id": "newvendor", "label": "New Vendor", "harness": "acp:new-vendor",
+           "binary": "newvendor", "kind": "acp-user", "roles": ["coder"],
+           "vendor": "newvendor", "model": {"required": True,
+                                            "pin_path": "executor.model"},
+           "login": "newvendor auth"}
+    monkeypatch.setattr(m, "REGISTRY",
+                        {**m.REGISTRY, "agents": m.REGISTRY["agents"] + [row]})
+    plan = _base_plan(coders=[{"id": "newvendor", "priority": 1,
+                               "model": "newvendor/model-x"}])
+    pre = m.render_preflight_map(plan)
+    assert "`coder_newvendor` -> `acp`" in pre
+    assert "`coder_newvendor` -> `acp:new-vendor`" not in pre
+
+
+def test_preflight_prose_says_the_acp_key_proves_transport_not_auth():
+    """The `acp` key is honest but shallow: it must not read as proof that the
+    agent's CLI is installed or logged in. The known ACP failure mode is named
+    so the orchestrator does not over-trust a clean preflight."""
+    skill = m.render_roster_skill(FOUR_CODER_PLAN)
+    assert "NOT that this agent's CLI is" in skill
+    assert "`ACP session/new`" in skill
+
+
+def test_dispatch_shape_names_agent_and_args_input():
+    """The real `sys_session_send` call NEEDS `agent` and `args.input`; the
+    generated text used to name only `title`/`args.purpose`, and following it
+    literally errored twice and burned a turn's dispatch budget."""
+    prompt = m.render_orchestrator(FOUR_CODER_PLAN)
+    assert "`agent` (the worker name)" in prompt
+    assert "`args.input` (the task text)" in prompt
+    skill = m.render_roster_skill(FOUR_CODER_PLAN)
+    assert "REQUIRES `agent`" in skill
+    assert "`args.input`" in skill
 
 
 def test_roster_skill_carries_the_per_worker_failure_shapes():

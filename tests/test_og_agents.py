@@ -1183,6 +1183,289 @@ def test_the_cwd_probe_is_skipped_entirely_under_all_roots():
 
 
 # ---------------------------------------------------------------------------
+# 6b. bug: two roots in the same directory — the STALE one is the live one
+# ---------------------------------------------------------------------------
+#
+# `test_a_quiet_workerless_root_in_the_cwd_narrows_the_view_to_its_tree` (above)
+# covers the case where NO root in the cwd was live. It cannot see this one, and
+# neither could any other test here, because every fixture until now had at most
+# one root in `$PWD` — which is why the wrong-session bug shipped: with a single
+# candidate, "first live match" and "root in this directory" are the same answer,
+# so the defect is invisible until a repo has a history of sessions in it.
+
+def _two_roots_in_one_repo():
+    """A repo with two root sessions in it: yesterday's run and today's.
+
+    `stale` is the trap. It is IDLE and has a finished worker, so `_is_live_root`
+    calls it live forever — which is correct for "worth showing" and useless for
+    "which directory am I in". `fresh` is the operator's session: brand new,
+    idle, nothing dispatched, so it is not in the live set at all.
+
+    Listing order is newest-first (og_herdr_watch's measured fact), which here is
+    ALSO the recency order — so on this fixture alone, "first row that matches"
+    would score the same as "most recent match". The tests below that put the two
+    in disagreement are what actually pin the rule; these pin the failure.
+    """
+    return [
+        listed("fresh", status="idle", title="og chat",
+               created_at=NOW - 60, updated_at=NOW - 60),
+        listed("stale", status="idle", title="yesterday's run",
+               created_at=NOW - 90000, updated_at=NOW - 90000),
+        listed("s1", parent="stale", status="idle", title="coder_zen:old work"),
+    ]
+
+
+_TWO_ROOTS_DETAILS = {
+    "fresh": detail("fresh", workspace="/repo/og", harness="claude-native"),
+    "stale": detail("stale", workspace="/repo/og", harness="claude-native"),
+    "s1": detail("s1", items=[ASSISTANT_MESSAGE]),
+}
+
+
+def test_the_newer_root_wins_when_a_stale_sibling_in_the_same_repo_is_live():
+    """`og agents` showed ~16 workers finished 22-41h ago. It was the wrong one.
+
+    A brand-new idle session in this repo, nothing dispatched from it, showed the
+    worker tree of the PREVIOUS root session in the same directory. `stale` won
+    for one reason only: it still has workers, so it is "live", so it matched
+    `$PWD` in the pass that checked live roots first and returned immediately —
+    and `fresh`, which was never asked at all.
+
+    The cwd question is about recency, not activity: the root in this directory
+    is the most recently active one, and a stale sibling with workers on screen
+    must not outrank the session the operator is standing in.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()] * 3,
+                           details=dict(_TWO_ROOTS_DETAILS))
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["fresh"], frame.rows
+    assert frame.rows[0].is_root, "it narrowed to the operator's own tree"
+    # The stale tree is not merely unshown behind the new one — it is absent,
+    # including the finished worker whose report is the tempting thing on screen.
+    assert not any("old work" in row.text for row in frame.rows), frame.rows
+
+
+def test_all_still_forces_the_wide_view_with_two_roots_in_one_repo():
+    """`--all` is the operator overriding the cwd rule, so it must still do that.
+
+    The fix moved the cwd decision off liveness and onto recency. `--all` is the
+    escape hatch for "I know there are other sessions, show me the live ones",
+    and a recency rule that leaked into it would turn it back into "this
+    directory's root". It shows every LIVE root — which here is `stale`, because
+    it has workers — and it pays nothing for the quiet root it declines to show.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()] * 2,
+                           details=dict(_TWO_ROOTS_DETAILS))
+    model = _model(opener, cwd="/repo/og", all_roots=True)
+
+    frame = model.refresh()
+
+    # The rail rows are structural — they open a state group — so the SESSIONS
+    # are the non-rail rows.
+    ids = [row.session_id for row in frame.rows if not row.rail]
+    assert ids == ["stale", "s1"], frame.rows
+    # The quiet root was never even asked: `--all` is a liveness decision, and
+    # liveness is free (the listing row already says idle-with-no-workers). What
+    # IS fetched is `stale`'s own label and `s1`'s report — both pre-existing,
+    # both for the worker the lazy "first idle" snippet exists to read.
+    assert [r.full_url for r in opener.detail_requests] == [
+        "http://x/v1/sessions/stale",
+        "http://x/v1/sessions/s1",
+    ], [r.full_url for r in opener.detail_requests]
+
+
+def test_the_stale_live_root_is_still_fetched_and_cached_not_reshown():
+    """The fix narrows the SCOPE; it must not stop `stale` being shown elsewhere.
+
+    A narrowing that dropped the root from the view would hide a real session
+    from an operator sitting in a different directory. So it is still fetched
+    (that is what its `harness` label and `workspace` cost) and still cached,
+    and it is still in scope the moment the operator is somewhere that has no
+    root of its own.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()] * 2,
+                           details=dict(_TWO_ROOTS_DETAILS))
+    elsewhere = _model(opener, cwd="/no/root/here", all_roots=False)
+
+    frame = elsewhere.refresh()
+
+    # No root lives in `/no/root/here`, so the wide live set stands — and
+    # `stale` is in it, because it has workers.
+    ids = [row.session_id for row in frame.rows if not row.rail]
+    assert ids == ["stale", "s1"], frame.rows
+    s1 = next(row for row in frame.rows if row.session_id == "s1")
+    assert "old work" in s1.text
+
+
+def test_the_cwd_probe_stops_at_the_newest_match_and_costs_one_fetch_per_root():
+    """The budget, asserted on the seam: no fetch per root, per poll.
+
+    The recency walk replaces "live roots first, then the rest". That could have
+    cost a fetch per root on every poll, so it is pinned here: the walk fetches
+    each root at most once, ever, and stops at the first match — so the roots
+    BELOW the answer are never asked at all, and later polls add nothing.
+
+    The timestamps are arranged so the walk has real work to do in both
+    directions: two roots more recent than the match (which must be fetched and
+    rejected, and are the cost the ordering is buying) and one less recent (which
+    must never be touched at all).
+    """
+    listing = _two_roots_in_one_repo() + [
+        # More recent than `fresh`, in other directories: the walk cannot stop at
+        # the first row, it has to check them and reject them.
+        listed("newest_other", status="idle", title="yet another repo",
+               created_at=NOW - 10, updated_at=NOW - 10),
+        listed("recent_other", status="idle", title="another repo",
+               created_at=NOW - 30, updated_at=NOW - 30),
+        # LESS recent than the match and in another directory: the walk stops at
+        # `fresh`, so this one is never put to the question.
+        listed("older_other", status="idle", title="an older repo",
+               created_at=NOW - 120, updated_at=NOW - 120),
+    ]
+    opener = RoutingOpener([listing] * 4, details={
+        **_TWO_ROOTS_DETAILS,
+        "newest_other": detail("newest_other", workspace="/a/fourth/place"),
+        "recent_other": detail("recent_other", workspace="/a/third/place"),
+        "older_other": detail("older_other", workspace="/a/second/place"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    model.refresh()
+    after_first = [r.full_url for r in opener.detail_requests]
+
+    # `stale` is read for its harness label regardless (it is live); the walk
+    # then reads the two roots more recent than the answer and rejects them, and
+    # matches `fresh`. Four fetches, and `older_other` is not one of them.
+    assert after_first == [
+        "http://x/v1/sessions/stale",
+        "http://x/v1/sessions/newest_other",
+        "http://x/v1/sessions/recent_other",
+        "http://x/v1/sessions/fresh",
+    ], [r.full_url for r in opener.detail_requests]
+
+    # One fetch per root, ONCE. Four polls of a stable listing cost exactly what
+    # the first did — the regression this rule exists to prevent is a walk that
+    # refetches 121 KB per root every three seconds.
+    for _ in range(3):
+        model.refresh()
+    assert [r.full_url for r in opener.detail_requests] == after_first
+
+
+def test_two_roots_in_the_cwd_do_not_widen_the_view_to_both():
+    """Most-recent wins outright: it is one root's tree, not two.
+
+    The bug showed the WRONG tree. The obvious wrong fix would show both, which
+    is no better — the operator still cannot tell which session they are looking
+    at. A match is the whole scope, exactly as before.
+    """
+    opener = RoutingOpener([_two_roots_in_one_repo()],
+                           details=dict(_TWO_ROOTS_DETAILS))
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["fresh"]
+    assert len([row for row in frame.rows if row.is_root]) == 1
+
+
+def test_a_root_with_no_usable_timestamp_is_not_treated_as_the_newest():
+    """Unknown age sorts LAST, so a row missing `updated_at` cannot win by luck.
+
+    The listing carries `created_at` and `updated_at` and nothing newer (see
+    og_herdr_watch's measured key list), so recency comes off the row itself and
+    costs no fetch. A root whose row carries neither is not evidence of recency;
+    treating it as newest would hand the operator whichever unknown-age root
+    happened to sort first, which is the bug being fixed, wearing a different hat.
+    """
+    listing = [
+        listed("dateless", status="idle", title="no timestamps at all"),
+        listed("stale", status="idle", title="yesterday's run",
+               updated_at=NOW - 90000),
+        listed("s1", parent="stale", status="idle", title="coder_zen:old work"),
+    ]
+    opener = RoutingOpener([listing], details={
+        "dateless": detail("dateless", workspace="/repo/og"),
+        "stale": detail("stale", workspace="/repo/og"),
+        "s1": detail("s1"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    ids = [row.session_id for row in frame.rows if not row.rail]
+    assert ids == ["stale", "s1"], frame.rows
+
+
+def test_recency_breaks_a_tie_by_created_at_when_updated_at_is_absent():
+    """`updated_at` is the answer; `created_at` is what is left when it is not.
+
+    Both come off the free LISTING row. Without this, two roots in one repo with
+    neither an `updated_at` would tie and fall back to listing order — which is
+    newest-first by the server's sort, but is a coincidence rather than a rule.
+    """
+    listing = [
+        listed("dateless", status="idle", title="older, no updated_at",
+               created_at=NOW - 90000),
+        listed("fresh", status="idle", title="newer, no updated_at",
+               created_at=NOW - 60),
+        listed("stale", status="idle", title="yesterday's run",
+               updated_at=NOW - 120000),
+        listed("s1", parent="stale", status="idle", title="coder_zen:old work"),
+    ]
+    opener = RoutingOpener([listing], details={
+        "dateless": detail("dateless", workspace="/repo/og"),
+        "fresh": detail("fresh", workspace="/repo/og"),
+        "stale": detail("stale", workspace="/repo/og"),
+        "s1": detail("s1"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    assert [row.session_id for row in frame.rows] == ["fresh"], frame.rows
+
+
+def test_a_live_root_in_the_cwd_still_wins_over_a_more_recent_root_elsewhere():
+    """The ordinary case must not regress: one live root in `$PWD`, and its tree.
+
+    Every other test in this file puts the answer in a quiet root. The common
+    real shape is the opposite — the operator's own session is running, has
+    workers, and is the only root in the repo — and that is the case where the
+    recency walk must agree with the live-root heuristic rather than fight it.
+    """
+    listing = [
+        listed("mine", status="running", title="this project",
+               created_at=NOW - 600, updated_at=NOW - 2),
+        listed("m1", parent="mine", status="running", title="coder_zen:work"),
+        listed("other", status="running", title="other project",
+               created_at=NOW - 300, updated_at=NOW - 1),
+        listed("o1", parent="other", status="running", title="coder_zen:elsewhere"),
+    ]
+    opener = RoutingOpener([listing] * 2, details={
+        "mine": detail("mine", workspace="/repo/og", harness="claude-native"),
+        "m1": detail("m1"),
+        "other": detail("other", workspace="/somewhere/else",
+                        harness="claude-native"),
+        "o1": detail("o1"),
+    })
+    model = _model(opener, cwd="/repo/og", all_roots=False)
+
+    frame = model.refresh()
+
+    ids = [row.session_id for row in frame.rows if not row.rail]
+    assert ids == ["mine", "m1"], frame.rows
+    # The root's harness label resolves in the gauge line of its header.
+    assert frame.rows[0].is_root
+    assert a._root_lines(frame.rows[0], 60)[1][0].endswith("Claude Code")
+    # `other` is MORE recently active than `mine` and is still not the answer:
+    # recency breaks a tie between roots in `$PWD`, it does not outrank the cwd.
+    assert opener.detail_requests, "both live roots were read"
+
+
+# ---------------------------------------------------------------------------
 # 7. a detail fetch that fails still renders the row
 # ---------------------------------------------------------------------------
 
@@ -2359,6 +2642,159 @@ def test_access_info_never_modifies_or_deletes_the_tunnel_cache(
         after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
         assert after == before, f"the cache was touched for {provider!r}"
         assert (tmp_path / "og-tunnel.url").exists()
+
+
+# ---------------------------------------------------------------------------
+# 14. the curses painter: full-width writes and a single footer
+# ---------------------------------------------------------------------------
+#
+# Both defects lived BELOW the pure renderer — in the paint loop, at the seam
+# between a composed `Pane` and `addnstr` — so no pure-`render` test could see
+# them. These drive the real `_run_tui` loop with a fake window that records
+# every `addnstr`, which is the smallest seam that reaches the painter.
+
+class _FakeStdscr:
+    """A curses window that records what the painter hands it.
+
+    `getch` answers `q` at once, so the loop paints exactly one frame and
+    returns; `erase` clears `writes` the way it clears the screen, so what is
+    left is one frame's worth of writes.
+    """
+
+    def __init__(self, height, width):
+        self.height, self.width = height, width
+        self.writes: list[tuple[int, str, int]] = []
+
+    def keypad(self, flag): pass
+    def getmaxyx(self): return (self.height, self.width)
+    def erase(self): self.writes.clear()
+    def refresh(self): pass
+    def timeout(self, ms): pass
+    def getch(self): return ord("q")
+
+    def addnstr(self, row, col, text, n, attr):
+        self.writes.append((row, text[:n], n))
+
+
+class _StubModel:
+    """A model whose refresh always returns the same frame."""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    def refresh(self, selected_id=None, expanded_ids=(), force=False):
+        return self._frame
+
+
+def _paint(frame, width, height, monkeypatch):
+    """Run one real paint of `frame` and return the `addnstr` writes."""
+    import curses
+
+    scr = _FakeStdscr(height, width)
+    monkeypatch.setattr(curses, "curs_set", lambda *_: None)
+    monkeypatch.setattr(curses, "wrapper", lambda fn, *a, **k: fn(scr))
+    a._run_tui(_StubModel(frame), 3.0, "http://x")
+    return scr.writes
+
+
+class _EdgeStdscr:
+    """A curses window that refuses ONLY its bottom-right cell, like the real one.
+
+    `addnstr` on the last line's last column is the single write curses rejects
+    with `curses.error`; `paint_line` must swallow exactly that and nothing else,
+    writing every other row at the full width.
+    """
+
+    def __init__(self, height, width, error):
+        self.height, self.width, self.error = height, width, error
+        self.writes: list[tuple[int, int, str, int]] = []
+
+    def addnstr(self, row, col, text, n, attr):
+        if row == self.height - 1 and col + n >= self.width:
+            raise self.error("addnstr: bottom-right cell")
+        self.writes.append((row, col, text[:n], n))
+
+
+def test_paint_line_writes_the_full_width_and_swallows_the_last_cell_alone():
+    """The writer's own contract: `width`, one tolerant cell, and no narrowing.
+
+    Every box line is exactly `width` columns and its closing border lives in the
+    last one, so `paint_line` has to write at full width. The window's
+    bottom-right cell is the one cell curses genuinely refuses; swallowing that
+    exactly (and no more) is what replaces the old blanket `width - 1`.
+    """
+    import curses
+
+    scr = _EdgeStdscr(5, 10, curses.error)
+
+    # A normal row is written at the FULL width.
+    a.paint_line(scr, 0, "╭────────╮", 10, 5, 0)
+    assert scr.writes == [(0, 0, "╭────────╮", 10)], scr.writes
+
+    # The bottom-right cell is attempted at full width and refused — swallowed,
+    # never raised, and never pre-empted by writing a column short.
+    a.paint_line(scr, 4, "╰────────╯", 10, 5, 0)
+
+    # Out of range or a zero width is a no-op, not an error.
+    a.paint_line(scr, 9, "x", 10, 5, 0)
+    a.paint_line(scr, 0, "x", 0, 5, 0)
+    assert scr.writes == [(0, 0, "╭────────╮", 10)], scr.writes
+
+
+def test_the_painter_writes_a_boxes_full_width_so_its_border_survives(
+        monkeypatch):
+    """A box closes in the pane's last column; `width - 1` clipped it off.
+
+    The old writer passed `width - 1` to `addnstr`, so every row lost its last
+    column — exactly the `╮`, `│` and `╯` of a box's right edge — and every box
+    rendered open on the right. This asserts on the recorded writes, which is
+    where the truncation happened and where a pure `render` test cannot look.
+    """
+    frame = a.Frame(rows=[worker("w1", "working")], selected=0)
+    writes = _paint(frame, 60, 20, monkeypatch)
+
+    # A worker draws a guttered, rounded box; its rows are the only writes that
+    # begin with the group rail, and a collapsed worker's box is three of them
+    # (top border, one content row, bottom border).
+    box = [text for _row, text, _n in writes if text.startswith(a.RAIL)]
+    assert len(box) == 3, "one rounded box: top, content, bottom"
+    assert all(len(line) == 60 for line in box), "each box row is the pane width"
+    assert box[0].endswith(a.ROUND_CORNERS[2]), "the top rule closes on the right"
+    assert box[-1].endswith(a.ROUND_CORNERS[5]), "the bottom rule closes on the right"
+    assert all(n == 60 for _row, _text, n in writes), \
+        "no row is written one column short"
+
+
+def test_a_short_list_paints_its_footer_once(monkeypatch):
+    """With the list shorter than the window the footer was painted twice.
+
+    The window ran over the whole of `items`, tail included, and landed on the
+    footer just above where the pinned tail drew it again — two footers, one
+    under the last box and one at the pane bottom.
+    """
+    frame = a.Frame(rows=[header(), worker("w1", "working")], selected=1)
+    writes = _paint(frame, 60, 24, monkeypatch)
+
+    # A 60-column pane selects the compact footer form, so the expected line is
+    # whatever form `_footer` picks for the width — not the full one.
+    footers = [row for row, text, _n in writes if text == a._footer(60)]
+    assert len(footers) == 1, "the footer is painted exactly once, not twice"
+    assert footers[0] == 23, "and once means pinned to the pane's bottom row"
+
+
+def test_a_long_list_keeps_one_footer_pinned_at_the_bottom(monkeypatch):
+    """A list that overflows the window still shows exactly one footer.
+
+    Here the window stops before the tail, so the pinned one is the only one —
+    the regression guard that the short-list fix did not drop the tail.
+    """
+    rows = [header()] + [worker(f"w{i}", "working") for i in range(16)]
+    frame = a.Frame(rows=rows, selected=1)
+    writes = _paint(frame, 60, 12, monkeypatch)
+
+    footers = [row for row, text, _n in writes if text == a._footer(60)]
+    assert len(footers) == 1, "the footer is painted exactly once"
+    assert footers[0] == 11, "and stays pinned to the bottom while the list scrolls"
 
 
 # ---------------------------------------------------------------------------

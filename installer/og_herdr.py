@@ -168,6 +168,25 @@ def _error_line(sid: str, exc) -> str:
     return f"error {sid}: {code}: {message}"
 
 
+def _says_gone(exc) -> bool:
+    """Whether an error from herdr means the thing we named is NOT there.
+
+    `not_found` covers `release_agent`'s "no such marker", which the removal path
+    already absorbs on its own; the namespaced forms are what a projection
+    actually comes back with — `workspace_not_found` for a tab created in a space
+    that is gone, `pane_not_found` for a report aimed at a closed pane. Both are
+    a statement about the RECORD, which is why `reconcile` repairs it on them.
+
+    Matched on the SUFFIX rather than against a fixed list, so a herdr that
+    gains a namespaced variant of the same fact is handled without a second edit
+    here — and a transport failure (`connect`, `timeout`, `disconnected`) is not
+    matched at all, because a socket that could not be reached has proved
+    nothing about any workspace.
+    """
+    code = getattr(exc, "code", "") or ""
+    return code == "not_found" or code.endswith("_not_found")
+
+
 def _id_of(entry, key: str) -> str | None:
     """The id `key` out of a create result's `workspace` / `tab` / `root_pane`
     sub-object.
@@ -188,6 +207,74 @@ def _id_of(entry, key: str) -> str | None:
     if isinstance(entry, dict):
         return entry.get(key) or None
     return None
+
+
+# ---------------------------------------------------------------------------
+# the rule about recorded workspace ids
+#
+# ONE statement of it, shared with og_herdr_launch (which asks the same question
+# of the same listing before it believes the same file). The launcher had this
+# first, and got it right; the bridge never learned it, and a recorded workspace
+# it never re-validated is what a fan-out of sub-agents projects into:
+#
+#     error f193205d…: workspace_not_found: workspace wV not found   (worker 1)
+#     error 5b011e8e…: workspace_not_found: workspace wV not found   (worker 2)
+#     error 3f3a1c0a…: workspace_not_found: workspace wV not found   (worker 3)
+#
+# wV had been recorded once and gone (the operator closed the space, or `og start
+# herdr` case (C) closed the pane that was the last one in it — closing a
+# workspace's last pane removes the workspace, measured). Every worker after that
+# was handed the dead id, forever.
+#
+# THE THREE ANSWERS, and collapsing any two of them is a bug:
+#   recorded id IS in the listing   — the space is there; use it
+#   recorded id is NOT in it        — herdr says the space is GONE; re-adopt
+#   the listing could not be read   — we CANNOT TELL; believe the record
+#
+# The third is the one that is easy to get wrong and expensive when it is: an
+# unreadable listing read as an empty one says "your space is gone", and the
+# bridge would open a SECOND space for a conversation that already has one.
+# The record is a cache, not a source of truth (docs/MUX-LAUNCHER §3) — only
+# herdr's own listing can say an id is gone.
+# ---------------------------------------------------------------------------
+
+SPACE_LIVE = "live"
+SPACE_GONE = "gone"
+SPACE_UNCONFIRMED = "unconfirmed"
+
+
+def workspace_index(spaces) -> dict:
+    """`{workspace_id: row}` from a `workspace.list` REPLY; `{}` for an empty one.
+
+    Built from a REPLY and never from a failure: an empty `{}` here means herdr
+    answered and said it has no workspaces, which is a different fact from "the
+    answer never arrived". Deciding between those is `space_status`'s job, not
+    this one's — keeping the parse free of the judgement is what stops the two
+    from being confused again.
+    """
+    index = {}
+    for ws in spaces if isinstance(spaces, list) else []:
+        if not isinstance(ws, dict):
+            continue
+        ws_id = ws.get("workspace_id")
+        if isinstance(ws_id, str) and ws_id:
+            index[ws_id] = ws
+    return index
+
+
+def space_status(recorded: str | None, index: dict | None) -> str:
+    """`SPACE_LIVE` / `SPACE_GONE` / `SPACE_UNCONFIRMED` for one recorded id.
+
+    `index` is `None` for "we could not ask" and a dict for "herdr answered";
+    `{}` is an answer, not a shrug.
+
+    Nothing recorded is `SPACE_UNCONFIRMED` rather than `SPACE_GONE`: with no id
+    there is nothing for herdr to have or not have, and calling that GONE would
+    let a caller that skips the "nothing recorded" branch invent a death.
+    """
+    if not recorded or index is None:
+        return SPACE_UNCONFIRMED
+    return SPACE_LIVE if recorded in index else SPACE_GONE
 
 
 def _parent_of(source) -> str | None:
@@ -510,11 +597,22 @@ class Bridge:
     """
 
     def __init__(self, watcher, client, dry_run=False, source=DEFAULT_SOURCE,
-                 cwd=None, server=DEFAULT_SERVER, state_path=None):
+                 cwd=None, server=DEFAULT_SERVER, state_path=None, filer=None):
         self.watcher = watcher
         self.client = client
         self.dry_run = dry_run
         self.source = source
+        # Files each new ROOT session under the install's project folder
+        # (og_projects.ProjectFiler), or None to leave filing off. It is a seam
+        # and not a call made here, because the bridge is AST-guarded against
+        # reaching for the network of its own accord (see the tests) — the
+        # watcher owns every HTTP call it makes, and this one arrives injected.
+        self.filer = filer
+        # Whether a filing failure has already been reported. Filing is a
+        # convenience, not the job, so a broken server warns ONCE per bridge and
+        # never once per session — a daemon that logs a line per new root for the
+        # life of the process is the noise this flag exists to prevent.
+        self._file_warned = False
         # The directory new panes open in when the session does not name one of
         # its own (see `_added`). It comes from THIS process, so with no
         # explicit --cwd it is the bridge's own cwd.
@@ -591,6 +689,23 @@ class Bridge:
                 lines.extend(self._apply(event))
             except _error_cls() as exc:
                 lines.append(_error_line(event.session_id, exc))
+                if event.kind != "removed" and _says_gone(exc):
+                    # The record is stale NOW, not just unlucky: herdr said the
+                    # pane or space we named is not there. Repair it once (see
+                    # `_reproject`) instead of logging the same line on every
+                    # poll for the rest of the process — which is what nine
+                    # `pane_not_found` lines for one root turned out to be. A
+                    # `removed` is excluded: that session is on its way out, and
+                    # re-opening a pane for it would be the opposite of the
+                    # cleanup the event asked for.
+                    try:
+                        self._reproject(event.session_id, event.session)
+                    except _error_cls() as repair_exc:
+                        lines.append(
+                            "error {0}: could not re-project it: {1}: {2}".format(
+                                event.session_id,
+                                getattr(repair_exc, "code", "herdr-error"),
+                                getattr(repair_exc, "message", repair_exc)))
         if self._ws_error:
             lines.append(self._ws_error)
             self._ws_error = None
@@ -799,6 +914,39 @@ class Bridge:
             return self._removed(sid)
         return []
 
+    def _file_under_project(self, sid: str) -> list:
+        """File a newly-seen ROOT session under this install's project folder.
+
+        The write lives HERE, in the bridge, and not in the watcher: the watcher
+        is read-only by contract — `og_agents` depends on that and says so — and
+        the bridge is the component that already acts on session events. The HTTP
+        itself belongs to the injected `filer`, so the bridge stays free of any
+        network call of its own (the tests pin that with an AST scan).
+
+        The name is the orchestrator bundle from the install plan, read here
+        rather than hard-coded, so a user's `hivemind` folder is the one the
+        session lands in. It defaults the same way the launcher's does, via
+        `og_herdr_launch`, so there is one spelling of the key and its fallback.
+
+        Best effort throughout. A dry run makes no calls at all; an already-filed
+        session is left exactly as it was (by the filer); and a failure is warned
+        ONCE and never raised, so it can neither take the bridge down nor keep the
+        session's pane from opening. There is no retry: a session is filed once.
+        """
+        if self.filer is None or self.dry_run:
+            return []
+        from og_herdr_launch import agent_name, install_config
+
+        name = agent_name(install_config())
+        status, detail = self.filer.file(sid, name)
+        if status == "filed":
+            return [f"filed {sid} under the '{name}' project"]
+        if status == "failed" and not self._file_warned:
+            self._file_warned = True
+            return [f"warn: could not file session {sid} under the '{name}' "
+                    f"project ({detail}); it stays unfiled"]
+        return []
+
     def _added(self, sid: str, session: dict) -> list:
         command = attach_command(self.server, sid)
         rec = self._recs.get(sid)
@@ -839,6 +987,13 @@ class Bridge:
         state = _state(session)
         parent = _parent_of(session)
 
+        # File this ROOT under the install's project folder, once, on first
+        # sighting. A sub-agent is skipped: it nests under its root in the
+        # sidebar already and must stay unlabelled, or every worker would sprout
+        # a folder of its own. The lines are folded into whichever return below
+        # fires, so a filing failure is reported without ever touching the pane.
+        filed = self._file_under_project(sid) if parent is None else []
+
         # (2)/(3) A space may already be on screen for this session without the
         # bridge having opened it in THIS process — because the launcher made it
         # and ran `og chat` in it, or because the bridge restarted and its
@@ -862,9 +1017,10 @@ class Bridge:
                         "title": title, "agent": agent, "parent": parent,
                         "owns_space": False, "step": 3, "ready": True,
                     }
-                    return [f"dry-run: {taken['action']} '{title}' → space "
-                            f"{taken['workspace_id']} ({cwd}) — unverified, "
-                            f"read from the state file without asking herdr"]
+                    return filed + [
+                        f"dry-run: {taken['action']} '{title}' → space "
+                        f"{taken['workspace_id']} ({cwd}) — unverified, "
+                        f"read from the state file without asking herdr"]
                 # A record naming a pane we can confirm is finished with: the
                 # space, its tab and its pane all exist and something is already
                 # running in it. Re-running setup would type the attach command
@@ -872,8 +1028,9 @@ class Bridge:
                 # is a second co-drive client on one session, which is the race
                 # `_state` exists to avoid. So: adopt it and touch nothing.
                 if taken["pane_ok"]:
-                    return self._adopt(sid, taken["record"], taken["action"],
-                                       title, agent, state, command)
+                    return filed + self._adopt(sid, taken["record"],
+                                               taken["action"], title, agent,
+                                               state, command)
                 # No pane to resume onto (an upgraded v1 record carries no pane
                 # id). The space is still this session's, so it becomes a TAB in
                 # that space rather than a second space beside it.
@@ -894,14 +1051,14 @@ class Bridge:
                 "step": 3, "ready": True,
             }
             where = f"tab in space {space}" if space else "space"
-            return [f"dry-run: add '{title}' → {where} ({cwd}) → "
-                    f"{command} [{state}]"]
+            return filed + [f"dry-run: add '{title}' → {where} ({cwd}) → "
+                            f"{command} [{state}]"]
 
         if space is None:
-            return self._add_space(sid, title, cwd, agent, state, command,
-                                   parent)
-        return self._add_tab(sid, title, space, cwd, agent, state, command,
-                             parent)
+            return filed + self._add_space(sid, title, cwd, agent, state,
+                                           command, parent)
+        return filed + self._add_tab(sid, title, space, cwd, agent, state,
+                                     command, parent)
 
     # -- adopting a space that is already on screen --------------------------
     #
@@ -947,18 +1104,19 @@ class Bridge:
             if record is None:
                 return None
         ws_id = record["workspace_id"]
-        # Three states, and collapsing any two of them is a bug:
-        #   index is a dict and ws_id is in it    — the space is there
-        #   index is a dict and ws_id is not in it — herdr says it is GONE
-        #   index is None                        — we could not find out
-        # A dry run cannot find out either (zero client calls is its whole
-        # contract), so its index is `{}` and the `dry_run` guard is what lets it
-        # adopt on the file's word and SAY the line is unverified. A real run
-        # that cannot find out adopts nothing: a wrong answer here means a dead
-        # pane id, which is the one outcome worse than a duplicate space.
+        # Three states, and collapsing any two of them is a bug — `space_status`
+        # is where that is stated, once, for this module and the launcher:
+        #   live        — the space is there
+        #   gone        — herdr says it is NOT, so the record is stale
+        #   unconfirmed — we could not find out, so we claim nothing
+        # A real run that cannot find out adopts nothing: a wrong answer here
+        # means a dead pane id, which is the one outcome worse than a duplicate
+        # space.
         index = self._workspace_index()
+        status = SPACE_UNCONFIRMED if self.dry_run else \
+            space_status(ws_id, index)
         info = index.get(ws_id) if index is not None else None
-        if index is not None and info is None and not self.dry_run:
+        if status == SPACE_GONE:
             self._drop_space_record(sid, ws_id)
             self._pass_notes.append(
                 f"state: dropped the {action} record for {sid} — workspace "
@@ -1018,7 +1176,8 @@ class Bridge:
             "workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
             "title": title, "agent": agent, "parent": None,
             "owns_space": record.get("owner") == OWNER_BRIDGE,
-            "step": 3, "ready": True}
+            "step": 3, "ready": True,
+            "cwd": record.get("cwd") or self.cwd}
         return [f"{action} {sid} → space {ws_id} tab {tab_id} pane "
                 f"{pane_id} '{title}' {command} [{state}] "
                 f"(pane already live; setup not re-run)"]
@@ -1078,8 +1237,10 @@ class Bridge:
         as `{}`, which means herdr was asked and answered that it has no
         workspaces at all. That distinction is the difference between "this
         space is gone" and "we do not know", and only herdr can tell them
-        apart. Callers treat None as UNCONFIRMED: nothing is adopted, nothing is
-        claimed, and nothing is pruned.
+        apart; `space_status` names the three answers and both this module and
+        the launcher read them through it. Callers treat None as UNCONFIRMED:
+        nothing is adopted, nothing is claimed, nothing is pruned, and no
+        recorded space is repaired away.
 
         That is the conservative direction, and deliberately so. Treating
         unknown as absent would turn one transient herdr hiccup into a
@@ -1087,14 +1248,16 @@ class Bridge:
         closable; a session that silently lost its space is a conversation the
         operator cannot see at all.
 
-        A `--dry-run` never calls herdr, so it gets `{}` — it can neither
-        confirm nor deny anything, and the lines it prints say so.
+        A `--dry-run` never calls herdr, so it has no listing at all and gets
+        the same UNCONFIRMED — which is what it actually knows. It used to get
+        `{}`, which reads as "herdr says it has nothing", and that is exactly
+        the third-answer-collapsed-into-the-second mistake.
         """
         if self._ws_index is not None:
             return self._ws_index if self._ws_ok else None
         if self.dry_run or self.client is None:
-            self._ws_index, self._ws_ok = {}, True
-            return self._ws_index
+            self._ws_index, self._ws_ok = {}, False
+            return None
         try:
             spaces = self.client.workspace_list()
         except _error_cls() as exc:
@@ -1103,13 +1266,7 @@ class Bridge:
                 getattr(exc, "code", "herdr-error"),
                 getattr(exc, "message", exc))
             return None
-        index = {}
-        for ws in spaces if isinstance(spaces, list) else []:
-            if not isinstance(ws, dict):
-                continue
-            ws_id = ws.get("workspace_id")
-            if isinstance(ws_id, str) and ws_id:
-                index[ws_id] = ws
+        index = workspace_index(spaces)
         self._ws_index, self._ws_ok = index, True
         return index
 
@@ -1177,11 +1334,165 @@ class Bridge:
         need to see it. So the caller gives the child its OWN space instead, and
         says so; when the root later shows up the child keeps the space it got,
         because re-parenting it would mean closing a pane someone may be reading.
+
+        THE PARENT'S SPACE IS RE-VALIDATED HERE, every time, before it is used —
+        and this is the half of the guard the bridge did not have. A ROOT's
+        record is validated when it adopts one (`_existing_space`), but a
+        sub-agent's is a lookup in `_recs`, and that map was written once at
+        `workspace.create` and never checked again. So the operator closed the
+        conversation's space — or `og start <mux>` case (C) closed the pane that
+        happened to be the last one in it, and closing a workspace's last pane
+        removes the workspace (measured) — and every worker delegated after that
+        was handed a dead id:
+
+            error f193205d…: workspace_not_found: workspace wV not found
+            error 5b011e8e…: workspace_not_found: workspace wV not found
+            error 3f3a1c0a…: workspace_not_found: workspace wV not found
+
+        one per worker, once, and the root's own pane reporting
+        `pane_not_found` on every poll after it. `space_status` says what to do
+        with the answer, and a GONE verdict repairs the parent (`_reproject`) so
+        the worker lands in a space that exists. An UNCONFIRMED verdict changes
+        nothing: the recorded id is used as it always was, because an unreadable
+        listing is not evidence and inventing a second space over a live one is
+        the worse mistake (see `space_status`).
         """
         if not parent:
             return None
         rec = self._recs.get(parent)
-        return rec.get("workspace_id") if rec else None
+        if not rec:
+            return None
+        ws_id = rec.get("workspace_id")
+        if space_status(ws_id, self._workspace_index()) == SPACE_GONE:
+            return self._reproject(parent)
+        return ws_id
+
+    def _reproject(self, sid: str, session: dict | None = None) -> str | None:
+        """Give a session a pane again after herdr said the old one is gone.
+
+        THE ONGOING FAILURE, as distinct from the first one. The guard in
+        `_space_of` and `_existing_space` stops a dead id being USED, but a
+        record can also go stale between two events — herdr restarts and re-mints
+        ids, the operator closes one tab out of a space that stays — and then the
+        error arrives from herdr instead of from the listing. Before this, that
+        error was logged and nothing else: the record survived it, so every
+        later poll for the same session repeated it, forever, silently. Nine
+        identical `pane_not_found` lines for one root is what it looked like.
+
+        So a `*_not_found` from herdr means the record is stale NOW, and the
+        repair is: forget the record, THEN project the session again from what
+        is still known about it. The order is the contract, not a detail —
+        dropping it afterwards would leave the dead record in place whenever the
+        re-projection itself fails, which is precisely the failure this exists
+        to stop: the next poll would report against the same pane herdr has
+        never heard of, and say it again.
+
+        Deliberately ONE attempt — the re-projection goes through the ordinary
+        `_add_space` / `_add_tab`, so a herdr that is still broken raises out of
+        here into `reconcile`'s handler, is said once, and the record stays
+        dropped. A session with no record is ignored by `changed` and `removed`,
+        so there is nothing left to repeat.
+
+        A record is not required. `reconcile` calls this for any `*_not_found`,
+        including one from the create call itself, which fails BEFORE anything is
+        recorded (by design — see `_reject_partial_create`). There the event's
+        own session is the only description of the session there is, and the
+        re-projection is built from that.
+
+        Where the session goes:
+          a WORKER returns to its parent's space, which `_space_of` has just
+            re-validated — and repairs in turn if that one is gone too, so a
+            whole crew moves together rather than one worker at a time;
+          a ROOT keeps its own space while herdr still lists it (the operator
+            may have closed only the tab, and a second space for one
+            conversation is the mistake this whole file is careful about) and
+            gets a brand-new one when the space itself is gone.
+
+        Returns the workspace the session now lives in, or None if it could not
+        be projected at all — which the caller reads as "this session has no
+        space", exactly as for any other reason there is none.
+        """
+        rec = self._recs.get(sid)
+        session = session if isinstance(session, dict) else {}
+        if rec is None and not session:
+            return None
+        if self.dry_run:
+            # A dry run creates nothing, so there is nothing to repair and its
+            # lines have to describe a run it is not performing.
+            return (rec or {}).get("workspace_id")
+        # FORGET IT FIRST, before anything that can fail — see the docstring.
+        # `rec` is a local from here on, so the rest of the repair can still read
+        # what the stale record said.
+        self._recs.pop(sid, None)
+        parent = (rec or {}).get("parent") or _parent_of(session)
+        # The re-projection needs what `_added` needs. An `added` event carries
+        # the DETAIL row and so the title and the directory; a `changed` event
+        # carries the LISTING row, which has neither `harness` nor
+        # `workspace` — so the record's own copy of both is the fallback. That
+        # is why `_add_space`/`_add_tab` cache `cwd` on it: the event that
+        # triggers a repair is often the one shape that cannot supply it.
+        title = session.get("title") or (rec or {}).get("title")
+        agent = (rec or {}).get("agent") or agent_label(session)
+        cwd = session.get("workspace") or (rec or {}).get("cwd") or self.cwd
+        state = _state(session)
+        command = attach_command(self.server, sid)
+
+        if parent is None:
+            recorded_ws = rec.get("workspace_id") if rec else None
+            if space_status(recorded_ws, self._workspace_index()) != SPACE_GONE:
+                # The space is still there (or we cannot tell), so the pane is
+                # the only thing that died: a new TAB in the same space.
+                space = recorded_ws
+                stale = "the pane {0} it named".format(
+                    (rec or {}).get("pane_id"))
+            else:
+                self._forget_stale(sid, recorded_ws)
+                space = None
+                stale = "workspace {0}".format(recorded_ws)
+        else:
+            space = self._space_of(parent)
+            stale = "its own record"
+
+        # The old pane is gone either way, so setup restarts from the beginning
+        # on the new one rather than resuming onto a pane herdr has closed.
+        if space is None:
+            lines = self._add_space(sid, title, cwd, agent, state, command,
+                                    parent)
+        else:
+            lines = self._add_tab(sid, title, space, cwd, agent, state, command,
+                                  parent)
+            owned = self._spaces.get(sid) or {}
+            if owned.get("workspace_id") == space and \
+                    owned.get("owner") == OWNER_BRIDGE:
+                # A root put back into its OWN space still owns it: `_add_tab`
+                # cannot know that, and a root that forgets it would close its
+                # tab instead of its space on removal and leave the space
+                # stranded with nothing recording it.
+                self._recs[sid]["owns_space"] = True
+        # Pass notes rather than the event's lines: this is work the event did
+        # not ask for — it belongs to a DIFFERENT session — and the same place
+        # `_existing_space` reports a record it dropped.
+        self._pass_notes.append(
+            "state: {0} could not be projected — herdr has no {1} any more — "
+            "so it was projected again rather than the error repeated on "
+            "every poll".format(sid, stale)
+            if rec else
+            "state: {0} could not be projected at all; tried once more rather "
+            "than repeating the error on every poll".format(sid))
+        self._pass_notes.extend(lines)
+        return self._recs.get(sid, {}).get("workspace_id")
+
+    def _forget_stale(self, sid: str, ws_id: str | None) -> None:
+        """Drop a record for a workspace herdr no longer lists, in both halves.
+
+        Memory and the file, because a record that survives in only one of them
+        is the shape this file already shipped once (the v1 map that was updated
+        in one place and read in another): the next restart would make the same
+        decision against the same dead id.
+        """
+        self._recs.pop(sid, None)
+        if ws_id:
+            self._drop_space_record(sid, ws_id)
 
     def _add_space(self, sid: str, title, cwd: str, agent: str, state: str,
                    command: str, parent: str | None) -> list:
@@ -1205,9 +1516,19 @@ class Bridge:
             return self._reject_partial_create(sid, ws_id, tab_id, pane_id)
         rec = {"workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
                "title": title, "agent": agent, "parent": parent,
-               "owns_space": True, "step": 0, "ready": False}
+               "owns_space": True, "step": 0, "ready": False, "cwd": cwd}
         self._recs[sid] = rec
         self._remember(sid, ws_id, tab_id=tab_id, pane_id=pane_id, cwd=cwd)
+        # The pass's listing is a SNAPSHOT, taken before this space existed, so
+        # it must not be believed for the rest of the pass: the very next
+        # `_space_of` in this batch asks it whether the ROOT's space is still
+        # there, and a snapshot taken thirty milliseconds earlier would answer
+        # no — re-projecting a space the bridge itself just opened, which is the
+        # duplicate-space bug with one more step to reach it. Dropped rather than
+        # amended, because the honest content of a row for a workspace created
+        # here is unknown (`pane_count` decides whether an adopted record's pane
+        # can be resumed on) and guessing it would be inventing a fact.
+        self._ws_index = None
         self._setup_pane(sid, rec, state)
         return [f"add {sid} → space {ws_id} tab {tab_id} pane {pane_id} "
                 f"'{title}' '{command}' [{state}]"]
@@ -1229,7 +1550,7 @@ class Bridge:
             return self._reject_partial_create(sid, None, tab_id, pane_id)
         rec = {"workspace_id": space, "tab_id": tab_id, "pane_id": pane_id,
                "title": title, "agent": agent, "parent": parent,
-               "owns_space": False, "step": 0, "ready": False}
+               "owns_space": False, "step": 0, "ready": False, "cwd": cwd}
         self._recs[sid] = rec
         # A tab created INSIDE an adopted space: the space was already recorded
         # against this session, and it now names a pane of its own, so the
@@ -1282,7 +1603,26 @@ class Bridge:
                                      state=state, agent_session_id=sid)
             rec["step"] = 2
         if rec["step"] <= 2:
-            self.client.report_metadata(pane_id, self.source, title=rec["title"])
+            # `pane.report_metadata` with NOTHING to set is refused by herdr:
+            #
+            #     invalid_metadata_request: missing metadata field to set or clear
+            #
+            # measured in the live bridge log on a root whose session had no
+            # title yet — a fresh `og chat` conversation has `title: None` until
+            # its first message, and `_drop_none` then strips the only field
+            # that was going to be set, leaving a frame with `pane_id` and
+            # `source` and nothing else. Those are the only two params herdr
+            # REQUIRES (PaneReportMetadataParams), which is why the frame is
+            # schema-valid and still rejected: the schema cannot say "you must
+            # mean something by this".
+            #
+            # So there is no field to set, and the call is skipped rather than
+            # sent empty. The step still advances: a later `added` must not come
+            # back and send the same rejected frame, and the title itself is
+            # reported by `_changed` the moment there is one.
+            if rec["title"]:
+                self.client.report_metadata(pane_id, self.source,
+                                            title=rec["title"])
             rec["step"] = 3
             rec["ready"] = True
 
@@ -1351,7 +1691,14 @@ class Bridge:
                                  agent=rec["agent"], state=state,
                                  agent_session_id=sid)
         if title_changed:
-            self.client.report_metadata(rec["pane_id"], self.source, title=title)
+            # A title that is None is a title that cannot be reported: see
+            # `_setup_pane` for the measured refusal herdr answers with a frame
+            # carrying nothing but `pane_id` and `source`. `rec["title"]` is
+            # still updated below, so the real title is reported by the next
+            # event that actually carries one.
+            if title:
+                self.client.report_metadata(rec["pane_id"], self.source,
+                                           title=title)
         rec["title"] = title
         return [f"update {sid} → state={state}" + (" (title)" if title_changed
                                                    else "")]
@@ -1737,21 +2084,27 @@ def main(argv=None) -> int:
 
     from og_herdr_watch import SessionWatcher
 
-    watcher = SessionWatcher(base_url=args.server, token=_load_token(args.server))
+    token = _load_token(args.server)
+    watcher = SessionWatcher(base_url=args.server, token=token)
     client = None
+    filer = None
     if not args.dry_run:
-        # Constructed only for a real run: --dry-run must make zero herdr calls,
-        # and building the client is the one step that could touch the socket.
+        # Constructed only for a real run: --dry-run must make zero calls, and
+        # building either is the step that could reach a socket or the network.
         from og_herdr_client import HerdrClient
+        from og_projects import ProjectFiler
 
         client = HerdrClient(socket_path=args.socket)
+        # Files og's own new root sessions into the install's project folder,
+        # against the same server and token the watcher uses.
+        filer = ProjectFiler(args.server, token=token)
 
     bridge = Bridge(watcher, client,
                     dry_run=args.dry_run, source=args.source, cwd=args.cwd,
                     # The same URL the watcher polls, and the one the pane's
                     # `omnigent attach --server` has to name: the pane cannot
                     # discover it (see attach_command).
-                    server=args.server)
+                    server=args.server, filer=filer)
 
     if args.once:
         for line in bridge.run_once():

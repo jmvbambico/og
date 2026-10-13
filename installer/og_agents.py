@@ -494,6 +494,14 @@ def select_scope(
     be read simply has no match and does not narrow anything — the view falls
     back to the wide set rather than hiding the session the user is in because
     one optional fetch failed.
+
+    ONE narrower's worth of caution, because this is where the wrong-session bug
+    lived: narrowed within the live roots, this rule can only ever return a LIVE
+    root, and a stale root in a repo with a history of sessions is live for as
+    long as it still has workers. `AgentModel._match_cwd_root` is what decides
+    which root is `$PWD` among ALL of them, newest first; this function supplies
+    the wide fallback and the `--all` path. The two agreeing is the common case,
+    and when they disagree the caller uses the probe's answer.
     """
     ids = [sid for sid in (_session_id(s) for s in roots) if sid]
     if all_roots or not cwd:
@@ -511,6 +519,29 @@ def _is_root(session: dict) -> bool:
     """A session with no parent is a root: the conversation the human drives."""
     parent = session.get("parent_session_id")
     return not (isinstance(parent, str) and parent)
+
+
+def _recency(session: dict) -> float:
+    """A root's recency, as epoch seconds, for "which of these is THIS one".
+
+    `updated_at` — the listing row's LAST ACTIVITY — first, because the root the
+    operator is standing in is the one that was used most recently. That is the
+    same field `worker_meta` reads and the reason it is the right one here: an
+    old root whose workers kept a long job alive can have been updated after a
+    newer conversation was opened, and neither field can see the difference, but
+    that is the truth of the data rather than a guess this function could avoid.
+
+    `created_at` is the fallback for a row the server sent without an
+    `updated_at`, and a row with neither sorts last rather than first: an unknown
+    age is not evidence of recency. There is no `last_activity_at` on a listing
+    row — see og_herdr_watch's measured key list — so this is the same free
+    LISTING field the rest of the view reads, not a detail-fetch one.
+    """
+    updated = _epoch(session.get("updated_at"))
+    if updated is not None:
+        return updated
+    created = _epoch(session.get("created_at"))
+    return created if created is not None else 0.0
 
 
 def _index(sessions: Iterable[dict]):
@@ -1522,6 +1553,53 @@ def next_wait(now: float, poll_due: float, working: bool,
 
 
 # ---------------------------------------------------------------------------
+# the painter: which rows get which line, and the one write itself
+# ---------------------------------------------------------------------------
+
+def paint_plan(items: list[tuple[str, str]], list_rows: int, offset: int,
+               list_view: int, height: int) -> list[tuple[int, str, str]]:
+    """The `(row, text, role)` triples a paint writes, top to bottom. Pure.
+
+    The scrolling window covers the LIST only — `items[:list_rows]` — so it can
+    never reach into the tail. The tail (blank, optional access panel, footer)
+    is then pinned to the bottom in exactly one place. Windowing over ALL of
+    `items` as the old loop did painted the tail twice on a short list, because
+    a window taller than the list ran past `list_rows` into the very footer the
+    second loop was about to draw at the bottom.
+    """
+    plan: list[tuple[int, str, str]] = []
+    for i, (text, role) in enumerate(
+            items[offset:min(offset + list_view, list_rows)]):
+        plan.append((i, text, role))
+    tail_top = max(0, height - (len(items) - list_rows))
+    for i, (text, role) in enumerate(items[list_rows:]):
+        plan.append((tail_top + i, text, role))
+    return plan
+
+
+def paint_line(stdscr, row: int, text: str, width: int, height: int,
+               attr: int) -> None:
+    """One `addnstr` at the full `width`, tolerant of the window's last cell.
+
+    A box closes its border in the pane's rightmost column, so the write has to
+    be `width` wide or every box renders open on the right. The one cell curses
+    refuses is the window's bottom-right — the last line's last column — so the
+    exception is swallowed there instead of narrowing every other line to dodge
+    it. The old `width - 1` paid that cost on every row; the docstring it had
+    claimed the dropped column was "already on screen", which is false for a
+    border that lives in that column.
+    """
+    import curses
+
+    if not 0 <= row < height or width < 1:
+        return
+    try:
+        stdscr.addnstr(row, 0, text, width, attr)
+    except curses.error:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # the model: listing + lazy detail
 # ---------------------------------------------------------------------------
 
@@ -1534,9 +1612,12 @@ class AgentModel:
       1. once per LIVE ROOT, to learn its `workspace` (the cwd rule needs it)
          and its `harness` (the header label). Roots come and go, so this is
          "once per root, on its first sighting", not "once per poll".
-      2. once per root the cwd rule probes past the live set, and only until one
-         matches (see `_match_cwd_root`). Also once per root, because the result
-         is cached under the same session id.
+      2. once per root the cwd rule puts to the question, walking every root
+         newest-first and stopping at the first one whose `workspace` is `$PWD`
+         (see `_match_cwd_root`). That stop IS the "most recent match" — the walk
+         is ordered by recency — so the rule costs the roots more recent than the
+         answer, and none of the ones after it. Also once per root, because the
+         result is cached under the same session id.
       3. once per worker that has gone IDLE, to capture the report it just
          produced. An idle report stops changing, so it is fetched once and kept.
       4. once for a row the user SELECTED, so its snippet can be read on demand
@@ -1620,34 +1701,45 @@ class AgentModel:
 
     # -- refresh ------------------------------------------------------------
 
-    def _match_cwd_root(self, by_id: dict, live_root_ids: list[str],
-                        asked: set[str]) -> Optional[str]:
-        """The root session whose `workspace` is `$PWD`, or None.
+    def _match_cwd_root(self, by_id: dict, asked: set[str]) -> Optional[str]:
+        """The MOST RECENTLY ACTIVE root whose `workspace` is `$PWD`, or None.
 
-        Checked against the live roots first (their details are already in hand,
-        so this costs nothing), and only then against the roots the live
-        heuristic EXCLUDED. That second pass is the fix for the wrong-directory
-        bug: "live" means working, blocked, or the parent of a worker, so a
-        brand-new `og chat` in this directory — idle, nothing dispatched yet —
-        is not live, its `workspace` was never fetched, nothing matched `$PWD`,
-        and the view fell back to every root on the machine. The cwd question is
-        not a question about activity, so it is answered independently of it.
+        Asked of EVERY root, live or not, in ONE pass newest-first, stopping at
+        the first match — so the stop IS the recency rule rather than something
+        that has to be checked for afterwards.
 
-        The probe stops at the first match and every result is cached per session
-        id (`_root_detail`), so this is one fetch per root ONCE, not one per
-        poll; `asked` records which roots were put to the question this refresh
-        so the prune keeps exactly their cache entries.
+        The failure this replaces: there were two passes, and pass 1 walked the
+        LIVE roots and returned on the first hit. In a repo with a history of
+        sessions that made the implemented rule "the first LIVE root in this
+        directory", and the live root there is the STALE one — it stays live
+        forever precisely because it still has workers (see `_is_live_root`),
+        while the session the operator is actually standing in is a brand-new
+        idle one that nothing dispatched from yet. Measured on a fresh `og chat`
+        in this repo: ~16 finished workers, done 22-41h earlier, belonging to the
+        previous root session in the same directory. A stale sibling with workers
+        beat the live session with none, every time, and the pass that would have
+        found the right one never ran.
+
+        So liveness is not a filter here at all. `workspace` is a DETAIL-row
+        field (see og_herdr_watch's measured key list), and the budget is kept by
+        the two things that were always keeping it: every root is fetched at most
+        ONCE per process (`_root_detail`, bounded by MAX_ROOT_DETAILS — the same
+        dict, the same eviction, so the walk is still capped), and the walk stops
+        at the first match. A root already fetched this refresh costs nothing,
+        which is every live root and every root behind an earlier match.
+
+        `asked` is how "asked, and therefore worth keeping in the cache" is
+        recorded, so the prune in `refresh` cannot turn this into a per-poll
+        refetch.
         """
         target = _norm_path(self.cwd)
-        for sid in live_root_ids:
-            workspace = self._root_info.get(sid, {}).get("workspace")
-            if isinstance(workspace, str) and workspace and \
-                    _norm_path(workspace) == target:
-                return sid
-        for sid, session in by_id.items():
-            if sid in asked or not _is_root(session):
-                continue
-            asked.add(sid)
+        newest_first = sorted(
+            (sid for sid, session in by_id.items() if _is_root(session)),
+            key=lambda sid: -_recency(by_id[sid]),
+        )
+        for sid in newest_first:
+            if sid not in asked:
+                asked.add(sid)
             workspace = self._root_detail(sid).get("workspace")
             if isinstance(workspace, str) and workspace and \
                     _norm_path(workspace) == target:
@@ -1686,16 +1778,26 @@ class AgentModel:
         for sid in live_root_ids:
             self._root_detail(sid)
 
+        # The wide view is every LIVE root; `select_scope` narrows it to `$PWD`
+        # and forces the wide view under `--all`. The narrowing only ever looks
+        # WITHIN the live roots, which is what made it unsafe to treat as final:
+        # a stale sibling root in the same repo stays live precisely because it
+        # still has workers (`_is_live_root`), so it answers `$PWD` on its own and
+        # the probe below — the only thing that can find the session the operator
+        # is actually standing in — gets skipped as unnecessary.
         scope = select_scope(
             [by_id[sid] for sid in live_root_ids if sid in by_id],
             self.cwd,
             self.all_roots,
         )
-        # `select_scope` reports "nothing matched `$PWD`" by handing back exactly
-        # what it was given, so the equality IS the no-match signal — the rule
-        # itself stays defined in one place.
-        if self.cwd and not self.all_roots and scope == live_root_ids:
-            match = self._match_cwd_root(by_id, live_root_ids, asked)
+        # So while the cwd rule is in force it is asked unconditionally, and its
+        # answer REPLACES the narrowing rather than only applying when that
+        # narrowing found nothing. `select_scope` keeps its own contract — it
+        # reports "nothing matched" by handing back exactly what it was given —
+        # because it is still what supplies the wide fallback below and the
+        # `--all` path, both of which are decisions about LIVENESS.
+        if self.cwd and not self.all_roots:
+            match = self._match_cwd_root(by_id, asked)
             if match is not None:
                 # A match IS the scope: one root's tree, not the live set plus
                 # this one.
@@ -1759,6 +1861,13 @@ class AgentModel:
         This decides what is WORTH SHOWING, never which directory the operator is
         in: a quiet root in `$PWD` is still the answer to that question, and
         `_match_cwd_root` asks it of every root regardless.
+
+        What this heuristic MUST NOT do is decide that question on its own. A
+        stale root is live for as long as its workers are on screen, so in a repo
+        with a history of sessions "the live root in this directory" is usually
+        the PREVIOUS session, not the one the operator is in. That is exactly how
+        a fresh `og chat` came to show ~16 workers finished 22-41h earlier.
+        Liveness is what gets shown when nothing else decides it, nothing more.
         """
         if herdr_state(root) in ("working", "blocked"):
             return True
@@ -2119,26 +2228,16 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         painted: Optional[list[tuple[str, str]]] = None
 
         def put(row: int, text: str, role: str) -> None:
-            """One `addnstr`, tolerant of the edges.
+            """One `addnstr` at the pane's full width (see `paint_line`).
 
-            curses raises when a write touches the last cell of the window, and
-            a line one column too long lands exactly there — the rest of the
-            line is already on screen, so swallowing it is a no-op rather than a
-            lost frame.
+            The attr map is the redesign's: SELECTED is bold, not reverse, since
+            it lands on the caret row alone and reverse-videoing it would light a
+            full row of the box; TITLE is the one line the design spends
+            A_REVERSE on, the root's bar.
             """
-            if not 0 <= row < height or width < 1:
-                return
-            # SELECTED is bold, not reverse: it lands on the caret row alone,
-            # so reverse-videoing it would still light a full row of the box.
-            # Bold keeps that one row findable without re-reading the old
-            # whole-block highlight the operator asked to be rid of. TITLE is
-            # the one line the design spends A_REVERSE on — the root's bar.
             attr = {NORMAL: curses.A_NORMAL, SELECTED: curses.A_BOLD,
                     DIM: curses.A_DIM, TITLE: curses.A_REVERSE}[role]
-            try:
-                stdscr.addnstr(row, 0, text, width - 1, attr)
-            except curses.error:
-                pass
+            paint_line(stdscr, row, text, width, height, attr)
 
         while True:
             height, width = stdscr.getmaxyx()
@@ -2195,12 +2294,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             if paint_needed(items, painted):
                 painted = items
                 stdscr.erase()
-                for row, (text, role) in enumerate(
-                        items[offset:offset + list_view]):
+                for row, text, role in paint_plan(items, pane.list_rows,
+                                                  offset, list_view, height):
                     put(row, text, role)
-                tail_top = max(0, height - tail_len)
-                for i, (text, role) in enumerate(items[pane.list_rows:]):
-                    put(tail_top + i, text, role)
                 stdscr.refresh()
 
             # Two clocks, and the wait is whichever comes first: the next data

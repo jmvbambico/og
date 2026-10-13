@@ -449,7 +449,7 @@ All three are now **resolved**; the sections above describe the resolution.
 | # | Decision | Resolved as |
 |---|---|---|
 | 1 | Deferred write in case (A) (§3) | Launcher writes a `pending` record keyed by cwd. The bridge claims it when a session appears in that directory. **Staleness is by existence, not by clock**: a pending record whose `workspace_id` is no longer in `workspace.list` is pruned on the next poll. Deterministic, self-cleaning, nothing to tune. |
-| 2 | `og agents` scope (§6) | Scope by cwd, the same rule the launcher uses: a session whose `workspace` is `$PWD` → that tree; otherwise all live roots. `--all` forces the wide view. This also means the TUI needs no session id passed in, which matters because at split-pane time there is not one yet. |
+| 2 | `og agents` scope (§6) | Scope by cwd, the same rule the launcher uses: a session whose `workspace` is `$PWD` → that tree; otherwise all live roots. `--all` forces the wide view. This also means the TUI needs no session id passed in, which matters because at split-pane time there is not one yet. Where MORE THAN ONE session has this workspace, the most recently active one wins — recency, not liveness: a previous session in the same repo stays "live" forever because it still has workers, and picking by liveness showed the operator yesterday's run. |
 | 3 | Missing multiplexer (§1) | Warn and proceed. `--require-mux` only if a script ever needs the distinction. |
 
 ### Why decision 1 could not go the other way
