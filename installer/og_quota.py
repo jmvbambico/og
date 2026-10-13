@@ -444,6 +444,20 @@ def _reset_of(windows: list[dict], name: str) -> str | None:
     return None
 
 
+def _kilo_free_pin(model_id: str | None) -> bool:
+    """True when the pinned Kilo model routes inside the free tier.
+
+    Derived from the id's SHAPE (last `/`-separated segment), never from a
+    list of tier names, so a future `kilo/<router>/free` maps without a code
+    change -- the same reasoning as _agy_family. `params["model"]` is the
+    established channel (og_stats.lineup already passes the pin down).
+    """
+    if not model_id:
+        return False
+    segs = [s for s in str(model_id).strip().lower().split("/") if s]
+    return bool(segs) and segs[-1] == "free"
+
+
 def _probe_kilo_profile(params: dict, ctx: Ctx) -> dict:
     exe = None
     for cand in (ctx.env.get("PATH", ""), str(Path.home() / ".kilo/bin")):
@@ -473,6 +487,20 @@ def _probe_kilo_profile(params: dict, ctx: Ctx) -> dict:
     if bal is None:
         return unknown_record(f"kilo profile: no balance field ({list(d)})")
     bal = float(bal)
+    # WHY (2026-10-13): `balance` is Kilo's PAID credit pool, and a worker
+    # pinned to the free auto-router (`kilo/kilo-auto/free`) never draws on it,
+    # so the balance stays 0 forever and the probe read `dry` on every single
+    # run -- permanently blacklisting a healthy worker the orchestrator never
+    # dispatched to. Same bug class as the antigravity min() (see _agy_family):
+    # a true fact about a binding this worker does not use. The free tier
+    # exposes no queryable remaining, so the pin reports state `ok` at tier
+    # `assumed` with no number, rather than a measured 0 that means nothing.
+    # A paid pin, or no pin at all, keeps the balance as the binding measure.
+    if _kilo_free_pin(params.get("model")):
+        return make_record(
+            "ok", "assumed", None, None, "credits", [], None, "kilo-profile",
+            _iso(ctx.now()),
+            f"kilo profile --json; free pin, paid balance {bal:g} does not bind")
     return make_record(
         "ok" if bal > 0 else "dry", "measured", bal, None, "credits", [],
         None, "kilo-profile", _iso(ctx.now()), "kilo profile --json")
