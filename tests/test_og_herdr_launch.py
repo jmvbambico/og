@@ -770,6 +770,34 @@ def test_a_split_that_cannot_be_found_costs_the_agents_pane_only(tmp_path):
     assert client.text_typed() == ["og chat"]
 
 
+def test_the_shared_split_returns_a_line_rather_than_reporting_it():
+    """`split_agents_pane` is the ONE implementation both the launcher's
+    `_split_agents` and the bridge's history/resume space call, so it must be
+    free of either caller's reporting channel: it RETURNS the failure lines and
+    the caller routes them (the launcher through `report`; the bridge through its
+    reconcile lines). A split that reported for itself would be unusable from the
+    bridge — and a second copy of it would drift."""
+    from og_herdr_launch import split_agents_pane
+
+    lines = split_agents_pane(NoSplitClient(), "w1", "w1:t1", "w1:p1", CWD, {})
+
+    assert len(lines) == 1 and "could not open the og agents pane" in lines[0]
+    assert "no room" in lines[0]
+
+
+def test_the_shared_split_starts_og_agents_when_it_can():
+    from og_herdr_launch import split_agents_pane
+
+    client = FakeClient()
+    lines = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
+
+    assert lines == []
+    assert client.text_typed()[-1] == "og agents"
+    # The split pane is found by difference against the tab, since the reply
+    # names no pane — the same lookup the launcher has always done.
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
 # ---------------------------------------------------------------------------
 # a create reply that cannot be used
 # ---------------------------------------------------------------------------
