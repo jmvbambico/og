@@ -1126,8 +1126,13 @@ def _two_col(left: str, right: str, width: int) -> str:
     """`left` flush left, `right` flush right, exactly `width` columns.
 
     The right part never loses its last column to the left part: when `left` has
-    more to say than there is room for, the RIGHT part is what is drawn (it is the
-    clock or the harness label — the part being waited on), clipped if need be.
+    more to say than there is room for, the RIGHT part is what is drawn and the
+    left is ellipsised into the columns that remain. The right side is the short,
+    fixed thing the row is really about, so it is worth keeping whole while the
+    elastic left gives way. Both callers rely on this: the worker row hands it
+    the meta — `2m14s`, `failed`, `waiting on you`, `done 6m ago`, the thing being
+    waited on — and the root gauge row the harness label (`Claude Code`). Only
+    when `right` alone is wider than `width` is it clipped itself.
     """
     if width <= 0:
         return ""
