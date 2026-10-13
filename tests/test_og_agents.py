@@ -4210,7 +4210,7 @@ def test_a_default_role_spends_no_pair_at_all():
     assert a._role_background(a.SELECTED, og) is None, role
     # ...while the theme that DOES carry them spends real pairs for them.
     dracula = _theme("dracula")
-    assert a._role_colour(a.PLAIN, dracula) == a.hex_to_ansi256("#f0e6d2")
+    assert a._role_colour(a.PLAIN, dracula) == a.hex_to_ansi256("#ffd7af")
     assert a._role_colour(a.META, dracula) == a.hex_to_ansi256("#6272a4")
     assert a._role_colour(a.state_role("idle"), dracula) \
         == a.hex_to_ansi256("#50fa7b")
@@ -4219,12 +4219,16 @@ def test_a_default_role_spends_no_pair_at_all():
 
 
 def test_parchment_is_the_dominant_text_colour_on_the_default_theme():
-    """THE OPERATOR'S ASK. dracula.text is #f0e6d2, a warm parchment, and PLAIN is
+    """THE OPERATOR'S ASK. dracula.text is #ffd7af, a warm parchment, and PLAIN is
     what paints agent names, titles and box borders — so routing PLAIN at the
-    theme's `text` is what makes parchment DOMINANT rather than merely present."""
+    theme's `text` is what makes parchment DOMINANT rather than merely present.
+
+    #ffd7af is the cell the operator picked from the 256-colour palette, and it
+    is ansi 223 exactly. It replaces #f0e6d2, whose nearest cell was 254 -- a
+    pure grey -- so this used to be parchment on paper and grey on the terminal."""
     dracula = _theme("dracula")
-    assert dracula.colour("text") == "#f0e6d2"
-    assert a._role_colour(a.PLAIN, dracula) == a.hex_to_ansi256("#f0e6d2")
+    assert dracula.colour("text") == "#ffd7af"
+    assert a._role_colour(a.PLAIN, dracula) == a.hex_to_ansi256("#ffd7af") == 223
     # ORCH is still a WEIGHT and no colour, and `undim:` is still not a colour.
     assert a._role_colour(a.ORCH, dracula) is None
     assert a._role_bold(a.ORCH) is True
@@ -4257,10 +4261,11 @@ def test_only_the_selected_row_gets_a_background(monkeypatch):
 
 
 def test_a_truecolor_terminal_paints_the_themes_exact_hexes(monkeypatch):
-    """Below truecolor a theme hex is mapped into the 256 palette, and for dracula
-    that maps the operator's warm parchment #f0e6d2 onto a pure GREY. So a
-    terminal that can take 24 bits is given 24 bits — the pane paints what the
-    catalog says, not an approximation of it."""
+    """On truecolor the pane paints the catalog's hexes and not an approximation
+    of them. That was worth arguing from the 256 path, where the operator's
+    parchment #f0e6d2 mapped onto a pure GREY — the converter has since been
+    fixed so that cannot happen, and the operator pinned the hex to the cell they
+    chose instead. Truecolor still takes the exact 24-bit value."""
     frame = a.Frame(rows=[header(),
                           worker("w1", "idle", harness="claude-native",
                                  meta="12s")], selected=1)
@@ -4268,8 +4273,9 @@ def test_a_truecolor_terminal_paints_the_themes_exact_hexes(monkeypatch):
                                  theme=_theme("dracula"))
     spent = [(fg, bg) for _p, fg, bg in fake.init_pair_calls]
     # The parchment reaches init_pair as the exact 24-bit value the catalog
-    # names, not as the nearest 256 cell -- which for #f0e6d2 is a pure grey.
-    assert (0xF0E6D2, 0x282A36) in spent, spent
+    # names -- #ffd7af, which is also cell 223 below truecolor, so the two paths
+    # agree on the colour and only the precision differs.
+    assert (0xFFD7AF, 0x282A36) in spent, spent
     # The window background asks for the terminal's own foreground (-1) against
     # the theme's own background, so the pane fills without a foreground.
     assert (-1, 0x282A36) in spent, spent

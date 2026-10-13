@@ -102,6 +102,86 @@ def test_the_converter_is_deterministic_and_exact_on_cube_cells():
     assert th.hex_to_ansi256("#7f7f7f") in {row[0] for row in th.PALETTE}
 
 
+def test_a_chromatic_colour_never_resolves_to_a_neutral_cell():
+    """THE CONVERTER MUST NOT DESATURATE, and the numbers here are the ones.
+
+    The greyscale ramp spans the whole lightness axis, so a nearest-cell search
+    over all 240 cells hands it any dim, low-chroma colour: dracula's background
+    #282a36 (OKLab chroma 0.022) resolved to 235, nord's #2e3440 to 236, and
+    solarized-dark's #002b36 (chroma 0.049) to 235. Fifty-two role-colours across
+    twenty-three of the twenty-five catalog themes lost their chroma that way,
+    and on the terminal this actually ships to -- TERM=tmux-256color, so
+    curses.COLORS is 256 and init_color does not exist -- the entire feature
+    rendered grey.
+
+    So the converter excludes the ramp and the cube's own neutral diagonal from
+    the candidate set whenever the TARGET has chroma above NEUTRAL_CHROMA. One
+    rule, every colour, no per-theme exceptions.
+    """
+    assert th.hex_to_ansi256("#282a36") == 52, "dracula's background went grey"
+    assert th.hex_to_ansi256("#2e3440") == 23, "nord's background went grey"
+    assert th.hex_to_ansi256("#002b36") == 17, "solarized-dark's background went grey"
+    assert th.hex_to_ansi256("#3e3e6d") == 24, "synthwave-84's rail went grey"
+    assert th.hex_to_ansi256("#f0e6d2") == 224, "the old parchment went grey"
+
+    # The rule itself, over a grid of real colours rather than five of them.
+    neutral = {index for index, rgb in th.PALETTE if rgb[0] == rgb[1] == rgb[2]}
+    assert len(neutral) == 30, "24 ramp cells plus the cube's own six-cell diagonal"
+    for r in range(0, 256, 17):
+        for g in range(0, 256, 17):
+            for b in range(0, 256, 17):
+                value = "#%02x%02x%02x" % (r, g, b)
+                index = th.hex_to_ansi256(value)
+                chromatic = th.oklab_hue(th.hex_to_rgb(value))[1] > th.NEUTRAL_CHROMA
+                assert (index not in neutral) == chromatic, (value, index)
+
+
+def test_a_neutral_colour_still_lands_on_the_ramp():
+    """THE OTHER HALF OF THE SAME RULE, so the guard cannot eat the greys.
+
+    A colour with no chroma to preserve must keep resolving to the greyscale
+    ramp: those are the colours that WERE grey on purpose, and moving them onto
+    the cube's saturated diagonal would be the same defect the other way round.
+    This is why the rule is a THRESHOLD and not a blanket ban on the ramp.
+    """
+    for value in ("#000000", "#7f7f7f", "#fefefe", "#fafafa", "#282828", "#e6e6e6"):
+        index = th.hex_to_ansi256(value)
+        rgb = th.ansi256_rgb(index)
+        assert rgb[0] == rgb[1] == rgb[2], (value, index, rgb)
+    assert th.hex_to_ansi256("#7f7f7f") == 244
+    assert th.hex_to_ansi256("#282828") == 235
+    assert th.hex_to_ansi256("#fefefe") == 231
+
+
+def test_the_threshold_is_the_constants_own_and_the_catalog_straddles_it():
+    """WHY 0.02, FROM THE DATA RATHER THAN FROM TASTE.
+
+    The catalog's own chroma distribution straddles the cut: the most chromatic
+    NEUTRAL role sits at 0.0185 (Solarized Light's `meta`) and the least
+    chromatic CHROMATIC one at 0.0201 (Monokai Light's rail, which a
+    post-conversion nudge pushed just over the line), with nothing in between.
+    `NEUTRAL_CHROMA` is already the constant `oklab_hue` uses to decide whether
+    a colour has a hue at all, so reusing it here means the converter and the hue
+    test cannot disagree about what neutral means.
+
+    The margin is worth watching rather than trusting: it is about 0.0015 wide on
+    each side, so a future hex nudged to land near 0.02 could move it. The
+    assertion below is what will say so.
+    """
+    catalog = th.load_catalog()
+    chromatic, neutral = [], []
+    for slug, theme in catalog.items():
+        if slug == "og":
+            continue
+        for role, value in theme.colors.items():
+            chroma = th.oklab_hue(th.hex_to_rgb(value))[1]
+            (chromatic if chroma > th.NEUTRAL_CHROMA else neutral).append(chroma)
+    assert max(neutral) < th.NEUTRAL_CHROMA < min(chromatic), (
+        f"the catalog no longer straddles the threshold: the most chromatic "
+        f"neutral is {max(neutral):.4f} and the least chromatic chromatic one "
+        f"is {min(chromatic):.4f}")
+
+
 def test_the_converter_accepts_uppercase_brand_hexes_and_refuses_junk():
     """The catalog is lowercase BY HOUSE RULE; a brand hex pasted out of a vendor's
     stylesheet is not, and rejecting "#F3EF4E" would guard against nothing."""
@@ -127,11 +207,12 @@ def test_curses_value_is_minus_one_for_default_and_a_pair_otherwise():
     assert th.curses_value("default", 1 << 24) == -1
     # On a 256-colour terminal the hex is mapped into the palette...
     assert th.curses_value("#87afaf", 256) == 109
-    # ...and on a truecolor one it goes in EXACTLY, which is what keeps the
-    # operator's warm parchment warm: the nearest 256 cell to #f0e6d2 is a pure
-    # grey, and shipping that grey would be shipping grey where parchment was
-    # asked for.
-    assert th.curses_value("#f0e6d2", 1 << 24) == 0xF0E6D2
+    # ...and on a truecolor one it goes in EXACTLY. Truecolor is the better path
+    # and it matters that it is still exact, but it is NOT the path that runs on
+    # the terminal this ships to: TERM=tmux-256color with COLORTERM=truecolor
+    # leaves curses.COLORS at 256 and init_color unavailable, so the 256 branch
+    # above is the one that paints.
+    assert th.curses_value("#ffd7af", 1 << 24) == 0xFFD7AF
     assert th.curses_value("#282a36", 1 << 24) == 0x282A36
 
 
@@ -164,6 +245,32 @@ def test_og_hexes_convert_back_to_the_indices_the_pane_already_shipped():
         state: th.hex_to_ansi256(og.colour(state))
         for state in ("idle", "working")
     } == {"idle": 46, "working": 226}
+
+
+def test_the_parchment_round_trips_to_the_cell_the_operator_chose():
+    """#ffd7af -> 223, EXACTLY, for the same reason `og`'s three hexes do.
+
+    The operator was shown the 256-colour cells near the original parchment and
+    picked 223 ("warm cream"): the nearest chromatic cell, 17.9 degrees of hue
+    from where it started, and the closest in lightness to the target -- which is
+    why it was taken over the brighter 230 and the more muted 187. So the catalog
+    stores the hex and the converter must reproduce 223 from it, with no drift
+    and no rounding, exactly as it reproduces 109 / 46 / 226 for `og`.
+
+    It replaces #f0e6d2, whose nearest cell is 254 -- a pure grey, 96 degrees of
+    hue away. That was the defect this whole commit is about, and a round trip
+    that merely came out "near 223" would let it back in.
+    """
+    assert th.hex_to_ansi256("#ffd7af") == 223
+    assert th.ansi256_rgb(223) == (255, 215, 175)
+    assert th.rgb_to_hex(th.ansi256_rgb(223)) == "#ffd7af"
+    dracula = th.load_catalog()["dracula"]
+    assert dracula.colour("text") == "#ffd7af"
+    assert dracula.index("text") == 223
+    assert th.BUILTIN["dracula"].colors["text"] == "#ffd7af"
+    assert th.BUILTIN["dracula"].index("text") == 223
+    # And it stays warm on the 256 path, which is the whole reason for the pin.
+    assert th.curses_value("#ffd7af", 256) == 223
 
 
 def test_the_og_row_is_todays_colours_including_a_transparent_background():

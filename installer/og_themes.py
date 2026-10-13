@@ -64,9 +64,11 @@ ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "rail")
 DEFAULT = "default"
 
 # dracula is the DEFAULT because the operator asked for it, and dracula's `text`
-# is the operator's warm parchment rather than Dracula's own #f8f8f2 (recorded in
-# the catalog row's `_note`). The default is a preference, not a fact about
-# colour: `--theme` and $OG_AGENTS_THEME both override it.
+# is the operator's warm parchment -- #ffd7af, which is ansi 223 EXACTLY and was
+# picked from the 256-colour cells rather than copied from Dracula's own #f8f8f2
+# (both facts recorded in the catalog row's `_note`). The default is a
+# preference, not a fact about colour: `--theme` and $OG_AGENTS_THEME both
+# override it.
 DEFAULT_THEME = "dracula"
 
 HEX_RE = re.compile(r"^#[0-9a-f]{6}$")
@@ -135,7 +137,7 @@ BUILTIN: dict = {
         order=10,
         colors={
             "bg": "#282a36",
-            "text": "#f0e6d2",
+            "text": "#ffd7af",
             "meta": "#6272a4",
             "sel_bg": "#44475a",
             "idle": "#50fa7b",
@@ -205,6 +207,18 @@ PALETTE = _build_palette()
 assert len(PALETTE) == 240, len(PALETTE)
 
 
+def _is_neutral(rgb: tuple) -> bool:
+    """A palette cell with no chroma at all: the ramp, and the cube's diagonal."""
+    return rgb[0] == rgb[1] == rgb[2]
+
+
+# The candidate set for a CHROMATIC target: every cell that carries chroma. Built
+# once at import because it is the whole of `hex_to_ansi256`'s search space for
+# every colour the catalog actually has, and because a second, smaller set is the
+# only way to say the rule below without changing what "nearest" is measured over.
+CHROMATIC_PALETTE = tuple(row for row in PALETTE if not _is_neutral(row[1]))
+
+
 def ansi256_rgb(index: int) -> tuple:
     """The sRGB triple index `n` paints for, as 0-255 ints."""
     if index < CUBE_BASE:
@@ -232,6 +246,21 @@ def rgb_to_hex(rgb: Iterable[float]) -> str:
 # OKLab chroma is under one rung of the cube: (175,175,145) — `opencode-zen`'s
 # mark — carries 0.055 and is NOT neutral (the table's comment makes a point of
 # that exact figure), while the greyscale ramp is exactly 0.
+#
+# THE NUMBER IS ALSO THE CONVERTER'S THRESHOLD (`hex_to_ansi256`), and it is
+# chosen from the catalog rather than from taste. Surveying all 175 measurable
+# role-colours in installer/themes.json for the defect a nearest-cell search over
+# the WHOLE palette produces — a chromatic colour resolving to a neutral cell —
+# gives 52 collapses across 23 of the 25 themes, with target chroma running from
+# 0.0212 (monokai-dark's rail #464538, which fell to 238) to 0.0788
+# (synthwave-84's rail #3e3e6d, which also fell to 238). The catalog itself
+# draws the line: the most chromatic role that IS neutral sits at 0.0193
+# (monokai-light's rail #d3c5bd) and the least chromatic one that is NOT sits at
+# 0.0212, with nothing measurable in between. 0.02 is inside that gap, so it
+# catches all 52 and leaves every true neutral on the ramp where it belongs. It
+# is also already the constant `oklab_hue` uses to decide whether a colour has a
+# hue at all, so the guard and the hue test cannot disagree about what "neutral"
+# means.
 NEUTRAL_CHROMA = 0.02
 
 
@@ -289,18 +318,44 @@ MARK_MIN_CONTRAST = 3.0
 
 
 def hex_to_ansi256(value: str) -> int:
-    """The palette index NEAREST `value`, judged in OKLab over all 240 cells.
+    """The palette index NEAREST `value`, judged in OKLab over all 240 cells —
+    or over the subset of them that can HONOUR the colour.
+
+    THE RULE: a target whose OKLab chroma exceeds `NEUTRAL_CHROMA` is searched
+    against `CHROMATIC_PALETTE` only, so it can never resolve to a neutral cell.
+    A target at or below the threshold really is neutral, has no hue to preserve,
+    and is searched against the whole palette exactly as before — the greyscale
+    ramp is the correct answer for it. The threshold is the same constant
+    `oklab_hue` uses to decide whether a colour has a hue at all, so the converter
+    and the hue test cannot disagree about what "neutral" means.
+
+    WHY, WHEN "NEAREST" LOOKS LIKE THE WHOLE RULE. The z-ai row of
+    `_VENDOR_COLOURS` already made the argument in its own words — "HUE IS THE
+    CHANNEL A BRAND MARK IS RECOGNISED BY", and a sage that lands on a grey is
+    "simply the wrong colour", so 144 (the strictly nearer cell) is overridden by
+    108. Nearest is a tie-break among cells that are the RIGHT COLOUR. Measured
+    over the whole palette it is not even that, because the greyscale ramp is
+    spread across the entire lightness axis and so is usually the nearest cell to
+    any dim, low-chroma colour: dracula's background #282a36 (OKLab chroma 0.022)
+    resolved to 235, nord's #2e3440 to 236, and solarized-dark's #002b36 (chroma
+    0.049) to 235. Twenty-three of the twenty-five catalog themes lost at least
+    one role that way — 52 roles, target chroma from 0.0212 to 0.0788 — and the
+    feature was neutralised on every terminal that reports 256 colours, which is
+    every terminal that does NOT claim truecolor, tmux included. That is why this
+    is a guard and not a penalty: a penalty still lets a strong-enough lightness
+    match win, and the ramp must not be a candidate at all.
 
     Deterministic: the cube is walked in index order and ties go to the lower
     index, so the same hex always answers with the same number on every machine.
-    Raises on anything that is not a hex — a caller that passes `"default"` has
-    a bug, and `Theme.index` is where that case is meant to be caught.
+    Raises on anything that is not a hex — a caller that passes `"default"` has a
+    bug, and `Theme.index` is where that case is meant to be caught.
     """
     if not ANY_HEX_RE.match(value):
         raise ThemeError(f"{value!r} is not a #rrggbb colour")
     target = rgb_to_oklab(hex_to_rgb(value))
-    best = min(PALETTE, key=lambda row: (math.dist(target, rgb_to_oklab(row[1])),
-                                         row[0]))
+    chromatic = math.hypot(target[1], target[2]) > NEUTRAL_CHROMA
+    best = min(CHROMATIC_PALETTE if chromatic else PALETTE,
+               key=lambda row: (math.dist(target, rgb_to_oklab(row[1])), row[0]))
     return best[0]
 
 
@@ -315,13 +370,20 @@ def curses_value(value: str, colors: int) -> int:
     """`value` as the int `init_pair(n, fg, bg)` wants on a terminal with `colors`.
 
     On a truecolor terminal the 24-bit value goes straight in, so the pane paints
-    the theme's EXACT hexes — which matters more than it sounds: dracula's text is
-    the operator's warm parchment #f0e6d2, and the nearest 256 cell is a pure
-    grey, so mapping it down would quietly ship grey where parchment was asked
-    for. Below truecolor the hex is mapped to its nearest cell by `hex_to_ansi256`
-    and the EXISTING degradation rules apply unchanged: `init_pair` is only reached
-    for a value below `colors`, so an 8- or 16-colour terminal still paints those
-    roles uncoloured rather than wrong.
+    the theme's EXACT hexes. Below truecolor the hex is mapped to a cell by
+    `hex_to_ansi256` and the EXISTING degradation rules apply unchanged:
+    `init_pair` is only reached for a value below `colors`, so an 8- or 16-colour
+    terminal still paints those roles uncoloured rather than wrong.
+
+    THE 256 PATH IS THE ONE THAT ACTUALLY RUNS on the terminal this shipped
+    against: `TERM=tmux-256color` with `COLORTERM=truecolor` set, so `init_color`
+    is not even available (`infocmp` reports no `ccc`) and `curses.COLORS` is 256.
+    A theme colour there MUST be one of the 240 existing cells, which is why the
+    converter refuses to resolve a chromatic colour onto a neutral one and why
+    dracula's parchment is the cell 223 rather than a hex whose nearest cell is a
+    grey. Truecolor remains the better path — it paints the hexes exactly — but it
+    is not the one to reason about, because a hex that only survives on truecolor
+    is a hex that renders grey everywhere else.
 
     `"default"` is `-1` whatever the terminal, which is the whole point of it.
     """

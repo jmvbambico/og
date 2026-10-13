@@ -22,9 +22,19 @@
     "new row added here must clear: text/bg >= 4.5, text/sel_bg >= 4.5,",
     "meta/bg, idle/bg, working/bg >= 3.0, rail/bg >= 1.5.",
     "",
+    "AND THE SAME FLOORS AGAIN ON THE RESOLVED 256-COLOUR CELL, because that",
+    "is what paints. On the terminal this ships to -- TERM=tmux-256color, so",
+    "curses.COLORS is 256 and init_color does not exist -- a hex is quantised to",
+    "one of the 240 palette cells, and a theme can clear every floor above on",
+    "paper and still paint under it. A colour that carries chroma may never",
+    "resolve to a neutral cell (installer/og_themes.py refuses it): 52 roles",
+    "across 23 of the 25 themes used to lose their chroma to the greyscale ramp,",
+    "so Nord and Solarized Dark and every Catppuccin lavender rendered as grey.",
+    "",
     "Where a theme's published foreground cannot reach its target, that single",
     "value is nudged in LIGHTNESS ONLY (hue and saturation untouched), by the",
-    "minimum amount that clears the target. Nudges are listed in the test file.",
+    "minimum amount that clears the target. Nudges are listed in the test file,",
+    "with the ones the CELLS demanded marked post-conversion.",
     "",
     "THE EXCEPTION IS `og`, WHICH IS NOT A THEME BUT TODAY. It is what this pane",
     "painted before themes existed, and it is the only row here whose values were",
@@ -92,7 +102,7 @@
         "text": "#5c6773",
         "meta": "#899099",
         "sel_bg": "#f0eee4",
-        "idle": "#749c00",
+        "idle": "#729900",
         "working": "#bf8500",
         "rail": "#cecccb"
       }
@@ -103,11 +113,11 @@
       "colors": {
         "bg": "#181a1f",
         "text": "#c8cbd4",
-        "meta": "#61677a",
+        "meta": "#6c7388",
         "sel_bg": "#34373d",
         "idle": "#37ae6f",
         "working": "#c9a022",
-        "rail": "#363b44"
+        "rail": "#3b404a"
       }
     },
     "bearded-light": {
@@ -119,21 +129,21 @@
         "meta": "#68909c",
         "sel_bg": "#c9e4ec",
         "idle": "#189433",
-        "working": "#aa8800",
-        "rail": "#c3c8cd"
+        "working": "#9b7c00",
+        "rail": "#bcc2c7"
       }
     },
     "catppuccin-frappe": {
       "label": "Catppuccin Frappe",
       "order": 6,
       "colors": {
-        "bg": "#303446",
+        "bg": "#444963",
         "text": "#c6d0f5",
-        "meta": "#787e98",
+        "meta": "#a5a9ba",
         "sel_bg": "#414559",
         "idle": "#a6d189",
         "working": "#e5c890",
-        "rail": "#51576d"
+        "rail": "#6c7492"
       }
     },
     "catppuccin-latte": {
@@ -141,11 +151,11 @@
       "order": 7,
       "colors": {
         "bg": "#eff1f5",
-        "text": "#4c4f69",
-        "meta": "#84899d",
+        "text": "#484b63",
+        "meta": "#777d93",
         "sel_bg": "#ccd0da",
-        "idle": "#3f9d2a",
-        "working": "#c07a19",
+        "idle": "#3e9b29",
+        "working": "#b57318",
         "rail": "#bcc0cc"
       }
     },
@@ -180,14 +190,14 @@
       "order": 10,
       "colors": {
         "bg": "#282a36",
-        "text": "#f0e6d2",
+        "text": "#ffd7af",
         "meta": "#6272a4",
         "sel_bg": "#44475a",
         "idle": "#50fa7b",
         "working": "#f1fa8c",
         "rail": "#44475a"
       },
-      "_note": "text is the operator's warm parchment #f0e6d2, deliberately NOT Dracula's own Parchment #f8f8f2. Do not 'correct' it: the operator asked for parchment as the dominant text colour and dracula is the default theme."
+      "_note": "text is #ffd7af, a warm parchment, and it was CHOSEN BY THE OPERATOR from the 256-colour palette cells -- not read off Dracula's upstream theme, and not a nudge of one. It is deliberately NEITHER Dracula's own Parchment #f8f8f2 NOR the #f0e6d2 this row used to ship. The reason it is not #f0e6d2 is a BUG, not a taste: #f0e6d2's nearest 256-colour cell is 254, a PURE GREY, so on any terminal reporting 256 colours -- every terminal that does not claim truecolor, tmux included -- the default pane painted its body text grey where parchment was asked for. The converter no longer does that (installer/og_themes.py: a chromatic colour may not resolve to a neutral cell), and #ffd7af is what the operator picked from the cells that remain. #ffd7af IS ansi 223 exactly -- it is a cube cell, so the round trip is lossless and asserted in tests/test_og_themes.py -- it is the closest in lightness of the candidates shown, and it sits 17.9 degrees of hue from the original parchment, which is why the brighter 230 and the more muted 187 were not chosen. Do not 'correct' it back to Dracula's #f8f8f2 and do not 'correct' it to #f0e6d2: neither is what was chosen, and only one of the two survives conversion at all."
     },
     "github-dark": {
       "label": "GitHub Dark",
@@ -234,11 +244,11 @@
       "colors": {
         "bg": "#faf4f2",
         "text": "#29242a",
-        "meta": "#928b8c",
+        "meta": "#8d8687",
         "sel_bg": "#eee5de",
-        "idle": "#269d69",
-        "working": "#cb790a",
-        "rail": "#d3c5bd"
+        "idle": "#259966",
+        "working": "#c4750a",
+        "rail": "#d2c4bb"
       }
     },
     "nord": {
@@ -246,12 +256,12 @@
       "order": 15,
       "colors": {
         "bg": "#2e3440",
-        "text": "#d8dee9",
-        "meta": "#717f9a",
-        "sel_bg": "#3b4252",
+        "text": "#dbe1eb",
+        "meta": "#909bb0",
+        "sel_bg": "#4a5367",
         "idle": "#a3be8c",
         "working": "#ebcb8b",
-        "rail": "#4c566a"
+        "rail": "#67748f"
       }
     },
     "one-dark": {
@@ -259,7 +269,7 @@
       "order": 16,
       "colors": {
         "bg": "#282c34",
-        "text": "#acb3bf",
+        "text": "#c7ccd4",
         "meta": "#6e7686",
         "sel_bg": "#3e4451",
         "idle": "#98c379",
@@ -311,7 +321,7 @@
       "order": 20,
       "colors": {
         "bg": "#002b36",
-        "text": "#93a1a1",
+        "text": "#c5cdcd",
         "meta": "#5d757c",
         "sel_bg": "#073642",
         "idle": "#859900",
@@ -329,7 +339,7 @@
         "sel_bg": "#eee8d5",
         "idle": "#829600",
         "working": "#b28700",
-        "rail": "#d7c99c"
+        "rail": "#d3c493"
       }
     },
     "synthwave-84": {
@@ -352,7 +362,7 @@
         "bg": "#0f172a",
         "text": "#e2e8f0",
         "meta": "#64748b",
-        "sel_bg": "#1e293b",
+        "sel_bg": "#253249",
         "idle": "#22c55e",
         "working": "#eab308",
         "rail": "#334155"
@@ -363,8 +373,8 @@
       "order": 24,
       "colors": {
         "bg": "#1a1b26",
-        "text": "#afb7d9",
-        "meta": "#5c6692",
+        "text": "#bfc5e0",
+        "meta": "#6872a0",
         "sel_bg": "#33467c",
         "idle": "#9ece6a",
         "working": "#e0af68",
@@ -377,11 +387,11 @@
       "colors": {
         "bg": "#e6e7ed",
         "text": "#343b59",
-        "meta": "#7881ae",
+        "meta": "#6671a3",
         "sel_bg": "#dcdee3",
         "idle": "#385f0d",
         "working": "#8f5e15",
-        "rail": "#bbbcc2"
+        "rail": "#b4b5bc"
       }
     }
   }

@@ -2363,8 +2363,11 @@ def _role_value(role: str, theme: Optional[Theme], colors: int) -> Optional[int]
     """`role` as the int `init_pair(n, fg, bg)` wants on a terminal with `colors`.
 
     THEME ROLES GO THROUGH THE CATALOG'S HEX, so a truecolor terminal takes the
-    exact value the catalog names: dracula's parchment #f0e6d2 stays parchment
-    instead of collapsing onto the nearest 256 cell, which is a pure grey.
+    exact value the catalog names: dracula's parchment #ffd7af stays parchment
+    instead of being quantised. Below truecolor the same hex goes through
+    `hex_to_ansi256`, which will NOT let a colour with chroma land on a grey —
+    the hex this replaced, #f0e6d2, resolved to cell 254, a pure grey, and took
+    every chromatic theme role in the catalog down with it.
 
     MARK ROLES STAY 256-PALETTE INDICES even on a truecolor terminal, because
     `_VENDOR_COLOURS` IS a table of palette indices and the readability guard
