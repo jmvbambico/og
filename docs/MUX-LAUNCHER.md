@@ -256,6 +256,11 @@ because a skip we could not justify is the mistake nothing undoes (a second spac
 and a second `og chat` in a conversation the operator already had), while the
 opposite error is a message on screen they can act on.
 
+Both ids are **detail** facts: the listing row carries neither `workspace` nor
+`host_id` (measured), so `og_herdr_watch` forwards both out of the one
+`GET /v1/sessions/{id}` fetch it already makes per session. The watcher emits a
+sub-agent's `host_id: null` as no key at all, which is the unknown case above.
+
 `workspace` is on the **detail** row only — the listing row does not carry it.
 The check therefore costs one detail fetch per live root, which is a handful.
 

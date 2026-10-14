@@ -8,8 +8,11 @@ worse hazard than the bug it is looking for.
 """
 from __future__ import annotations
 
+import io
+import json
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -35,7 +38,7 @@ from og_herdr_launch import (  # noqa: E402
     pane_env_for,
     session_space_cap,
 )
-from og_herdr_watch import SessionEvent  # noqa: E402
+from og_herdr_watch import SessionEvent, SessionWatcher  # noqa: E402
 
 SERVER = "http://127.0.0.1:6767"
 CWD = "/Users/someone/projects/og"
@@ -212,6 +215,55 @@ class UnreadableWatcher(FakeWatcher):
         raise OSError("connection refused")
 
 
+class _Body(io.BytesIO):
+    """What a stub opener's `urlopen` hands back: a context manager with read()."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class RoutingOpener:
+    """A stub HTTP layer for a REAL `SessionWatcher`, routed by path.
+
+    `FakeWatcher` can hand `live_session` a session the real watcher would never
+    emit — which is precisely how the host rule shipped green while being unable
+    to fire: the launcher tests put `host_id` on the session dict, and nothing
+    ever proved the real `_enrich` forwards it from the detail row. This answers
+    by URL instead of by call order: the listing, one `/v1/sessions/{id}` detail
+    fetch per session, and the `/v1/hosts` lookup behind `local_host_id` — which
+    also pins that the hosts request travels the watcher's own authenticated
+    path rather than a second opener of its own.
+    """
+
+    def __init__(self, rows, details, hosts=None):
+        self.rows = list(rows)
+        self.details = dict(details)
+        self.hosts = HOSTS if hosts is None else hosts
+        self.requests = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        path = urllib.parse.urlsplit(request.full_url).path
+        if path == "/v1/hosts":
+            body = self.hosts
+        elif path == "/v1/sessions":
+            body = {"object": "list", "data": self.rows, "has_more": False}
+        else:
+            body = self.details[urllib.parse.unquote(path.rsplit("/", 1)[-1])]
+        return _Body(json.dumps(body).encode())
+
+
+def real_watcher(rows, details, hosts=None):
+    """The REAL watcher over a stubbed HTTP layer: no network, and no fake able
+    to report a shape the enrichment path does not actually produce."""
+    return SessionWatcher(base_url=SERVER,
+                          opener=RoutingOpener(rows, details, hosts))
+
+
 class NoSplitClient(FakeClient):
     """A multiplexer whose `pane.split` fails — the agents pane's own failure."""
 
@@ -228,6 +280,35 @@ def root_session(sid="s1", cwd=CWD, status="idle", **extra):
                "title": "the conversation"}
     session.update(extra)
     return session
+
+
+def listed(sid="s1", status="idle", **extra):
+    """A LISTING row in the MEASURED shape — the keys `GET /v1/sessions?kind=any`
+    actually returns, which is to say no `host_id`, no `workspace` and no
+    `runner_online`. Anything the launcher reads beyond these three has to have
+    been merged in from the detail fetch, which is the whole point of building
+    the fixture from the API's shape rather than from what the code wants."""
+    row = {"id": sid, "agent_id": "a1", "agent_name": "hivemind",
+           "archived": False, "comments_count": 0, "created_at": 1791566251,
+           "external_session_id": "ses_" + sid, "labels": {}, "owner": "cryogenix",
+           "parent_session_id": None, "pending_elicitations_count": 0,
+           "permission_level": 4, "runner_id": "runner_token_b6d2",
+           "status": status, "title": "the conversation",
+           "updated_at": 1791566384, "viewer_unread": False}
+    row.update(extra)
+    return row
+
+
+def detail_of(sid="s1", workspace=CWD, host_id=None, **extra):
+    """A `GET /v1/sessions/{id}` row: the directory, the machine, and the rest
+    the listing does not carry."""
+    row = {"id": sid, "workspace": workspace, "parent_session_id": None,
+           "kind": "default", "harness": "opencode-native",
+           "sub_agent_name": None, "host_id": host_id, "git_branch": None,
+           "pending_elicitations": [], "runner_online": True, "status": "idle",
+           "title": "the conversation"}
+    row.update(extra)
+    return row
 
 
 def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
@@ -486,6 +567,75 @@ def test_an_answer_that_does_not_name_this_machine_leaves_it_unknown():
                     "nonsense"):
         assert local_host_id(FakeWatcher(hosts=payload)) is None, payload
     assert local_host_id(FakeWatcher(hosts_error=OSError("refused"))) is None
+
+
+def test_the_host_rule_runs_against_the_real_enrichment_path(tmp_path):
+    """THE TEST THAT WAS MISSING, end to end, and the reason the first version
+    of this fix could not work: the launcher tests drove a FAKE watcher, which
+    could put `host_id` on a session the real `_enrich` never emits — because
+    the listing row does not carry it and nothing forwarded the detail's. The
+    rule passed its tests and could never fire in production.
+
+    Everything here is real except the socket: a LISTING row in the measured
+    shape (no `host_id` anywhere in it) plus a DETAIL fetch per session, through
+    the real `SessionWatcher`, into the real `live_session`. The work-mac session
+    must be skipped and a fresh space opened."""
+    rows = [listed("s-work")]
+    details = {"s-work": detail_of("s-work", host_id=WORK_HOST)}
+    client = FakeClient()
+
+    assert launch(make_ctx(tmp_path, client, real_watcher(rows, details))) == "attach"
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert ("omnigent attach --server {0} s-work".format(SERVER)
+            not in client.text_typed())
+
+
+def test_a_session_on_this_machine_still_attaches_through_the_real_watcher(
+        tmp_path):
+    """The other direction through the same real path, so the test above cannot
+    be satisfied by a filter that refuses everything. This session came off the
+    same detail row, from the same fetch, carrying THIS machine's host."""
+    rows = [listed("s-mine")]
+    details = {"s-mine": detail_of("s-mine", host_id=LOCAL_HOST)}
+    client = FakeClient()
+
+    assert launch(make_ctx(tmp_path, client, real_watcher(rows, details))) == "attach"
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_a_real_detail_row_with_no_host_still_attaches(tmp_path):
+    """The unknown direction, through the real path: a detail row whose
+    `host_id` is null (a sub-agent's shape) reaches the launcher with NO key at
+    all — not a null — and the rule must leave it alone rather than read the
+    absence as "somewhere else"."""
+    rows = [listed("s-nohost")]
+    details = {"s-nohost": detail_of("s-nohost", host_id=None)}
+    client = FakeClient()
+
+    assert launch(make_ctx(tmp_path, client, real_watcher(rows, details))) == "attach"
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-nohost".format(SERVER)]
+
+
+def test_the_hosts_lookup_rides_the_same_authenticated_path(tmp_path):
+    """With a real watcher in hand, the hosts request is provably the watcher's
+    own: same opener, same base URL, and the token that was handed to it —
+    `--server` can name a server we hold no token for, and a second opener would
+    be a second opinion about which server we are on."""
+    opener = RoutingOpener([listed("s-mine")],
+                           {"s-mine": detail_of("s-mine", host_id=LOCAL_HOST)})
+    watcher = SessionWatcher(base_url=SERVER, token="secret", opener=opener)
+
+    launch(make_ctx(tmp_path, FakeClient(), watcher))
+
+    hosts = [r for r in opener.requests
+             if urllib.parse.urlsplit(r.full_url).path == "/v1/hosts"]
+    assert [r.full_url for r in hosts] == [SERVER + "/v1/hosts"]
+    assert all(r.get_header("Authorization") == "Bearer secret" for r in hosts)
 
 
 def test_is_inside_reads_herdr_env():
