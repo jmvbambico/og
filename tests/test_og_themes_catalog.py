@@ -671,8 +671,11 @@ def test_status_glyphs_are_tellable_apart(themes):
 # against -- `TERM=tmux-256color`, so `curses.COLORS` is 256 even though
 # `COLORTERM=truecolor` is exported, and `infocmp` reports no `ccc`, so
 # `init_color` is not available either -- what a role paints is one of the 240
-# existing palette cells and NOT its hex. That makes the two sets of numbers
-# different questions, and only the second one is about the pane.
+# existing palette cells and NOT its hex. That is now true of EVERY terminal, not
+# just this one: `curses_value` has no truecolor branch at all, because
+# `init_pair` takes colour numbers and nothing in this ncurses turns a hex into
+# one. That makes the two sets of numbers different questions, and only the
+# second one is about the pane.
 #
 # The gap is not subtle. Before the converter refused to desaturate, dracula's
 # parchment #f0e6d2 painted as 254 (#e4e4e4, a pure grey) -- 96 degrees of hue
@@ -709,8 +712,8 @@ def test_the_selected_row_is_still_a_different_colour_from_the_pane(themes):
     roles were far enough apart to land on far enough apart. They are not any
     more. Catppuccin Frappe's #303446 and #414559, Nord's #2e3440 and #3b4252,
     and Tailwind's #0f172a and #1e293b each resolved to the SAME cell -- so the
-    selected row would have been invisible, in three themes, on every terminal
-    that does not claim truecolor. A hex test cannot see that and this one can.
+    selected row would have been invisible, in three themes, on every terminal.
+    A hex test cannot see that and this one can.
     """
     for slug, label, colors in _rows(themes):
         pane, selected = _index(colors["bg"]), _index(colors["sel_bg"])

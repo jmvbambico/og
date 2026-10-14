@@ -33,12 +33,12 @@ makes the change cost nothing for an operator who wants none of it.
 LOADING IS TWO-TIERED ON PURPOSE. An absent or unreadable `themes.json` falls
 back SILENTLY to the one built-in theme below: a theme catalog is a preference,
 and a missing preference must not stop the pane from opening. A catalog file
-that is present, readable, valid JSON, and structurally WRONG — a theme missing a
-role, a role carrying something that is neither a hex nor `"default"` — raises.
-That asymmetry is AGENTS.md's "a loud refusal beats a silent breakage": the first
-case is an absent file and the operator has simply never chosen, the second is a
-bad edit someone will look at again and cannot look at unless told which row and
-which role.
+that is present, readable, valid JSON, and structurally WRONG — an empty or
+list-valued `themes`, a theme missing a role, a role carrying something that is
+neither a hex nor `"default"` — raises. That asymmetry is AGENTS.md's "a loud
+refusal beats a silent breakage": the first case is an absent file and the
+operator has simply never chosen, the second is a bad edit someone will look at
+again and cannot look at unless told which row and which role.
 """
 from __future__ import annotations
 
@@ -449,39 +449,40 @@ def hex_to_ansi256(value: str) -> int:
     return nearest
 
 
-# A terminal reporting at least this many colours takes a 24-bit RGB value
-# directly, which is what `COLORTERM=truecolor` sets `curses.COLORS` to. Below
-# it there is no alternative to the 256 palette, and a theme hex is mapped into
-# it — see `curses_value`.
-TRUECOLOR_MIN = 1 << 24
-
-
 def curses_value(value: str, colors: int) -> int:
     """`value` as the int `init_pair(n, fg, bg)` wants on a terminal with `colors`.
 
-    On a truecolor terminal the 24-bit value goes straight in, so the pane paints
-    the theme's EXACT hexes. Below truecolor the hex is mapped to a cell by
-    `hex_to_ansi256` and the EXISTING degradation rules apply unchanged:
-    `init_pair` is only reached for a value below `colors`, so an 8- or 16-colour
-    terminal still paints those roles uncoloured rather than wrong.
-
-    THE 256 PATH IS THE ONE THAT ACTUALLY RUNS on the terminal this shipped
-    against: `TERM=tmux-256color` with `COLORTERM=truecolor` set, so `init_color`
-    is not even available (`infocmp` reports no `ccc`) and `curses.COLORS` is 256.
-    A theme colour there MUST be one of the 240 existing cells, which is why the
-    converter refuses to resolve a chromatic colour onto a neutral one and why
-    dracula's parchment is the cell 223 rather than a hex whose nearest cell is a
-    grey. Truecolor remains the better path — it paints the hexes exactly — but it
-    is not the one to reason about, because a hex that only survives on truecolor
-    is a hex that renders grey everywhere else.
-
     `"default"` is `-1` whatever the terminal, which is the whole point of it.
+    Every other value is a PALETTE INDEX, mapped by `hex_to_ansi256`.
+
+    THE DEGRADATION RULES LIVE IN THE CALLER — `_Colours.attr` range-checks both
+    ends against `colors` and paints the glyph bare rather than wrong on an 8- or
+    16-colour terminal — so `colors` is not consulted here, and that is
+    deliberate: one place decides what a terminal can hold, and this one only
+    says what a theme hex means.
+
+    THERE IS NO TRUECOLOR PATH, AND THERE WAS NEVER A CORRECT ONE HERE. It used to
+    hand a packed 24-bit int to `init_pair`, whose second and third arguments are
+    colour NUMBERS — indices into the palette `alloc_color` would have had to
+    register first. Nothing in this build registers one: the module that could,
+    `curses.init_extended_pair`, is absent, as is `init_extended_color`, and
+    `curses.ncurses_version` is 6.0.20150808. So the value was never a colour;
+    it was a large number in a slot whose meaning is the terminal's. And the path
+    was unreachable anyway: the terminal this ships to is `TERM=tmux-256color`
+    with `infocmp` reporting no `ccc`, so `init_color` fails there too and
+    `curses.COLORS` stays at 256. Dropping it is not a narrowing — the 256 path
+    was ALWAYS the one that ran, and it is now the only one, so the pane paints
+    the SAME cell on every terminal instead of a different wrong colour on the
+    rare one.
+
+    WHICH IS THE POINT. A theme colour there MUST be one of the 240 existing
+    cells, which is why the converter refuses to resolve a chromatic colour onto a
+    neutral one and why dracula's parchment is the cell 223 rather than a hex
+    whose nearest cell is a grey. A hex that only survives as an exact RGB triple
+    is a hex that renders grey everywhere else.
     """
     if value == DEFAULT:
         return CURSES_DEFAULT
-    if colors >= TRUECOLOR_MIN:
-        r, g, b = hex_to_rgb(value)
-        return (r << 16) | (g << 8) | b
     return hex_to_ansi256(value)
 
 
@@ -620,17 +621,41 @@ def _parse_theme(slug: str, raw) -> Theme:
 def load_catalog(path: Optional[Path] = None) -> dict:
     """Every theme, slug -> `Theme`, from `themes.json` or the built-in fallback.
 
-    SILENT on an absent or unreadable FILE — a preference nobody set is not an
-    error, and the pane still has to open. LOUD on a bad row, which is an edit
-    someone has to look at.
+    SILENT on an absent, unreadable or unparseable FILE — a preference nobody
+    set is not an error, and the pane still has to open. Those three are the
+    cases where the file said NOTHING.
+
+    LOUD on a file that said something WRONG, and an empty `themes` is one of
+    those things. `{"themes": {}}` and `{"themes": []}` are present, readable,
+    valid JSON and structurally wrong: there is no row to paint, and falling back
+    to dracula says "your catalog is one theme, from nowhere" instead of "your
+    catalog is empty and that is why the menu you are looking at is not the one
+    you wrote". It took a deliberate decision to put that on this side of the line
+    rather than the silent one, and the argument is the module's own: the absent
+    file is an operator who has never chosen, and this is a bad edit somebody
+    will look at again and cannot look at unless told which shape is wrong. The
+    same is true of a document that is not an object and of one with no `themes`
+    key — all three used to arrive here through the same `except` as the missing
+    file, which is why this docstring and the code once disagreed.
     """
+    source = Path(path or CATALOG)
     try:
-        document = json.loads(Path(path or CATALOG).read_text(encoding="utf-8"))
-        themes = document["themes"]
-    except (OSError, ValueError, KeyError, TypeError):
+        document = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return dict(BUILTIN)
-    if not isinstance(themes, dict) or not themes:
-        return dict(BUILTIN)
+    if not isinstance(document, dict):
+        raise ThemeError(f"{source} is not a themes document: "
+                         f"top level is {type(document).__name__}, not an object")
+    if "themes" not in document:
+        raise ThemeError(f"{source} has no 'themes' key")
+    themes = document["themes"]
+    if not isinstance(themes, dict):
+        raise ThemeError(f"{source} has a 'themes' that is "
+                         f"{type(themes).__name__}, not an object")
+    if not themes:
+        raise ThemeError(f"{source} has an EMPTY 'themes': a catalog with no rows "
+                         f"in it paints nothing, so it is refused rather than "
+                         f"quietly replaced by {DEFAULT_THEME!r}")
     return {slug: _parse_theme(slug, raw) for slug, raw in themes.items()}
 
 
@@ -709,16 +734,32 @@ def save_theme(slug: str, environ: Optional[dict] = None) -> None:
     away the theme the operator just chose — the pane repaints either way — so a
     failure to persist is swallowed rather than raised. Nothing here is load
     bearing enough to crash a TUI over.
+
+    AND IT CLEANS UP AFTER ITSELF WHEN IT CANNOT FINISH. `mkstemp` has already
+    made a file by the time the write can go wrong, and swallowing the failure
+    while leaving that file behind is how a picker driven by muscle memory — the
+    operator picks a theme, nothing happens, they pick another — fills a home that
+    is read-only or full with `tmp*.tmp` nobody will ever read. The unlink is in a
+    `finally`, is itself swallowed, and is skipped once `os.replace` has consumed
+    the name.
     """
     path = theme_state_path(environ)
+    temporary = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, temporary = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             json.dump({"version": 1, "theme": slug}, stream)
         os.replace(temporary, path)
+        temporary = None                    # consumed; nothing left to remove
     except (OSError, ValueError):
         return
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def theme_for(slug: Optional[str] = None, environ: Optional[dict] = None) -> Theme:

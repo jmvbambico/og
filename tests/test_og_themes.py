@@ -282,18 +282,40 @@ def test_contrast_is_the_wcag_formula():
     assert th.relative_luminance("#ffffff") == pytest.approx(1.0, abs=1e-9)
 
 
-def test_curses_value_is_minus_one_for_default_and_a_pair_otherwise():
+def test_curses_value_is_minus_one_for_default_and_a_palette_cell_otherwise():
+    """`init_pair(n, fg, bg)` takes colour NUMBERS. There is no truecolor path and
+    there never was a correct one here: `curses.init_extended_pair` — the only API
+    through which a packed RGB value could become a colour — is ABSENT from this
+    build's ncurses (6.0.20150808), as is `init_extended_color`. The branch that
+    packed one was handing a 24-bit integer to a slot whose meaning is a palette
+    index, and it was unreachable besides: the terminal this ships to is
+    `TERM=tmux-256color` with no `ccc`, so `init_color` fails there too.
+
+    So `colors` CANNOT change the answer, and that is the assertion: a terminal
+    claiming truecolor paints the SAME cell as one that does not, and no value
+    this returns is anything but `-1` or one of the 240.
+    """
     assert th.curses_value("default", 256) == -1
     assert th.curses_value("default", 1 << 24) == -1
-    # On a 256-colour terminal the hex is mapped into the palette...
     assert th.curses_value("#87afaf", 256) == 109
-    # ...and on a truecolor one it goes in EXACTLY. Truecolor is the better path
-    # and it matters that it is still exact, but it is NOT the path that runs on
-    # the terminal this ships to: TERM=tmux-256color with COLORTERM=truecolor
-    # leaves curses.COLORS at 256 and init_color unavailable, so the 256 branch
-    # above is the one that paints.
-    assert th.curses_value("#ffd7af", 1 << 24) == 0xFFD7AF
-    assert th.curses_value("#282a36", 1 << 24) == 0x282A36
+    for colors in (0, 8, 16, 256, 1 << 24, 1 << 32):
+        assert th.curses_value("#ffd7af", colors) == 223, colors
+        assert th.curses_value("#282a36", colors) == 235, colors
+
+
+def test_no_value_curses_value_returns_can_be_a_packed_rgb_triple():
+    """The defect, pinned over the whole catalog rather than on two hexes.
+
+    The old truecolor branch returned `(r << 16) | (g << 8) | b` — 16.7 million at
+    most, and `init_pair` was handed it as a colour NUMBER. If any role in any
+    theme could still produce one, `colours.attr` would put it in a pair and the
+    terminal would paint whatever slot that number happens to own, which is a
+    colour nobody chose. Every value is `-1` or a cell of the 240.
+    """
+    for slug, theme in th.load_catalog().items():
+        for role, value in theme.colors.items():
+            answer = th.curses_value(value, 1 << 24)
+            assert answer == -1 or 0 <= answer < 256, (slug, role, value, answer)
 
 
 # ---------------------------------------------------------------------------
@@ -426,12 +448,54 @@ def test_a_missing_file_falls_back_silently(tmp_path):
 
 
 def test_an_unreadable_or_unparseable_file_falls_back_silently(tmp_path):
+    """NOT AN ERROR. A theme catalog is a preference; an operator who has never
+    chosen one still gets a pane, and a raised error would take that away.
+
+    All three cases here are the file saying NOTHING — absent, unreadable, or not
+    JSON at all. A file that parses and is still wrong is the other half of the
+    asymmetry, and it raises; see the empty-and-wrong-shaped cases below.
+    """
     broken = tmp_path / "broken.json"
     broken.write_text("{not json at all", encoding="utf-8")
     assert th.load_catalog(broken) == th.BUILTIN
-    empty = tmp_path / "empty.json"
-    empty.write_text('{"version": 1, "themes": {}}', encoding="utf-8")
-    assert th.load_catalog(empty) == th.BUILTIN
+    zero_length = tmp_path / "zero-length.json"
+    zero_length.write_text("", encoding="utf-8")
+    assert th.load_catalog(zero_length) == th.BUILTIN, \
+        "an EMPTY file is a file that said nothing, not a bad catalog"
+
+
+@pytest.mark.parametrize("document,expected", [
+    ({"version": 1, "themes": {}}, "EMPTY"),
+    ({"version": 1, "themes": []}, "not an object"),
+    ({"version": 1}, "'themes' key"),
+    ({"themes": "dracula"}, "not an object"),
+    ([{"label": "Example"}], "top level"),
+    ("dracula", "top level"),
+])
+def test_a_catalog_that_parsed_and_is_still_wrong_is_refused(tmp_path, document,
+                                                            expected):
+    """THE LOUD HALF, and the case the docstring had been claiming all along.
+
+    `{"themes": {}}` is present, readable, valid JSON and structurally wrong, and
+    it used to fall back to dracula in silence. So did `{"themes": []}`, a
+    document with no `themes` key at all, and a top level that is not an object —
+    all four arrived through the same `except` as the missing file, which is why
+    the module's own claim and its code disagreed.
+
+    Falling back is the wrong answer here. The absent file is an operator who has
+    never chosen; these are files somebody WROTE, and a catalog that parses and
+    then quietly paints dracula reports a one-theme menu to someone with
+    twenty-six rows in the file, which is the silent breakage this module exists
+    to refuse. A refusal names the shape, which is what somebody looking at the
+    file again needs.
+    """
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(th.ThemeError) as caught:
+        th.load_catalog(path)
+    assert expected in str(caught.value), caught.value
+    assert str(path) in str(caught.value), \
+        "the refusal has to name the FILE, or it is nobody's bad edit"
 
 
 def test_the_builtin_fallback_is_exactly_one_theme_and_it_is_dracula():
@@ -545,6 +609,57 @@ def test_saving_never_raises_on_an_unwritable_home(tmp_path):
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("", encoding="utf-8")
     th.save_theme("nord", {"OMNIGENT_HOME": str(blocker)})
+
+
+def _strays(home: Path) -> list:
+    """Every file under `home` that is not the state file."""
+    return [p.name for p in home.iterdir() if p.name != th.STATE_FILE]
+
+
+@pytest.mark.parametrize("where", ["replace", "write"])
+def test_a_save_that_cannot_finish_removes_its_own_temporary_file(tmp_path,
+                                                                  monkeypatch,
+                                                                  where):
+    """THE LEAK. `mkstemp` has already made a file by the time the write or the
+    replace can go wrong, and swallowing the failure while leaving that file
+    behind is how a picker driven by muscle memory fills a home that is read-only
+    or full with `tmp*.tmp` nobody will ever read.
+
+    Both failure points are covered. `where="replace"` fails at the LAST step,
+    after a complete file exists — the shape a full disk takes, and the one that
+    leaks most: `json.dump` succeeded, so the temp is a whole, valid, useless
+    file. `where="write"` fails inside the dump, which is the one where the file
+    is still empty and looks like nothing happened. Either way `save_theme` stays
+    best effort: it returns, it does not raise, and it leaves the home as it
+    found it.
+    """
+    home = tmp_path / ".omnigent"
+    home.mkdir()
+    monkeypatch.setattr(th.json if where == "write" else th.os,
+                        "dump" if where == "write" else "replace",
+                        _explode)
+    th.save_theme("nord", {"OMNIGENT_HOME": str(home)})     # must not raise
+    assert _strays(home) == [], (where, _strays(home))
+
+
+def _explode(*_args, **_kwargs):
+    """What a full disk and a read-only home both look like from inside."""
+    raise OSError(28, "No space left on device")
+
+
+def test_a_save_that_cannot_finish_leaves_the_previous_choice_readable(tmp_path,
+                                                                     monkeypatch):
+    """And the file it was REPLACING is still there, untouched. The whole of the
+    atomic write is that a failure leaves the previous theme rather than half of
+    one, and the cleanup must not become a second way to lose it."""
+    home = tmp_path / ".omnigent"
+    env = {"OMNIGENT_HOME": str(home)}
+    th.save_theme("nord", env)
+    monkeypatch.setattr(th.os, "replace", _explode)
+    th.save_theme("gruvbox", env)
+    assert th.load_theme(env) == "nord", \
+        "the failed save did not write, so the old slug is still what loads"
+    assert _strays(home) == []
 
 
 def test_theme_for_falls_back_for_a_stale_slug_but_a_typed_slug_is_checked():

@@ -4446,31 +4446,160 @@ def test_only_the_selected_row_gets_a_background(monkeypatch):
     assert a.hex_to_ansi256(dracula.colour("sel_bg")) in backgrounds
 
 
-def test_a_truecolor_terminal_paints_the_themes_exact_hexes(monkeypatch):
-    """On truecolor the pane paints the catalog's hexes and not an approximation
-    of them. That was worth arguing from the 256 path, where the operator's
-    parchment #f0e6d2 mapped onto a pure GREY — the converter has since been
-    fixed so that cannot happen, and the operator pinned the hex to the cell they
-    chose instead. Truecolor still takes the exact 24-bit value."""
+def test_a_terminal_claiming_truecolor_paints_exactly_what_a_256_one_does(monkeypatch):
+    """THE TRUECOLOR BRANCH IS GONE, and the claim is not that one of the two is
+    broken but that they are now the SAME paint.
+
+    It used to answer `0xFFD7AF` and `0x282A36` here and hand them to
+    `init_pair`, whose second and third arguments are colour NUMBERS. Nothing in
+    this ncurses (6.0.20150808) turns a packed triple into a colour —
+    `curses.init_extended_pair` and `init_extended_color` are both absent — so
+    what that painted was whatever slot 0xFFD7AF happened to name, and the
+    terminal it claimed to serve (`TERM=tmux-256color`, `infocmp` reporting no
+    `ccc`) reports 256 colours anyway. A hex that only survives as an exact RGB
+    triple is a hex that renders as an arbitrary palette cell everywhere else.
+
+    Two runs of the SAME frame, differing only in what the fake claims `curses`
+    saw, and an assertion that every pair spent is identical. That is how a
+    future re-add has to argue with a test rather than with a comment.
+    """
     frame = a.Frame(rows=[header(),
                           worker("w1", "idle", harness="claude-native",
                                  meta="12s")], selected=1)
-    fake, writes = _colour_paint(monkeypatch, frame, colors=1 << 24,
-                                 theme=_theme("dracula"))
-    spent = [(fg, bg) for _p, fg, bg in fake.init_pair_calls]
-    # The parchment reaches init_pair as the exact 24-bit value the catalog
-    # names -- #ffd7af, which is also cell 223 below truecolor, so the two paths
-    # agree on the colour and only the precision differs.
-    assert (0xFFD7AF, 0x282A36) in spent, spent
+    theme = _theme("dracula")
+    painted = {}
+    for colors in (256, 1 << 24):
+        fake, _writes = _colour_paint(monkeypatch, frame, colors=colors,
+                                      theme=theme)
+        painted[colors] = [(fg, bg) for _pair, fg, bg in fake.init_pair_calls]
+        assert painted[colors], colors
+    assert painted[1 << 24] == painted[256], painted
+    # And what they agree on is the palette: the parchment is the CELL the
+    # operator picked (223), not the hex and not a packed triple.
+    assert (223, a.hex_to_ansi256("#282a36")) in painted[256], painted[256]
+    assert all(fg == -1 or 0 <= fg < 256
+               for fg, _bg in painted[256]), painted[256]
     # The window background asks for the terminal's own foreground (-1) against
     # the theme's own background, so the pane fills without a foreground.
-    assert (-1, 0x282A36) in spent, spent
-    # Every background is one the theme named -- the pane's, or the selected
-    # row's -- and never the terminal's own.
-    assert {bg for _fg, bg in spent} == {0x282A36, 0x44475A}, spent
-    # And a mark is still its 256 PALETTE index even here: `_VENDOR_COLOURS` is
-    # a table of palette cells, and the guard above it is reasoned in that space.
-    assert (173, 0x282A36) in spent, spent
+    assert (-1, a.hex_to_ansi256("#282a36")) in painted[256], painted[256]
+    # And a mark is its 256 PALETTE index: `_VENDOR_COLOURS` is a table of
+    # palette cells, and the guard above it is reasoned in that space.
+    assert (a._VENDOR_COLOURS["anthropic"], a.hex_to_ansi256("#282a36")) \
+        in painted[256], painted[256]
+
+
+def test_a_pair_number_outside_the_palette_is_refused_rather_than_allocated():
+    """What the old truecolor branch would have reached, at the one place that
+    can refuse it. `_Colours.attr` range-checks BOTH ends against `COLORS` and
+    allows `-1` — curses' "the terminal's own" — on either side of a pair, and
+    nothing else below the limit. A 24-bit RGB triple is not a colour number, so
+    the honest answer is to paint the glyph bare, which is what every other
+    unallocatable value on this path already gets."""
+    class _C:
+        has_colors = staticmethod(lambda: True)
+        COLORS, COLOR_PAIRS = 256, 256
+        init_pair_calls = []
+
+        @staticmethod
+        def init_pair(n, fg, bg):
+            _C.init_pair_calls.append((n, fg, bg))
+
+        @staticmethod
+        def color_pair(n):
+            return n << 8
+
+    colours = a._Colours(_C, _theme("dracula"))
+    assert colours.attr(0x282A36, 0x282A36) == 0, "a packed triple is not a cell"
+    assert colours.attr(-5, 0x282A36) == 0, "-1 is the only inherit value"
+    assert colours.attr(223, -5) == 0
+    assert _C.init_pair_calls == []
+    # ...while a cell on either end, and -1 on either end, still allocates.
+    assert colours.attr(-1, 235), "the terminal's own text on the theme's bg"
+    assert colours.attr(223, -1), "the theme's text on the terminal's own bg"
+    assert len(_C.init_pair_calls) == 2
+
+
+def _hand_edited_theme(tmp_path: Path, **colors) -> th.Theme:
+    """A theme built the way an operator builds one: written to a `themes.json`
+    and read back THROUGH THE LOADER.
+
+    `_theme` reads the shipped catalog and exists so that no test can pin a
+    `Theme` object the pane could not actually resolve. This is the same rule for
+    the rows the catalog cannot reach — `text: "default"` on a theme with a
+    coloured background is a legal file the shipped twenty-six never contain, and
+    building it any other way would test a fiction.
+    """
+    row = {"label": "Hand Edited", "order": 99,
+           "colors": {**{role: "default" for role in th.ROLES}, **colors}}
+    path = tmp_path / "themes.json"
+    path.write_text(json.dumps({"version": 1, "themes": {"hand": row}}),
+                    encoding="utf-8")
+    return th.load_catalog(path)["hand"]
+
+
+def test_a_default_foreground_still_paints_on_a_coloured_background(tmp_path):
+    """`"default"` MEANS CURSES -1 IN ANY ROLE, and `-1` is a legal `init_pair`
+    FOREGROUND. A span whose text is `"default"` on a themed background is still
+    a span on that background — it is the one that reads as the terminal's own
+    text — and returning no pair for it drops the background silently, so the
+    operator asks for terminal-coloured text on a dracula pane and gets terminal
+    text on whatever the pane behind it happened to be.
+
+    The shipped catalog cannot show this: `og` is the only theme with a
+    `"default"` role anywhere and its `bg` and `sel_bg` are `"default"` too, so
+    the theme is written here instead. Both ends are exercised, because a fix
+    that only handled the pane's own background would leave the SELECTED row —
+    the one row the operator is looking straight at — unthemed.
+    """
+    theme = _hand_edited_theme(tmp_path, bg="#282a36", sel_bg="#44475a")
+    assert theme.is_default("text") and not theme.is_default("sel_bg")
+    fake = FakeCurses(colors=256, color_pairs=256)
+    colours = a._Colours(fake, theme)
+
+    pane = colours.role_attr(a.PLAIN, theme)
+    selected = colours.role_attr(a.PLAIN, theme, on_selected=True)
+    assert pane and selected and pane != selected
+    assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
+        (-1, a.hex_to_ansi256("#282a36")),
+        (-1, a.hex_to_ansi256("#44475a")),
+    ], fake.init_pair_calls
+    # The foreground really is -1 and not the theme's text colour: this theme's
+    # `text` IS "default", so there is nothing else it could be.
+    assert a._role_value(a.PLAIN, theme, 256) == th.CURSES_DEFAULT
+
+
+def test_a_coloured_role_still_wins_where_it_has_a_colour_to_win_with(tmp_path):
+    """AND THE OTHER DIRECTION. A coloured `text` on a `"default"` background is
+    the case this all has to not break: the pair is allocated as before, with the
+    terminal's own background behind it."""
+    theme = _hand_edited_theme(tmp_path, text="#ffd7af")
+    fake = FakeCurses(colors=256, color_pairs=256)
+    colours = a._Colours(fake, theme)
+    assert colours.role_attr(a.PLAIN, theme)
+    assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] \
+        == [(223, th.CURSES_DEFAULT)], fake.init_pair_calls
+
+
+def test_og_still_spends_no_pair_where_both_ends_are_default():
+    """THE NO-REGRESSION HALF. Both ends `"default"` really is the case with no
+    pair to spend: `use_default_colors` has already made pair 0 the terminal's own
+    colours, so allocating `init_pair(n, -1, -1)` would spend a pair from a
+    256-entry table to say exactly what pair 0 already says. The `og` row is the
+    one that relies on it, and it is the reason the fix above had to be written
+    as "unless BOTH ends are default" rather than "always".
+
+    `ORCH` is here too and for a different reason: it is a WEIGHT and no colour,
+    so there is no foreground to contribute at all. None is reserved for that,
+    which is the distinction `_role_value`'s docstring draws.
+    """
+    og = _theme("og")
+    fake = FakeCurses(colors=256, color_pairs=256)
+    colours = a._Colours(fake, og)
+    for role in (a.PLAIN, "undim:plain", a.ORCH):
+        assert colours.role_attr(role, og) == 0, role
+        assert colours.role_attr(role, og, on_selected=True) == 0, role
+    assert fake.init_pair_calls == [], \
+        "og must spend nothing to say nothing, selected row included"
 
 
 def test_the_pair_table_is_keyed_by_the_pair_not_the_foreground():
