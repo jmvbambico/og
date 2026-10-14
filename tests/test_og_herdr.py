@@ -56,6 +56,10 @@ class RecordingClient:
         # it just made, and the bridge's re-validation would — correctly — read
         # that as "your space is gone" and re-project into a second one.
         self._live: dict[str, dict] = {}
+        # Every pane herdr would list, so the agents-pane split's new pane can be
+        # found by DIFFERENCE against the tab (`pane.split` names no pane, so the
+        # shared split falls back to `pane.list`). Seeded by the creates below.
+        self._panes: list[dict] = []
         self._seq = 0
 
     def _call(self, name, *args, **kwargs):
@@ -73,6 +77,32 @@ class RecordingClient:
         self._seq += 1
         return self._seq
 
+    def call(self, method, params=None):
+        """The generic seam the agents-pane split uses: `pane.split`/`pane.list`.
+
+        The shared split reaches for `pane.split` through the raw `call` (herdr
+        names no new pane in its reply), so this records it here and remembers
+        the pane it made — which is how the split's fallback `pane.list` finds
+        the new pane by difference. Mirrors the launcher test's FakeClient.
+        """
+        params = params or {}
+        self.calls.append((method, params))
+        if method == "pane.split":
+            src = next((p for p in self._panes
+                        if p["pane_id"] == params.get("target_pane_id")), {})
+            n = self._next()
+            self._panes.append({
+                "pane_id": f"split{n}",
+                "tab_id": src.get("tab_id", f"tab{n}"),
+                "workspace_id": src.get("workspace_id", f"ws{n}")})
+            return {"type": "ok"}
+        if method == "pane.list":
+            ws = params.get("workspace_id")
+            return {"type": "pane_list",
+                    "panes": [p for p in self._panes
+                              if p["workspace_id"] == ws]}
+        return {"type": "ok"}
+
     def workspace_create(self, label, cwd, focus=False, env=None):
         """The MEASURED workspace.create reply: workspace, tab AND root_pane, all
         three in one call — the schema's own result listing is lossy.
@@ -87,6 +117,8 @@ class RecordingClient:
         n = self._next()
         self._live[f"ws{n}"] = {"workspace_id": f"ws{n}", "label": label,
                                 "pane_count": 1, "tab_count": 1}
+        self._panes.append({"pane_id": f"pane{n}", "tab_id": f"tab{n}",
+                            "workspace_id": f"ws{n}"})
         return {"type": "workspace_created",
                 "workspace": {"workspace_id": f"ws{n}", "label": label},
                 "tab": {"tab_id": f"tab{n}", "workspace_id": f"ws{n}"},
@@ -95,6 +127,8 @@ class RecordingClient:
     def workspace_close(self, workspace_id):
         self._call("workspace_close", workspace_id)
         self._live.pop(workspace_id, None)
+        self._panes = [p for p in self._panes
+                       if p["workspace_id"] != workspace_id]
 
     def tab_create(self, workspace_id, cwd, label, focus=False, env=None):
         self._call("tab_create", workspace_id, cwd=cwd, label=label, env=env)
@@ -102,6 +136,8 @@ class RecordingClient:
             return self.create_results.pop(0)
         n = self._next()
         # The REAL herdr 0.9.3 shape: `tab_id` / `pane_id`, never a generic `id`.
+        self._panes.append({"pane_id": f"pane{n}", "tab_id": f"tab{n}",
+                            "workspace_id": workspace_id})
         return {"tab": {"tab_id": f"tab{n}"},
                 "root_pane": {"pane_id": f"pane{n}"}}
 
@@ -638,6 +674,28 @@ def test_a_server_url_with_shell_metacharacters_still_parses_as_one_command():
     assert m.attach_command("http://127.0.0.1:6767", "s1") == ATTACH
 
 
+def test_resume_command_is_the_og_chat_resume_line():
+    # The line a HISTORY space's pane is handed, and the one a fresh `og start`
+    # never uses. `og chat` — not a bare `omnigent run` — is what brings the
+    # local server and the agent bundle with it, exactly as for a fresh session
+    # in a launcher pane; `og chat` forwards to `omnigent run -r/--resume <id>`,
+    # documented to attach to a prior conversation. It deliberately names no
+    # `--server`: `og chat` has no such flag.
+    assert m.resume_command("dead1") == "og chat --resume dead1"
+
+
+def test_a_resume_session_id_with_metacharacters_still_parses_as_one_command():
+    # A session id is operator input typed into a shell, so each part is quoted
+    # separately. The proof is not that quotes appear — it is that the line
+    # splits back into exactly the four arguments it was built from: an id
+    # carrying a space, a separator or a command substitution can then neither
+    # break the line nor run anything.
+    nasty = "a b;rm -rf /$(whoami)"
+    assert shlex.split(m.resume_command(nasty)) == [
+        "og", "chat", "--resume", nasty]
+    assert m.resume_command("abc") == "og chat --resume abc"
+
+
 def test_main_threads_the_cli_server_into_the_bridge(monkeypatch, tmp_path):
     # The wiring is the defect's other half: a --server that reached the watcher
     # but not the Bridge would leave every pane on the default while the bridge
@@ -676,6 +734,42 @@ def test_main_threads_the_cli_server_into_the_bridge(monkeypatch, tmp_path):
     assert m.main(["--once", "--dry-run", "--server", "https://og.example:8443"]) == 0
     assert captured["base_url"] == "https://og.example:8443"
     assert captured["server"] == "https://og.example:8443"
+
+
+def test_main_threads_the_agents_pane_setting_into_the_bridge(
+        monkeypatch, tmp_path):
+    # The install's `herdr_agents_pane` must reach the bridge the same way
+    # `herdr_session_space_cap` does; a bridge that decided its own answer would
+    # ignore the operator's choice for every resumed conversation.
+    import sys
+    import types
+
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    (tmp_path / "og-install.json").write_text(
+        json.dumps({"herdr_agents_pane": False}))
+
+    class StubWatcher:
+        def __init__(self, base_url=None, token=None):
+            pass
+
+        def poll_once(self):
+            return []
+
+    stub_module = types.ModuleType("og_herdr_watch")
+    stub_module.SessionWatcher = StubWatcher
+    monkeypatch.setitem(sys.modules, "og_herdr_watch", stub_module)
+
+    captured = {}
+    real_bridge = m.Bridge
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_bridge(FakeWatcher([]), None, dry_run=True)
+
+    monkeypatch.setattr(m, "Bridge", spy)
+
+    assert m.main(["--once", "--dry-run"]) == 0
+    assert captured["agents_pane"] is False
 
 
 def test_main_returns_zero_when_the_forever_loop_is_interrupted(
@@ -1055,18 +1149,23 @@ def test_a_dead_root_gets_a_space_labelled_with_its_title(seams, tmp_path):
 
 def test_a_dead_roots_pane_holds_the_resume_line_unsubmitted(seams, tmp_path):
     # THE HARD CONSTRAINT. A space for a past conversation must not resurrect it.
-    # The pane is a plain shell — one `workspace.create` — holding the resume line
-    # as UNSENT text: `pane_send_text` with no trailing newline, and NOT
-    # `pane_run`, which would append the newline that starts it.
+    # The CHAT pane is a plain shell — one `workspace.create` — holding the resume
+    # line as UNSENT text: `pane_send_text` with no trailing newline, and NOT
+    # `pane_run`, which would append the newline that starts it. The agents pane
+    # the same create now splits runs `og agents` in a DIFFERENT pane, so this
+    # pins the two apart: no pane_run ever carries the resume line, and the chat
+    # pane only ever receives it as unsent text.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path))
     bridge.reconcile([Ev("added", "dead1", root_session(
         "New Alignment", runner_online=False, workspace=str(tmp_path)))])
 
-    assert "pane_run" not in _names(client)
     _name, args, _kwargs = _call(client, "pane_send_text")
     assert args == ("pane1", "og chat --resume dead1")
     assert not args[1].endswith("\n"), "the resume line must not be submitted"
+    runs = [c[1] for c in client.calls if c[0] == "pane_run"]
+    assert ("pane1", "og chat --resume dead1") not in runs, (
+        "the resume line must never be submitted, on the chat pane or any other")
 
 
 def test_a_history_spaces_first_tab_is_labelled_too(seams, tmp_path):
@@ -1080,6 +1179,79 @@ def test_a_history_spaces_first_tab_is_labelled_too(seams, tmp_path):
 
     assert _call(client, "workspace_create")[1] == ("New Alignment",)
     assert _call(client, "tab_rename")[1] == ("tab1", "New Alignment")
+
+
+def test_a_history_space_opens_the_agents_pane_when_enabled(seams, tmp_path):
+    # THE BUG. Resuming a past conversation from the spaces list did not open
+    # the `og agents` pane a fresh `og start` opens, because the history/resume
+    # path never consulted `herdr_agents_pane`. With it on (the default), the
+    # split happens with the SAME command and ratio a fresh launch uses — one
+    # implementation, so the two cannot disagree about either.
+    import og_herdr_launch
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      pane_env={"BROWSER": "true"})
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
+
+    assert "pane.split" in _names(client)
+    assert _call(client, "pane.split")[1] == {
+        "target_pane_id": "pane1", "direction": "right", "focus": False,
+        "cwd": str(tmp_path), "ratio": og_herdr_launch.AGENTS_PANE_RATIO,
+        "env": {"BROWSER": "true"}}
+    assert og_herdr_launch.AGENTS_PANE_RATIO == 0.7
+    # ...and `og agents` is STARTED, in the new pane rather than the chat pane.
+    runs = {c[1][0]: c[1][1] for c in client.calls if c[0] == "pane_run"}
+    assert "og agents" in runs.values()
+    assert "pane1" not in runs, "og agents must not run in the chat pane"
+
+
+def test_a_history_space_honours_agents_pane_off(seams, tmp_path):
+    # The other half of the pair: `herdr_agents_pane: false` must reach the
+    # history/resume path too. A Bridge with it off opens NO split and starts
+    # nothing — the operator asked for a chat pane only.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      agents_pane=False)
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
+
+    assert "pane.split" not in _names(client)
+    assert "pane_run" not in _names(client)
+    # The resume line is still there, still unsubmitted: turning the split off
+    # must not turn the space's own job off.
+    assert _call(client, "pane_send_text")[1] == ("pane1",
+                                                  "og chat --resume dead1")
+
+
+def test_the_history_split_is_the_launchers_one_implementation(
+        seams, tmp_path, monkeypatch):
+    # ONE implementation, called by both. If the bridge ever grew its own copy of
+    # the pane-split logic, this monkeypatched function would not be reached and
+    # the two would drift — which is exactly how a fresh launch and a resumed
+    # conversation would start disagreeing about the agents pane.
+    import og_herdr_launch
+    seen = {}
+
+    def spy(client, ws_id, tab_id, root_pane, cwd, pane_env):
+        seen.update(ws_id=ws_id, tab_id=tab_id, root_pane=root_pane, cwd=cwd,
+                    pane_env=pane_env)
+        return ["the shared split degraded"]
+
+    monkeypatch.setattr(og_herdr_launch, "split_agents_pane", spy)
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      pane_env={"BROWSER": "true"})
+    lines = bridge.reconcile([Ev("added", "dead1", root_session(
+        "T", runner_online=False, workspace=str(tmp_path)))])
+
+    assert seen == {"ws_id": "ws1", "tab_id": "tab1", "root_pane": "pane1",
+                    "cwd": str(tmp_path), "pane_env": {"BROWSER": "true"}}
+    # The bridge did not reach for pane.split itself; the shared function owns it.
+    assert "pane.split" not in _names(client)
+    # ...and the degradation the shared function returned reaches reconcile's
+    # lines, so a broken split is reported, never swallowed.
+    assert any("the shared split degraded" in ln for ln in lines), lines
 
 
 def test_a_live_root_still_gets_todays_exact_treatment(seams):
@@ -1276,11 +1448,19 @@ def test_a_repaired_history_space_still_leaves_its_resume_line_unsubmitted(
         "New Alignment", state="idle"), previous=root_session(
             "New Alignment", state="idle"))])
 
-    assert "pane_run" not in _names(client), (
-        "a repaired history space must never submit a runner")
+    # The resume line is UNSENT — `pane_send_text`, no newline — and no
+    # `pane_run` ever carries it. (A repaired history space also opens the agents
+    # pane, whose `og agents` runs in its OWN pane; see
+    # `test_a_history_space_opens_the_agents_pane_when_enabled`.) The pane is read
+    # off the record rather than hardcoded: the agents pane consumes an id, so the
+    # repair's create is not the number it would be without a split.
+    repair_pane = bridge._recs["dead1"]["pane_id"]
     _name, args, _kwargs = _call(client, "pane_send_text")
-    assert args == ("pane2", "og chat --resume dead1")
+    assert args == (repair_pane, "og chat --resume dead1")
     assert not args[1].endswith("\n")
+    runs = [c[1] for c in client.calls if c[0] == "pane_run"]
+    assert (repair_pane, "og chat --resume dead1") not in runs, (
+        "a repaired history space must never submit a runner")
     # ...and it is still recorded as a history space the cap counts.
     assert bridge._recs["dead1"]["owns_space"] is True
 

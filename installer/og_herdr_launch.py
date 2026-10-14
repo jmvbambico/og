@@ -631,6 +631,44 @@ def _close_quietly(ctx: Launch, ws_id: str) -> None:
                     "it by hand".format(ws_id, exc))
 
 
+def split_agents_pane(client, ws_id: str, tab_id: str, root_pane: str,
+                      cwd: str, pane_env) -> list:
+    """Put `og agents` in a split beside `root_pane`; RETURN what failed.
+
+    ONE implementation of the split, called by the two things that open a pane
+    og expects to carry an `og agents` beside it: the launcher's `_open_space`
+    (case A/D) and the bridge's history/resume space
+    (`og_herdr._add_history_space`). The bridge never split, so resuming a past
+    conversation from the spaces list came up without the pane a fresh `og start`
+    opens — and a second copy of the split would only drift, leaving the next
+    person to discover which one ran.
+
+    It RETURNS its failures rather than reporting them, so each caller can route
+    a degradation through its own channel: the launcher's `_split_agents` sends
+    each line through `report` (log + re-surface before the terminal is handed
+    to herdr), and the bridge appends them to its `reconcile` lines. The strings
+    are deliberately stable so the launcher's log-matching tests keep passing.
+    """
+    params = {"target_pane_id": root_pane, "direction": "right",
+              "focus": False, "cwd": cwd, "ratio": AGENTS_PANE_RATIO}
+    if pane_env:
+        params["env"] = pane_env
+    try:
+        reply = client.call("pane.split", params)
+    except Exception as exc:
+        return ["could not open the og agents pane ({0}); the chat is up "
+                "without it".format(exc)]
+    pane_id = _split_pane_id(client, ws_id, tab_id, root_pane, reply)
+    if not pane_id:
+        return ["herdr split the chat pane but reported no new pane id; "
+                "`og agents` was not started there"]
+    try:
+        client.pane_run(pane_id, AGENTS_COMMAND)
+    except Exception as exc:
+        return ["could not start og agents in the split pane ({0})".format(exc)]
+    return []
+
+
 def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
     """Put `og agents` in a split beside the chat.
 
@@ -643,29 +681,17 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
     `pane.split` makes a pane too, so it takes the same pane environment as the
     space's own pane; the split runs `og agents`, which opens no browser, but a
     pane og creates under a mux launch should carry the map regardless.
+
+    The split itself is `split_agents_pane`, shared with og_herdr's
+    history/resume path so the two cannot drift; this launcher caller is the one
+    that routes its returned lines through `report` (see the note there).
     """
-    params = {"target_pane_id": root_pane, "direction": "right",
-              "focus": False, "cwd": ctx.cwd, "ratio": AGENTS_PANE_RATIO}
-    if ctx.pane_env:
-        params["env"] = ctx.pane_env
-    try:
-        reply = ctx.client.call("pane.split", params)
-    except Exception as exc:
-        report(ctx, "could not open the og agents pane ({0}); the chat is up "
-                    "without it".format(exc))
-        return
-    pane_id = _split_pane_id(ctx, ws_id, tab_id, root_pane, reply)
-    if not pane_id:
-        report(ctx, "herdr split the chat pane but reported no new pane id; "
-                    "`og agents` was not started there")
-        return
-    try:
-        ctx.client.pane_run(pane_id, AGENTS_COMMAND)
-    except Exception as exc:
-        report(ctx, "could not start og agents in the split pane ({0})".format(exc))
+    for line in split_agents_pane(ctx.client, ws_id, tab_id, root_pane,
+                                  ctx.cwd, ctx.pane_env):
+        report(ctx, line)
 
 
-def _split_pane_id(ctx: Launch, ws_id: str, tab_id: str, root_pane: str,
+def _split_pane_id(client, ws_id: str, tab_id: str, root_pane: str,
                    reply: Any) -> Optional[str]:
     """The pane `pane.split` just made.
 
@@ -682,7 +708,7 @@ def _split_pane_id(ctx: Launch, ws_id: str, tab_id: str, root_pane: str,
         if found:
             return found
     try:
-        panes = ctx.client.call("pane.list", {"workspace_id": ws_id})
+        panes = client.call("pane.list", {"workspace_id": ws_id})
     except Exception:
         return None
     others = sorted(

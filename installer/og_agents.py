@@ -75,6 +75,18 @@ from og_herdr_watch import (
     _session_id,
     herdr_state,
 )
+from og_themes import (
+    CURSES_DEFAULT,
+    Theme,
+    curses_value,
+    hex_to_ansi256,
+    load_catalog,
+    ordered_themes,
+    readable_index,
+    save_theme,
+    theme_for,
+    valid_slugs,
+)
 
 DEFAULT_INTERVAL = 3.0
 
@@ -228,9 +240,22 @@ DEFAULT_WIDTH = 80
 # and ␣ (U+2423) are Narrow — checked, not assumed — and `_display_width` charges
 # Ambiguous two as a backstop for anything a future edit adds. See
 # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
-FOOTER = "q quit  r refresh  ^/v move  enter focus  space expand  a access"
-FOOTER_COMPACT = "q quit r refresh ^v ⏎ focus ␣ expand a access"
-FOOTER_KEYS = "q r ^v ⏎ ␣ a"
+#
+# `t theme` JOINED ALL THREE FORMS WITHOUT MOVING ANY THRESHOLD, and that took a
+# deliberate choice about WHICH label degrades. The full form could simply grow to
+# 73, but the COMPACT form is the one the ~46-column agents split actually shows,
+# and appending ` t theme` to it would have pushed it to 53 — handing every real
+# pane the bare KEYS form, a far worse trade than losing one word. So COMPACT
+# sheds `refresh` and keeps `q quit`, `⏎ focus`, `␣ expand`, `a access` and
+# `t theme`: the key `r` still EXISTS in all three forms (the rule is that a key
+# may never degrade, only its label), and `r` is the one binding whose loss costs
+# the operator nothing — it is a convenience refresh, where every other binding is
+# something you cannot guess. COMPACT is therefore 45 columns wide, the width it
+# has always been, and `test_the_footer_chooses_a_form_by_measured_width` pins
+# that.
+FOOTER = "q quit  r refresh  ^/v move  enter focus  space expand  a access  t theme"
+FOOTER_COMPACT = "q quit r ^v ⏎ focus ␣ expand a access t theme"
+FOOTER_KEYS = "q r ^v ⏎ ␣ a t"
 
 # The caveats shown under the address, mirroring bin/og's `show_access`: the
 # operator must know whether the address is scannable only on the same wifi or
@@ -287,6 +312,12 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              glyph are exempt on every row, selected or not.
 PLAIN, META, ORCH = "plain", "meta", "orch"
 UNDIM = "undim:"
+
+# PLAIN is a COLOUR ROLE; `text` is the THEME role it asks the catalog for. They
+# are different vocabularies on purpose: `plain` means "the body of the pane",
+# which is exactly what a theme's `text` is the colour of, and the two are spelled
+# differently so a reader cannot mistake one for a lookup key in the other.
+PLAIN_TEXT = "text"
 
 
 def undim(role: str) -> str:
@@ -903,12 +934,23 @@ _HARNESS_MARKS = {
 #     the darkest colour the table ships: hermes 130 at 0.173 keeps that slot, which
 #     is why the floor test still names hermes rather than this row.
 #
-# THE FLOOR ABOVE IS A DARK-PANE FLOOR, and it is an ASSUMPTION, not an enforced
-# one: `_Colours.attr` colours a FOREGROUND on the TERMINAL'S OWN background (the
-# `-1` in `init_pair`), so on a light terminal every entry here inverts into the
-# very problem the floor exists to prevent — 227 is the second-brightest mark in
-# the table (only xai's white is brighter) and would wash out against white. That
-# is a background decision, not a fourteen-colour retune, so it is not made here.
+# THE FLOOR ABOVE IS A DARK-PANE FLOOR, AND IT IS NOW AN ASSUMPTION ABOUT A
+# BACKGROUND RATHER THAN ABOUT A TERMINAL. Before themes, `_Colours.attr` coloured
+# a FOREGROUND on the TERMINAL'S OWN background (the `-1` in `init_pair`), so on a
+# light terminal every entry here inverted into the very problem the floor exists
+# to prevent — 227 is the second-brightest mark in the table (only xai's white is
+# brighter) and washed out against white. That comment was right that the fix is
+# a background decision and wrong that it is not made here: it is made in
+# `themes.json`, and `_role_colour` now asks the ACTIVE THEME for its `bg` before
+# it paints anything.
+#
+# THE TABLE ITSELF IS UNCHANGED AND MUST STAY THAT WAY. These fourteen indices are
+# the operator's logo colours and they ship byte-identical; a brand colour is not a
+# taste. What answers the light-terminal case is `readable_index` at PAINT time:
+# on a theme dark enough for a mark it returns the table index unchanged — all
+# fourteen, on dracula and on every other dark row — and only where a mark would
+# be invisible does it walk that mark's HUE to a readable LIGHTNESS. It never
+# writes here.
 _VENDOR_COLOURS = {
     "anthropic": 173,
     "openai": 36,
@@ -926,9 +968,37 @@ _VENDOR_COLOURS = {
     "moonshotai": 252,
 }
 
-# The one colour every worker META paints in (ansi 109, a light slate that reads
-# as secondary on a dark pane). Not bold — see `_role_bold`.
-META_COLOR = 109
+# TODAY'S COLOURS, AS A THEME. `og` reproduces exactly what this pane painted
+# before themes existed — bg, text and sel_bg all `"default"`, so the pane keeps
+# the terminal's own background, and the three coloured roles converted straight
+# back to the indices above. It is the ONLY way back to a transparent pane now
+# that every other theme fills it, which makes it the regression guard for the
+# whole background change rather than a cosmetic extra: with `og` selected the
+# pane spends `init_pair(n, fg, -1)` exactly as it did, and the golden test pins
+# `render` byte-for-byte against the pre-theme output.
+#
+# `order: 0` puts it FIRST in the picker. dracula remains the default theme; `og`
+# is the way back, not the way in.
+_OG_COLOURS = {
+    "bg": "default",
+    "text": "default",
+    "meta": "#87afaf",
+    "sel_bg": "default",
+    "idle": "#00ff00",
+    "working": "#ffff00",
+    "rail": "default",
+}
+
+# The one colour every worker META paints in under the `og` theme: ansi 109, a
+# light slate that reads as secondary on a dark pane. Not bold — see `_role_bold`.
+#
+# NOT A CONSTANT ANY MORE: it is the `og` theme's `meta` row converted, which is
+# the honest direction of travel (the catalog is the source, this module reads it)
+# and is also what makes it checkable — `hex_to_ansi256("#87afaf") == 109` is a
+# test, so if the converter and this ever disagree the failure is named rather
+# than shipped as a colour nobody chose. Under any other theme `_role_colour`
+# asks THAT theme instead, and this is simply what `og` paints.
+META_COLOR = hex_to_ansi256(_OG_COLOURS["meta"])
 
 # THE STATUS GLYPH's colours, asked for by name: the check mark NEON GREEN and the
 # spinner NEON YELLOW, so a pane with four workers running reads as four lit
@@ -945,9 +1015,13 @@ META_COLOR = 109
 # reads as "secondary"; the named 8 are duller still. Both indices are > 16, so
 # like every vendor colour here they want a 256-colour terminal and fall back to
 # uncoloured below that (`_Colours.attr`).
+#
+# Like `META_COLOR`, these are the `og` theme's rows read back through the
+# converter, not literals: the mapping is which STATE gets a colour, and that is
+# still the whole table.
 _STATE_COLOURS = {
-    "idle": 46,
-    "working": 226,
+    "idle": hex_to_ansi256(_OG_COLOURS["idle"]),
+    "working": hex_to_ansi256(_OG_COLOURS["working"]),
 }
 
 
@@ -1352,17 +1426,28 @@ def _display_width(text: str) -> int:
                for ch in text)
 
 
-def _boxed(lines: Iterable[str], width: int) -> list[str]:
+def _boxed(lines: Iterable[str], width: int,
+           title: str = ACCESS_TITLE) -> list[str]:
     """`lines` in a box as wide as their widest row, never wider than `width`.
 
     Content-sized, not pane-sized: a QR boxed out to eighty columns is mostly
     border, and the border is what the eye lands on when scanning for the code.
+
+    `title` defaults to the access panel's own so the one existing caller is
+    unchanged; the theme picker passes its own, because a box that says "access"
+    while listing twenty-six themes is worse than no title. An EMPTY title drops
+    the `┌─ ` rule with it — four columns the picker cannot always spend on a pane
+    narrow enough to need the untitled form in the first place.
     """
     rows = [_clip(text, max(1, width - BOX_PADDING)) for text in lines]
-    # Never narrower than the title rule, or the box loses its rectangle.
+    # Never narrower than the title rule, or the box loses its rectangle. An
+    # UNTITLED box has no rule to be narrower than, so it is sized to its content
+    # alone -- four columns of `┌─ ` that buy nothing at a width narrow enough to
+    # need the untitled form.
     inner = max(max((len(row) for row in rows), default=0),
-                len(ACCESS_TITLE) + 3) + 2
-    head = f"┌─ {ACCESS_TITLE} " + "─" * (inner - len(ACCESS_TITLE) - 3) + "┐"
+                len(title) + 3 if title else 0) + 2
+    head = (f"┌─ {title} " + "─" * (inner - len(title) - 3) + "┐") if title \
+        else "┌" + "─" * inner + "┐"
     body = [f"│ {row.ljust(inner - 2)} │" for row in rows]
     return [head] + body + ["└" + "─" * inner + "┘"]
 
@@ -1751,6 +1836,187 @@ def _footer(width: int) -> str:
     return FOOTER_KEYS
 
 
+# ---------------------------------------------------------------------------
+# the theme picker (`t`)
+# ---------------------------------------------------------------------------
+#
+# An OVERLAY, not a mode: the pane behind it keeps its lines and its selection,
+# the picker paints over the middle of them, and Esc puts back exactly what was
+# there. It is drawn by the same `put`/`paint_line` pair as everything else, so
+# its entries go through the same colour roles and the same theme as the pane —
+# which is what makes applying a theme LIVE and checkable rather than a claim.
+
+# The caret on the cursor row. `▸` is East Asian NARROW (measured, not assumed),
+# for the same reason the footer is ASCII: an Ambiguous glyph here would shear the
+# box by a column in a CJK locale, exactly the bug the three footer forms exist to
+# end.
+PICKER_CARET = "▸"
+PICKER_TITLE = "theme"
+
+# The keys the overlay answers, and it answers ONLY these: every other key is
+# ignored, so a stray key cannot quit the pane from inside a dialog.
+PICKER_KEYS = "^/v move  ⏎ apply  esc cancel"
+
+# What `picker_lines` spends on the box itself before any entry: the top and
+# bottom border, the title row, the blank row and the keys row. Named because the
+# entry count is derived from it and a bare `4` here would read as a magic number
+# the first time someone adds a row to the overlay.
+PICKER_CHROME = 5
+
+# Cursor keys arrive from curses as KEY_UP / KEY_DOWN, which is an import this
+# module does not want at module scope (it is standalone and paints without
+# curses). `_run_tui` maps them onto these two sentinels so the handler below can
+# be driven by a test with no terminal at all.
+PICKER_UP, PICKER_DOWN = -1, -2
+
+
+@dataclass
+class Picker:
+    """The picker's whole state: which themes, where the caret is, what is live.
+
+    `applied` is None until Enter, which is what makes Esc unambiguous — a cancel
+    and an apply are different values rather than the same one meaning "both".
+    """
+    slugs: list
+    labels: dict
+    cursor: int = 0
+    active: str = ""
+    applied: Optional[str] = None
+    closed: bool = False
+
+    def current(self) -> str:
+        """The slug under the caret."""
+        return self.slugs[self.cursor] if self.slugs else self.active
+
+
+def _picker(themes: Optional[list] = None, active: str = "") -> Picker:
+    """A picker over the catalog, caret on the ACTIVE theme rather than the top.
+
+    Opening on the active row is the difference between a list you can read and a
+    list you have to hunt: the operator is looking for the thing that is already
+    on, not for row one.
+    """
+    rows = ordered_themes() if themes is None else themes
+    slugs = [theme.slug for theme in rows]
+    cursor = slugs.index(active) if active in slugs else 0
+    return Picker(slugs=slugs, labels={t.slug: t.label for t in rows},
+                  cursor=cursor, active=active)
+
+
+def picker_key(state: Picker, key: int) -> Picker:
+    """`state` after `key`, by value. Pure: no curses, no terminal.
+
+    Up/down and j/k both move (the pane's own move keys are KEY_UP/KEY_DOWN and
+    `j`/`k`, so the overlay matches what the operator's fingers already do), Enter
+    applies and closes, `q` and Esc cancel and close. The caret CLAMPS rather than
+    wrapping: a list that runs off its own end and comes back is a list you can
+    get lost in, and this one is read by eye.
+    """
+    if state.closed:
+        return state
+    if key in (PICKER_UP, ord("k")):
+        state.cursor = max(0, state.cursor - 1)
+    elif key in (PICKER_DOWN, ord("j")):
+        state.cursor = min(max(0, len(state.slugs) - 1), state.cursor + 1)
+    elif key in (10, 13):
+        state.applied = state.current()
+        state.closed = True
+    elif key in (27, ord("q")):
+        state.closed = True
+    return state
+
+
+def _picker_keycode(curses_mod: Any, key: int) -> int:
+    """`key` with curses' two cursor keys folded onto `PICKER_UP` / `PICKER_DOWN`.
+
+    The only reason this exists at all is that `picker_key` is pure and this
+    module does not import curses at module scope — the overlay must be testable
+    by handing it plain integers. `getattr` rather than a direct attribute
+    because the mapping is applied against whatever curses object the view is
+    holding, which in the tests is a stand-in.
+    """
+    if key == getattr(curses_mod, "KEY_UP", -9999):
+        return PICKER_UP
+    if key == getattr(curses_mod, "KEY_DOWN", -9999):
+        return PICKER_DOWN
+    return key
+
+
+# The narrowest pane a box can be drawn in at all: two borders, one column of
+# content and the two of padding `_boxed` charges around it. Below this the
+# picker draws NOTHING rather than a rectangle that does not close — which is the
+# `access_lines`-drops-its-QR rule taken to its honest end. The agents pane is
+# never this narrow (its own footer floor is 14 columns), so this is a guard on
+# the arithmetic, not a mode an operator will meet.
+PICKER_MIN_WIDTH = BOX_PADDING + 1
+
+
+def picker_lines(state: Picker, width: int, height: int) -> list[Line]:
+    """The overlay as LINES, exactly like `_pane` produces them.
+
+    FEWER ENTRIES RATHER THAN OVERFLOWING, which is the precedent `access_lines`
+    set when it dropped its QR and `_pane` sets when it trims the list: a picker
+    taller than the pane is a picker with its own bottom edge off-screen, and the
+    key hint that says how to close it is usually the thing at the bottom. So the
+    entry list is trimmed to what fits and scrolls to keep the caret visible — the
+    one case where dropping rows is correct, because the caret is what the
+    operator is tracking and it is never dropped.
+
+    Never returns a row wider than `width` or more rows than `height`, at ANY
+    size. `attr_for`'s counterpart for the overlay is `paint_line`, which clips
+    by column anyway; this is the backstop, and it holds at widths the pane itself
+    will never reach.
+    """
+    if width < PICKER_MIN_WIDTH or height < 1:
+        return []
+    # The box's own two borders, its title row, the blank row and the keys row.
+    room = max(1, height - PICKER_CHROME)
+    top = 0
+    if len(state.slugs) > room:
+        top = max(0, min(state.cursor - room + 1, len(state.slugs) - room))
+    shown = state.slugs[top:top + room]
+
+    rows = ["".join(text for text, _role in _picker_entry(
+        state, slug, slug == state.current(), slug == state.active))
+        for slug in shown]
+    if top + room < len(state.slugs):
+        # Say what is hidden BELOW rather than letting the list read as complete —
+        # the same rule as TRUNCATED_NOTICE for the listing. Not when the window
+        # is at the end of the catalog: there is nothing below, and a marker there
+        # would be claiming entries that do not exist.
+        rows[-1] = rows[-1] + " …"
+
+    # The keys hint goes before an entry does. A pane too short to hold the box
+    # AND the hint loses the hint first: an overlay you cannot tell how to close
+    # is a worse failure than an overlay showing fewer themes. Only when there is
+    # no room for anything but the frame do entries go, and then there is nothing
+    # left to draw in them anyway.
+    extra = ["", _clip(PICKER_KEYS, width)]
+    while len(rows) + len(extra) + 2 > height and extra:
+        extra.pop()
+    while len(rows) + len(extra) + 2 > height and rows:
+        rows.pop()
+    # The title goes before the content does, for the same reason: a rectangle
+    # with no name is still a rectangle, and a truncated name is neither.
+    title = PICKER_TITLE if width >= len(PICKER_TITLE) + BOX_PADDING + 3 else ""
+    body = _boxed(rows + extra, width, title=title)
+    return [([(line, PLAIN)], NORMAL) for line in body[:height]]
+
+
+def _picker_entry(state: Picker, slug: str, on_cursor: bool,
+                  is_active: bool) -> list[Span]:
+    """One entry: the caret, a marker on the LIVE theme, and the label.
+
+    The active theme is marked rather than left implicit, so an operator who
+    cannot tell whether the pane has already changed does not have to close the
+    overlay and look to find out. The marker rides on META so it dims with the
+    rest of the secondary text instead of competing with the label for attention.
+    """
+    caret = PICKER_CARET if on_cursor else " "
+    mark = " •" if is_active else "  "
+    return [(caret, PLAIN), (mark, META), (state.labels.get(slug, slug), PLAIN)]
+
+
 def _blocks(frame: Frame, width: int) -> list[list[Line]]:
     """The frame's rows as atomic BLOCKS, in display order, composed to spans.
 
@@ -2039,24 +2305,152 @@ def _role_brightness(role: str) -> Optional[str]:
     return NORMAL if role.startswith(UNDIM) else None
 
 
-def _role_colour(role: str) -> Optional[int]:
+def _role_colour(role: str, theme: Optional[Theme] = None) -> Optional[int]:
     """The ANSI-256 foreground a colour role names, or None for the default.
 
-    PLAIN and ORCH carry no colour (ORCH is bold only); META has its one slate;
-    a `mark:<vendor>` names its vendor's brand colour, or None when that vendor
-    has none (which cannot happen for a vendor with a mark, but keeps the table
-    the single source); a `state:<state>` names the STATUS GLYPH's colour for
-    that state, or None for the states that have none. Any `undim:` prefix is
-    not a colour and is stripped first (see `_bare_role`).
+    With no `theme` this is the historical resolution and nothing else — which is
+    what keeps every caller that has no active theme (and every existing test) on
+    exactly today's colours. With one, the theme is asked instead:
+
+        PLAIN   -> `text`, the theme's dominant body colour. This is the operator's
+                   parchment: on dracula PLAIN is what paints agent names, titles
+                   and box borders, so making PLAIN the theme's text is what makes
+                   parchment DOMINANT rather than merely present.
+        META    -> `meta`.
+        state:* -> `idle` / `working`, the two states in `_STATE_COLOURS`; a state
+                   with no role paints uncoloured, exactly as before.
+        mark:*  -> the vendor's entry in `_VENDOR_COLOURS`, then the READABILITY
+                   GUARD (below).
+        ORCH    -> None, still: a bold weight and no colour, as it has always been.
+
+    A theme whose role is `"default"` answers None, which is the point of having
+    that value: under `og`, PLAIN resolves exactly as it did before themes
+    existed and META still resolves to the same 109.
     """
     role = _bare_role(role)
-    if role == META:
-        return META_COLOR
     if role.startswith("mark:"):
-        return _VENDOR_COLOURS.get(role[len("mark:"):])
-    if role.startswith("state:"):
-        return _STATE_COLOURS.get(role[len("state:"):])
-    return None
+        return _mark_colour(role[len("mark:"):], theme)
+    name = _theme_role(role)
+    if name is None:
+        return None
+    if theme is None:
+        return META_COLOR if name == META else _STATE_COLOURS.get(name)
+    return _theme_index(theme, name)
+
+
+def _theme_role(role: str) -> Optional[str]:
+    """The THEME role a colour role names, or None when it names no colour.
+
+    ONE mapping, two conversions: `_role_colour` turns it into a 256 palette
+    index (the pure, testable seam) and `_role_value` into whatever `init_pair`
+    wants on the terminal in hand. Keeping them apart here is what stops the two
+    from drifting into two different opinions about which role a span names.
+    """
+    bare = _bare_role(role)
+    if bare.startswith("mark:"):
+        return None                      # a mark is the table's, not a theme's
+    if bare == ORCH:
+        return None                      # a weight, and no colour, as always
+    if bare == META:
+        return META
+    if bare.startswith("state:"):
+        state = bare[len("state:"):]
+        return state if state in _STATE_COLOURS else None
+    return PLAIN_TEXT
+
+
+def _role_value(role: str, theme: Optional[Theme], colors: int) -> Optional[int]:
+    """`role` as the int `init_pair(n, fg, bg)` wants on a terminal with `colors`.
+
+    THEME ROLES GO THROUGH THE CATALOG'S HEX AND THEN THE 256 PALETTE, because
+    that is the only thing `init_pair` accepts: a colour NUMBER. `hex_to_ansi256`
+    will NOT let a colour with chroma land on a grey — the hex this replaced,
+    #f0e6d2, resolved to cell 254, a pure grey, and took every chromatic theme
+    role in the catalog down with it. It will also not let a DARK tint reach for
+    the cube's saturated primaries, because paying 0.13 of OKLab to hold a hue
+    the palette cannot express is a worse failure than a charcoal grey; see
+    MAX_CHROMA_PENALTY. There is no 24-bit branch to bypass any of this, and
+    there is not one to have: `curses.init_extended_pair` does not exist in the
+    ncurses this ships against (`curses_value` records the measurement).
+
+    A THEME ROLE THAT IS `"default"` ANSWERS `-1`, NOT None. That is the whole
+    contract of the value and it is legal in every role, including as a
+    foreground: `-1` is curses' "the terminal's own", and a span whose text is
+    `"default"` on a themed background still has to paint ON that background.
+    Returning None here would spend no pair at all and silently drop it. None is
+    reserved for the OTHER absence — a role that names no colour because it is a
+    WEIGHT (`ORCH`) or a mark nobody has — which has no colour to contribute and
+    so cannot be the foreground of a pair either.
+
+    MARK ROLES STAY 256-PALETTE INDICES, because `_VENDOR_COLOURS` IS a table of
+    palette indices and the readability guard above it is reasoned in that same
+    space — moving marks anywhere else would be answering a question nobody asked
+    and would put the guard's output through a second, different conversion.
+    """
+    bare = _bare_role(role)
+    if bare.startswith("mark:"):
+        return _mark_colour(bare[len("mark:"):], theme)
+    name = _theme_role(role)
+    if name is None:
+        return None
+    if theme is None:
+        return META_COLOR if name == META else _STATE_COLOURS.get(name)
+    return curses_value(theme.colour(name), colors)
+
+
+def _theme_index(theme: Theme, role: str) -> Optional[int]:
+    """`role`'s palette index under `theme`, or None where it is `"default"`.
+
+    None rather than `-1`, because `-1` is itself a value curses understands and
+    this function's callers OR it into an attribute: handing back `-1` would look
+    like a colour. `"default"` and "no colour" are the same thing to the painter.
+    """
+    return None if theme.is_default(role) else theme.index(role)
+
+
+def _mark_colour(vendor: str, theme: Optional[Theme] = None) -> Optional[int]:
+    """`vendor`'s brand index, walked in HUE only if the theme's pane would hide it.
+
+    The table is never written to — see `_VENDOR_COLOURS`. `readable_index` returns
+    the index unchanged whenever the mark reads against the active `bg`, which on
+    dracula and on every other dark row means ALL FOURTEEN paint at exactly their
+    table index. It is a no-op when `bg` is `"default"` too, because a background
+    this process cannot see has no computable contrast and guessing would silently
+    recolour the logos on the one theme that promises not to.
+
+    Mark colours are the 256 palette's, never a 24-bit value: `_VENDOR_COLOURS`
+    IS a table of palette indices, and a guard that walked true colour would be
+    answering a different question from the one the table asks.
+    """
+    index = _VENDOR_COLOURS.get(vendor)
+    if index is None or theme is None:
+        return index
+    return readable_index(index, theme.background())
+
+
+def _role_background(role: str, theme: Optional[Theme] = None, *,
+                     on_selected: bool = False) -> Optional[str]:
+    """The theme hex a span of `role` paints its background in, or None.
+
+    EVERY SPAN GETS THE PANE'S BACKGROUND under a theme, and that is the whole
+    change: `init_pair(n, fg, -1)` put a coloured foreground on the terminal's own
+    background, which is why a light terminal inverted the whole logo table. Now
+    `bg` is the theme's own and the marks are judged against it.
+
+    EXCEPT THE SELECTED ROW, which is the one place `sel_bg` is spent. Selection
+    was a BRIGHTNESS axis (DIM vs NORMAL) and still is — `_role_bold` and the
+    `undim:` exemption are untouched — so this only puts a background underneath
+    the brightness of the one line already marked SELECTED. It is a FLAG rather
+    than a role because SELECTED is hung as a LINE's brightness by `_blocks`, not
+    as a span role, and the painter is what knows both. It is what a theme's
+    `sel_bg` is for, and what the catalog's `text`/`sel_bg` >= 4.5 floor is
+    actually testing. Under `og` both answers are None, which is why the golden
+    render is unaffected.
+    """
+    if theme is None:
+        return None
+    key = "sel_bg" if on_selected else "bg"
+    return None if theme.is_default(key) else theme.colour(key)
 
 
 def _role_bold(role: str) -> bool:
@@ -2072,22 +2466,30 @@ def _role_bold(role: str) -> bool:
 
 
 class _Colours:
-    """Lazily allocates ONE curses colour pair per colour role, cached.
+    """Lazily allocates ONE curses colour pair per (foreground, background), cached.
 
-    `init_pair(n, fg, -1)` paints a coloured FOREGROUND on the TERMINAL'S OWN
-    BACKGROUND (curses' `-1`), which is the non-obvious part and what lets colour
-    and the pane's transparency coexist: `use_default_colors()` has already made
-    pair 0 the terminal's own colours and cleared the default background, so every
-    pair allocated here leaves the background untouched and only tints the glyphs.
+    `init_pair(n, fg, bg)` is what makes a THEME a theme: with `bg` at `-1` the
+    pair paints a coloured foreground on the terminal's OWN background, and the
+    pane has no colour of its own — the behaviour `og` still reproduces and the
+    golden test pins. With `bg` carrying the theme's `bg` the pane fills, and that
+    is the decision the `_VENDOR_COLOURS` comment block deferred and this now
+    makes.
+
+    `use_default_colors()` is still called first, and is still what lets a
+    `"default"` role inherit: pair 0 is the terminal's own colours, so a role that
+    asks for `-1` on both sides spends no pair at all.
 
     Pairs are spent on FIRST USE and cached, so a terminal that never shows a
     vendor mark never spends a pair on it, and a colour is never re-initialised.
+    The cache key is the PAIR, not the foreground: one fg against two backgrounds
+    is two different paints and has to be two allocations.
 
     Degrades rather than crashes, in this order: no colour support (`has_colors()`
     false) -> every role paints uncoloured; a terminal with fewer colours than a
     role needs (the vendor brand colours and the status glyph's neon green and
     yellow want 256) -> that role paints uncoloured, the glyph falling back to the
-    default foreground exactly as every other colour here does;
+    default foreground exactly as every other colour here does; a background or
+    foreground out of range is the same case, and so is
     the pair table exhausted -> the roles that could not be allocated paint
     uncoloured. NEVER a wrong colour and never an exception: a terminal that
     cannot colour still has to show the pane, and a bare-but-correct pane beats a
@@ -2096,34 +2498,166 @@ class _Colours:
     all.
     """
 
-    def __init__(self, curses: Any):
+    def __init__(self, curses: Any, theme: Optional[Theme] = None):
         self._curses = curses
-        self._pairs: dict[int, int] = {}
+        self.theme = theme
+        self._pairs: dict = {}
         self._next = 1
         try:
             self._enabled = bool(curses.has_colors())
+            self._colors = int(curses.COLORS)
         except Exception:
             self._enabled = False
+            self._colors = 0
 
-    def attr(self, colour: int) -> int:
-        """The curses attribute for foreground `colour`, or 0 when unavailable."""
+    def attr(self, fg: int, bg: int = CURSES_DEFAULT) -> int:
+        """The curses attribute for foreground `fg` on background `bg`, or 0."""
         if not self._enabled:
             return 0
-        if colour in self._pairs:
-            return self._pairs[colour]
+        key = (fg, bg)
+        if key in self._pairs:
+            return self._pairs[key]
         attr = 0
         try:
-            if colour < self._curses.COLORS \
-                    and self._next < self._curses.COLOR_PAIRS:
-                self._curses.init_pair(self._next, colour, -1)
+            # BOTH ends are range-checked against COLORS, and `-1` — the one value
+            # below it curses accepts, on either side — is legal on both. Nothing
+            # else is: a 256 foreground on an 8-colour terminal is as
+            # unallocatable as a background over the same terminal's table, and
+            # the honest answer is to paint the glyph bare. There is no third
+            # case any more. With the truecolor branch gone from `curses_value`,
+            # every value that reaches here is `-1` or a cell of the 240, so the
+            # colour painted is the SAME on every terminal.
+            if ((fg == CURSES_DEFAULT or 0 <= fg < self._colors)
+                    and (bg == CURSES_DEFAULT or 0 <= bg < self._colors)
+                    and self._next < self._curses.COLOR_PAIRS):
+                self._curses.init_pair(self._next, fg, bg)
                 attr = self._curses.color_pair(self._next)
                 self._next += 1
         except Exception:
             attr = 0
-        # Cached either way: a colour that could not be allocated this once is not
+        # Cached either way: a pair that could not be allocated this once is not
         # retried on every paint, and never painted as a DIFFERENT colour.
-        self._pairs[colour] = attr
+        self._pairs[key] = attr
         return attr
+
+    def background_attr(self) -> Optional[int]:
+        """The attribute the WINDOW background is set to, or None to leave it alone.
+
+        Passed to `window.bkgdset` by `apply_background` so an OPAQUE theme fills
+        the whole pane rather than only the cells behind glyphs — without it the
+        background shows in stripes, because every cell not covered by an
+        `addnstr` keeps whatever was there.
+
+        None when the theme's `bg` is `"default"`, and that is the whole of the
+        OG theme's promise: leaving the background untouched is what lets the
+        terminal's own background through, and setting it to a pair that happened
+        to be allocated for some other role would put a colour on the pane nobody
+        chose.
+
+        NOT None when the theme is opaque but the colour could not be allocated:
+        `attr` returns 0 in that case, and 0 IS the right background (pair 0,
+        which `use_default_colors` has already made the terminal's own). A
+        theme nobody can colour shows uncoloured, not unthemed.
+        """
+        if self.theme is None or self.theme.is_default("bg"):
+            return None
+        # `attr(fg, bg)`, and the theme's background is the SECOND of the two.
+        # Passing it first paints the pane's own colour as its text and leaves
+        # the background terminal-owned, which looks almost right and is not.
+        return self.attr(CURSES_DEFAULT,
+                         curses_value(self.theme.colour("bg"), self._colors))
+
+    def role_attr(self, role: str, theme: Optional[Theme] = None, *,
+                    on_selected: bool = False) -> int:
+        """The pair attribute `role` paints at, or 0 when there is no pair to spend.
+
+        A FOREGROUND OF `-1` STILL SPENDS A PAIR whenever the background is a
+        colour, and that is not a corner. `"default"` means "the terminal's own
+        TEXT", not "the terminal's own cell", so a span that inherits its
+        foreground while sitting on the theme's background has to be painted ON
+        that background. Returning nothing for a `"default"` foreground spent no
+        pair at all, which dropped the background silently: the operator asked
+        for terminal-coloured text on a themed pane and got terminal text on
+        whatever was behind the pane. No shipped theme reaches it — `og` has
+        `"default"` on BOTH ends of every role it leaves — and a hand-edited row
+        that mixes the two is what the fix is for.
+
+        ZERO IS FOR THE TWO CASES THAT REALLY HAVE NO PAIR TO SPEND: both ends
+        `"default"`, where `use_default_colors` has already made pair 0 the
+        terminal's own colours, and a role that names no colour at all (`ORCH` is
+        a weight, a mark nobody has), which has no foreground to contribute.
+        """
+        active = self.theme if theme is None else theme
+        fg = _role_value(role, active, self._colors)
+        if fg is None:
+            return 0                       # a weight, or a mark nobody has
+        background = _role_background(role, active, on_selected=on_selected)
+        if fg == CURSES_DEFAULT and background is None:
+            return 0                       # both ends `"default"`: pair 0 already is
+        bg = CURSES_DEFAULT if background is None \
+            else curses_value(background, self._colors)
+        return self.attr(fg, bg)
+
+
+# The character the window background is filled with. `bkgdset(ch, attr)` takes a
+# character AND an attribute; a space is the blank a wipe already uses, so setting
+# it changes the colour without ever putting a glyph on screen.
+BKGD_CHAR = " "
+
+
+def apply_background(stdscr, curses, colours: _Colours,
+                     *, restore: bool = False) -> None:
+    """Fill the pane with the theme's background, or leave the terminal's own.
+
+    `window.bkgdset(ch, attr)` IS A CALL, and that is the whole of why it is a
+    function rather than an assignment. This line once read `stdscr.bkgd = attr`,
+    which on a real `_curses.window` raises:
+
+        AttributeError: '_curses.window' object attribute 'bkgd' is read-only
+
+    `_curses.window` has `__dictoffset__ == 0` — no instance dict — and `bkgd` is a
+    `method_descriptor`, so the name cannot be rebound at all. The assignment sat
+    under `except Exception: pass`, so it never raised on screen: every OPAQUE
+    theme silently rendered as stripes, coloured text on the terminal's own
+    background. The unit tests passed because the fake screen modelled `bkgd` as a
+    plain attribute, where assignment works. A FAKE THAT IS EASIER TO SATISFY THAN
+    THE REAL OBJECT CERTIFIES CODE THAT CANNOT RUN.
+
+    WHY `bkgdset` AND NOT `bkgd`. Both set the window's background character and
+    attribute and both leave `getbkgd()` returning it; `bkgd()` additionally wipes
+    the window immediately, and `bkgdset()` does not. The view repaints as
+    `erase()` -> writes -> `refresh()`, and ncurses' `werase` fills every cell with
+    the window's background character and attributes, so `bkgdset` alone already
+    makes the next `erase()` fill with the theme's colour — measured on a real
+    pty against xterm-256color, an unwritten cell after `erase()` reads back its
+    pair under either call (`stdscr.inch(0, 5) >> 8 == 1`, `getbkgd() == 288`).
+    `bkgdset` is the one that says what is meant: set the default for what comes
+    next, not paint over the screen now.
+
+    `restore` is the one thing the STARTUP call must not do. A `"default"` theme
+    means "do not touch the background", because untouched IS the terminal's own
+    and that is the whole of what `og` promises. Once the background HAS been set
+    — the operator previewed an opaque theme — "do not touch it" is no longer the
+    same thing: leaving the last opaque theme's colour on the pane while the text
+    goes back to `-1` backgrounds is a striped pane with nobody's colours. So a
+    THEME CHANGE passes `restore=True`, which sets pair 0 (attribute 0), which
+    `use_default_colors` has already made the terminal's own.
+
+    `curses.error` is caught BY NAME, as `use_default_colors` is a few lines above.
+    A terminal that refuses the call (some do, for a colour pair its hardware
+    cannot show) still has to show the pane, so that is survivable. An
+    `AttributeError` or a `TypeError` is not a terminal quirk — it is a bug in this
+    function — and a blanket `except Exception` is precisely what hid this one.
+    """
+    attr = colours.background_attr()
+    if attr is None and not restore:
+        # The theme's own background is `"default"` and nothing has been set yet:
+        # the terminal's comes through.
+        return
+    try:
+        stdscr.bkgdset(BKGD_CHAR, 0 if attr is None else attr)
+    except curses.error:
+        pass
 
 
 def paint_line(stdscr, row: int, spans: list[Span], width: int, height: int,
@@ -2751,7 +3285,8 @@ def focus_in_herdr(session_id: str,
 
 
 def _run_tui(model: AgentModel, interval: float, server: str,
-             start_access: bool = False) -> int:
+             start_access: bool = False,
+             theme: Optional[Theme] = None) -> int:
     """The live view. curses paints exactly what `render` returns; keys drive
     the model.
 
@@ -2759,9 +3294,16 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     selection, Enter FOCUSES the selected row in herdr (jumping the operator's
     herdr UI to the pane it belongs to — a worker's ROOT, see `focus_target` and
     `focus_in_herdr`), Space expands or collapses
-    the selected row's snippet, and `a` toggles the access panel. It sends
+    the selected row's snippet, `a` toggles the access panel, and `t` opens the
+    theme picker. It sends
     nothing to a session and changes no session state: `agent.focus` is the ONE
     outbound call it makes, and it moves the operator's own terminal alone.
+
+    `theme` None means "whatever is configured" (`load_theme`: `$OG_AGENTS_THEME`,
+    then the stored slug, then dracula). It is a parameter rather than only a
+    lookup so a caller — `main`, or a test that wants to paint the `og` theme's
+    exact colours — can name one, and so that the choice `--theme` made once is
+    the same object the picker then replaces.
 
     TWO CLOCKS, deliberately. The data poll (`interval`, 3s) asks the server for
     new rows; the spinner tick (SPIN_TICK, 120ms) only advances a counter that
@@ -2775,10 +3317,20 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     `refresh` entirely — it blocks on the keyboard until the next poll
     (`next_wait`) instead. An `og agents` pane an operator leaves open all day
     then costs one wakeup per poll, not eight repaints a second forever.
+
+    The one exception to "nothing is painted unless the lines change" is a THEME
+    CHANGE, which repaints with identical text on purpose: the composer is pure
+    and knows nothing about colour, so the lines really are unchanged and
+    `paint_needed` would correctly report False. `painted` is reset instead, and
+    that is the whole of what makes applying a theme LIVE.
     """
     import curses
 
     def loop(stdscr) -> None:
+        # The pane's live theme. It starts as whatever the caller resolved and is
+        # REPLACED by the picker, so it is a local rather than the parameter: the
+        # parameter is the starting choice, not the constraint.
+        active_theme = theme_for() if theme is None else theme
         curses.curs_set(0)
         # Take the terminal's own colours for pair 0. `curses.wrapper` calls
         # `start_color()` before this point, and once colour is started pair 0
@@ -2791,11 +3343,14 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # it; the view still has to paint there, so it runs uncoloured rather
         # than dying at startup.
         #
-        # COLOUR AND TRANSPARENCY COEXIST BECAUSE OF THIS CALL. Every colour pair
-        # this view spends is allocated with a `-1` BACKGROUND — see `_Colours`
-        # — which paints the glyph on whatever pair 0 now is, i.e. the terminal's
-        # own background. So the marks tint and the pane stays transparent at the
-        # same time.
+        # COLOUR AND TRANSPARENCY COEXIST BECAUSE OF THIS CALL — but only under
+        # the `og` theme, or any theme whose `bg` is `"default"`. Every pair this
+        # view spends is allocated with a `-1` BACKGROUND when the theme asks for
+        # that (see `_Colours`), which paints the glyph on whatever pair 0 now is,
+        # i.e. the terminal's own background. An OPAQUE theme inverts that: it
+        # allocates the same pairs against its own `bg` and sets the window
+        # background below, so the pane fills instead of tinting. Both are
+        # available to the operator and neither is a special case in the painter.
         try:
             curses.use_default_colors()
         except curses.error:
@@ -2803,7 +3358,14 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # The colour pairs, allocated lazily on first use and cached. Guarded by
         # `has_colors()` inside, so no-colour terminals fall back to no colour
         # and the pane renders exactly as it did before colour existed.
-        colours = _Colours(curses)
+        colours = _Colours(curses, active_theme)
+        # FILL THE PANE, not just the glyphs. Every cell no `addnstr` covers keeps
+        # the window background, so without this an opaque theme renders as
+        # stripes: coloured text floating on the terminal's own background. It is
+        # a CALL (`bkgdset`) and it is in `apply_background`, which carries the
+        # whole argument; skipped when the theme's `bg` is `"default"`, which is
+        # the entire promise `og` makes.
+        apply_background(stdscr, curses, colours)
         stdscr.keypad(True)
         selected = 0
         offset = 0
@@ -2858,14 +3420,94 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             def attr_for(role: str) -> int:
                 own = _role_brightness(role) or brightness
                 attr = attr_of[own]
-                colour = _role_colour(role)
-                if colour is not None:
-                    attr |= colours.attr(colour)
+                attr |= colours.role_attr(role, active_theme, on_selected=own == SELECTED)
                 if _role_bold(role):
                     attr |= curses.A_BOLD
                 return attr
 
             paint_line(stdscr, row, spans, width, height, attr_for)
+
+        def _choose_theme(screen, curses_mod, colours: _Colours,
+                          current: Theme, put) -> Optional[Theme]:
+            """Run the picker to a close, and return the applied theme or None.
+
+            The ONE place curses is spoken to for the overlay, and deliberately
+            thin: every decision the overlay makes — which rows fit, what a key
+            does — lives in `picker_lines` and `picker_key`, which are pure and
+            tested without a terminal. What is left here is the loop that draws
+            them and the translation of the two curses cursor keys into the
+            sentinels `picker_key` understands.
+
+            THE PREVIEW IS LIVE, not on Enter. Moving the caret repaints the pane
+            underneath the overlay in that theme, because a theme you have to
+            commit to in order to look at is a theme nobody changes, and the whole
+            cost of the live repaint (`painted = None` back in the caller) is
+            paid on close either way.
+            """
+            state = _picker(active=current.slug)
+            preview = current
+            while not state.closed:
+                lines = picker_lines(state, width, height)
+                first = max(0, min((height - len(lines)) // 2,
+                                   height - len(lines)))
+                screen.erase()
+                # `first`, never `offset`: `offset` is the PANE's scroll offset in
+                # the enclosing loop, and shadowing it here would repaint the
+                # tree behind the overlay at the overlay's own row number.
+                for row, (spans, brightness) in enumerate(lines):
+                    put(first + row, spans, brightness)
+                screen.refresh()
+                # BLOCKING, like every other key in this view: the overlay owns the
+                # keyboard until it closes, so no key reaches the pane behind it.
+                screen.timeout(-1)
+                key = screen.getch()
+                if key == -1:
+                    # ERR from `getch` -- a curses error, not a keypress. Closing
+                    # is the only safe answer: a dialog that spins forever because
+                    # the keyboard is broken is worse than one that gives up and
+                    # leaves the pane as it was.
+                    break
+                state = picker_key(state, _picker_keycode(curses_mod, key))
+                if state.current() != state.active:
+                    chosen = _theme_by_slug(state.current())
+                    if chosen is not None:
+                        preview = chosen
+                        colours.theme = chosen
+                        # The WINDOW BACKGROUND travels with the preview. It is
+                        # not painted by the overlay's own `erase()` alone: a
+                        # preview of an opaque theme has to fill the pane it is
+                        # previewing on, or the candidate looks striped and the
+                        # one thing the operator is judging is not shown.
+                        apply_background(stdscr, curses_mod, colours,
+                                        restore=True)
+                        # Repaint the PANE under the overlay in the previewed
+                        # theme. `painted` is deliberately not consulted here:
+                        # the overlay is a modal layer, not a mode, and the pane
+                        # behind it must show the candidate.
+                        stdscr.erase()
+                        for row, spans, brightness in paint_plan(
+                                items, pane.list_rows, offset, list_view, height):
+                            put(row, spans, brightness)
+            if state.applied is None:
+                # A CANCEL puts the previous theme back, including the pairs
+                # already spent on it — `painted` was never reset, so nothing
+                # about the pane changes. The WINDOW BACKGROUND is the one thing
+                # that did change, if the preview moved the caret onto an opaque
+                # theme, so it is restored here too: cancelling has to put back
+                # exactly what was there.
+                colours.theme = current
+                apply_background(stdscr, curses_mod, colours, restore=True)
+                return None
+            colours.theme = preview
+            apply_background(stdscr, curses_mod, colours, restore=True)
+            return preview
+
+        def _theme_by_slug(slug: str) -> Optional[Theme]:
+            """The catalog row for `slug`, or None if the catalog changed under us."""
+            for row in ordered_themes():
+                if row.slug == slug:
+                    return row
+            return None
 
         while True:
             height, width = stdscr.getmaxyx()
@@ -2948,7 +3590,26 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 show_access = not show_access
                 if show_access:
                     access = access_info(server)
-            if key in (curses.KEY_UP, ord("k")):
+            elif key == ord("t"):
+                # The theme picker. It draws over the pane and drives its own keys,
+                # so it is entered and left in one blocking call; on the way back
+                # the pane's own state (selection, scroll, expanded, access) is
+                # untouched, which is what "cancel puts back exactly what was
+                # there" means here.
+                chosen = _choose_theme(stdscr, curses, colours, active_theme,
+                                       put)
+                if chosen is not None:
+                    active_theme = chosen
+                    colours.theme = chosen
+                    # THE LIVE REPINT. The lines are byte-identical under any
+                    # theme (the composer is pure and never sees colour), so
+                    # `paint_needed` would correctly say "nothing changed" and the
+                    # operator would have chosen a theme and seen no evidence.
+                    # Forcing `painted = None` is the whole fix.
+                    painted = None
+                    save_theme(chosen.slug)
+                continue
+            elif key in (curses.KEY_UP, ord("k")):
                 selected = move_selection(frame.rows, selected, -1)
             elif key in (curses.KEY_DOWN, ord("j")):
                 selected = move_selection(frame.rows, selected, 1)
@@ -3004,6 +3665,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "with 'a'")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                         help="seconds between refreshes in the live view")
+    parser.add_argument("--theme", metavar="SLUG", default=None,
+                        help="paint this theme for THIS RUN and do not save it; "
+                             "overrides $OG_AGENTS_THEME and the stored choice")
     return parser
 
 
@@ -3024,7 +3688,24 @@ def build_model(args: argparse.Namespace, opener: Optional[Any] = None) -> Agent
 
 def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> int:
     """`og agents`. `--once` (and any non-tty fallback) prints one plain frame."""
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    # `--theme` REFUSES BY NAME rather than falling back to dracula, which is what
+    # `theme_for` does for a stored slug. The difference is who typed it: a stored
+    # slug can be stale because someone edited `themes.json`, and falling back is
+    # right; a slug on the command line was typed a moment ago, and quietly
+    # painting something else is how a flag gets believed and stops being read.
+    # A `--theme` that IS known also beats `$OG_AGENTS_THEME`: both are explicit,
+    # and the one on the command line was typed more recently.
+    catalog = load_catalog()
+    theme = theme_for() if args.theme is None else catalog.get(args.theme)
+    if theme is None:
+        sys.stderr.write(
+            f"og agents: unknown theme {args.theme!r}. "
+            f"Valid: {', '.join(valid_slugs(catalog))}\n")
+        return 2
+
     model = build_model(args, opener)
 
     if args.once or not _tty_available():
@@ -3056,7 +3737,7 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
         return 0
 
     try:
-        return _run_tui(model, args.interval, args.server, args.access)
+        return _run_tui(model, args.interval, args.server, args.access, theme)
     except KeyboardInterrupt:
         return 0
 
