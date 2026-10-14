@@ -234,10 +234,27 @@ equals `$PWD`, and which is live:
 - not `archived`
 - `runner_online` is true
 - `status` in (`running`, `idle`)
+- **`host_id` is this machine's**, when both ids are known
 
 `idle` counts deliberately: an idle root is one waiting for the human to type,
 which is precisely the session they want to be returned to. A failed or
 runner-offline session must not block a fresh start.
+
+The host rule exists because `workspace` is a path, not a machine: a session on
+a work-mac whose checkout of the same repo is at the same path is a real shape,
+and it passes every filter above — including `runner_online`, which says nothing
+at all about a machine that is merely not here. Attaching to it types an attach
+that dies with `no online runner … its host is offline`. This machine's own id
+comes from `GET /v1/hosts` (the entry with `status: "online"`, the same read
+`ensure_project` in `bin/og` makes), asked once per launch through the session
+watcher so the request carries that server's own token.
+
+The rule is deliberately asymmetric: a session is skipped **only** when both ids
+are known and differ. A hosts endpoint that errors, answers nothing, or reports
+no online host, and a session row with no `host_id`, all leave the session alone —
+because a skip we could not justify is the mistake nothing undoes (a second space
+and a second `og chat` in a conversation the operator already had), while the
+opposite error is a message on screen they can act on.
 
 `workspace` is on the **detail** row only — the listing row does not carry it.
 The check therefore costs one detail fetch per live root, which is a handful.
