@@ -3261,6 +3261,39 @@ NOTICE_FOCUS_FAILED = "focus: {0}"
 # known to match no record would only draw herdr's own `agent_not_found` back.
 NOTICE_FOCUS_NO_ROOT = "focus: no root session to focus"
 
+# What the pane says INSTEAD of a traceback when the listing itself could not be
+# read — the one wire failure the live view must survive rather than die on. A
+# transient non-200 used to escape `refresh` and take the whole pane down; the
+# reported failure was a 404 from the WRONG server (og's own runs on 6768 when
+# 6767 is taken, while `og agents` still asked 6767). The base URL is IN the line
+# on purpose: a 404 at the wrong port is diagnosable from this line alone, which
+# is the whole point now that the operator no longer has a traceback to read.
+# `{0}` is the base URL, `{1}` the reason (with the HTTP status when there is one).
+NOTICE_LISTING_FAILED = "server {0}: {1} (retrying)"
+
+
+def listing_failure_notice(server: str, exc: BaseException) -> str:
+    """The one line a failed listing fetch becomes, for `Frame.notice`.
+
+    NEVER raises, like `focus_in_herdr`: the pane must keep painting, so a
+    failure whose own message cannot be rendered must still become a notice
+    rather than a traceback that kills it. The HTTP status is spelled out when
+    the failure carries one, because a bare 404 at the wrong port is exactly the
+    failure this line has to explain.
+    """
+    try:
+        code = getattr(exc, "code", None)
+        if isinstance(code, int):
+            reason = f"HTTP {code} {getattr(exc, 'reason', '')}".rstrip()
+        else:
+            # A URLError carries its cause in `.reason` (often an OSError whose
+            # text is the real diagnosis: "Connection refused"); anything else
+            # falls back to its own `str`.
+            reason = str(getattr(exc, "reason", None) or exc)
+        return NOTICE_LISTING_FAILED.format(server, reason)
+    except Exception:
+        return f"server unreachable: {server}"
+
 
 def focus_target(row: Row) -> Optional[str]:
     """The session id herdr can resolve for `row`: a root is its own, a worker's is its root.
@@ -3442,6 +3475,14 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # (`_pane`). It is cleared on the NEXT keypress, so it sits for as long as
         # the operator is reading it and goes once they act.
         notice: Optional[str] = None
+        # The one-line reason the last LISTING fetch failed, or None while the
+        # server answers. A SEPARATE variable from `notice`, not a reuse of it: a
+        # keypress must not be able to dismiss a server outage (it clears only the
+        # focus notice), and a poll that succeeds must clear the outage without
+        # wiping a focus notice the operator has not read yet. `_pane` shows
+        # whichever is live, the outage first — while the server is unreachable it
+        # is the more important thing to say.
+        listing_notice: Optional[str] = None
         # `poll` asks for a refresh now; `force` additionally drops the selected
         # row's cached report so it is read again. They are separate so Space can
         # redraw the tree this tick without paying for a second 121 KB fetch.
@@ -3591,9 +3632,28 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 ids = [row.session_id for row in frame.rows]
                 sel_id = ids[selected] if selected is not None \
                     and 0 <= selected < len(ids) else None
-                frame = model.refresh(selected_id=sel_id,
-                                      expanded_ids=expanded, force=force)
-                selected = snap_selection(frame.rows, sel_id, selected)
+                try:
+                    frame = model.refresh(selected_id=sel_id,
+                                          expanded_ids=expanded, force=force)
+                except Exception as exc:
+                    # THE PANE DEGRADES, IT DOES NOT DIE. `refresh` touches the
+                    # wire in one place `og_herdr_watch` does not already swallow
+                    # (`fetch_listing`; every detail fetch is guarded there), and a
+                    # transient non-200 — a 404 from the wrong server included —
+                    # must not escape into `curses.wrapper` and kill the screen.
+                    # `frame` is deliberately NOT reassigned, so the last good
+                    # rows stay up; the notice replaces the footer until a poll
+                    # succeeds. The clock below still advances, so the NEXT tick
+                    # retries and a server that comes back heals the pane with no
+                    # restart. Placed HERE rather than inside `refresh` because the
+                    # PREVIOUS frame to fall back to lives in the loop, not in the
+                    # model, and because `--once` (which has no previous frame by
+                    # design) should still fail loudly rather than print an empty
+                    # listing indistinguishable from a server with no sessions.
+                    listing_notice = listing_failure_notice(server, exc)
+                else:
+                    listing_notice = None
+                    selected = snap_selection(frame.rows, sel_id, selected)
                 next_poll = now + interval
                 poll = False
                 force = False
@@ -3605,7 +3665,10 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             frame.access = access if show_access else None
             frame.selected = selected
             frame.spin = spin
-            frame.notice = notice
+            # A server outage outranks a stale focus notice: both want the one
+            # footer row (`_pane`), and the outage is the one that explains why
+            # the tree stopped moving.
+            frame.notice = listing_notice or notice
             # The spinner tick: advance the counter only while something is
             # working, and only once the tick is due. `frame.spin` was set from
             # the PREVIOUS value, so the frame just painted uses it and the
