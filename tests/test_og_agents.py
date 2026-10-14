@@ -632,16 +632,26 @@ def test_a_quiet_pane_renders_the_same_lines_and_schedules_no_repaint():
 def test_the_selection_moves_between_workers_in_the_order_they_are_displayed():
     """THE HAZARD: grouping by state reorders the rows, so the selection must walk
     them in the order the eye reads — not in tree order. `Frame.rows` is itself
-    in display order, which is what makes `move_selection` correct unchanged."""
+    in display order, which is what makes `move_selection` correct unchanged.
+
+    The walk starts from an ADOPTED selection rather than an assumed one: the
+    pane opens untouched, and the first movement key is what takes a worker."""
     rows = [header(),
             rail("working"),
             worker("w1", "working", text="one"),
             rail("idle"),
             worker("w2", "idle", text="two"),
             worker("w3", "idle", text="three")]
-    assert a.snap_selection(rows, None, 0) == 2, \
-        "the view opens on the first WORKER, not the root box or a rail"
-    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, None, 0))
+    # THE VIEW OPENS UNTOUCHED. No session to follow and no caret to keep, so
+    # nothing is selected and every box paints at the same brightness.
+    assert a.snap_selection(rows) is None
+    assert a.snap_selection(rows, None, None) is None
+    # And the first movement key ADOPTS the first worker in BOTH directions,
+    # rather than being swallowed and costing a second keypress.
+    assert a.move_selection(rows, None, 1) == 2, "down adopts the first WORKER"
+    assert a.move_selection(rows, None, -1) == 2, "up adopts it too, not the top"
+    frame = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))
+    assert frame.selected == 2, "w1, the first worker box"
     worker_text = {i: row.text for i, row in enumerate(rows) if a._is_box(row)}
 
     seen = []
@@ -653,9 +663,110 @@ def test_the_selection_moves_between_workers_in_the_order_they_are_displayed():
         assert sum(1 for _t, role in items if role == a.SELECTED) == 1
     assert seen == ["two", "three", "two", "one"], "display order, not tree order"
 
-    # No workers at all: the selection has nowhere to go and must not crash.
+    # No workers at all: there is nothing to adopt and nowhere to move to, so
+    # the state passes through unchanged in both directions rather than crashing
+    # or inventing a selection.
     assert a.move_selection([header()], 0, 1) == 0
-    assert a.snap_selection([header()], None, 3) == 0
+    assert a.move_selection([header()], None, -1) is None, "still untouched"
+    assert a.snap_selection([header()], None, 3) == 3, "the index is left alone"
+
+
+def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selected():
+    """THE REPORTED BUG: a pane nobody has moved the caret in opened with one box
+    undimmed and `sel_bg` behind it, and every OTHER box dimmed — a selection on
+    a row the operator never chose.
+
+    Before the fix the very first frame already had a SELECTED line (index 0 is
+    the root, so the nearest worker won), which meant both a brightness lie and —
+    once the theme engine wired `sel_bg` to the selected line — a coloured bar on
+    an arbitrary row. `Frame()` with no `selected` is the untouched pane, and it
+    has to carry no SELECTED line at all for `attr_for` to keep `on_selected`
+    False everywhere.
+    """
+    rows = [header(),
+            rail("idle"),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+
+    pane = a._pane(a.Frame(rows=rows), 48)
+    # The LIST only. The tail below it — the access panel and the footer — is DIM
+    # by design and has nothing to do with selection.
+    items = pane.items[:pane.list_rows]
+
+    assert not [role for _t, role in items if role == a.SELECTED], \
+        "an untouched pane has no selected line to scroll to or to paint"
+    assert not [role for _t, role in items if role == a.DIM], \
+        "and dimming is what says 'not the one your cursor is on'"
+    assert {role for _t, role in items} == {a.NORMAL}
+
+    # ONE key, and the pane has a selection: adopted on w1, which now reads
+    # SELECTED on its first row while w2's whole box goes DIM.
+    moved = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))
+    moved_items = a._pane(moved, 48).items
+    assert sum(1 for _t, role in moved_items if role == a.SELECTED) == 1
+    assert moved_items[4][1] == a.SELECTED, "w1's box, first row"
+    assert [role for _t, role in moved_items[7:10]] == [a.DIM] * 3, "w2's box"
+
+
+def _unsprung(frame):
+    """A painted frame with the spinner glyphs dropped, so two frames can be
+    compared for everything except the one thing that is animating."""
+    return [line for line in frame
+            if not any(glyph in line for glyph in a.SPIN_FRAMES)]
+
+
+def test_enter_on_an_untouched_pane_focuses_nothing_and_shows_no_notice(monkeypatch):
+    """There is no target to focus, so Enter does NOTHING and says nothing.
+
+    Not a notice: a notice would report a failure the operator did not cause —
+    they pressed the key the footer tells them focuses the selected row, and the
+    honest answer is that they have to select a row first, which is one arrow key
+    away and visible the moment they press it. And never a focus: Enter moves the
+    operator's OWN terminal, and moving it somewhere they never pointed is worse
+    than not moving it at all.
+    """
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = _fake_herdr_client(monkeypatch)
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+
+    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=_model(opener))
+
+    assert calls == [], f"nothing was on the wire: {calls}"
+    assert screen.painted, "the pane was painted"
+    assert not any("focus:" in text for text in screen.painted)
+    # Enter changed NOTHING — the frame after it is the frame before it, spinner
+    # aside, so the key did not quietly adopt the first worker either. The
+    # contrast is the point: one DOWN first and the very same Enter focuses.
+    assert _unsprung(screen.frames[-1]) == _unsprung(screen.frames[0])
+    focused = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=_model(opener))
+    assert calls == [("agent.focus", {"target": "root"})], calls
+
+
+def test_space_on_an_untouched_pane_expands_nothing(monkeypatch):
+    """Same shape as Enter: with no row selected there is nothing to expand.
+
+    Space does not move the operator's terminal, so the stakes are lower, but the
+    contract is the same one — the untouched pane has no row to act on and must
+    not quietly act on the first worker instead.
+    """
+    monkeypatch.delenv("HERDR_ENV", raising=False)
+
+    def model():
+        return _model(RoutingOpener(
+            [_live_listing()],
+            details={"root": ROOT_DETAIL,
+                     "w1": detail("w1", items=[ASSISTANT_MESSAGE])}))
+
+    report = "The work was already committed"
+
+    untouched = _run_tui_capture(monkeypatch, [SPACE, QUIT], model=model())
+    assert not any(report in text for text in untouched.frames[-1]), \
+        "space expanded a row nobody had selected"
+
+    # One arrow key first, and the very same key expands the row it adopted.
+    adopted = _run_tui_capture(monkeypatch, [ord("j"), SPACE, QUIT], model=model())
+    assert any(report in text for text in adopted.frames[-1]), \
+        "the adopted row expands exactly as before"
 
 
 def test_the_selection_follows_its_session_across_a_state_change_reorder():
@@ -698,8 +809,13 @@ def test_the_selection_follows_its_session_across_a_state_change_reorder():
     # empty string.
     assert a.snap_selection(before, before[0].session_id, 0) == 2
     assert a.snap_selection(before, "", 3) == 2
-    # The no-id first frame still opens on the first worker, never the root box.
-    assert a.snap_selection(after, None, 0) == 2
+    # The no-id first frame is UNTOUCHED, not open-on-the-first-worker: nothing was
+    # selected before the refresh, so there is nothing to snap onto and nothing to
+    # snap FROM. Every box paints NORMAL and the pane opens with no bar behind any
+    # of them — which is the whole point of the fix.
+    assert a.snap_selection(after, None, None) is None
+    assert a.snap_selection(after, None, 0) == 2, \
+        "once a selection exists, an unreadable id still falls back to nearest"
 
 
 def test_the_selected_box_is_normal_and_every_other_box_is_dim_but_its_gutter():
@@ -825,7 +941,7 @@ def test_a_selection_move_still_repaints_the_pane():
             rail("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    frame = a.Frame(rows=rows, selected=a.snap_selection(rows, None, 0))   # w1
+    frame = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))   # w1
     before = a._pane(frame, 48).items
 
     frame.selected = a.move_selection(rows, frame.selected, 1)       # w2
@@ -2404,9 +2520,14 @@ def test_main_once_prints_exactly_what_render_returns(monkeypatch, tmp_path, cap
     # The listing fixture carries no timestamps, so the meta lines are clock
     # free and the two frames below are the same frame.
     expected_frame = _model(opener).refresh()
-    # The selection opens on the first WORKER: rows 0-2 are the root box and row
-    # 3 is the group's breathing rail, none of which are boxes.
-    expected_frame.selected = a.snap_selection(expected_frame.rows, None, 0)
+    # The dump is UNTOUCHED, and it has to be computed the way `main` computes it:
+    # `refresh` leaves `selected` None and `snap_selection` keeps it None. Passing
+    # 0 here would pick the first WORKER instead, and the two frames would still
+    # render to identical text — selection is a paint attribute — so the
+    # comparison below would pass while pinning the wrong frame.
+    assert expected_frame.selected is None, "refresh must not select anything"
+    assert a.snap_selection(expected_frame.rows, None,
+                            expected_frame.selected) is None
     expected = a.render(expected_frame)
 
     rc = a.main(["--once", "--all", "--server", "http://x"], opener=opener)
@@ -3268,7 +3389,7 @@ def _theme(slug: str):
 
 
 def _colour_paint(monkeypatch, frame, width=80, height=24, colors=256,
-                  color_pairs=256, theme=None):
+                  color_pairs=256, theme=None, keys=None):
     """Paint one frame through `_run_tui` with a colour-capable fake curses.
 
     DEFAULT THEME IS `og`, AND THAT IS A CLAIM, NOT A CONVENIENCE. `og` is the
@@ -3280,10 +3401,18 @@ def _colour_paint(monkeypatch, frame, width=80, height=24, colors=256,
     values, not on the plumbing.
 
     A caller that wants a real theme's own colours passes one.
+
+    `keys` drives the view past the one paint this normally does: the selection
+    lives in `_run_tui`, NOT on the frame the stub model hands back (the loop
+    starts untouched and owns the caret from the first keypress), so a test that
+    needs a SELECTED row has to send a movement key. Passing none — the default —
+    is the untouched pane, which is itself worth asserting.
     """
     fake = FakeCurses(colors=colors, color_pairs=color_pairs)
     monkeypatch.setitem(sys.modules, "curses", fake)
     scr = _WriteScreen(height, width)
+    if keys is not None:
+        scr.keys = list(keys)
     fake.wrapper = lambda loop: loop(scr)
     a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
                theme=_theme("og") if theme is None else theme)
@@ -3646,17 +3775,21 @@ def test_a_status_glyph_is_neon_and_undimmed_on_an_unselected_row(monkeypatch):
     dim and coloured by the same span role — and the reason a colour alone would
     not have answered the report: neon yellow at half brightness is still dim.
     """
-    for state, glyph in (("idle", "✓"), ("working", a.SPIN_FRAMES[0])):
+    for state, glyphs in (("idle", {"✓"}), ("working", set(a.SPIN_FRAMES))):
         # w1 is SELECTED and w2 carries the state under test, so w2's box is the
-        # unselected one. A frame with a single worker cannot say: the view snaps
-        # the selection onto the first worker box, so that box is always selected.
+        # unselected one. The selection lives in the loop, not on the frame, so
+        # DOWN is what puts it there — which is why a SINGLE-worker frame could
+        # not say this before: with nothing else to move to, the first key adopted
+        # the only box and there was no unselected box to test.
         frame = a.Frame(rows=[header(),
                               worker("w1", "blocked", text="one"),
-                              worker("w2", state, text="two", meta="12s")],
-                        selected=1)
-        fake, writes = _colour_paint(monkeypatch, frame, colors=256)
+                              worker("w2", state, text="two", meta="12s")])
+        fake, writes = _colour_paint(monkeypatch, frame, colors=256,
+                                     keys=[DOWN, QUIT])
+        # Any frame of the spinner will do: DOWN costs a repaint, so the glyph on
+        # it is whichever frame the clock was on, not the one frozen at 0.
         painted = [(row, attr) for row, _col, text, attr in writes
-                   if text == glyph + " "]
+                   if text[:-1] in glyphs]
         assert painted, (state, writes)
         row, attrs = zip(*painted)
         assert len(set(row)) == 1, (state, painted)
@@ -3719,6 +3852,10 @@ def test_bold_roles_still_bold_on_a_monochrome_terminal(monkeypatch):
 ENTER = 13          # what the view treats as Enter (curses.KEY_ENTER, 10 or 13)
 SPACE = 32
 QUIT = ord("q")
+# The pane opens UNTOUCHED, so every test that acts ON a row has to move the caret
+# there first. `j` is one of the two keys the view reads as down (the other is
+# curses.KEY_DOWN, which `FakeCurses` numbers 258).
+DOWN = ord("j")
 
 
 class _KeyScreen(FakeScreen):
@@ -3835,9 +3972,9 @@ def test_enter_on_a_sub_agent_row_focuses_its_root_session(monkeypatch):
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
     model = _model(opener)
 
-    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=model)
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=model)
 
-    # w1, the first worker, is the selected row, so the RESOLVED target — its
+    # DOWN adopts w1, the first worker, so it is the selected row, so the RESOLVED target — its
     # root — is what went on the wire.
     assert calls == [("agent.focus", {"target": "root"})], calls
     # Focus is not a reason to refetch: exactly the one listing walk for the
@@ -3886,7 +4023,7 @@ def test_a_row_whose_root_cannot_be_resolved_declines_and_does_not_call_out(
         def refresh(self, **kwargs):
             return a.Frame(rows=[orphan])
 
-    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=OneRow())
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=OneRow())
 
     assert calls == [], "a row with no resolvable root must not call out"
     assert any(a.NOTICE_FOCUS_NO_ROOT in text for text in screen.painted), \
@@ -3904,7 +4041,7 @@ def test_enter_outside_herdr_makes_no_call_and_shows_a_notice(monkeypatch):
     monkeypatch.delenv("HERDR_ENV", raising=False)
     calls = _fake_herdr_client(monkeypatch)
 
-    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT])
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
     assert calls == [], "no herdr pane, no call"
     assert any(a.NOTICE_FOCUS_OUTSIDE_HERDR in text for text in screen.painted), \
@@ -3917,7 +4054,7 @@ def test_focus_degrades_when_the_herdr_client_cannot_be_imported(monkeypatch):
     monkeypatch.setenv("HERDR_ENV", "1")
     monkeypatch.setitem(sys.modules, "og_herdr_client", None)
 
-    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT])
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
     assert any(a.NOTICE_FOCUS_UNAVAILABLE in text for text in screen.painted), \
         screen.painted
@@ -3929,7 +4066,7 @@ def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(
     calls = _fake_herdr_client(monkeypatch,
                                error=RuntimeError("connect: no such socket"))
 
-    screen = _run_tui_capture(monkeypatch, [ENTER, ENTER, QUIT])
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, ENTER, QUIT])
 
     # One Enter per press: the failure neither swallows the key nor retries, and
     # the loop is still taking keys after the first failure.
@@ -3982,7 +4119,7 @@ def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
     monkeypatch.delenv("HERDR_ENV", raising=False)
     _fake_herdr_client(monkeypatch)
 
-    screen = _run_tui_capture(monkeypatch, [ENTER, QUIT])
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
     rows = _rows_with_attr(screen.frame_writes[-1])
     bottom = rows[max(rows)][0]
@@ -4002,14 +4139,16 @@ def test_space_expands_and_collapses_the_selected_snippet(monkeypatch):
 
     report = "The work was already committed"
 
-    expanded = _run_tui_capture(monkeypatch, [SPACE, QUIT], model=model())
+    expanded = _run_tui_capture(monkeypatch, [DOWN, SPACE, QUIT], model=model())
     assert any(report in text for text in expanded.frames[-1]), \
         "space expanded the selected snippet"
 
     # A second space collapses it: the report is in the frame the first space
-    # produced and gone from the last one.
-    collapsed = _run_tui_capture(monkeypatch, [SPACE, SPACE, QUIT], model=model())
-    assert any(report in text for text in collapsed.frames[1]), \
+    # produced and gone from the last one. `frames[0]` is the untouched pane,
+    # `frames[1]` the frame DOWN adopted a row in, `frames[2]` the first expand.
+    collapsed = _run_tui_capture(monkeypatch, [DOWN, SPACE, SPACE, QUIT],
+                               model=model())
+    assert any(report in text for text in collapsed.frames[2]), \
         "the first space expanded the snippet"
     assert not any(report in text for text in collapsed.frames[-1]), \
         "the second space collapsed it"
@@ -4050,9 +4189,10 @@ def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_ref
             seen.append(kwargs.get("selected_id"))
             return inner.refresh(**kwargs)
 
-    # `j` moves the selection down onto w2; `r` forces the refresh that reorders
+    # The pane opens UNTOUCHED, so the caret has to be ADOPTED before it can be moved:
+# the first `j` takes w1, the second takes w2. `r` forces the refresh that reorders
     # the rows; `q` ends the loop after that frame is painted.
-    screen = _run_tui_capture(monkeypatch, [ord("j"), ord("r"), ord("q")],
+    screen = _run_tui_capture(monkeypatch, [DOWN, DOWN, ord("r"), ord("q")],
                               model=Recording())
 
     # The refresh was handed the SESSION under the selection, not an index.
@@ -4440,10 +4580,43 @@ def test_only_the_selected_row_gets_a_background(monkeypatch):
     assert a._role_background(a.PLAIN, og) is None
     assert a._role_background(a.PLAIN, og, on_selected=True) is None
 
-    fake, writes = _colour_paint(monkeypatch, frame, theme=dracula)
+    fake, writes = _colour_paint(monkeypatch, frame, theme=dracula, keys=[DOWN, QUIT])
     backgrounds = {bg for _p, _fg, bg in fake.init_pair_calls}
     assert DRACULA_BG in backgrounds
     assert a.hex_to_ansi256(dracula.colour("sel_bg")) in backgrounds
+
+
+def test_an_opaque_theme_spends_no_sel_bg_pair_while_the_pane_is_untouched(monkeypatch):
+    """THE THEME CONSEQUENCE OF THE UNTOUCHED PANE, on `github-dark` (`sel_bg`
+    `#163356`, a visible bar against its `#0d1117` background).
+
+    `sel_bg` is only ever reached through `attr_for`'s `on_selected`, which is
+    False on every span of every line while nothing is selected — so the painter
+    allocates the pair for NOTHING. This is the assertion the theming change made
+    load-bearing: a phantom selection is no longer a subtle brightness
+    difference, it is a coloured bar on a row the operator never chose.
+    """
+    rows = [header(),
+            rail("idle"),
+            worker("w1", "idle", text="one"),
+            worker("w2", "idle", text="two")]
+    theme = _theme("github-dark")
+    sel_bg = theme.colour("sel_bg")
+    assert sel_bg != theme.colour("bg"), "the theme really does tint its selection"
+
+    def backgrounds(keys):
+        fake, _writes = _colour_paint(monkeypatch, a.Frame(rows=rows),
+                                      theme=theme, keys=keys)
+        return {bg for _pair, _fg, bg in fake.init_pair_calls}
+
+    untouched = backgrounds([QUIT])
+    assert a.hex_to_ansi256(theme.colour("bg")) in untouched, "the theme is on"
+    assert a.hex_to_ansi256(sel_bg) not in untouched, \
+        "no sel_bg pair is allocated at all"
+
+    # One arrow key, and the pair appears — so the absence above is the selection
+    # being absent, not the theme being unable to spend one.
+    assert a.hex_to_ansi256(sel_bg) in backgrounds([DOWN, QUIT])
 
 
 def test_a_terminal_claiming_truecolor_paints_exactly_what_a_256_one_does(monkeypatch):

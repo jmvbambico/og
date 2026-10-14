@@ -281,6 +281,11 @@ TRUNCATED_NOTICE = "… partial listing: some sessions may be missing"
 # block to scroll to. Lose it and scroll-to-selection breaks silently, with no
 # symptom until the list outgrows the pane.
 #
+# THERE IS A STATE WITH NO SELECTION AT ALL: an untouched pane has no selected
+# row, and then EVERY box paints NORMAL — no DIM, no SELECTED line, and no
+# `sel_bg` spent anywhere (`snap_selection`). The mapping above only describes
+# what happens once the operator has moved the caret.
+#
 # THE BRIGHTNESS A LINE HANGS IS A DEFAULT, NOT A VERDICT: a span carrying the
 # `undim:` role prefix paints NORMAL whatever its line says (see below). That is
 # what keeps the gutter and the status glyph full-brightness on an unselected
@@ -758,19 +763,24 @@ class Access:
 class Frame:
     """The whole view at one instant: the rows, plus anything to say about it.
 
-    `selected` is an index into `rows` and `spin` is the spinner frame counter.
-    Both live on the frame rather than being read from a clock so `render` stays
-    pure: the same frame rendered twice is the same two screens, and a caller
-    that only wants a tree need not own a clock. Only a WORKING row reads `spin`
-    (`state_glyph`), so a frame with nothing working renders identically at every
-    value.
+    `selected` is an index into `rows` — or None, meaning UNTOUCHED — and `spin` is
+    the spinner frame counter. Both live on the frame rather than being read from a
+    clock so `render` stays pure: the same frame rendered twice is the same two
+    screens, and a caller that only wants a tree need not own a clock. Only a
+    WORKING row reads `spin` (`state_glyph`), so a frame with nothing working
+    renders identically at every value.
+
+    `selected` DEFAULTS TO None, not 0, and that is the point: a frame nobody has
+    moved the caret in has no selection, and a frame nobody has moved the caret in
+    paints every box at the same brightness — see `snap_selection` for why the
+    pane opens untinted rather than opened on its first worker.
     """
 
     rows: list[Row] = field(default_factory=list)
     truncated: bool = False
     notice: Optional[str] = None
     access: Optional[Access] = None
-    selected: int = 0
+    selected: Optional[int] = None
     spin: int = 0
 
 
@@ -1767,8 +1777,8 @@ def _workers(rows: list[Row]) -> list[int]:
 
 
 def snap_selection(rows: list[Row], selected_id: Optional[str] = None,
-                   selected: int = 0) -> int:
-    """The index the caret takes after a refresh: the row whose SESSION was selected.
+                   selected: Optional[int] = None) -> Optional[int]:
+    """The index the caret takes after a refresh, or None while nothing is selected.
 
     Run after every refresh, when the row list has just changed underneath the
     caret. The caret follows the SESSION, not the index it used to sit at, and
@@ -1779,19 +1789,50 @@ def snap_selection(rows: list[Row], selected_id: Optional[str] = None,
     session id of the row that was selected; when that session is still on screen
     as a BOX the caret returns to it wherever the reorder moved it.
 
-    When that session is GONE — it fell off the listing, or the scope moved to
-    another tree — the fallback is the box NEAREST the old index (`selected`),
-    never the top of the list: the operator's eye stays where it was instead of
-    the caret teleporting to a part of the pane they were not reading. A tie goes
-    to the upper box. The old index is also the whole story when the caller has no
-    session id at all (the first frame of a view that opens on the first WORKER);
-    nearest to index 0 finds that first worker rather than row 0, which is the
-    root's title bar and draws no box, so a view that opened there would look
-    like it had no selection at all.
+    NONE MEANS UNTOUCHED, and this function returning it is the whole change. It
+    used to return an `int` unconditionally, and with no `selected_id` to follow it
+    fell through to "the box nearest the old index", which for a brand new view is
+    the first worker. Its own docstring argued for that in as many words — "a view
+    that opened there would look like it had no selection at all" — and the
+    argument was sound WHEN SELECTION WAS ONLY A BRIGHTNESS AXIS: an undimmed box
+    against dimmed ones was a hint, and a hint on an unfocused pane was cheaper
+    than the alternative of a pane with no anchor at all.
+
+    It stopped being sound once the theme engine wired `sel_bg` to the selected
+    line. Selection stopped being a hint and became a BACKGROUND, so on every
+    theme whose `sel_bg` differs from its `bg` the untouched pane opened with a
+    coloured bar sitting on a row the operator had never chosen, and every OTHER
+    row dimmed — which reads the wrong way round. Dimming here says "not the one
+    your cursor is on", and on an untouched pane the operator's cursor is not on
+    any of them; dimming most of the list implies the undimmed one is the
+    important one, which is not a thing the pane knows. The bar was on a row
+    nobody picked, in the one place the eye reads as deliberate.
+
+    So the pane opens UNTOUCHED: `selected` None, every box NORMAL, no DIM, no
+    `sel_bg`, no SELECTED line anywhere. The first movement key adopts a worker
+    (`move_selection`), so the cost of the fix is that an operator who wants to
+    press Enter straight away presses a key first — and they get a visible
+    response to that key, which the old behaviour also gave them. Nobody has to
+    press anything twice.
+
+    The near-the-old-index fallback is UNCHANGED for every case where a selection
+    already existed: that path is about a caret that was following a session that
+    has just disappeared, and snapping back to untouched there would silently
+    throw away the operator's place in a list they were reading. It keeps the
+    caret near the old index rather than teleporting it to the top, a tie goes to
+    the upper box, and an id that is on screen but is not a BOX (the root's, a
+    rail's empty string) never captures it.
+
+    Returns None when there are no worker rows at all AND nothing was selected —
+    nothing to follow and nothing to keep. With a selection already made and no
+    workers left it returns the old index unchanged, which no row can match, so
+    the pane paints untinted rather than crashing.
     """
+    if selected is None:
+        return None                       # untouched: there is no caret to keep
     workers = _workers(rows)
     if not workers:
-        return 0
+        return selected                   # nowhere to land it; paints nothing
     if selected_id:
         for index in workers:
             if rows[index].session_id == selected_id:
@@ -1799,17 +1840,31 @@ def snap_selection(rows: list[Row], selected_id: Optional[str] = None,
     return min(workers, key=lambda index: (abs(index - selected), index))
 
 
-def move_selection(rows: list[Row], selected: int, delta: int) -> int:
+def move_selection(rows: list[Row], selected: Optional[int],
+                   delta: int) -> Optional[int]:
     """The selection after a keypress: the next or previous WORKER.
 
     Roots and rails are stepped over instead of landed on, for the same reason
     `snap_selection` prefers a worker: the caret belongs to a box. Because
     `Frame.rows` is in DISPLAY order (`build_rows`), this walks the workers in
     the order the eye reads them.
+
+    A `selected` of None is the UNTOUCHED pane, and the keypress that moves off
+    it ADOPTS the first worker rather than being swallowed — down once and the
+    first worker is selected, up once and it is the same worker, not the one
+    above the top of the list. Stepping from -1 instead (what a None would have
+    got through the general path) would land on the first worker for one
+    direction and then refuse to move at all for the other, so an operator
+    pressing up would get no visible response to the key they just pressed.
+
+    With no worker rows there is nothing to adopt, so the state is returned
+    unchanged: None stays None, an index stays that index.
     """
     workers = _workers(rows)
     if not workers:
-        return 0
+        return selected                   # no boxes: nothing to adopt, nowhere to go
+    if selected is None:
+        return workers[0]                 # the first movement key adopts, and shows
     at = workers.index(selected) if selected in workers else -1
     return workers[min(max(at + (1 if delta > 0 else -1), 0), len(workers) - 1)]
 
@@ -2037,6 +2092,13 @@ def _blocks(frame: Frame, width: int) -> list[list[Line]]:
     """
     blocks: list[list[Line]] = []
     unit: Optional[list[Line]] = None
+    # AN UNTOUCHED PANE HAS NO SELECTION, which is not the same as "no row is
+    # selected". `on_selected` below is False for every row in that case, and the
+    # naive reading of that — every box is UNSELECTED, so every box is DIM — is
+    # the reported bug with the DIM left in: an unfocused pane in which most rows
+    # read as secondary to a row nobody picked. While `selected` is None there is
+    # nothing to be secondary TO, so every box paints NORMAL.
+    untouched = frame.selected is None
     for index, row in enumerate(frame.rows):
         if (row.is_root or row.rail) and unit is not None:
             blocks.append(unit)
@@ -2065,7 +2127,9 @@ def _blocks(frame: Frame, width: int) -> list[list[Line]]:
                 # and those segments override it. That exemption is the reported
                 # fix, and it lives in the spans rather than here so that this
                 # function keeps one rule for every line it composes.
-                if not on_selected:
+                if untouched:
+                    brightness = NORMAL          # nothing is selected, so nothing dims
+                elif not on_selected:
                     brightness = DIM
                 elif position == selected_row:
                     brightness = SELECTED
@@ -3367,7 +3431,10 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # the entire promise `og` makes.
         apply_background(stdscr, curses, colours)
         stdscr.keypad(True)
-        selected = 0
+        # None until the operator moves: the pane opens UNTOUCHED, so no box is
+        # bright, no box is dim, and no row carries `sel_bg` (see
+        # `snap_selection`). Every index-keyed read below is guarded on it.
+        selected: Optional[int] = None
         offset = 0
         expanded: set[str] = set()
         # The one-line reason the last Enter could not focus, shown in the pane
@@ -3519,8 +3586,11 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 # exists, and the id is what survives the reorder a state change
                 # causes. A row that is not a box (a rail carries "") reads as no
                 # id at all, and `snap_selection` falls back to the old index.
+                # On an UNTOUCHED pane there is no index to read an id FROM, so
+                # there is nothing to follow and the refresh leaves it untouched.
                 ids = [row.session_id for row in frame.rows]
-                sel_id = ids[selected] if 0 <= selected < len(ids) else None
+                sel_id = ids[selected] if selected is not None \
+                    and 0 <= selected < len(ids) else None
                 frame = model.refresh(selected_id=sel_id,
                                       expanded_ids=expanded, force=force)
                 selected = snap_selection(frame.rows, sel_id, selected)
@@ -3550,7 +3620,11 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             tail_len = len(items) - pane.list_rows
 
             # Keep the selected box on screen: the list scrolls, the tail stays
-            # pinned to the bottom of the pane.
+            # pinned to the bottom of the pane. With NOTHING selected there is no
+            # first_selected and `offset` is left where it is — which is right,
+            # because on an untouched pane `offset` is still the 0 it started at
+            # (nothing but this block has ever moved it), so the list shows from
+            # the top exactly as a pane with no caret should.
             list_view = max(1, height - tail_len)
             first_selected = next((i for i, (_spans, brightness) in enumerate(items)
                                    if brightness == SELECTED), None)
@@ -3624,7 +3698,17 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 # focus, or a row that resolves to no pane at all, sets a notice,
                 # and the next paint shows it. See `focus_in_herdr` for every way
                 # it can decline.
-                if 0 <= selected < len(frame.rows):
+                #
+                # ON AN UNTOUCHED PANE IT DOES NOTHING, and it says nothing. There
+                # is no target to focus, so there is no wrong pane to jump the
+                # operator's terminal into; a notice here would be reporting a
+                # failure the operator did not cause, and the fix — a movement key
+                # first — is a single obvious keystroke they have just been told
+                # about by the caret appearing. Focusing the nearest worker
+                # instead would be the one genuinely dangerous option: Enter moves
+                # the operator's OWN terminal, and moving it somewhere they never
+                # pointed is worse than not moving it.
+                if selected is not None and 0 <= selected < len(frame.rows):
                     target = focus_target(frame.rows[selected])
                     notice = focus_in_herdr(target) if target is not None \
                         else NOTICE_FOCUS_NO_ROOT
@@ -3632,8 +3716,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 # Expand/collapse moved off Enter when Enter took focus. It DOES
                 # set `poll`: the expanded set feeds the rebuild, so the tree has
                 # to be redrawn, and the report is already cached, so this costs
-                # nothing beyond the listing walk.
-                if 0 <= selected < len(frame.rows):
+                # nothing beyond the listing walk. Like Enter, it does nothing at
+                # all while the pane is untouched: there is no row to expand.
+                if selected is not None and 0 <= selected < len(frame.rows):
                     sid = frame.rows[selected].session_id
                     if sid in expanded:
                         expanded.discard(sid)
@@ -3718,17 +3803,18 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
         if args.access:
             frame.access = access_info(args.server)
         # No animation headless: one frame, at spinner frame 0, with the
-        # selection where the live view opens it — on the first worker. A working
-        # row still draws its spinner, frozen on the first frame.
+        # selection where the live view opens it — which is nowhere. A working row
+        # still draws its spinner, frozen on the first frame.
         frame.spin = 0
-        # No previous frame, so no session to follow: this snaps to the first
-        # worker, which is where the live view opens too.
+        # No previous frame, so no session to follow and no caret to keep: the
+        # one-shot dump is UNTOUCHED, exactly as the live pane is until the
+        # operator moves. This returns None rather than snapping to a worker,
+        # which is what a live view would not do either.
         frame.selected = snap_selection(frame.rows, None, frame.selected)
-        # `--once` PRINTS TEXT ONLY, and selection is now a paint attribute (DIM
+        # `--once` PRINTS TEXT ONLY, and selection is a paint attribute (DIM
         # vs NORMAL), never a glyph — so a one-shot dump shows NO selection at
-        # all. That is acceptable for a dump that is read once and not navigated,
-        # but it is a real difference from the live view: do not read a `--once`
-        # frame and expect to see which worker was selected.
+        # all, for two reasons now that it also OPENS untouched. Do not read a
+        # `--once` frame and expect to see which worker was selected.
         # The real pane width drives the QR fit; off a tty there is none, so
         # fall back to the classic 80 columns.
         width = shutil.get_terminal_size((DEFAULT_WIDTH, 24)).columns
