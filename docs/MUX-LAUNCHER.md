@@ -184,8 +184,12 @@ second one.
 - If that session has a space: `workspace.focus(ws)`, then `exec herdr`.
 - If it does not: adopt it (§4), then focus and attach.
 
-**Known gap, unfixed.** Only `_open_space` opens the `og agents` pane, so this
-case never splits — and says nothing when the space it attaches to has no agents
+**Known gap, unfixed.** TWO things open the `og agents` pane, and neither is this
+case: `_open_space` (a fresh launch) and `og_herdr._add_history_space` (a history
+space for a past conversation, resumed from the spaces list). Both go through the
+one implementation, `og_herdr_launch.split_agents_pane`; there is deliberately no
+second copy of the split to drift. ADOPTING AN EXISTING SPACE is still the case
+that never splits — and says nothing when the space it attaches to has no agents
 pane (closed by hand, or created before the feature). At the keyboard that is
 indistinguishable from case (A)'s split failing. It is not a small fix: the
 split needs a tab id and a root pane, and an existing space's layout cannot be
