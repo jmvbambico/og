@@ -244,22 +244,36 @@ The host rule exists because `workspace` is a path, not a machine: a session on
 a work-mac whose checkout of the same repo is at the same path is a real shape,
 and it passes every filter above — including `runner_online`, which says nothing
 at all about a machine that is merely not here. Attaching to it types an attach
-that dies with `no online runner … its host is offline`. This machine's own id
-comes from `GET /v1/hosts` (the entry with `status: "online"`, the same read
-`ensure_project` in `bin/og` makes), asked once per launch through the session
-watcher so the request carries that server's own token.
+that dies with `no online runner … its host is offline`.
+
+**Which machine am I** is answered in this order, and the first source is the
+one that identifies rather than infers:
+
+1. **this machine's own daemon record** — `$OMNIGENT_HOME/daemons/*.json`, written
+   by this machine's host daemon, stating `host_id` directly (`omnigent host
+   status` prints the same value). The filename is a config signature, so there
+   may be several; only records whose `server_url` / `target` /
+   `resolved_server_url` name this server count, and several that agree are one
+   answer while several that **disagree** are unknown.
+2. **`GET /v1/hosts`, only when exactly one host is online.** This endpoint
+   describes every host the *account* has, across every machine, so "the first
+   online entry" is a position in a list this process has no stake in. A user who
+   runs two machines would have had their own sessions skipped — every start
+   opening a new space. Ask `/v1/hosts` when it can actually identify, not when it
+   can merely enumerate.
+
+Both ids are **detail** facts: the listing row carries neither `workspace` nor
+`host_id` (measured), so `og_herdr_watch` forwards both out of the one
+`GET /v1/sessions/{id}` fetch it already makes per session. The watcher emits a
+sub-agent's `host_id: null` as no key at all, which is the unknown case below.
 
 The rule is deliberately asymmetric: a session is skipped **only** when both ids
 are known and differ. A hosts endpoint that errors, answers nothing, or reports
 no online host, and a session row with no `host_id`, all leave the session alone —
 because a skip we could not justify is the mistake nothing undoes (a second space
 and a second `og chat` in a conversation the operator already had), while the
-opposite error is a message on screen they can act on.
-
-Both ids are **detail** facts: the listing row carries neither `workspace` nor
-`host_id` (measured), so `og_herdr_watch` forwards both out of the one
-`GET /v1/sessions/{id}` fetch it already makes per session. The watcher emits a
-sub-agent's `host_id: null` as no key at all, which is the unknown case above.
+opposite error is a message on screen they can act on. That is also why an
+ambiguous "which machine am I" resolves to unknown rather than to a guess.
 
 `workspace` is on the **detail** row only — the listing row does not carry it.
 The check therefore costs one detail fetch per live root, which is a handful.
