@@ -40,9 +40,9 @@ no record for its directory and opens a second space. See `_open_space`.
 Everything here is a view. `og start` works without a multiplexer at all, so a
 failure to open a space is reported and the og server is left running.
 
-Read by tests through injected fakes: the herdr client, the session watcher and
-the spawn of the mux's own server. Nothing in this module connects to a herdr
-socket at import time, and no test has to.
+Read by tests through injected fakes: the herdr client, the session watcher, the
+host id this machine is known by, and the spawn of the mux's own server. Nothing
+in this module connects to a herdr socket at import time, and no test has to.
 """
 from __future__ import annotations
 
@@ -292,8 +292,100 @@ def resolve_chat_dir(path: str, config: dict) -> Path:
 # which session, if any, this directory already has
 # ---------------------------------------------------------------------------
 
-def live_session(watcher, cwd: str) -> Optional[dict]:
+def local_host_id(watcher) -> Optional[str]:
+    """This machine's `host_id` according to the Omnigent server, or None.
+
+    `GET /v1/hosts` answers `{"hosts": [...]}`, and the entry whose `status` is
+    "online" is the machine this process is on — the same read `ensure_project`
+    in bin/og does before it pins a project to a host, deliberately in the same
+    shape (`status`, then `host_id`), because two answers to "which host am I"
+    that disagree would pin a session to one machine and then go looking for it on
+    another.
+
+    Asked THROUGH the watcher rather than with a urllib call of our own, for the
+    reason `live_session` reads its listing that way: its `_get_json` already
+    carries the base URL and this server's token, and `--server` can name a
+    server we were not handed a token for. (`_get_json` is private; promoting it
+    to a public method would be a change in og_herdr_watch, which this fix
+    deliberately does not make.)
+
+    Every failure — a 404, a refused connection, a payload in a shape we do not
+    recognise, a host row with no id — is None rather than an exception, and the
+    catch is deliberately broad for that reason. The rule below is ADDITIVE: with
+    no id of our own there is nothing to compare a session's against, so the
+    honest answer is "I do not know which host I am". The worst a bug in these
+    lines can do is leave the launch behaving exactly as it did before the filter
+    existed — never fail an `og start` the operator is waiting on, and never hide
+    a local session.
+    """
+    try:
+        payload = watcher._get_json("{0}/v1/hosts".format(watcher.base_url))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, list):
+        return None
+    online = next((host for host in hosts
+                   if isinstance(host, dict) and host.get("status") == "online"),
+                  None)
+    host_id = online.get("host_id") if online else None
+    return host_id if isinstance(host_id, str) and host_id else None
+
+
+def session_on_another_host(session: dict, host_id: Optional[str]) -> bool:
+    """Whether this session is known to belong to a DIFFERENT machine.
+
+    Only a POSITIVE answer skips a session, and it takes two known-and-different
+    ids to produce one. Every other combination keeps the session, for the same
+    reason `runner_is_offline` reads an unreadable answer as live: a skip we had
+    no evidence for opens a SECOND space and types a second `og chat` into a
+    conversation the operator already had — the one mistake nothing undoes —
+    while attaching to a session that is not ours is a line on screen they can
+    read and re-run. An endpoint we could not read must never get to decide that
+    a local session is foreign.
+
+    So, exhaustively:
+
+    * `host_id` is None — our own lookup failed, found nothing, or found no
+      online host. We do not know who we are, so nothing is filtered and the
+      launch behaves exactly as it did before this rule existed.
+    * the session carries no `host_id`, or a null / non-string one — we do not
+      know who IT is. Same verdict.
+    * both present and equal — ours, keep.
+    * both present and different — someone else's, skip.
+
+    The failure this exists for, which nothing above it could catch: a session
+    running on a work-mac, in the SAME project path as this one (`~/projects/og`
+    is not an unusual directory to have checked out twice), turned up in the
+    local `kind=any` listing, matched `workspace == cwd`, passed the status and
+    runner checks, and was handed back as "the live session". `runner_is_offline`
+    cannot see that by design — it is True only for an explicit
+    `runner_online: False`, and a session on a machine that is simply not here
+    reports nothing at all, which that predicate deliberately reads as live. So
+    `launch` took case (B), `_adopt` typed the attach, and the pane said:
+
+        Error: Session … has no online runner … its host is offline.
+    """
+    if not host_id:
+        return False
+    theirs = session.get("host_id")
+    if not isinstance(theirs, str) or not theirs:
+        return False
+    return theirs != host_id
+
+
+def live_session(watcher, cwd: str,
+                 host_id: Optional[str] = None) -> Optional[dict]:
     """The live ROOT session whose detail-row `workspace` is `cwd`, or None.
+
+    `host_id` is this machine's, INJECTED — resolved once per launch by
+    `launch` and handed in like the herdr client and the watcher, so no test
+    reaches a network for it. It defaults to None, which is the UNKNOWN state,
+    and unknown filters nothing (see `session_on_another_host`): a caller that
+    could not resolve an id gets the pre-filter behaviour rather than a silent
+    skip of everything.
 
     Read through `og_herdr_watch.SessionWatcher` rather than by fetching the API
     directly, so pagination, `kind=any` and per-server token matching stay in one
@@ -319,6 +411,21 @@ def live_session(watcher, cwd: str) -> Optional[dict]:
     opens a second space and types a second `og chat` into a conversation the
     operator already had — while attaching to a session that turns out to be dead
     is a visible error the operator can simply re-run.
+
+    The HOST rule is the second filter the listing cannot decide on its own, and
+    it is applied for the same reason and in the same direction. A session on
+    another machine whose project path is the SAME directory is a real shape —
+    two checkouts of one repo, one machine asleep — and it passes everything
+    above: the listing is server-wide, `workspace` is a path rather than a
+    machine, and `runner_is_offline` is silent about a host that is merely not
+    here. It was handed back as "the live session", `launch` took case (B), and
+    `_adopt` typed an attach that dies with the same line quoted above. Unlike
+    the runner, this one HAS an answer to ask — `/v1/hosts`, which already says
+    which host is this one (see `local_host_id`) — so it is a real comparison
+    rather than a heuristic. Both unknowns still keep the session, for the reason
+    the paragraph above gives: a hosts endpoint we could not read must not be
+    able to hide a local session. See `session_on_another_host` for the full
+    truth table.
 
     `poll_once` is used rather than `list_sessions` because the directory is on
     the DETAIL row only; poll_once enriches exactly the sessions it has not seen
@@ -355,6 +462,16 @@ def live_session(watcher, cwd: str) -> Optional[dict]:
             continue
         # The directory is on the DETAIL row, which is why poll_once was used.
         if session.get("workspace") != cwd:
+            continue
+        # THE HOST RULE, last of the filters and for the same reason as the
+        # runner one: a session belonging to another machine is not something
+        # this pane can attach to, whatever its status and path say. LAST on
+        # purpose — only a session that is otherwise exactly ours is worth a
+        # line of terminal — and `continue` rather than `return`, so a foreign
+        # row sitting in front of the real one does not hide it.
+        if session_on_another_host(session, host_id):
+            info("skipping session {0} (host {1} is not this machine)".format(
+                session.get("id"), session.get("host_id")))
             continue
         return session
     return None
@@ -527,7 +644,12 @@ def _hold_for_problems(ctx: Launch) -> None:
 def launch(ctx: Launch) -> str:
     """Do the work. Returns "attach" (caller execs the TUI) or "done"."""
     inside = is_inside(ctx.env)
-    session = live_session(ctx.watcher, ctx.cwd)
+    # Resolved ONCE and injected, like the herdr client and the watcher: the host
+    # id is a fact about the MACHINE, not about any one session, so asking per
+    # candidate would put the same request to the same endpoint up to a hundred
+    # times to get one answer. `live_session` is called from exactly here.
+    session = live_session(ctx.watcher, ctx.cwd,
+                           host_id=local_host_id(ctx.watcher))
     if inside:
         if session:
             return _close_here(ctx, session)

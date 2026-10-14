@@ -39,6 +39,7 @@ from og_herdr_launch import (  # noqa: E402
     launch,
     launch_log_path,
     live_session,
+    local_host_id,
     main,
     pane_env_for,
     projects_dir,
@@ -50,6 +51,16 @@ from og_herdr_watch import SessionEvent  # noqa: E402
 
 SERVER = "http://127.0.0.1:6767"
 CWD = "/Users/someone/projects/og"
+
+# The two machines in every host test below: this one, which the server calls
+# online, and the work-mac whose sessions share the SAME project path.
+LOCAL_HOST = "host_this_mac"
+WORK_HOST = "host_work_mac"
+
+# A `/v1/hosts` payload in the measured shape. The offline host is listed FIRST
+# on purpose: the read picks the ONLINE entry by status, not by position.
+HOSTS = {"hosts": [{"host_id": WORK_HOST, "status": "offline"},
+                   {"host_id": LOCAL_HOST, "status": "online"}]}
 
 
 # ---------------------------------------------------------------------------
@@ -177,18 +188,35 @@ class FakeClient:
 
 
 class FakeWatcher:
-    """A SessionWatcher stand-in: `poll_once` returns what the test scripted."""
+    """A SessionWatcher stand-in: `poll_once` returns what the test scripted.
+
+    `_get_json` answers the OTHER request the launcher makes of a watcher — the
+    `/v1/hosts` lookup behind `local_host_id` — and records the URLs it was asked
+    for, so a test can prove that lookup rides the watcher's own path (which owns
+    the server and its token) and happens once per launch. `hosts` overrides the
+    payload; `hosts_error` makes the endpoint fail the way a server that is down
+    would.
+    """
 
     base_url = SERVER
 
-    def __init__(self, sessions=()):
+    def __init__(self, sessions=(), hosts=None, hosts_error=None):
         self.base_url = SERVER
         self.events = [
             SessionEvent("added", session.get("id", "s?"), session)
             for session in sessions]
+        self.hosts = HOSTS if hosts is None else hosts
+        self.hosts_error = hosts_error
+        self.urls = []
 
     def poll_once(self):
         return list(self.events)
+
+    def _get_json(self, url):
+        self.urls.append(url)
+        if self.hosts_error is not None:
+            raise self.hosts_error
+        return self.hosts
 
 
 class UnreadableWatcher(FakeWatcher):
@@ -318,6 +346,158 @@ def test_a_dead_root_in_another_directory_does_not_interfere(tmp_path):
     watcher = FakeWatcher([root_session("s-dead", cwd="/elsewhere",
                                         runner_online=False)])
     assert live_session(watcher, CWD) is None
+
+
+# --- the host rule: a session on ANOTHER machine is not this directory's ---
+# THE REGRESSION THIS PINS: a session running on a work-mac, in the SAME project
+# path as this one (`~/projects/og` is not an unusual directory to have checked
+# out twice), turned up in the local `kind=any` listing, matched
+# `workspace == cwd`, passed the status and runner checks, and was handed back as
+# "the live session" — so `launch` took case (B), `_adopt` typed the attach, and
+# the pane said:
+#
+#     Error: Session … has no online runner on … - its host is offline.
+#
+# `runner_is_offline` cannot catch that, by design: it is True only for an
+# explicit `runner_online: False`, and a session on a machine that is simply not
+# here reports nothing at all. The answer exists though — `/v1/hosts` already
+# says which host this machine is — so this is a real comparison, not a heuristic.
+
+def test_a_session_on_another_machine_is_not_the_live_session():
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)])
+    assert live_session(watcher, CWD, host_id=LOCAL_HOST) is None
+
+
+def test_a_session_on_this_machine_is_still_the_live_session():
+    """The other side of the pair: a filter that refused everything would pass
+    the test above and lose case (B) entirely, which looks exactly like a launch
+    that worked."""
+    watcher = FakeWatcher([root_session(host_id=LOCAL_HOST)])
+    assert live_session(watcher, CWD, host_id=LOCAL_HOST)["id"] == "s1"
+
+
+def test_a_session_naming_no_host_is_not_assumed_to_be_another_machines():
+    """Unknown is not "not mine". The rule needs BOTH ids known and different;
+    one side unreadable leaves the session alone, for the reason the runner rule
+    reads an unreadable answer as live: a skip we could not justify opens a second
+    space and types a second `og chat` into a conversation the operator already
+    had, and the opposite error is a line on screen they can act on."""
+    for extra in ({}, {"host_id": None}, {"host_id": ""}, {"host_id": 7}):
+        watcher = FakeWatcher([root_session(**extra)])
+        assert live_session(watcher, CWD, host_id=LOCAL_HOST)["id"] == "s1", extra
+
+
+def test_a_session_on_another_machine_does_not_mask_this_one_behind_it():
+    """The skip CONTINUES the scan, like every other filter here: a foreign row
+    listed first (the listing is newest-first) must not hide the real one."""
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST),
+                           root_session("s-mine", host_id=LOCAL_HOST)])
+    assert live_session(watcher, CWD, host_id=LOCAL_HOST)["id"] == "s-mine"
+
+
+def test_the_skip_says_which_session_and_whose_host_it_was(capsys):
+    """A silently skipped session is indistinguishable from a launch that simply
+    found nothing, and the operator has no way to tell that a conversation on
+    another machine is the reason they got a new one."""
+    live_session(FakeWatcher([root_session("s-work", host_id=WORK_HOST)]),
+                 CWD, host_id=LOCAL_HOST)
+    out = capsys.readouterr().out
+    assert "s-work" in out and WORK_HOST in out and "not this machine" in out
+
+
+def test_a_foreign_session_opens_a_new_space_instead_of_a_doomed_attach(tmp_path):
+    """THE REGRESSION, end to end: the case the bug produced. A session from the
+    work-mac in this directory must fall through to case (A) — open a space, run
+    `og chat`, split the agents pane — rather than adopt and type an attach that
+    dies with "its host is offline"."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)])
+
+    assert launch(make_ctx(tmp_path, client, watcher)) == "attach"
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert ("omnigent attach --server {0} s-work".format(SERVER)
+            not in client.text_typed())
+
+
+def test_a_hosts_endpoint_that_cannot_be_read_still_attaches(tmp_path):
+    """THE CHOSEN DIRECTION for OUR side of the comparison. The very session the
+    test above refuses is attached when the lookup that would have refused it
+    could not be answered: a hosts endpoint we could not read is not evidence that
+    anything is foreign. Refusing on that evidence is the outcome that cannot be
+    undone — a second space, and a second `og chat` typed into a conversation the
+    operator already had."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)],
+                          hosts_error=OSError("connection refused"))
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-work".format(SERVER)]
+
+
+def test_no_online_host_means_this_machine_is_unknown_not_foreign(tmp_path):
+    """The same session again, with a payload that answers the request and still
+    cannot say who we are: every host is offline (this one included — it is what
+    a machine that has not brought its host up looks like). "No online host" is
+    an absence, not a verdict, so nothing is filtered."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)],
+                          hosts={"hosts": [{"host_id": LOCAL_HOST,
+                                            "status": "offline"}]})
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-work".format(SERVER)]
+
+
+def test_the_host_lookup_rides_the_watchers_own_request_and_happens_once(
+        tmp_path):
+    """ONE request per launch, asked of the watcher. It is the only holder of the
+    base URL and the per-server token, and `--server` can name a server we were
+    not handed one for — a second urllib call here would be a second opinion about
+    which server we are talking to, and would present a credential to a host it
+    was not issued for. Counted once even with several candidates to judge."""
+    watcher = FakeWatcher([root_session("s1"),
+                           root_session("s-elsewhere", cwd="/elsewhere"),
+                           root_session("s-dead", runner_online=False),
+                           root_session("s-work", host_id=WORK_HOST)])
+
+    launch(make_ctx(tmp_path, FakeClient(), watcher))
+
+    assert watcher.urls == [SERVER + "/v1/hosts"]
+
+
+def test_the_local_host_is_the_one_the_server_calls_online():
+    """`/v1/hosts` answers a LIST and the machine we are is the entry whose status
+    is online — the same read `ensure_project` in bin/og makes before it pins a
+    project to a host, deliberately in the same shape, so the pin and this filter
+    cannot disagree about which machine og is on."""
+    assert local_host_id(FakeWatcher()) == LOCAL_HOST
+    # Order is the server's, not ours: the first entry listed is not the answer.
+    watcher = FakeWatcher(hosts={"hosts": [
+        {"host_id": "host_asleep", "status": "offline"},
+        {"host_id": LOCAL_HOST, "status": "online"}]})
+    assert local_host_id(watcher) == LOCAL_HOST
+
+
+def test_an_answer_that_does_not_name_this_machine_leaves_it_unknown():
+    """Everything /v1/hosts can fail to say, in one list. None means UNKNOWN and
+    unknown filters nothing; the launch must never die here over a lookup whose
+    only job is to make one filter sharper."""
+    for payload in ({},                                   # no hosts key
+                    {"hosts": []},                       # nothing connected
+                    {"hosts": [{"host_id": LOCAL_HOST, "status": "offline"}]},
+                    {"hosts": [{"status": "online"}]},    # online, but no id
+                    {"hosts": [{"host_id": 7, "status": "online"}]},
+                    {"hosts": [{"host_id": "", "status": "online"}]},
+                    {"hosts": "nonsense"},                # not a list
+                    [],                                  # not an object
+                    "nonsense"):
+        assert local_host_id(FakeWatcher(hosts=payload)) is None, payload
+    assert local_host_id(FakeWatcher(hosts_error=OSError("refused"))) is None
 
 
 def test_is_inside_reads_herdr_env():
