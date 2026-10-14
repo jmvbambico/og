@@ -70,6 +70,26 @@ HOSTS = {"hosts": [{"host_id": WORK_HOST, "status": "offline"},
 # fakes
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _redirect_the_omnigent_home(tmp_path, monkeypatch):
+    """Point `$OMNIGENT_HOME` at an empty directory for every test in this file.
+
+    `local_host_id` reads this machine's OWN daemon record out of
+    `<OMNIGENT_HOME>/daemons/*.json` — which is the point: it is the one source
+    that says "this machine" rather than inferring it from a list of every host
+    the account has. The cost is that on a developer who has actually installed
+    og, the suite would read the REAL one: the launcher's host id would come out
+    of the operator's live `~/.omnigent`, and the tests below would both depend
+    on this machine's state and fail outright against it (CI has no
+    `~/.omnigent` at all, so they would go green there and red here — the exact
+    asymmetry the PYTHONPATH fixture in conftest.py exists to prevent).
+
+    Redirecting the variable is the documented way to move that home (see
+    og_herdr.default_home), so this changes where the answer is read from and
+    nothing else. A test that WANTS a record writes one under `tmp_path`.
+    """
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path / "omnigent-home"))
+
 def create_reply(ws="w1", tab="w1:t1", pane="w1:p1", **over):
     """A `workspace.create` result in the shape herdr actually sends.
 
@@ -337,6 +357,34 @@ def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
                   log_path=tmp_path / "logs" / "herdr-server.log")
 
 
+def daemon_home(tmp_path, records):
+    """An `$OMNIGENT_HOME` whose `daemons/` holds `records` — a signature ->
+    record mapping, written as the host daemon writes it.
+
+    Under the same path the autouse fixture redirects the variable to, so a test
+    that builds one here also exercises the `launch` path that reads the
+    environment rather than the `home` argument.
+    """
+    home = tmp_path / "omnigent-home"
+    (home / "daemons").mkdir(parents=True, exist_ok=True)
+    for signature, record in records.items():
+        (home / "daemons" / "{0}.json".format(signature)).write_text(
+            json.dumps(record))
+    return home
+
+
+def daemon_record(signature=None, host_id=LOCAL_HOST, server_url=SERVER, **over):
+    """One `daemons/*.json` row, shaped like the real one (`omnigent host status`
+    prints the same `host_id`). `resolved_server_url` is null on a server-mode
+    record, which is why every URL key is exercised separately below."""
+    row = {"config_sig": signature or "18fa469718d9c868", "host_id": host_id,
+           "log_path": None, "mode": "server", "pid": 59562,
+           "resolved_server_url": None, "server_url": server_url,
+           "started_at": 1791941709, "target": server_url}
+    row.update(over)
+    return row
+
+
 # ---------------------------------------------------------------------------
 # which session this is (the "is there one in $PWD" question)
 # ---------------------------------------------------------------------------
@@ -536,11 +584,14 @@ def test_no_online_host_means_this_machine_is_unknown_not_foreign(tmp_path):
 
 def test_the_host_lookup_rides_the_watchers_own_request_and_happens_once(
         tmp_path):
-    """ONE request per launch, asked of the watcher. It is the only holder of the
-    base URL and the per-server token, and `--server` can name a server we were
-    not handed one for — a second urllib call here would be a second opinion about
-    which server we are talking to, and would present a credential to a host it
-    was not issued for. Counted once even with several candidates to judge."""
+    """ONE request per launch, asked of the watcher — and only when this
+    machine's daemon record has nothing to say (the autouse fixture points
+    `$OMNIGENT_HOME` at an empty directory, which is the single-machine-install
+    case). The watcher is the only holder of the base URL and the per-server
+    token, and `--server` can name a server we were not handed one for — a second
+    urllib call would be a second opinion about which server we are talking to,
+    and would present a credential to a host it was not issued for. Counted once
+    even with several candidates to judge."""
     watcher = FakeWatcher([root_session("s1"),
                            root_session("s-elsewhere", cwd="/elsewhere"),
                            root_session("s-dead", runner_online=False),
@@ -634,10 +685,12 @@ def test_a_real_detail_row_with_no_host_still_attaches(tmp_path):
 
 
 def test_the_hosts_lookup_rides_the_same_authenticated_path(tmp_path):
-    """With a real watcher in hand, the hosts request is provably the watcher's
-    own: same opener, same base URL, and the token that was handed to it —
-    `--server` can name a server we hold no token for, and a second opener would
-    be a second opinion about which server we are on."""
+    """With a real watcher in hand, the fallback request is provably the
+    watcher's own: same opener, same base URL, and the token that was handed to
+    it — `--server` can name a server we hold no token for, and a second opener
+    would be a second opinion about which server we are on. (On a machine with a
+    daemon record there is no request at all; see
+    `test_a_daemon_record_skips_the_hosts_request_entirely`.)"""
     opener = RoutingOpener([listed("s-mine")],
                            {"s-mine": detail_of("s-mine", host_id=LOCAL_HOST)})
     watcher = SessionWatcher(base_url=SERVER, token="secret", opener=opener)
@@ -648,6 +701,240 @@ def test_the_hosts_lookup_rides_the_same_authenticated_path(tmp_path):
              if urllib.parse.urlsplit(r.full_url).path == "/v1/hosts"]
     assert [r.full_url for r in hosts] == [SERVER + "/v1/hosts"]
     assert all(r.get_header("Authorization") == "Bearer secret" for r in hosts)
+
+
+# --- which machine am I? the daemon record first, the API only if unambiguous ---
+# THE REVIEW FINDING, which is the second bug in this story and the more
+# expensive one: `/v1/hosts` describes every host the ACCOUNT has, across every
+# machine, so "the first online entry" is a position in a list this process has
+# no stake in. On a user who genuinely runs two machines — the user this whole
+# bug came from — the other one sorts first, and every `og start herdr` then
+# judged THIS machine's own session foreign: skipped, and a brand new space
+# opened. That is the unrecoverable direction (a second space, and a second `og
+# chat` into a conversation the operator already had) arriving through the very
+# filter added to prevent it.
+#
+# So: this machine's own daemon record decides, and an ambiguous answer is
+# unknown rather than a guess.
+
+def test_a_daemon_record_beats_another_machine_listed_first_and_online(tmp_path):
+    """THE REGRESSION GUARD for that finding, and it fails against the version
+    that took the first online host: `/v1/hosts` answers with exactly one online
+    entry, it is the WRONG machine, and the record this machine's own daemon
+    wrote says so."""
+    home = daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    hosts = {"hosts": [{"host_id": WORK_HOST, "status": "online"}]}
+
+    assert local_host_id(FakeWatcher(hosts=hosts), home=home) == LOCAL_HOST
+    # …and what the API alone says, which is precisely what the record exists to
+    # correct. Pinned so the fallback can never quietly grow back into "first
+    # online wins".
+    assert local_host_id(FakeWatcher(hosts=hosts),
+                         home=tmp_path / "no-daemon-home") == WORK_HOST
+
+
+def test_two_online_hosts_and_no_daemon_record_is_unknown_not_the_first(tmp_path):
+    """The finding's direct answer: the list cannot say who we are, so we do not
+    say. Guessing would skip the operator's own sessions on a machine that has
+    both online."""
+    hosts = {"hosts": [{"host_id": WORK_HOST, "status": "online"},
+                       {"host_id": LOCAL_HOST, "status": "online"}]}
+    assert local_host_id(FakeWatcher(hosts=hosts),
+                         home=tmp_path / "no-daemon-home") is None
+
+
+def test_a_local_session_still_attaches_when_the_hosts_list_cannot_say(tmp_path):
+    """…and the consequence of that unknown, end to end. The session below IS on
+    this machine, so a filter that guessed would skip it and open a second space
+    in a conversation the operator already had. Unknown filters nothing."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)],
+                          hosts={"hosts": [{"host_id": WORK_HOST, "status": "online"},
+                                           {"host_id": LOCAL_HOST,
+                                            "status": "online"}]})
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_one_online_host_and_no_daemon_record_is_used(tmp_path):
+    """The fallback's precondition, and the case it is still good for: ONE
+    online host leaves nothing to confuse it with. This is the shape a
+    single-machine install is in, which is why the fallback exists at all."""
+    assert local_host_id(FakeWatcher(), home=tmp_path / "no-daemon-home") == LOCAL_HOST
+
+
+@pytest.mark.parametrize("url_key", ["server_url", "target",
+                                     "resolved_server_url"])
+def test_a_record_counts_as_ours_under_any_of_its_three_url_keys(tmp_path, url_key):
+    """Which key is populated depends on mode and age — `resolved_server_url` is
+    null on a server-mode record — so reading only one would make the record
+    invisible for half the daemons this codebase starts."""
+    record = daemon_record(**{url_key: SERVER})
+    home = daemon_home(tmp_path, {"sig": record})
+
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+def test_a_record_for_another_server_is_not_ours(tmp_path):
+    """`--server` can name a server this launch is not talking to, and a daemon
+    record for THAT one says nothing about us."""
+    home = daemon_home(tmp_path, {"sig": daemon_record(
+        server_url="http://10.0.0.9:6767")})
+
+    assert local_host_id(FakeWatcher(), home=tmp_path / "no-daemon-home") == LOCAL_HOST
+    assert local_host_id(FakeWatcher(hosts={"hosts": []}),
+                         home=home) is None
+
+
+@pytest.mark.parametrize("shape", ["no_daemon_dir", "unreadable", "not_json",
+                                   "not_an_object", "no_host_id", "null_host_id",
+                                   "empty_host_id", "numeric_host_id",
+                                   "another_server_only"])
+def test_a_daemon_record_that_cannot_answer_falls_through_to_the_api(tmp_path,
+                                                                     shape):
+    """Every way a record can fail to say anything, and NONE of them may raise:
+    this lookup only ever sharpens a filter, so it must not be able to stop a
+    launch. Each one falls through to the unambiguous single-online answer, which
+    is what the pre-record behaviour was."""
+    home = tmp_path / "omnigent-home"
+    if shape == "no_daemon_dir":
+        home = tmp_path / "never-created"
+    elif shape == "unreadable":
+        # A DIRECTORY named like a record: read_text raises IsADirectoryError,
+        # which is the portable stand-in for "the file could not be read" (a
+        # chmod-000 file is not, under a runner that may be root).
+        (home / "daemons").mkdir(parents=True)
+        (home / "daemons" / "sig.json").mkdir()
+    elif shape == "not_json":
+        home = daemon_home(tmp_path, {})
+        (home / "daemons" / "sig.json").write_text("{not json")
+    elif shape == "not_an_object":
+        home = daemon_home(tmp_path, {})
+        (home / "daemons" / "sig.json").write_text('["a", "list"]')
+    elif shape == "no_host_id":
+        record = daemon_record()
+        del record["host_id"]
+        home = daemon_home(tmp_path, {"sig": record})
+    elif shape == "null_host_id":
+        home = daemon_home(tmp_path, {"sig": daemon_record(host_id=None)})
+    elif shape == "empty_host_id":
+        home = daemon_home(tmp_path, {"sig": daemon_record(host_id="")})
+    elif shape == "numeric_host_id":
+        home = daemon_home(tmp_path, {"sig": daemon_record(host_id=7)})
+    else:
+        home = daemon_home(tmp_path, {"sig": daemon_record(
+            server_url="http://10.0.0.9:6767")})
+
+    # Falls through to the API's single online host rather than raising or
+    # returning a half-answer.
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+@pytest.mark.parametrize("spelling", ["http://127.0.0.1:6767/",
+                                      "HTTP://127.0.0.1:6767"])
+def test_a_record_counts_as_ours_when_the_urls_differ_only_in_spelling(tmp_path,
+                                                                      spelling):
+    """The match goes through `og_herdr_watch._server_key`, the same canonical
+    form that decides which token belongs to which server, so a trailing slash or
+    a shouted scheme is one server rather than two — and a userinfo in the URL
+    cannot reach the comparison, the same reason that function strips it."""
+    home = daemon_home(tmp_path, {"sig": daemon_record(server_url=spelling)})
+
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+def test_a_record_naming_another_port_is_not_ours(tmp_path):
+    """Canonicalisation must not be so aggressive that it merges servers: the
+    port is part of the identity, exactly as it is for the token."""
+    home = daemon_home(tmp_path, {"sig": daemon_record(
+        server_url="http://127.0.0.1:6768")})
+
+    assert local_host_id(FakeWatcher(hosts={"hosts": []}), home=home) is None
+
+
+def test_two_records_for_this_server_that_agree_are_one_answer(tmp_path):
+    """The filename is a config signature, so a restarted daemon writes a second
+    one. Agreement is not ambiguity — it is the same machine, twice."""
+    home = daemon_home(tmp_path, {
+        "21c1ba0105d3dd34": daemon_record(),
+        "9f0c1122aabbccdd": daemon_record(signature="deadbeefdeadbeef"),
+    })
+
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+def test_two_records_for_this_server_that_disagree_are_unknown(tmp_path):
+    """And disagreement IS ambiguity, and it is NOT a fall-through to the API:
+    two daemons on this machine claiming this server with two different machines
+    is our own evidence contradicting itself, and that is precisely when letting
+    the account-wide list answer instead would be worst. Unknown even though
+    `/v1/hosts` would have offered a tidy single online host."""
+    home = daemon_home(tmp_path, {
+        "21c1ba0105d3dd34": daemon_record(),
+        "9f0c1122aabbccdd": daemon_record(host_id=WORK_HOST),
+    })
+
+    assert local_host_id(FakeWatcher(hosts=HOSTS), home=home) is None
+
+
+def test_contested_records_still_attach_rather_than_skipping(tmp_path):
+    """…and unknown still means unknown: the session below is on this machine,
+    so the contested lookup must cost the operator nothing."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record(),
+                           "9f0c1122aabbccdd": daemon_record(host_id=WORK_HOST)})
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)])
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_a_daemon_record_still_lets_a_foreign_session_be_skipped(tmp_path):
+    """(f) The behaviour the rule exists for, with the id now coming from the
+    record rather than the API. A work-mac session in this directory must not be
+    adopted just because the identity is now certain."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)])
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert ("omnigent attach --server {0} s-work".format(SERVER)
+            not in client.text_typed())
+
+
+def test_a_daemon_record_still_attaches_this_machines_own_session(tmp_path):
+    """The other side of that pair, and the regression guard for the finding in
+    its worst shape: a session on THIS host must never be skipped just because
+    another machine exists."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)],
+                          hosts={"hosts": [{"host_id": WORK_HOST, "status": "online"},
+                                           {"host_id": LOCAL_HOST,
+                                            "status": "online"}]})
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_a_daemon_record_skips_the_hosts_request_entirely(tmp_path):
+    """With an identity in hand there is nothing left for `/v1/hosts` to answer,
+    so the launch makes no request at all."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)])
+
+    launch(make_ctx(tmp_path, FakeClient(), watcher))
+
+    assert watcher.urls == []
 
 
 def test_is_inside_reads_herdr_env():
