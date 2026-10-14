@@ -2362,21 +2362,30 @@ def _theme_role(role: str) -> Optional[str]:
 def _role_value(role: str, theme: Optional[Theme], colors: int) -> Optional[int]:
     """`role` as the int `init_pair(n, fg, bg)` wants on a terminal with `colors`.
 
-    THEME ROLES GO THROUGH THE CATALOG'S HEX, so a truecolor terminal takes the
-    exact value the catalog names: dracula's parchment #ffd7af stays parchment
-    instead of being quantised. Below truecolor the same hex goes through
-    `hex_to_ansi256`, which will NOT let a colour with chroma land on a grey —
-    the hex this replaced, #f0e6d2, resolved to cell 254, a pure grey, and took
-    every chromatic theme role in the catalog down with it. It will also not let
-    a DARK tint reach for the cube's saturated primaries, because paying 0.13 of
-    OKLab to hold a hue the palette cannot express is a worse failure than a
-    charcoal grey; see MAX_CHROMA_PENALTY.
+    THEME ROLES GO THROUGH THE CATALOG'S HEX AND THEN THE 256 PALETTE, because
+    that is the only thing `init_pair` accepts: a colour NUMBER. `hex_to_ansi256`
+    will NOT let a colour with chroma land on a grey — the hex this replaced,
+    #f0e6d2, resolved to cell 254, a pure grey, and took every chromatic theme
+    role in the catalog down with it. It will also not let a DARK tint reach for
+    the cube's saturated primaries, because paying 0.13 of OKLab to hold a hue
+    the palette cannot express is a worse failure than a charcoal grey; see
+    MAX_CHROMA_PENALTY. There is no 24-bit branch to bypass any of this, and
+    there is not one to have: `curses.init_extended_pair` does not exist in the
+    ncurses this ships against (`curses_value` records the measurement).
 
-    MARK ROLES STAY 256-PALETTE INDICES even on a truecolor terminal, because
-    `_VENDOR_COLOURS` IS a table of palette indices and the readability guard
-    above it is reasoned in that same space — moving marks into 24-bit would be
-    answering a question nobody asked and would put the guard's output through a
-    second, different conversion.
+    A THEME ROLE THAT IS `"default"` ANSWERS `-1`, NOT None. That is the whole
+    contract of the value and it is legal in every role, including as a
+    foreground: `-1` is curses' "the terminal's own", and a span whose text is
+    `"default"` on a themed background still has to paint ON that background.
+    Returning None here would spend no pair at all and silently drop it. None is
+    reserved for the OTHER absence — a role that names no colour because it is a
+    WEIGHT (`ORCH`) or a mark nobody has — which has no colour to contribute and
+    so cannot be the foreground of a pair either.
+
+    MARK ROLES STAY 256-PALETTE INDICES, because `_VENDOR_COLOURS` IS a table of
+    palette indices and the readability guard above it is reasoned in that same
+    space — moving marks anywhere else would be answering a question nobody asked
+    and would put the guard's output through a second, different conversion.
     """
     bare = _bare_role(role)
     if bare.startswith("mark:"):
@@ -2386,8 +2395,7 @@ def _role_value(role: str, theme: Optional[Theme], colors: int) -> Optional[int]
         return None
     if theme is None:
         return META_COLOR if name == META else _STATE_COLOURS.get(name)
-    return None if theme.is_default(name) \
-        else curses_value(theme.colour(name), colors)
+    return curses_value(theme.colour(name), colors)
 
 
 def _theme_index(theme: Theme, role: str) -> Optional[int]:
@@ -2511,11 +2519,16 @@ class _Colours:
             return self._pairs[key]
         attr = 0
         try:
-            # BOTH ends are range-checked against COLORS. That is the existing
-            # degradation rule applied to the new half: a truecolor background on
-            # a 256-colour terminal is as unallocatable as a 256 foreground on an
-            # 8-colour one, and the honest answer is to paint the glyph bare.
-            if (fg < self._colors and (bg < 0 or bg < self._colors)
+            # BOTH ends are range-checked against COLORS, and `-1` — the one value
+            # below it curses accepts, on either side — is legal on both. Nothing
+            # else is: a 256 foreground on an 8-colour terminal is as
+            # unallocatable as a background over the same terminal's table, and
+            # the honest answer is to paint the glyph bare. There is no third
+            # case any more. With the truecolor branch gone from `curses_value`,
+            # every value that reaches here is `-1` or a cell of the 240, so the
+            # colour painted is the SAME on every terminal.
+            if ((fg == CURSES_DEFAULT or 0 <= fg < self._colors)
+                    and (bg == CURSES_DEFAULT or 0 <= bg < self._colors)
                     and self._next < self._curses.COLOR_PAIRS):
                 self._curses.init_pair(self._next, fg, bg)
                 attr = self._curses.color_pair(self._next)
@@ -2556,12 +2569,31 @@ class _Colours:
 
     def role_attr(self, role: str, theme: Optional[Theme] = None, *,
                     on_selected: bool = False) -> int:
-        """The pair attribute `role` paints at, or 0 when it carries no colour."""
+        """The pair attribute `role` paints at, or 0 when there is no pair to spend.
+
+        A FOREGROUND OF `-1` STILL SPENDS A PAIR whenever the background is a
+        colour, and that is not a corner. `"default"` means "the terminal's own
+        TEXT", not "the terminal's own cell", so a span that inherits its
+        foreground while sitting on the theme's background has to be painted ON
+        that background. Returning nothing for a `"default"` foreground spent no
+        pair at all, which dropped the background silently: the operator asked
+        for terminal-coloured text on a themed pane and got terminal text on
+        whatever was behind the pane. No shipped theme reaches it — `og` has
+        `"default"` on BOTH ends of every role it leaves — and a hand-edited row
+        that mixes the two is what the fix is for.
+
+        ZERO IS FOR THE TWO CASES THAT REALLY HAVE NO PAIR TO SPEND: both ends
+        `"default"`, where `use_default_colors` has already made pair 0 the
+        terminal's own colours, and a role that names no colour at all (`ORCH` is
+        a weight, a mark nobody has), which has no foreground to contribute.
+        """
         active = self.theme if theme is None else theme
         fg = _role_value(role, active, self._colors)
         if fg is None:
-            return 0
+            return 0                       # a weight, or a mark nobody has
         background = _role_background(role, active, on_selected=on_selected)
+        if fg == CURSES_DEFAULT and background is None:
+            return 0                       # both ends `"default"`: pair 0 already is
         bg = CURSES_DEFAULT if background is None \
             else curses_value(background, self._colors)
         return self.attr(fg, bg)
