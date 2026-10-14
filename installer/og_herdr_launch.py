@@ -427,6 +427,14 @@ def live_session(watcher, cwd: str,
     able to hide a local session. See `session_on_another_host` for the full
     truth table.
 
+    The session's OWN `host_id` arrives the same way its directory does — on the
+    DETAIL row, merged in by `og_herdr_watch._enrich` — because the LISTING row
+    carries no `host_id` at all (measured; see `og_herdr_watch.DETAIL_FIELDS`).
+    That is worth stating plainly here: a filter reading `session.get("host_id")`
+    off an event the watcher did not enrich it with reads "unknown" on every
+    single session, and unknown means "do not filter" — which is this rule
+    silently doing nothing.
+
     `poll_once` is used rather than `list_sessions` because the directory is on
     the DETAIL row only; poll_once enriches exactly the sessions it has not seen
     before, which for a fresh process is all of them, so it costs one detail

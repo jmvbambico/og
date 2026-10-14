@@ -1278,6 +1278,67 @@ def test_a_failed_detail_fetch_still_omits_the_identity_fields():
         assert event.session["title"] == "coder_zen:space-per-session"
 
 
+# --------------------------------------------------------------------------
+# the session's MACHINE: which host does it run on? The launcher's attach path
+# needs this — it must not type an `omnigent attach` for a session belonging to
+# another machine — and the LISTING row does not carry it (measured; see the key
+# list in `runner_is_offline`). So if this is not forwarded here, the rule that
+# uses it can never fire, and the pane it opens says only "its host is
+# offline". That is the bug these two pin.
+# --------------------------------------------------------------------------
+
+def test_the_host_id_rides_the_detail_row_onto_the_event():
+    # Stated as the wiring bug it was: `_enrich` copies the LISTING row and
+    # forwards a few detail fields, so a session's host was dropped on the floor
+    # between the server and `og_herdr_launch.live_session`. The launcher then
+    # read "unknown", and unknown means "do not filter" — so a work-mac session
+    # in the same project path was adopted and its pane opened on an attach
+    # bound for another machine.
+    opener = RoutingOpener(
+        [envelope([session("s1")])],
+        details={"s1": detail("s1", workspace="/repo/og", host_id="host_a1b2c3")},
+    )
+    event = w.SessionWatcher(opener=opener).poll_once()[0]
+
+    assert event.session["host_id"] == "host_a1b2c3"
+    # …and it really does come from the detail row: the listing fixture carries
+    # no such key, so this assertion is the half that says "detail-only".
+    assert "host_id" not in session("s1")
+
+
+def test_a_detail_row_with_no_host_leaves_the_key_absent():
+    # A sub-agent reports `host_id: null` (measured), and the merge guard drops
+    # a non-string rather than forwarding it — which is what the launcher needs:
+    # an ABSENT key is the honest "I do not know which machine this is", and a
+    # null would be one more thing every consumer has to learn to read as
+    # "not mine".
+    for value in (None, ""):
+        opener = RoutingOpener(
+            [envelope([session("s1")])],
+            details={"s1": detail("s1", workspace="/repo/og", host_id=value)},
+        )
+        enriched = w.SessionWatcher(opener=opener).poll_once()[0].session
+
+        assert "host_id" not in enriched, value
+
+
+def test_the_host_id_costs_no_request_beyond_the_ones_already_paid():
+    # Same one-fetch-per-newly-seen-session contract as everything else merged
+    # here: the host is an answer from the row being fetched anyway, never a
+    # round trip of its own.
+    opener = RoutingOpener(
+        [envelope([session("s1")]), envelope([session("s1")])],
+        details={"s1": detail("s1", workspace="/repo/og", host_id="host_a1b2c3")},
+    )
+    watcher = w.SessionWatcher(opener=opener)
+
+    assert watcher.poll_once()[0].session["host_id"] == "host_a1b2c3"
+    watcher.poll_once()
+
+    assert len(opener.detail_requests) == 1, (
+        [r.full_url for r in opener.detail_requests])
+
+
 def test_a_changed_event_does_not_refetch_the_detail():
     # The other half of "once per session": a `changed` event is a session the
     # watcher already knows, so it must not cost a request either.
