@@ -25,6 +25,13 @@ no session id to record the space under, and the handshake is a `pending`
 record keyed by directory that og_herdr's bridge claims when a session appears
 there. (B) and (C) already have one, and adopt.
 
+That handshake now has a SECOND end, and it is the same record: the operator
+can open a space by hand ("new space"), `cd` into a directory and type `og
+chat` — so `og chat` itself has to write the pending record for the pane it is
+running in, and open the `og agents` split beside it. See `chat_pane`, reached
+as `og_herdr_launch.py chat-pane` from bin/og. It is the SAME writer for the
+same reason this module is: one spelling of the state format, in one file.
+
 The pending record is written BEFORE `og chat` is typed. The bridge is already
 running (bin/og starts it first) and polls every few seconds, so a record
 written AFTER the send can lose that race — the poll sees a root session with
@@ -121,7 +128,12 @@ LIVE_STATUSES = frozenset({"running", "idle"})
 AGENT_NAME_KEY = "agent_name"
 AGENTS_PANE_KEY = "herdr_agents_pane"
 SESSION_SPACE_CAP_KEY = "herdr_session_space_cap"
+PROJECTS_DIR_KEY = "projects_dir"
 DEFAULT_AGENT_NAME = "dev-lead"
+# Where a RELATIVE `og chat --dir` lands. `~/projects` because that is where
+# `og_repo_dir` (bin/og) already looks for a checkout, so the two halves of the
+# installer agree on where work lives.
+DEFAULT_PROJECTS_DIR = "~/projects"
 
 # How long to wait for `herdr server` to answer a ping before giving up. Bounded
 # on purpose: a launcher that blocks here is an `og start` that never finishes
@@ -216,6 +228,54 @@ def session_space_cap(config: dict) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return DEFAULT_SPACE_CAP
     return value
+
+
+def projects_dir(config: dict) -> Path:
+    """The root a RELATIVE `og chat --dir` resolves against.
+
+    `~` is expanded HERE and not by the installer, so a plan written by hand —
+    or by an installer that predates the key — means the same thing as one
+    written by `og setup`. Anything that is not a non-empty string falls back to
+    the default rather than raising, on the `session_space_cap` rule: this is
+    read on the way to exec'ing a REPL, and an unusable hand-edited value must
+    not be the reason `og chat` will not start.
+    """
+    value = config.get(PROJECTS_DIR_KEY)
+    if not isinstance(value, str) or not value.strip():
+        value = DEFAULT_PROJECTS_DIR
+    return Path(value.strip()).expanduser()
+
+
+def resolve_chat_dir(path: str, config: dict) -> Path:
+    """The directory `og chat --dir <path>` roots the session in.
+
+    ABSOLUTE is used as given. RELATIVE resolves against the configured
+    projects root (`projects_dir`), which is what makes `og chat --dir og` mean
+    something from $HOME, where the interesting thing is a repo under
+    ~/projects.
+
+    A path that does not exist is REFUSED, never created. `omnigent run` roots
+    the session at `Path.cwd().resolve()` (omnigent cli.py), so a missing
+    directory would have to be made by something — and an `og chat` that
+    silently mkdirs a typo is a session rooted in an empty directory with no
+    error anywhere in it. Resolution also normalises the path (`.resolve()`), so
+    what comes back is what `os.getcwd()` will report in the pane, which is
+    the string the pending record below is keyed by and the string the bridge
+    matches against.
+    """
+    target = Path(path).expanduser()
+    relative = not target.is_absolute()
+    if relative:
+        target = projects_dir(config) / target
+    resolved = target.resolve()
+    if not resolved.exists():
+        raise LaunchError("--dir {0}: no such directory{1}".format(
+            path,
+            " — a relative path resolves against {0}".format(
+                projects_dir(config)) if relative else ""))
+    if not resolved.is_dir():
+        raise LaunchError("--dir {0}: not a directory".format(path))
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -338,16 +398,33 @@ def launch_log_path(ctx: Launch) -> Optional[Path]:
     return ctx.log_path.parent / LAUNCH_LOG_NAME
 
 
+def launcher_log_path() -> Optional[Path]:
+    """The launcher log derived from $OMNIGENT_HOME rather than from a launch.
+
+    `launch_log_path` (the launch's own) derives from `ctx.log_path` so a launch
+    that redirects the log directory moves the log with it. A caller with no
+    launch behind it — `chat_pane`, which runs from a pane the operator opened
+    by hand — has no `ctx` to derive from, and `~/.omnigent/logs` is where
+    `build_launch` puts it anyway, so both spellings name one file.
+    """
+    base = Path(os.environ.get("OMNIGENT_HOME") or Path.home() / ".omnigent")
+    return base / "logs" / LAUNCH_LOG_NAME
+
+
 def log_line(ctx: Launch, line: str) -> None:
     """Append one timestamped line to the launcher log. Never raises.
 
-    Best effort to exactly the degree the failure it describes is: a log that
+    Best effort to exactly the degree the failure it describes: a log that
     cannot be written must not turn a degraded launch into a failed one. A
     launch with no log at all (a test, or an older caller that passes no
     `log_path`) simply has no durable channel, which is the old behaviour and
     not a reason to fail.
     """
-    path = launch_log_path(ctx)
+    _append_log(launch_log_path(ctx), line)
+
+
+def _append_log(path: Optional[Path], line: str) -> None:
+    """One timestamped line in `path`, or nothing at all. Never raises."""
     if path is None:
         return
     try:
@@ -597,7 +674,7 @@ def _open_space(ctx: Launch, attach: bool) -> str:
     # takes its record with it. The `pane_run` path below does not rest on that
     # — the space SURVIVES a failed send, and a live-but-empty space is exactly
     # what the bridge will not prune — so it drops the record itself.
-    _record(ctx, "pending", ctx.cwd, {
+    _record(ctx.state_path, "pending", ctx.cwd, {
         "workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
         "owner": OWNER_LAUNCHER, "cwd": ctx.cwd,
     })
@@ -607,7 +684,7 @@ def _open_space(ctx: Launch, attach: bool) -> str:
         # No session was minted, so nothing will ever claim this record; drop it
         # and close the space it named (the create-missing-pane rule above:
         # "no stray empty spaces").
-        _unrecord(ctx, "pending", ctx.cwd)
+        _unrecord(ctx.state_path, "pending", ctx.cwd)
         _close_quietly(ctx, ws_id)
         raise
     if ctx.agents_pane:
@@ -632,22 +709,33 @@ def _close_quietly(ctx: Launch, ws_id: str) -> None:
 
 
 def split_agents_pane(client, ws_id: str, tab_id: str, root_pane: str,
-                      cwd: str, pane_env) -> list:
+                      cwd: str, pane_env, known_panes=None) -> list:
     """Put `og agents` in a split beside `root_pane`; RETURN what failed.
 
-    ONE implementation of the split, called by the two things that open a pane
+    ONE implementation of the split, called by the three things that open a pane
     og expects to carry an `og agents` beside it: the launcher's `_open_space`
-    (case A/D) and the bridge's history/resume space
-    (`og_herdr._add_history_space`). The bridge never split, so resuming a past
-    conversation from the spaces list came up without the pane a fresh `og start`
-    opens — and a second copy of the split would only drift, leaving the next
-    person to discover which one ran.
+    (case A/D), the bridge's history/resume space (`og_herdr._add_history_space`)
+    and `og chat` in a pane the operator opened by hand (`chat_pane`). The
+    bridge never split, so resuming a past conversation from the spaces list came
+    up without the pane a fresh `og start` opens — and a second copy of the
+    split would only drift, leaving the next person to discover which one ran.
+
+    `known_panes` is the set of pane ids the tab held BEFORE the split, for a
+    caller whose tab may already have other panes in it. The two callers that
+    create their own space pass nothing: there is exactly one split, so
+    difference against the tab is exact. An operator's hand-made tab is not —
+    they may have split it themselves — and taking the lowest-numbered "other
+    pane" there would type `og agents` into THEIR pane. Given the set, a pane
+    that is not in it is the one just made; if none is, the split's new pane
+    could not be identified and `og agents` is not started, which is the safe
+    answer.
 
     It RETURNS its failures rather than reporting them, so each caller can route
     a degradation through its own channel: the launcher's `_split_agents` sends
     each line through `report` (log + re-surface before the terminal is handed
-    to herdr), and the bridge appends them to its `reconcile` lines. The strings
-    are deliberately stable so the launcher's log-matching tests keep passing.
+    to herdr), the bridge appends them to its `reconcile` lines, and `chat_pane`
+    prints and logs them. The strings are deliberately stable so the launcher's
+    log-matching tests keep passing.
     """
     params = {"target_pane_id": root_pane, "direction": "right",
               "focus": False, "cwd": cwd, "ratio": AGENTS_PANE_RATIO}
@@ -658,7 +746,7 @@ def split_agents_pane(client, ws_id: str, tab_id: str, root_pane: str,
     except Exception as exc:
         return ["could not open the og agents pane ({0}); the chat is up "
                 "without it".format(exc)]
-    pane_id = _split_pane_id(client, ws_id, tab_id, root_pane, reply)
+    pane_id = _split_pane_id(client, ws_id, tab_id, root_pane, reply, known_panes)
     if not pane_id:
         return ["herdr split the chat pane but reported no new pane id; "
                 "`og agents` was not started there"]
@@ -692,14 +780,17 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
 
 
 def _split_pane_id(client, ws_id: str, tab_id: str, root_pane: str,
-                   reply: Any) -> Optional[str]:
+                   reply: Any, known_panes=None) -> Optional[str]:
     """The pane `pane.split` just made.
 
     The reply does not name it: the schema's `pane.split` result is `{"type":
     "ok"}` — no pane, no id. So the new pane is found by DIFFERENCE against the
-    tab, which is exact while there is exactly one split (there is: the launch
-    makes one) and is pinned here so a future second split cannot quietly return
-    the wrong pane. A reply that does carry the pane is preferred over the
+    tab, which is exact while there is exactly one split (there is, for a caller
+    that made the space itself) and is pinned here so a future second split
+    cannot quietly return the wrong pane. `known_panes` (the tab's panes as they
+    were BEFORE the split) narrows that difference to the pane herdr just made,
+    for a caller whose tab the operator may already have split; see
+    `split_agents_pane`. A reply that does carry the pane is preferred over the
     listing, since a server that starts naming it should not have its answer
     second-guessed.
     """
@@ -715,7 +806,27 @@ def _split_pane_id(client, ws_id: str, tab_id: str, root_pane: str,
         str(pane.get("pane_id")) for pane in (panes or {}).get("panes", [])
         if isinstance(pane, dict) and pane.get("tab_id") == tab_id
         and pane.get("pane_id") and pane.get("pane_id") != root_pane)
+    if known_panes is not None:
+        fresh = [pane_id for pane_id in others if pane_id not in known_panes]
+        return fresh[0] if fresh else None
     return others[0] if others else None
+
+
+def tab_pane_ids(client, ws_id: str, tab_id: str) -> set:
+    """The pane ids herdr currently lists in a tab, or an EMPTY set.
+
+    Read BEFORE a split so the pane that split makes can be told from the ones
+    the operator had already. An empty set is the honest "could not find out",
+    and `_split_pane_id` then refuses to guess — an unreadable listing is not a
+    licence to type `og agents` into whichever pane sorts first.
+    """
+    try:
+        panes = client.call("pane.list", {"workspace_id": ws_id})
+    except Exception:
+        return set()
+    return {str(pane.get("pane_id")) for pane in (panes or {}).get("panes", [])
+            if isinstance(pane, dict) and pane.get("tab_id") == tab_id
+            and pane.get("pane_id")}
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +920,7 @@ def _adopt(ctx: Launch, session: dict) -> dict:
     ctx.client.pane_run(pane_id, attach_command(ctx.server, sid))
     record = {"workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
               "owner": OWNER_LAUNCHER, "cwd": str(cwd)}
-    _record(ctx, "spaces", sid, record)
+    _record(ctx.state_path, "spaces", sid, record)
     info("adopted session {0} into space {1}".format(sid, ws_id))
     return record
 
@@ -824,29 +935,212 @@ def _load(ctx: Launch) -> dict:
             "pending": state.get("pending") or {}}
 
 
-def _record(ctx: Launch, bucket: str, key: str, record: dict) -> None:
+def _record(state_path: Path, bucket: str, key: str, record: dict) -> None:
     """Put one record into the shared state file, through og_herdr's writer.
 
     Re-read immediately before writing: the file is not a lock and both this
     process and the bridge write it, whole and last-writer-wins (see
     og_herdr.save_state). A load at the top of the launch and a save here would
     silently drop whatever the bridge wrote in between.
+
+    Takes the PATH rather than a `Launch` because the record now has two
+    writers — the launcher's `_open_space` and `og chat`'s own pane
+    (`record_chat_pane`) — and the re-read rule has to hold for both of them,
+    not be re-implemented for whichever caller was written second.
     """
-    state = load_state(ctx.state_path)
+    state = load_state(state_path)
     state.setdefault(bucket, {})[key] = record
-    save_state(ctx.state_path, state)
+    save_state(state_path, state)
 
 
-def _unrecord(ctx: Launch, bucket: str, key: str) -> None:
+def _unrecord(state_path: Path, bucket: str, key: str) -> None:
     """Drop one record, re-reading first for the same reason `_record` does.
 
     Used when a record names a space that turned out to be unusable — the chat
     never started, so no session will ever claim it. Missing key is not an
     error: the bridge may have claimed it already, which is also a fine outcome.
     """
-    state = load_state(ctx.state_path)
+    state = load_state(state_path)
     state.setdefault(bucket, {}).pop(key, None)
-    save_state(ctx.state_path, state)
+    save_state(state_path, state)
+
+
+def record_chat_pane(state_path: Path, cwd: str, workspace_id: str,
+                     tab_id: str, pane_id: str) -> dict:
+    """Record THIS pane as the one a session in `cwd` will be run in.
+
+    The record `_open_space` writes, through the same writer, keyed by the same
+    thing: the directory. `og chat` mints the session the instant it execs, and
+    there is no session id yet to key it by, so the bridge claims this record
+    when a root appears in this directory (og_herdr._claim_pending) and renames
+    the space to the conversation's title — which is the entire point of an
+    operator opening a space by hand, `cd`ing into a repo and typing `og chat`.
+
+    Written BEFORE the exec for the same reason `_open_space` writes before it
+    types: the bridge is already running and polls every few seconds, so a
+    record written after the session exists can lose the race and the poll
+    opens a second space.
+    """
+    record = {"workspace_id": workspace_id, "tab_id": tab_id,
+              "pane_id": pane_id, "owner": OWNER_LAUNCHER, "cwd": cwd}
+    _record(state_path, "pending", cwd, record)
+    return record
+
+
+# ---------------------------------------------------------------------------
+# `og chat`'s end of the same handshake — the other way a space gets a session
+# ---------------------------------------------------------------------------
+# The user's flow this exists for: "new space" in herdr, `cd` to the repo, `og
+# chat`. No launcher ran, so nothing wrote the pending record the bridge adopts
+# — and the bridge, seeing a root session appear in a directory it has no space
+# for, opens a SECOND space for the conversation already on screen. So `og
+# chat` writes the record itself, for the pane it is running in, and puts the
+# agents pane beside it the way `_open_space` does.
+#
+# It is a NO-OP outside a herdr pane — a plain `og chat` in an ordinary terminal
+# must behave exactly as it always has, including never touching the state file.
+# The marker is `HERDR_ENV=1`, herdr's own flag for "this process was spawned by
+# a managed pane" (measured, not assumed: herdr's bundled agent skill, `herdr
+# --skill`, states `test "${HERDR_ENV:-}" = 1` as the check before touching
+# herdr, and the same pane context is what `is_inside` above already reads).
+
+# The pane context herdr injects into every managed pane. Measured against
+# herdr 0.9.4 the same way: `herdr --skill` documents HERDR_WORKSPACE_ID,
+# HERDR_TAB_ID and HERDR_PANE_ID as the caller context it injects into each
+# managed pane (and herdr's binary carries them as one contiguous env-table
+# block, which is why they are a set rather than three guesses). Nothing here
+# invents a name.
+PANE_ID_KEYS = ("HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID")
+
+
+def pane_identity(env: dict) -> Optional[tuple]:
+    """`(workspace_id, tab_id, pane_id)` for the pane this process is in.
+
+    None when herdr did not put all three in the environment. All three are
+    required rather than defaulted: a pending record with a null tab or pane id
+    is one the bridge would adopt and then fail to set up against, and that —
+    a record naming a pane that does not exist — is worse than recording
+    nothing, which costs the operator nothing but a second space they can
+    close.
+    """
+    ids = tuple((env.get(key) or "").strip() for key in PANE_ID_KEYS)
+    return ids if all(ids) else None
+
+
+def _chat_client(environ: dict):
+    """A herdr client for the pane this process is in.
+
+    Built lazily and only when a split is actually wanted: `HerdrClient` resolves
+    its socket from `$HERDR_SOCKET_PATH` / `$HERDR_SESSION` — both set by herdr
+    in a pane — and connects on the first call, so a `chat_pane` with nothing to
+    split must not construct one at all. `environ` is passed rather than read
+    from `os.environ` so the socket resolves against the same environment the
+    pane identity came from; in production the two are the same dictionary.
+    """
+    from og_herdr_client import HerdrClient
+    return HerdrClient(socket_path=HerdrClient.resolve_socket_path(
+        None, env=environ))
+
+
+def chat_pane(argv=None, client=None, env=None) -> int:
+    """`og chat`'s multiplexer half. Run by bin/og before it execs the REPL.
+
+    `argv` takes `--dir <path>`; a None means NO arguments rather than this
+    process's own command line — `main` is the only caller that reads
+    `sys.argv`, and a helper that silently parsed whatever launched the
+    interpreter is how a test ends up asserting on pytest's flags.
+
+    The resolved directory is printed on **stdout** as data (bin/og captures it,
+    `cd`s there and execs `omnigent run` from it) and every human-facing line
+    goes to stderr, so the capture can never pick up a sentence.
+
+    `client` is the herdr client, injected so no test opens a real socket; None
+    means "build one if a split is actually needed".
+
+    Exit codes: 0 for the ordinary case, INCLUDING every degradation — the chat
+    is the session and a cosmetic second pane must not be able to stop it, which
+    is the trade `report`/`_split_agents` already makes. 2 only for `--dir`
+    naming something that is not a directory, which is a refusal rather than a
+    degradation: running the session somewhere the operator did not ask for is
+    not a degraded version of what they asked for.
+    """
+    args = build_chat_parser().parse_args([] if argv is None else argv)
+    environ = dict(os.environ) if env is None else dict(env)
+    config = install_config()
+
+    cwd = None
+    if args.dir:
+        try:
+            cwd = str(resolve_chat_dir(args.dir, config))
+        except LaunchError as exc:
+            print("error: {0}".format(exc), file=sys.stderr)
+            return 2
+        print(cwd)
+
+    # Outside herdr there is nothing to record and nothing to split. Checked
+    # here as well as in bin/og (which gates on the same variable to avoid
+    # spawning python for every plain `og chat`): this is the end that OWNS the
+    # handshake, so it cannot take the caller's word for it.
+    if not is_inside(environ):
+        return 0
+
+    identity = pane_identity(environ)
+    if identity is None:
+        _chat_degrade(
+            "HERDR_ENV says this is a herdr pane, but it carries none of "
+            "{0}, so the chat was not recorded; the bridge will open its own "
+            "space for it".format(", ".join(PANE_ID_KEYS)))
+        return 0
+    ws_id, tab_id, pane_id = identity
+
+    # `os.getcwd()` and not `$PWD`: the record is claimed by EXACT match against
+    # the session's own `workspace`, which `omnigent run` fills with
+    # `str(Path.cwd().resolve())` (cli.py) — a physical path, where a shell's
+    # `$PWD` is a logical one and the two part company under a symlink.
+    here = cwd or os.getcwd()
+    try:
+        record_chat_pane(default_state_path(), here, ws_id, tab_id, pane_id)
+    except Exception as exc:
+        # The record is what stops a second space appearing; failing to write it
+        # is not worth refusing the chat over, but it must never be silent.
+        _chat_degrade("could not record this pane for the bridge ({0})".format(exc))
+
+    if not agents_pane_enabled(config):
+        return 0
+
+    opened = client if client is not None else _chat_client(environ)
+    try:
+        # Read the tab's panes BEFORE splitting: unlike a launch, this tab is one
+        # the operator made and may have split themselves, and "the first pane
+        # in this tab that is not the chat pane" is then their pane, not ours.
+        for line in split_agents_pane(opened, ws_id, tab_id, pane_id, here,
+                                      pane_env_for(environ),
+                                      known_panes=tab_pane_ids(
+                                          opened, ws_id, tab_id)):
+            _chat_degrade(line)
+    except Exception as exc:
+        _chat_degrade("could not open the og agents pane ({0}); the chat is up "
+                      "without it".format(exc))
+    finally:
+        if client is None:
+            try:
+                opened.close()
+            except Exception:
+                pass
+    return 0
+
+
+def _chat_degrade(line: str) -> None:
+    """Say what did not work, where it survives the REPL taking the terminal.
+
+    Printed AND logged, for the reason `report` gives: `og chat` ends in an
+    `exec omnigent run`, whose REPL takes over the terminal in the same way
+    herdr's TUI does, so a line that reached only stderr is gone before anybody
+    reads it. The log is the copy that answers "why did the agents pane never
+    appear?" days later.
+    """
+    print("! " + line, file=sys.stderr)
+    _append_log(launcher_log_path(), line)
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +1208,28 @@ def spawn_herdr_server(binary: str, log_path: Path) -> Callable[[], Any]:
 # CLI
 # ---------------------------------------------------------------------------
 
+# The second entry point, as a SUBCOMMAND rather than another `og start` flag:
+# `og start` and `og chat` are different jobs with different callers (bin/og's
+# `cmd_start` vs `cmd_chat`), and one flag set for both would make every
+# `og start` flag mean something in a command that has none of them.
+CHAT_PANE_COMMAND = "chat-pane"
+
+
+def build_chat_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="og chat (herdr pane handshake)",
+        description="Record the pane this `og chat` is running in, and open the "
+                    "`og agents` pane beside it. Does nothing outside a herdr "
+                    "pane. Prints the resolved --dir on stdout; everything a "
+                    "human should read goes to stderr.")
+    ap.add_argument("--dir", default=None,
+                    help="directory to root the session in. Absolute paths are "
+                         "used as given; a relative one resolves against the "
+                         "install's projects_dir (default: {0}). Refused if it "
+                         "does not exist.".format(DEFAULT_PROJECTS_DIR))
+    return ap
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="og start {0}".format(MUX_HERDR),
@@ -958,6 +1274,12 @@ def build_launch(args: argparse.Namespace) -> Launch:
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Dispatched on the subcommand BEFORE the `og start` parser sees it, so that
+    # parser keeps exactly the flags it has always had — `og start herdr --once`
+    # must not grow a vocabulary it does not want.
+    if argv and argv[0] == CHAT_PANE_COMMAND:
+        return chat_pane(argv[1:])
     args = build_parser().parse_args(argv)
     if args.mux != MUX_HERDR:
         # A registry row buys detection and the README table; the backend code

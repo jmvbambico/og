@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import shlex
 import socket
@@ -1380,6 +1381,107 @@ def test_the_herdr_agents_pane_key_round_trips_into_state(tmp_path, monkeypatch)
 
 
 # --------------------------------------------------------------------------
+# projects_dir -- the root `og chat --dir <name>` resolves against
+# --------------------------------------------------------------------------
+# Declared here rather than read from a hand-edited file: the key is asked by
+# the installer, answered by `--questions`, and defaulted in `main`'s --plan
+# seam, so an og-install.json that predates it still loads and re-applies. That
+# last half is the idempotence requirement -- `og update` re-applies the saved
+# plan, and a plan that could not be re-applied would be a broken upgrade.
+
+def test_emit_questions_declares_the_projects_dir_default(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude"})
+    monkeypatch.setattr(m, "scan_multiplexers", lambda: {})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    item = next(x for x in q["questions"] if x["key"] == "projects_dir")
+    assert item["type"] == "path"
+    assert item["default"] == "~/projects"
+    # The ask has to say what the value DOES, since `og chat --dir` is the only
+    # thing that ever reads it: an AI installer answers this question from the
+    # text alone.
+    assert "--dir" in item["ask"]
+
+
+def test_the_projects_dir_key_round_trips_into_state(tmp_path, monkeypatch):
+    _apply_into(tmp_path, monkeypatch, _chain_plan(projects_dir="~/code"))
+    state = json.loads((tmp_path / "og-install.json").read_text())
+    assert state["projects_dir"] == "~/code"
+
+
+def test_an_old_plan_without_a_projects_dir_still_loads(tmp_path, monkeypatch):
+    """The idempotence case, the same shape as herdr_agents_pane: a live
+    og-install.json written before `og chat --dir` existed must load, take the
+    default, and re-apply without failing validation."""
+    old = _chain_plan()
+    assert "projects_dir" not in old
+    plan_file = tmp_path / "og-install.json"
+    plan_file.write_text(json.dumps(old))
+    captured = {}
+    monkeypatch.setattr(m, "apply", lambda plan, dry_run=False: captured.update(plan))
+    monkeypatch.setattr(sys, "argv", ["og-install", "--plan", str(plan_file)])
+    m.main()
+    assert captured["projects_dir"] == m.DEFAULT_PROJECTS_DIR == "~/projects"
+    assert not any(level == "error" for level, _ in m.validate(captured))
+
+
+def test_a_relative_dir_resolves_against_the_configured_projects_root(tmp_path):
+    """`og chat --dir og` from $HOME is the case the key exists for, so it is
+    pinned END TO END through bin/og: the fake `omnigent` stands in for the REPL
+    and prints the directory it was started in, which is exactly what
+    `omnigent run` roots the session at. The `RUN-ARGS` line proves `--dir` was
+    CONSUMED rather than forwarded -- the rest of `$@` still is."""
+    home = tmp_path / "home"
+    omni = home / ".omnigent"
+    (omni / "agents" / "dev-lead").mkdir(parents=True)
+    (omni / "og-install.json").write_text(json.dumps({"projects_dir": "~/code"}))
+    (omni / "og.env").write_text("OG_AGENT=dev-lead\nOG_PORT=6767\n")
+    repo = home / "code" / "myrepo"
+    repo.mkdir(parents=True)
+    elsewhere = home / "elsewhere"
+    elsewhere.mkdir()
+
+    result = _chat_in(home, elsewhere, ["--dir", "myrepo"])
+
+    assert result.returncode == 0, result.stderr
+    assert f"RUN-CWD={repo.resolve()}" in result.stdout
+    assert "--dir" not in result.stdout
+
+
+def test_chat_stays_in_the_current_directory_without_a_dir(tmp_path):
+    """The default, and the no-op guarantee: no --dir means no cd, no python and
+    no state, so an ordinary `og chat` behaves exactly as it always has."""
+    home = tmp_path / "home"
+    (home / ".omnigent" / "agents" / "dev-lead").mkdir(parents=True)
+    here = home / "here"
+    here.mkdir()
+
+    result = _chat_in(home, here)
+
+    assert result.returncode == 0, result.stderr
+    assert f"RUN-CWD={here.resolve()}" in result.stdout
+
+
+def test_a_dir_that_does_not_exist_is_refused_and_nothing_runs(tmp_path):
+    """A refusal, not a degradation: `og chat --dir typo` must not quietly open
+    a conversation in the directory the operator was already standing in, which
+    is a different conversation from the one they asked for."""
+    home = tmp_path / "home"
+    (home / ".omnigent" / "agents" / "dev-lead").mkdir(parents=True)
+    here = home / "here"
+    here.mkdir()
+
+    result = _chat_in(home, here, ["--dir", "typo"])
+
+    assert result.returncode == 2
+    assert "--dir typo" in result.stderr
+    assert "RUN-CWD" not in result.stdout
+    assert not (here / "typo").exists()
+
+
+# --------------------------------------------------------------------------
 # bin/og credential store (the `file` backend is the cross-platform floor)
 # --------------------------------------------------------------------------
 OG = REPO / "bin" / "og"
@@ -1393,6 +1495,40 @@ def _og(args, home, stdin="", **env):
     return subprocess.run(
         ["bash", str(OG), *args], input=stdin, capture_output=True, text=True,
         timeout=30, env=full_env,
+    )
+
+
+# `og chat` needs the opposite: an `omnigent` that says the server is up (so
+# cmd_chat's precondition passes) and stands in for the REPL, printing the
+# directory it was started in. `omnigent run` roots the session at its own cwd,
+# so that one line is what a --dir has to move. OG_REPO points at this checkout
+# so the handshake helper can find og_herdr_launch.py without a real install.
+FAKE_OMNIGENT = """#!/bin/sh
+if [ "$1" = server ] && [ "$2" = status ]; then
+  echo "running at http://127.0.0.1:6767"; exit 0
+fi
+echo "RUN-CWD=$(pwd)"
+echo "RUN-ARGS=$*"
+"""
+
+
+def _chat_in(home, cwd, args=()):
+    """Run `og chat <args>` from `cwd` against a sandbox HOME and a fake REPL.
+
+    `home` and `cwd` are separate because that is the whole point of `--dir`:
+    the bundle lives in HOME (bin/og resolves $HOME/.omnigent) and the session
+    is rooted wherever the pane is standing.
+    """
+    bin_dir = cwd / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    omnigent = bin_dir / "omnigent"
+    omnigent.write_text(FAKE_OMNIGENT)
+    omnigent.chmod(0o755)
+    env = {"HOME": str(home), "PATH": os.pathsep.join([str(bin_dir), "/usr/bin:/bin"]),
+           "OG_REPO": str(REPO), "TERM": "xterm-256color"}
+    return subprocess.run(
+        ["bash", str(OG), "chat", *args], cwd=str(cwd), capture_output=True,
+        text=True, timeout=30, env=env,
     )
 
 
