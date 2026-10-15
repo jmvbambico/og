@@ -65,13 +65,15 @@ ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "failed", "rail")
 # terminal's own". Legal in every role (see the module docstring).
 DEFAULT = "default"
 
-# dracula is the DEFAULT because the operator asked for it, and dracula's `text`
-# is the operator's warm parchment -- #ffd7af, which is ansi 223 EXACTLY and was
-# picked from the 256-colour cells rather than copied from Dracula's own #f8f8f2
-# (both facts recorded in the catalog row's `_note`). The default is a
-# preference, not a fact about colour: `--theme` and $OG_AGENTS_THEME both
-# override it.
-DEFAULT_THEME = "dracula"
+# `og` is the DEFAULT because the operator asked for it: it is the pane as it
+# painted before themes existed, and a fresh install should open in it rather than
+# in a palette somebody else chose. The default is a preference, not a fact about
+# colour: `--theme` and $OG_AGENTS_THEME both override it. dracula stays in the
+# catalog as an ordinary row -- still the slug a stored preference can name, and
+# still the operator's warm parchment (#ffd7af, ansi 223 EXACTLY, picked from the
+# 256-colour cells; see the row's `_note`). Only the default moved; nothing was
+# removed.
+DEFAULT_THEME = "og"
 
 HEX_RE = re.compile(r"^#[0-9a-f]{6}$")
 # The converter is more permissive than the CATALOG on purpose: a catalog row is
@@ -128,30 +130,33 @@ class Theme:
         return -1 if value == DEFAULT else hex_to_ansi256(value)
 
 
-# The BUILT-IN fallback: ONE theme, dracula, byte-for-byte the catalog row. It is
-# the whole of what the pane can paint with no `themes.json` at all, which is a
-# deliberate floor and not an oversight — a fallback that ships twenty-five
-# palettes would be a second catalog nobody edits.
+# The BUILT-IN fallback: ONE theme, the DEFAULT one (`og`), byte-for-byte the
+# catalog row. It is the whole of what the pane can paint with no `themes.json` at
+# all, which is a deliberate floor and not an oversight — a fallback that ships
+# twenty-six palettes would be a second catalog nobody edits. It tracks the
+# default so a machine with a missing or unreadable catalog opens on the same
+# theme a fresh install does, rather than on a palette the default no longer
+# names.
 BUILTIN: dict = {
-    "dracula": Theme(
-        slug="dracula",
-        label="Dracula",
-        order=10,
+    "og": Theme(
+        slug="og",
+        label="OG",
+        order=0,
         colors={
-            "bg": "#282a36",
-            "text": "#ffd7af",
-            "meta": "#6272a4",
-            "sel_bg": "#44475a",
-            "idle": "#50fa7b",
-            "working": "#f1fa8c",
-            "failed": "#ff5555",
-            "rail": "#44475a",
+            "bg": "default",
+            "text": "default",
+            "meta": "#87afaf",
+            "sel_bg": "default",
+            "idle": "#00ff00",
+            "working": "#ffff00",
+            "failed": "#ff0000",
+            "rail": "default",
         },
     ),
 }
 
-# The built-in dracula is checked against the catalog row by a test
-# (`test_the_builtin_dracula_matches_the_catalog_row`), not by an assert here: an
+# The built-in `og` is checked against the catalog row by a test
+# (`test_the_builtin_og_matches_the_catalog_row`), not by an assert here: an
 # import-time assert kills the pane when someone is mid-edit on themes.json, and
 # this file's whole argument is that a theme preference must never stop the view
 # opening.
@@ -631,7 +636,7 @@ def load_catalog(path: Optional[Path] = None) -> dict:
     LOUD on a file that said something WRONG, and an empty `themes` is one of
     those things. `{"themes": {}}` and `{"themes": []}` are present, readable,
     valid JSON and structurally wrong: there is no row to paint, and falling back
-    to dracula says "your catalog is one theme, from nowhere" instead of "your
+    to the default says "your catalog is one theme, from nowhere" instead of "your
     catalog is empty and that is why the menu you are looking at is not the one
     you wrote". It took a deliberate decision to put that on this side of the line
     rather than the silent one, and the argument is the module's own: the absent
@@ -707,10 +712,10 @@ def load_theme(environ: Optional[dict] = None) -> str:
 
     Precedence, most specific first: `$OG_AGENTS_THEME` (a shell export, set
     before the command so it applies to a run the operator did not type the theme
-    into), then the stored slug, then dracula. An unknown or corrupt stored slug
-    is not an error either — a stale slug left by a catalog that has since dropped
-    that theme is the NORMAL consequence of editing `themes.json`, and the right
-    response is to open on dracula rather than to refuse.
+    into), then the stored slug, then the default (`og`). An unknown or corrupt
+    stored slug is not an error either — a stale slug left by a catalog that has
+    since dropped that theme is the NORMAL consequence of editing `themes.json`,
+    and the right response is to open on the default rather than to refuse.
     """
     env = os.environ if environ is None else environ
     override = (env.get(THEME_ENV) or "").strip()
@@ -730,8 +735,8 @@ def save_theme(slug: str, environ: Optional[dict] = None) -> None:
     Atomic because the write is tiny and the crash window is real: a theme picker
     is the one part of this view an operator drives by muscle memory, and a
     half-written file read on the next launch is a corrupt slug, which then falls
-    back to dracula and looks like the setting was lost. `os.replace` within the
-    same directory cannot leave a partial file behind.
+    back to the default and looks like the setting was lost. `os.replace` within
+    the same directory cannot leave a partial file behind.
 
     Best effort by design. A read-only `$OMNIGENT_HOME` is not a reason to throw
     away the theme the operator just chose — the pane repaints either way — so a

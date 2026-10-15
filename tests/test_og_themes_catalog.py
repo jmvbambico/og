@@ -529,9 +529,9 @@ def test_labels_are_the_reference_set_plus_og(themes):
     assert sorted(labels) == sorted(EXPECTED_LABELS + ["OG"])
     assert len(labels) == len(set(labels)), "duplicate label"
     # The 25 keep the reference site's picker order; `og` sits at the front
-    # because order 0 puts it first in the picker and dracula is still the
-    # default. `og` is not one of the reference site's themes, so it is checked
-    # separately rather than folded into EXPECTED_LABELS.
+    # because order 0 puts it first in the picker. `og` is not one of the
+    # reference site's themes, so it is checked separately rather than folded into
+    # EXPECTED_LABELS.
     ordered = [themes[slug]["label"] for slug, _ in
                sorted(themes.items(), key=lambda kv: kv[1]["order"])]
     assert ordered == ["OG"] + EXPECTED_LABELS
@@ -1024,10 +1024,10 @@ def test_nudge_table_covers_every_shipped_palette():
 def test_dracula_text_is_the_operators_parchment(themes):
     """dracula.text is #ffd7af, NOT Dracula's own #f8f8f2. Do not "fix" it.
 
-    The operator asked for a warm parchment as the dominant text colour and
-    dracula is the default theme, so the default pane reads parchment. Every
-    other theme uses its own published foreground; this one value is the
-    operator's call and is recorded in the catalog's `_note`.
+    The operator asked for a warm parchment as the dominant text colour, and
+    dracula is the row that carries the choice. Every other theme uses its own
+    published foreground; this one value is the operator's call and is recorded
+    in the catalog's `_note`.
 
     #ffd7af IS ansi 223 -- exactly, because 223 is a cube cell and the round trip
     is lossless. That is the same guarantee the `og` row's three hexes carry, and

@@ -1010,8 +1010,10 @@ _VENDOR_COLOURS = {
 # `init_pair(n, fg, -1)` exactly as it did, and the golden test pins
 # `render` byte-for-byte against the pre-theme output.
 #
-# `order: 0` puts it FIRST in the picker. dracula remains the default theme; `og`
-# is the way back, not the way in.
+# `order: 0` puts it FIRST in the picker -- and it is also the DEFAULT, because the
+# operator asked for `og` to be what a fresh install opens in, so order 0 and the
+# default agree and the picker leads with the theme the pane starts on. dracula
+# stays an ordinary row.
 _OG_COLOURS = {
     "bg": "default",
     "text": "default",
@@ -3428,10 +3430,10 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     outbound call it makes, and it moves the operator's own terminal alone.
 
     `theme` None means "whatever is configured" (`load_theme`: `$OG_AGENTS_THEME`,
-    then the stored slug, then dracula). It is a parameter rather than only a
-    lookup so a caller — `main`, or a test that wants to paint the `og` theme's
-    exact colours — can name one, and so that the choice `--theme` made once is
-    the same object the picker then replaces.
+    then the stored slug, then the default `og`). It is a parameter rather than
+    only a lookup so a caller — `main`, or a test that wants to paint the `og`
+    theme's exact colours — can name one, and so that the choice `--theme` made
+    once is the same object the picker then replaces.
 
     TWO CLOCKS, deliberately. The data poll (`interval`, 3s) asks the server for
     new rows; the spinner tick (SPIN_TICK, 120ms) only advances a counter that
@@ -3870,10 +3872,10 @@ def main(argv: Optional[Iterable[str]] = None, opener: Optional[Any] = None) -> 
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    # `--theme` REFUSES BY NAME rather than falling back to dracula, which is what
-    # `theme_for` does for a stored slug. The difference is who typed it: a stored
-    # slug can be stale because someone edited `themes.json`, and falling back is
-    # right; a slug on the command line was typed a moment ago, and quietly
+    # `--theme` REFUSES BY NAME rather than falling back to the default, which is
+    # what `theme_for` does for a stored slug. The difference is who typed it: a
+    # stored slug can be stale because someone edited `themes.json`, and falling
+    # back is right; a slug on the command line was typed a moment ago, and quietly
     # painting something else is how a flag gets believed and stops being read.
     # A `--theme` that IS known also beats `$OG_AGENTS_THEME`: both are explicit,
     # and the one on the command line was typed more recently.

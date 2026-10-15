@@ -160,15 +160,15 @@ def test_the_converter_never_spends_more_than_the_cap_of_oklab_error():
 
 
 def test_the_cap_sends_draculas_background_to_its_nearest_cell():
-    """THE CAP ON THE DEFAULT THEME, WHICH IS WHERE IT MATTERS MOST.
+    """THE CAP ON A LOW-CHROMA DARK BACKGROUND, WHERE IT MATTERS MOST.
 
-    dracula is the default theme, so this hex is the operator's pane background
-    on every terminal that reports 256 colours. Its OKLab chroma is 0.022, just
-    above NEUTRAL_CHROMA, and at lightness 0.288 the only chromatic cells within
-    reach are the cube's dark saturated ones: 52 (#5f0000, a dark maroon) at
-    0.1359 and 17 (#00005f, a navy) are both candidates the ramp-less search
-    wanted, and both are 0.106+ further from the colour than 235 (#262626, a
-    charcoal grey) at 0.0295. The palette has no charcoal-blue cell to give it;
+    dracula's background is the canonical low-chroma dark case, and its hex
+    quantises on every terminal that reports 256 colours. #282a36's OKLab chroma
+    is 0.022, just above NEUTRAL_CHROMA, and at lightness 0.288 the only chromatic
+    cells within reach are the cube's dark saturated ones: 52 (#5f0000, a dark
+    maroon) at 0.1359 and 17 (#00005f, a navy) are both candidates the ramp-less
+    search wanted, and both are 0.106+ further from the colour than 235 (#262626,
+    a charcoal grey) at 0.0295. The palette has no charcoal-blue cell to give it;
     235 is the honest answer and MAX_CHROMA_PENALTY is what says so out loud
     rather than shipping the maroon.
 
@@ -186,7 +186,7 @@ def test_the_cap_sends_draculas_background_to_its_nearest_cell():
     assert tinted[0] - nearest[0] > th.MAX_CHROMA_PENALTY, "the cap moved and this is no longer an example"
     assert th.hex_to_ansi256("#282a36") == nearest[1]
     # And the two it must NOT be: the saturated primaries the unbounded guard
-    # reached for. The operator's default pane background was going to be maroon.
+    # reached for. dracula's pane background was going to be maroon.
     assert th.ansi256_rgb(52) == (95, 0, 0)
     assert th.ansi256_rgb(17) == (0, 0, 95)
     assert th.hex_to_ansi256("#282a36") not in (17, 52)
@@ -372,8 +372,6 @@ def test_the_parchment_round_trips_to_the_cell_the_operator_chose():
     dracula = th.load_catalog()["dracula"]
     assert dracula.colour("text") == "#ffd7af"
     assert dracula.index("text") == 223
-    assert th.BUILTIN["dracula"].colors["text"] == "#ffd7af"
-    assert th.BUILTIN["dracula"].index("text") == 223
     # And it stays warm on the 256 path, which is the whole reason for the pin.
     assert th.curses_value("#ffd7af", 256) == 223
 
@@ -450,9 +448,9 @@ def test_ordered_themes_sorts_by_the_rows_own_order_not_by_file_order():
     rows = th.ordered_themes(th.load_catalog())
     assert [t.order for t in rows] == sorted(t.order for t in rows)
     assert rows[0].slug == "og", "order 0 sorts first in the picker"
-    # dracula sorts where its own order says, not first: it is the DEFAULT, and a
-    # default that also happened to be first in the menu would be indistinguishable
-    # from a theme that merely got added recently.
+    # dracula sorts where its own order says, not next to `og`: its row keeps the
+    # reference site's order, so the picker reads the same as the site that
+    # supplied the 25.
     assert [t.slug for t in rows].index("dracula") == 10
     assert all(a < b for (a, _x), (b, _y) in
                zip([(t.order, t.slug) for t in rows],
@@ -527,21 +525,21 @@ def test_a_catalog_that_parsed_and_is_still_wrong_is_refused(tmp_path, document,
         "the refusal has to name the FILE, or it is nobody's bad edit"
 
 
-def test_the_builtin_fallback_is_exactly_one_theme_and_it_is_dracula():
-    """ONE, deliberately. A fallback that shipped twenty-five palettes would be a
+def test_the_builtin_fallback_is_exactly_one_theme_and_it_is_og():
+    """ONE, deliberately. A fallback that shipped twenty-six palettes would be a
     second catalog nobody edits; the whole of what the pane can paint with no
     themes.json is the default theme and no more."""
     assert list(th.BUILTIN) == [th.DEFAULT_THEME]
-    assert th.DEFAULT_THEME == "dracula"
+    assert th.DEFAULT_THEME == "og"
 
 
-def test_the_builtin_dracula_matches_the_catalog_row_exactly():
+def test_the_builtin_og_matches_the_catalog_row_exactly():
     """The fallback and the file must not drift. A drift here means a machine
     with no themes.json paints a different pane from a machine with one, and
     there is no way to tell which is right."""
-    assert th.BUILTIN["dracula"].colors == th.load_catalog()["dracula"].colors
-    assert th.BUILTIN["dracula"].label == th.load_catalog()["dracula"].label
-    assert th.BUILTIN["dracula"].order == th.load_catalog()["dracula"].order
+    assert th.BUILTIN["og"].colors == th.load_catalog()["og"].colors
+    assert th.BUILTIN["og"].label == th.load_catalog()["og"].label
+    assert th.BUILTIN["og"].order == th.load_catalog()["og"].order
 
 
 @pytest.mark.parametrize("role", list(th.ROLES))
@@ -611,7 +609,7 @@ def test_the_env_override_beats_the_stored_value(tmp_path):
 
 
 def test_an_unknown_or_corrupt_stored_slug_falls_back_and_never_raises(tmp_path):
-    """`load_theme` READS the preference; `theme_for` is what opens on dracula
+    """`load_theme` READS the preference; `theme_for` is what opens on the default
     when that preference names a row the catalog no longer has. Both are here
     because the split is the point: reading a stale slug must never be an error,
     and resolving one must never crash the pane."""
@@ -691,10 +689,17 @@ def test_a_save_that_cannot_finish_leaves_the_previous_choice_readable(tmp_path,
     assert _strays(home) == []
 
 
-def test_theme_for_falls_back_for_a_stale_slug_but_a_typed_slug_is_checked():
-    assert th.theme_for("nord").slug == "nord"
-    assert th.theme_for("a-theme-that-was-removed").slug == th.DEFAULT_THEME
-    assert th.theme_for().slug == th.DEFAULT_THEME
+def test_theme_for_falls_back_for_a_stale_slug_but_a_typed_slug_is_checked(tmp_path):
+    """The typed slug is checked; the stale one and the configured one both fall
+    back to the default. The last assert reads `OMNIGENT_HOME`, so it is pinned to
+    a tmp home like its neighbours: left to the real home it asserts against
+    whatever theme this machine happens to have stored, which passes on the machine
+    that wrote the default and fails on any other."""
+    env = _home(tmp_path)
+    assert th.theme_for("nord", environ=env).slug == "nord"
+    assert th.theme_for("a-theme-that-was-removed",
+                        environ=env).slug == th.DEFAULT_THEME
+    assert th.theme_for(environ=env).slug == th.DEFAULT_THEME
 
 
 # ---------------------------------------------------------------------------
