@@ -1918,6 +1918,12 @@ class Bridge:
         read as "every session is gone", or this closes every space the
         operator has. None (and `dry_run`) sweeps nothing, the same safety
         `_prune_pending` leans on `_workspace_index` for.
+
+        `_removed` acts only on `_recs`, which is rebuilt by every process, so
+        an orphan this process never projected had nothing for it to act on and
+        was silently skipped — see `_hydrate_for_close`, which is what makes the
+        case that matters here (a session deleted while the bridge was down, then
+        a restart) reachable at all rather than merely correct in the abstract.
         """
         if self.dry_run or live_ids is None or not self._spaces:
             return []
@@ -1926,13 +1932,97 @@ class Bridge:
             return []
         lines: list[str] = []
         for sid in list(gone):
+            hydrated = self._hydrate_for_close(sid)
             try:
                 lines.extend(self._removed(sid))
             except _error_cls() as exc:
                 # A failed close must not take the sweep down: keep the record
                 # and retry next pass, exactly as `_removed`'s own caller would.
                 lines.append(_error_line(sid, exc))
+            finally:
+                # The handle is this call's alone and does not outlive it, even
+                # when the close failed. `_removed` keeps its record on purpose,
+                # so retrying means re-hydrating from `_spaces` next pass — and
+                # a hydrated record left in `_recs` would be read by `_added` as
+                # "already projected", silently swallowing a session that is
+                # live and unprojected.
+                self._discard_hydrated(sid, hydrated)
         return lines
+
+    def _hydrate_for_close(self, sid: str) -> dict | None:
+        """The smallest `_recs` entry that lets `_removed` close this space, or
+        None when there is nothing to hydrate.
+
+        WHY THIS EXISTS. The two halves of what a bridge knows do not survive
+        equally well. `_spaces` is the durable record — it is written to the
+        state file and read back by the next process. `_recs` holds the live
+        HANDLES (the agent string, the parent, how far through setup a pane got)
+        and is rebuilt from nothing on every start; it is filled only when a
+        session is seen and adopted. So the sweep, which finds orphans by
+        scanning `_spaces`, and `_removed`, which acts only on `_recs`, agree
+        within a process and disagree at exactly one moment: the restart. An
+        operator who deletes a session in the web UI while the bridge is down
+        gets exactly that moment — the space is recorded, the session is gone
+        from the very first listing, and the sweep hands `_removed` a session it
+        has no handle for, which answers nothing and closes nothing. The sweep
+        ran, found the orphan, and declined: the same outcome as never running,
+        on the one path that needed it.
+
+        Built from `_spaces` and nothing else, so a space og never recorded can
+        never be closed by this — the sweep only ever asks about ids it is
+        already holding a record for. `owner` becomes `owns_space` through the
+        same `BRIDGE_OWNED` rule `_adopt` uses, so a record rebuilt for a close
+        decides the same thing the record would have decided had this process
+        projected the session itself. Deriving it a second, differently, is how
+        a launcher space would start being closed whole.
+
+        NOT rebuilt: the agent string, the parent, and the setup step. The state
+        file carries none of them, and inventing a value for a process this one
+        cannot see would be a guess dressed as a fact. Each is read by exactly
+        one caller and none of them is `_removed`; the agent's absence costs the
+        release below and nothing else.
+
+        Returns the record it made so the caller can drop it again, and None
+        when `_recs` already holds a real record (this process projected the
+        session, so there is nothing to rebuild) or when the state-file entry
+        names no workspace — a close aimed at nothing is not a close.
+        """
+        if sid in self._recs:
+            return None
+        record = self._spaces.get(sid)
+        if not isinstance(record, dict):
+            return None
+        ws_id = record.get("workspace_id")
+        if not isinstance(ws_id, str) or not ws_id:
+            return None
+        hydrated = {
+            "workspace_id": ws_id,
+            "tab_id": record.get("tab_id"),
+            "pane_id": record.get("pane_id"),
+            "title": None,
+            # The state file does not carry the agent string, and `_removed`
+            # releases the agent marker only when it can name one — see there.
+            "agent": None,
+            # Only a ROOT is recorded in `_spaces`: a sub-agent's own tab is
+            # deliberately not (see `_add_tab`), so this is not a guess about
+            # the parent, it is the only shape a record here can have.
+            "parent": None,
+            "owns_space": record.get("owner") in BRIDGE_OWNED,
+        }
+        self._recs[sid] = hydrated
+        return hydrated
+
+    def _discard_hydrated(self, sid: str, hydrated: dict | None) -> None:
+        """Drop a record `_hydrate_for_close` made, and only that one.
+
+        The identity check is the whole guard: a real record that appeared
+        against this sid mid-pass (an `added` cannot interleave — the sweep runs
+        before the batch — but a record written by a later pass certainly can)
+        must not be dropped by a cleanup meant for a temporary handle. Cheap
+        enough to be worth saying out loud.
+        """
+        if hydrated is not None and self._recs.get(sid) is hydrated:
+            self._recs.pop(sid, None)
 
     def _space_of(self, parent: str | None) -> str | None:
         """The herdr workspace a sub-agent's tab belongs in, or None.
@@ -2421,7 +2511,6 @@ class Bridge:
         if self.dry_run:
             self._recs.pop(sid, None)
             return [f"dry-run: remove {sid} (release pane, close {what})"]
-        pane_id = rec["pane_id"]
         # release_agent and the close are handled SEPARATELY because a
         # `not_found` from the two means different things. From release_agent it
         # means only that no agent marker was registered for the pane — which
@@ -2438,15 +2527,33 @@ class Bridge:
         # The same agent string that was reported has to be released: herdr
         # matches a claim by (source, agent), so a release naming anything else
         # would leave our marker sitting on a pane we have already closed.
-        try:
-            self.client.release_agent(pane_id, self.source, agent=rec["agent"])
-        except _error_cls() as exc:
-            if getattr(exc, "code", None) != "not_found":
-                # Any other error keeps the mapping: popping it here would leave
-                # the pane and tab untracked with no way to retry, leaking them
-                # for good. The error is recorded by `reconcile` and a later
-                # `removed` retries this cleanup.
-                raise
+        #
+        # BEST EFFORT WHEN THE STRING IS NOT KNOWN, which is the hydrated case
+        # (see `_hydrate_for_close`): the state file records which pane a space
+        # belongs to and not which agent claimed it, so after a restart there is
+        # nothing to name and `rec["agent"]` would raise a KeyError out of the
+        # sweep and kill the daemon. The release is skipped and the close goes
+        # ahead, because the close is the operator-visible half and the marker
+        # goes with the pane it was drawn on — the very next statement closes the
+        # tab or the space that holds that pane. Leaving the operator's workspace
+        # open forever, to release a marker nobody will ever see again, is the
+        # wrong trade; the reverse — skip the close — is not a trade at all.
+        #
+        # A record with no PANE id is skipped for the same reason and has always
+        # been: a v1-upgraded record names neither tab nor pane, and there is
+        # nothing to release either way.
+        pane_id = rec["pane_id"]
+        agent = rec.get("agent")
+        if pane_id and agent:
+            try:
+                self.client.release_agent(pane_id, self.source, agent=agent)
+            except _error_cls() as exc:
+                if getattr(exc, "code", None) != "not_found":
+                    # Any other error keeps the mapping: popping it here would
+                    # leave the pane and tab untracked with no way to retry,
+                    # leaking them for good. The error is recorded by
+                    # `reconcile` and a later `removed` retries this cleanup.
+                    raise
         closer = "workspace_close" if owns_space else "tab_close"
         try:
             getattr(self.client, closer)(target)

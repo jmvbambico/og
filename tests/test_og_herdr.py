@@ -1435,11 +1435,10 @@ def _bridge_with_one_recorded_space(opener):
     """A bridge with ONE recorded space, as the daemon finds it after a session
     has been projected: in `_recs` (the live handle) and in `_spaces` (the file).
 
-    Both halves are needed and neither alone is enough: `_close_orphan_spaces`
-    finds the orphan by scanning `_spaces`, while `_removed` can only act on a
-    `_recs` entry — releasing a pane needs the agent string the in-memory record
-    carries and the state file does not. Returns `(bridge, client)`, with the
-    calls the projection made already cleared.
+    Returns `(bridge, client)`, with the calls the projection made already
+    cleared. Both halves are here because this is the in-process shape; a space
+    recorded by an EARLIER process has no `_recs` entry at all, which is the
+    section below.
     """
     import og_herdr_watch as w
 
@@ -1586,6 +1585,200 @@ def test_the_daemon_sweeps_nothing_under_dry_run(monkeypatch, capsys, seams):
     assert "root" in bridge._recs, "a dry run retired a recorded space"
     assert bridge._owned == {"wB": "root"}
     assert "remove" not in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# THE SAME SWEEP, ACROSS A RESTART. Everything above reaches the sweep with a
+# `_recs` entry behind the space: the same process projected the session, so it
+# holds the handle. The operator's report is the other shape — the session was
+# deleted while the bridge was DOWN, so the only surviving trace of the space is
+# the state file, and the process that finds it holds no handle at all. These
+# drive that shape directly: a state file, a fresh bridge, and a listing the
+# session is absent from.
+# --------------------------------------------------------------------------
+
+def _recorded_before_the_restart(**halves):
+    """A state file holding one space, and nothing in memory to go with it."""
+    return write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1", **halves}})
+
+
+def test_the_daemon_closes_a_space_recorded_before_the_bridge_restarted(
+        monkeypatch, seams, capsys):
+    # THE OPERATOR'S BUG, END TO END, and the whole reason this branch exists.
+    # They delete a session in the web UI while the bridge is down. They start it
+    # again. The space og opened for that session is still on their screen and
+    # still in the state file; the session is gone from the first listing the new
+    # process ever fetches, so no event is ever produced about it.
+    #
+    # The new process has never seen that session, so `_recs` — the live handles,
+    # which every process rebuilds from nothing — is empty, and before the fix
+    # `_removed` was handed the session id and answered with nothing at all. The
+    # sweep ran, found the orphan, and declined: the reported symptom exactly,
+    # and every sweep test above missed it because they all hand the bridge a
+    # record it built itself.
+    import og_herdr_watch as w
+
+    _recorded_before_the_restart()
+    client = RecordingClient()
+    bridge = m.Bridge(w.SessionWatcher(poll_interval=0.01,
+                                       opener=_EmptyListing()), client)
+    # The premise, pinned, because the fix is invisible without it: this process
+    # holds no handle on that space. It can only be closed from the file.
+    assert bridge._spaces == {"root": bridge._spaces["root"]}
+    assert bridge._recs == {}, "the fresh process already holds a handle"
+    assert bridge._owned == {"wB": "root"}, "the state file lost the record"
+
+    drive_daemon(monkeypatch, bridge, polls=2)
+
+    # No `release_agent`: there is no agent string to name one with (see
+    # `_removed`), and nothing else was asked either — no workspace.list, no
+    # re-projection. The close is the only thing this pass did.
+    assert [c[0] for c in client.calls] == ["workspace_close"], client.calls
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert "remove root" in capsys.readouterr().out
+    assert bridge._owned == {}, "the space is still recorded as ours"
+    # And the handle did not outlive the pass: a record left in `_recs` would be
+    # read by `_added` as "already projected" and silently swallow a live session.
+    assert bridge._recs == {}
+    # The state file is pruned too, so a later `--cleanup` does not try again.
+    assert json.loads(Path(os.environ["OMNIGENT_HOME"], m.STATE_FILENAME)
+                      .read_text())["spaces"] == {}
+
+
+def test_a_hydrated_record_decides_what_the_owner_says_it_decides(seams):
+    # The ownership rule must not be re-derived for a hydrated record, or a
+    # launcher space would start being closed whole. `owner` becomes `owns_space`
+    # through the same BRIDGE_OWNED rule `_adopt` uses, and a root removal is
+    # still the space-wide close either way — so both owners close wB, exactly
+    # as they do for a record this process projected (the launcher case is
+    # `test_a_launcher_owned_root_removal_closes_the_whole_space_and_drops_its_
+    # workers`, which asserts the same close against a live handle).
+    for owner, owns in (("bridge", True), ("history", True),
+                        ("launcher", False)):
+        write_state(os.environ["OMNIGENT_HOME"], spaces={
+            "root": {"workspace_id": "wB", "owner": owner, "tab_id": "wB:t1",
+                     "pane_id": "wB:p1"}})
+        client = RecordingClient()
+        bridge = m.Bridge(FakeWatcher([]), client)
+
+        hydrated = bridge._hydrate_for_close("root")
+
+        assert hydrated["owns_space"] is owns, (
+            f"an {owner} record must hydrate to owns_space={owns}, the same "
+            "answer `_adopt` gives it")
+        assert hydrated["workspace_id"] == "wB"
+        assert hydrated["tab_id"] == "wB:t1"
+        assert hydrated["pane_id"] == "wB:p1"
+
+        bridge._discard_hydrated("root", hydrated)
+        assert bridge._recs == {}, "a temporary handle outlived its pass"
+
+
+def test_the_sweep_closes_a_launcher_space_after_a_restart_too(seams):
+    # ...and the whole path, not just the derivation: a launcher-owned space
+    # recorded before the restart is closed as a SPACE, the same call the
+    # in-process launcher removal makes. A tab close here would leave the
+    # launcher space open, held by whatever else is in it — the leak
+    # `_removed`'s root rule exists to prevent.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "launcher", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([], live_ids=frozenset())
+
+    assert [c[0] for c in client.calls] == ["workspace_close"], client.calls
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert any("remove root" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_a_recorded_space_whose_session_is_still_live_is_left_alone(seams):
+    # The gate is unchanged and is still the only gate: an id the listing says
+    # is live is not an orphan, whether or not this process has a handle on it.
+    # Cross-restart, the session comes back in the listing as an `added` event
+    # and gets adopted, but even before that — the sweep is asked with the live
+    # set directly here — the space stays.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    assert bridge.reconcile([], live_ids=frozenset({"root"})) == []
+    assert client.calls == [], client.calls
+    assert bridge._owned == {"wB": "root"}
+    assert bridge._recs == {}, "a live session's space was hydrated for closing"
+
+
+def test_dry_run_neither_closes_a_restart_record_nor_hydrates_it(seams):
+    # `--dry-run` leaves what the operator left, and it leaves MEMORY as it was
+    # too: hydrating into `_recs` under a dry run would mutate state a dry run
+    # exists not to touch, and would leave a handle behind for `_added` to find.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
+
+    assert bridge.reconcile([], live_ids=frozenset()) == []
+    assert client.calls == [], client.calls
+    assert bridge._recs == {}, "a dry run hydrated a record"
+    assert bridge._owned == {"wB": "root"}
+
+
+def test_a_restart_record_with_no_agent_string_still_closes_its_space(seams):
+    # THE MISSING STRING, and the trade. The state file names the pane but not
+    # the agent that claimed it, so the marker cannot be released by name — and
+    # `rec["agent"]` raising a KeyError here would take the whole daemon down
+    # mid-sweep, which is a worse version of the bug this closes. The close is
+    # the operator-visible half and goes ahead regardless; the marker dies with
+    # the pane the close removes.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([], live_ids=frozenset())
+
+    assert "release_agent" not in _names(client)
+    assert _names(client) == ["workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert any("remove root" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_a_close_that_fails_after_a_restart_keeps_the_record_and_retries_it(seams):
+    # A failed close keeps the record so the next pass retries — and after a
+    # restart the retry has nothing to re-hydrate from but the file, which is
+    # exactly why it must still be there. The temporary handle, though, must not
+    # outlive the pass that made it: a record left in `_recs` reads as "already
+    # projected" to `_added`, which would silently swallow a live session that
+    # comes back after the restart.
+    _recorded_before_the_restart()
+    client = RecordingClient()
+    # `fail_always`, not `fail`: a close that fails once and then works would
+    # prove nothing about the record being kept for a retry.
+    client.fail_always["workspace_close"] = FakeHerdrError("boom", "cannot close")
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([], live_ids=frozenset())
+
+    assert sum("error root" in ln for ln in lines) == 1, lines
+    assert _names(client) == ["workspace_close"]
+    assert bridge._owned == {"wB": "root"}, "a failed close forgot the record"
+    assert bridge._recs == {}, "the temporary handle outlived its pass"
+
+    # The retry needs no memory of its own: herdr starts answering, and the next
+    # sweep re-hydrates from the file that survived and closes the space.
+    client.fail_always.clear()
+    bridge.reconcile([], live_ids=frozenset())
+
+    assert _names(client).count("workspace_close") == 2
+    assert bridge._owned == {}
 
 
 def test_a_nested_worker_lands_beside_its_own_parent(seams):
