@@ -906,10 +906,21 @@ def split_agents_pane(client, ws_id: str, tab_id: str, root_pane: str,
     to the split attempt exactly as before. An unreadable tab must not be able to
     suppress a real action — the same reasoning the host rule uses, that an
     unreadable answer must not hide a local session.
+
+    LIMITATION: the herdr `pane.list` protocol returns only pane identity
+    (`pane_id`, `tab_id`, `workspace_id`) — no command, title, or process info.
+    There is no reliable way to distinguish a pane running `og agents` from one
+    the operator split manually for another purpose. The guard therefore treats
+    ANY non-root pane as "agents pane already present". Consequence: an operator
+    who manually splits their chat tab will not get an `og agents` pane opened
+    automatically. This is a known gap; the alternative (attempting to read pane
+    content to guess the command) is fragile and was rejected.
     """
     # Idempotency check: does this tab already have a non-root pane?
     # If so, the split has already happened — succeed silently.
     # Fail safe: any error or unreadable answer means "proceed to split".
+    # LIMITATION: pane.list carries no command/title; we cannot identify an
+    # `og agents` pane specifically. Any non-root pane suppresses the split.
     try:
         panes_reply = client.call("pane.list", {"workspace_id": ws_id})
         existing = [

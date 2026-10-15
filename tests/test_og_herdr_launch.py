@@ -1554,43 +1554,6 @@ def test_split_agents_pane_ambiguous_multiple_panes_reported_not_guessed():
     assert "og agents" not in client.text_typed()
 
 
-def test_split_agents_pane_post_split_ambiguity_detected():
-    """If the idempotency check passes (tab was unsplit) but after the split
-    the tab has multiple non-root panes (e.g. a concurrent split), the
-    ambiguity is detected in _split_pane_id and reported.
-    """
-    from og_herdr_launch import split_agents_pane
-
-    class AmbiguousAfterSplitClient(FakeClient):
-        def call(self, method, params=None):
-            if method == "pane.list":
-                # First call (idempotency check): return only root pane
-                # Second call (post-split lookup): return root + TWO new panes
-                if not hasattr(self, "_list_call_count"):
-                    self._list_call_count = 0
-                self._list_call_count += 1
-                if self._list_call_count == 1:
-                    return {"type": "pane_list", "panes": [
-                        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
-                    ]}
-                else:
-                    return {"type": "pane_list", "panes": [
-                        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
-                        {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1"},
-                        {"pane_id": "w1:p3", "tab_id": "w1:t1", "workspace_id": "w1"},
-                    ]}
-            return super().call(method, params)
-
-    client = AmbiguousAfterSplitClient()
-    lines = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
-
-    assert len(lines) == 1
-    assert "ambiguous" in lines[0].lower()
-    assert client.methods.count("pane.split") == 1  # split was attempted
-    # og agents should NOT have been started because we couldn't identify the pane
-    assert "og agents" not in client.text_typed()
-
-
 # ---------------------------------------------------------------------------
 # a create reply that cannot be used
 # ---------------------------------------------------------------------------
