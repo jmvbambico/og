@@ -4414,9 +4414,14 @@ def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_ref
 
 
 def test_the_footer_names_the_focus_and_expand_bindings():
-    assert "enter focus" in a.FOOTER, "the footer must name the Enter binding"
-    assert "space expand" in a.FOOTER, "the footer must name the Space binding"
+    # The FULL form spells Enter and Space with their KEY GLYPHS now (`⏎ focus`,
+    # `␣ expand`), not the words — that is the 8 columns `c cli` was bought with,
+    # and it is the same vocabulary COMPACT already used. Every binding stays
+    # LABELLED; only the word became a glyph. See `FOOTER_ENTRIES`.
+    assert "⏎ focus" in a.FOOTER, "the footer must name the Enter binding"
+    assert "␣ expand" in a.FOOTER, "the footer must name the Space binding"
     assert "a access" in a.FOOTER, "the existing bindings must survive"
+    assert "c cli" in a.FOOTER, "the footer must name the CLI mirror binding"
 
 
 def _cjk_width(text: str) -> int:
@@ -4452,7 +4457,7 @@ def test_the_footer_names_every_key_at_every_width():
         assert a._display_width(form) <= width, (width, form)
         assert _cjk_width(form) <= width, (width, form)
         assert row.rstrip() == form and len(row) == width, (width, row)
-        for letter in ("q", "r", "a"):
+        for letter in ("q", "r", "a", "t", "c"):
             assert letter in row, (width, letter, row)
         assert ("^/v" in row or "^v" in row), (width, row)
         # Enter and Space are words at full width and glyphs when compact, but a
@@ -4476,13 +4481,19 @@ def test_the_footer_chooses_a_form_by_measured_width():
     # a single space, its pre-separator spelling), so the forms measure 79 / 45 / 26
     # and an 80-column terminal gets the full form back. The key `r` is still in all
     # three forms: only labels degrade.
+    #
+    # THE NUMBERS MOVED A THIRD TIME, for `c cli` (the read-only harness mirror).
+    # The full form was already exactly 79, so Enter and Space were respelled as
+    # their key glyphs (`⏎ focus`, `␣ expand`, -8) to buy the new entry without
+    # dropping any label, and COMPACT shed `theme`'s label (`t` stays) to stay at
+    # 45. So the three forms measure 79 / 45 / 30.
     assert a._footer(79) == a.FOOTER
     assert a._footer(80) == a.FOOTER, "the full form fits the classic 80 columns again"
     assert a._footer(45) == a.FOOTER_COMPACT
     assert a._footer(44) == a.FOOTER_KEYS
     assert a._display_width(a.FOOTER) == 79
     assert a._display_width(a.FOOTER_COMPACT) == 45
-    assert a._display_width(a.FOOTER_KEYS) == 26
+    assert a._display_width(a.FOOTER_KEYS) == 30
     # And the boundary is the MEASUREMENT, checked from both sides of each form,
     # so a future edit to the strings cannot quietly move a threshold. FOOTER_KEYS
     # is excluded from the lower side on purpose: it is the FLOOR, and `_footer`
@@ -4494,9 +4505,10 @@ def test_the_footer_chooses_a_form_by_measured_width():
     floor = a._display_width(a.FOOTER_KEYS)
     assert a._footer(floor) == a.FOOTER_KEYS
     assert all(a._footer(w) == a.FOOTER_KEYS for w in range(0, floor + 1))
-    # Only labels degrade: every form names every key and every form names `t`.
+    # Only labels degrade: every form names every key, `t` and `c` included.
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
         assert "q" in form and "r" in form and "a" in form and "t" in form, form
+        assert "c" in form, form
         assert ("^/v" in form or "^v" in form), form
     # THE SEPARATOR IS SPACED IN THE TWO LABELLED FORMS AND ABSENT FROM COMPACT:
     # COMPACT is the degraded form and has already given up words, so it carries no
@@ -4578,9 +4590,12 @@ def test_the_footer_key_is_prominent_and_its_label_recedes():
                        if a._bare_role(role) == a.FOOTER_KEY)
     label_text = "".join(t for t, role in spans
                          if a._bare_role(role) == a.FOOTER_LABEL)
-    for key in ("q", "r", "^/v", "enter", "space", "a", "t"):
+    # The full form names Enter, Space and the CLI mirror by their KEY GLYPHS and
+    # letter (`⏎`, `␣`, `c`) — the words became glyphs to buy `c cli` its columns.
+    for key in ("q", "r", "^/v", "⏎", "␣", "a", "t", "c"):
         assert key in key_text, (key, key_text)
-    for label in ("quit", "refresh", "move", "focus", "expand", "access", "theme"):
+    for label in ("quit", "refresh", "move", "focus", "expand", "access",
+                  "theme", "cli"):
         assert label in label_text, (label, label_text)
     # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES, and there is exactly one per
     # join between entries.

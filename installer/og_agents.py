@@ -287,6 +287,19 @@ DEFAULT_WIDTH = 80
 # the operator nothing — it is a convenience refresh, where every other binding is
 # something you cannot guess.
 #
+# `c cli` — THE MIRROR OF THE AGENT'S OWN HARNESS TUI — WAS THE SECOND BINDING TO
+# MOVE A THRESHOLD, and it did so against the SAME 79-column ceiling. The full
+# form already measured exactly 79 (an 80-column terminal is the classic case it
+# is sized for), so a new entry could not be appended without pushing it over and
+# dropping that terminal back to COMPACT. The columns were bought back by
+# spelling Enter and Space with their KEY GLYPHS in the full form too (`⏎ focus`,
+# `␣ expand` — the exact spelling COMPACT already uses), which is -8 columns and
+# keeps every binding LABELLED; the alternative — dropping a label — would have
+# left a bare key beside labelled ones. COMPACT then had to shed one more label
+# to stay <= 45, and it shed `theme` (the `t` key stays: a cosmetic picker, where
+# `access` is the sharing panel the operator cannot guess). MEASURED WIDTHS:
+# 79 / 45 / 30. The key `c` is in all three forms.
+#
 # THE THREE FORMS ARE BUILT FROM (key, label) PAIRS, not typed out, so a key can
 # never appear in one form without its label and the separator can never be
 # forgotten in one of them: `_footer_form` is the ONE place a form is spelled out,
@@ -327,15 +340,16 @@ def _footer_form(entries: Iterable[tuple[str, str]], sep: str = FOOTER_SEP) -> s
 
 
 FOOTER_ENTRIES = (
-    ("q", "quit"), ("r", "refresh"), ("^/v", "move"), ("enter", "focus"),
-    ("space", "expand"), ("a", "access"), ("t", "theme"),
+    ("q", "quit"), ("r", "refresh"), ("^/v", "move"), ("⏎", "focus"),
+    ("␣", "expand"), ("a", "access"), ("t", "theme"), ("c", "cli"),
 )
 FOOTER_COMPACT_ENTRIES = (
     ("q", "quit"), ("r", ""), ("^v", ""), ("⏎", "focus"),
-    ("␣", "expand"), ("a", "access"), ("t", "theme"),
+    ("␣", "expand"), ("a", "access"), ("t", ""), ("c", "cli"),
 )
 FOOTER_KEYS_ENTRIES = (
-    ("q", ""), ("r", ""), ("^v", ""), ("⏎", ""), ("␣", ""), ("a", ""), ("t", ""),
+    ("q", ""), ("r", ""), ("^v", ""), ("⏎", ""), ("␣", ""), ("a", ""),
+    ("t", ""), ("c", ""),
 )
 FOOTER = _footer_form(FOOTER_ENTRIES)
 FOOTER_COMPACT = _footer_form(FOOTER_COMPACT_ENTRIES, _footer_sep(FOOTER_COMPACT_ENTRIES))
@@ -3761,6 +3775,62 @@ def focus_in_herdr(session_id: str,
     return None
 
 
+# What the pane says when the CLI mirror could not be opened or closed, one line
+# each. The same shape and the same reasons as the focus notices above: short so
+# they survive `_clip`, and distinct so "this can never work here" reads
+# differently from "try again". The ACP and "no terminal" reasons are formed in
+# `og_herdr_launch.cli_terminal_notice`, which is the half that knows the harness
+# kind; these three are the ones this module can produce on its own.
+NOTICE_CLI_OUTSIDE_HERDR = "cli: not inside herdr (no HERDR_ENV)"
+NOTICE_CLI_UNAVAILABLE = "cli: herdr client unavailable"
+NOTICE_CLI_FAILED = "cli: {0}"
+# A rail or a root row that carries no session id at all: there is no agent to
+# mirror, and saying so is better than opening a pane onto nothing.
+NOTICE_CLI_NO_AGENT = "cli: no agent on this row to mirror"
+
+
+def cli_pane_for_row(row: Row, environ: Optional[dict] = None) -> Optional[str]:
+    """Open/close the read-only CLI pane for `row`'s agent. None on success.
+
+    The mirror of `focus_in_herdr`, and built the same way for the same reason:
+    this view is deliberately not herdr-specific and must start in any terminal,
+    so `og_herdr_launch` — and with it every herdr client — is imported INSIDE
+    the handler, never at module load. It NEVER raises: an `og agents` pane an
+    operator leaves open all day must survive a herdr that is absent, a terminal
+    outside a herdr pane, or a socket that is down, so every failure becomes a
+    notice rather than a traceback that kills the pane.
+
+    `row.session_id` is the agent whose TUI is mirrored; `focus_target(row)` —
+    its ROOT — keys the SPACE, because only a root has one (see `focus_target`).
+    The harness comes from the row's own id where a root has one, else from the
+    installed spec for the row's agent name (a worker's listing row carries no
+    harness), which is what tells an ACP harness from a native one so the honest
+    "no terminal" line can be chosen.
+
+    The whole open/close decision belongs to `og_herdr_launch.cli_pane_toggle`:
+    it owns the state record that remembers whether the pane is open, and it is
+    the only place a herdr pane is split or closed for this feature — which is
+    also what keeps this module's outbound traffic to `agent.focus` alone (see
+    `test_source_only_makes_read_only_calls`).
+    """
+    env = os.environ if environ is None else environ
+    if not row.session_id:
+        return NOTICE_CLI_NO_AGENT
+    try:
+        from og_herdr_launch import cli_pane_toggle
+    except Exception:
+        return NOTICE_CLI_UNAVAILABLE
+    try:
+        harness = row.harness or agent_harness(row.agent) or ""
+        return cli_pane_toggle(focus_target(row) or "", row.session_id, harness,
+                               environ=env)
+    except Exception as exc:
+        try:
+            return NOTICE_CLI_FAILED.format(exc)
+        except Exception:
+            return NOTICE_CLI_FAILED
+
+
 def _run_tui(model: AgentModel, interval: float, server: str,
              start_access: bool = False,
              theme: Optional[Theme] = None) -> int:
@@ -4168,6 +4238,19 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                     else:
                         expanded.add(sid)
                     poll = True
+            elif key == ord("c"):
+                # Open/close the READ-ONLY mirror of the selected agent's own
+                # harness TUI, in a second pane in that agent's space. Like
+                # Enter, it does nothing at all while the pane is untouched —
+                # there is no agent to mirror — and like Enter it does NOT set
+                # `poll`: the mirror lives in another pane, so nothing this view
+                # draws changes; a refetch would be a listing walk for nothing.
+                # The notice (why the mirror did not open, or a stale one) is
+                # shown on the next paint. See `cli_pane_for_row` for every way
+                # it can decline, and `og_herdr_launch.cli_pane_toggle` for the
+                # resize-safe attach it runs.
+                if selected is not None and 0 <= selected < len(frame.rows):
+                    notice = cli_pane_for_row(frame.rows[selected])
 
     curses.wrapper(loop)
     return 0
