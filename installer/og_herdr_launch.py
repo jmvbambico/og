@@ -1047,6 +1047,32 @@ def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
     a cosmetic extra pane rather than a missing one, the same trade
     `split_agents_pane` makes when the listing fails after a split has already
     been issued.
+
+    The tab is matched EXACTLY, and a record carrying NO `tab_id` does not
+    match — not "the tab is unknown, so it must be this one". The lenience that
+    clause used to grant is the one way this function can lose the pane it
+    exists to protect, and it is found rather than reasoned out: a tab-less
+    record reads as og's own in EVERY tab, so one stale or hand-edited record
+    makes `og chat` stand down in a tab the launcher never touched — and
+    standing down when nobody is splitting is the one failure the operator pays
+    for with the agents pane itself, silently, with nothing degraded to show
+    for it. Review also noted the supporting fact is not established (that
+    pane ids can never be reused across tabs), which is exactly why the
+    comparison cannot be loosened: a tab-less record is not evidence about any
+    particular tab.
+
+    No writer produces one, which is what makes the exact match strict rather
+    than merely safe. `_open_space` closes the space and refuses when the create
+    reply carried no tab, so the record it writes always has one;
+    `record_chat_pane` is called from one place, with a `pane_identity` that is
+    None unless all three ids are non-empty; and both `_add_space` and
+    `_add_history_space` reach `_remember` only after rejecting the same partial
+    create. A v1 state file upgraded in place DOES yield tab-less records —
+    `_upgrade_v1` records the workspace/session pair and invents nothing, by
+    design — so this path really does meet one. Those carry no `pane_id` either
+    and so fail the pane test already, and refusing them is the direction this
+    whole function already fails in. Do not read this as leniency to be
+    restored.
     """
     try:
         state = load_state(state_path)
@@ -1057,9 +1083,8 @@ def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
             if not isinstance(record, dict):
                 continue
             if (record.get("workspace_id") == workspace_id
-                    and record.get("pane_id") == pane_id
-                    and (not record.get("tab_id")
-                         or record.get("tab_id") == tab_id)):
+                    and record.get("tab_id") == tab_id
+                    and record.get("pane_id") == pane_id):
                 return True
     return False
 

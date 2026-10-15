@@ -1311,6 +1311,55 @@ def test_a_record_for_another_pane_in_the_same_space_does_not_suppress_the_split
     assert client.text_typed() == ["og agents"]
 
 
+def test_a_record_with_no_tab_does_not_suppress_the_split(tmp_path, monkeypatch):
+    """THE HAZARD AN EXACT TAB MATCH EXISTS FOR, found in review.
+
+    A record carrying no `tab_id` names no tab, so reading it as "mine in
+    whichever tab is asking" makes og's own guard answer yes in EVERY tab — and
+    one stale or legacy record then stands `og chat` down in a tab the launcher
+    never touched. Standing down when nobody is splitting is the one wrong
+    answer that costs the operator the agents pane itself, with nothing
+    degraded to show for it.
+
+    Nothing current writes such a record, and a v1 file upgraded in place cannot
+    match on `pane_id` either, so this state is stale or hand-edited. That is
+    still not evidence about any tab, and it is exactly the record the guard has
+    to refuse rather than honour."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "pane_id": "w1:p1",
+                                  "owner": "launcher"}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
+def test_the_same_pane_id_in_a_different_tab_does_not_suppress_the_split(
+        tmp_path, monkeypatch):
+    """The tab is not decoration on the match, and pane ids are not assumed to be
+    unique across tabs — nothing here establishes that they are, and the guard
+    must not be the thing that finds out the hard way. A record for `w1:t9`
+    saying og owns `w1:p1` is not a claim about the pane in `w1:t1`, so it cannot
+    stand this split down."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t9",
+                                  "pane_id": "w1:p1", "owner": "launcher"}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
 def test_og_owns_pane_is_false_for_a_state_file_nobody_wrote(tmp_path):
     """The guard's own default, so the fail-safe direction is pinned where it is
     decided rather than only where it is used."""
