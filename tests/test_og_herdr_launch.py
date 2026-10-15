@@ -2972,6 +2972,203 @@ def test_resolve_harness_terminal_survives_an_unreadable_bridge_json(tmp_path, s
         "sess-8", {"TMPDIR": str(tmp_path)}) is None
 
 
+# ---------------------------------------------------------------------------
+# the runner's terminal resources: the API path, with the scan as its fallback
+# ---------------------------------------------------------------------------
+
+class FakeRunnerWatcher:
+    """A `SessionWatcher` stand-in for the runner's terminal-resources route.
+
+    It presents the two things the resolver uses — `base_url` (what the route is
+    composed against) and `_get_json` (the one transport this server's token
+    rides, see `online_host_id`). `urls` records every request, so a test can
+    prove WHICH resource this asked for and that it asked at all. `error` makes
+    the endpoint fail the way a server that is down would.
+    """
+
+    def __init__(self, payload=None, error=None, base_url=SERVER):
+        self.base_url = base_url
+        self.payload = payload if payload is not None else {"data": []}
+        self.error = error
+        self.urls = []
+
+    def _get_json(self, url):
+        self.urls.append(url)
+        if self.error is not None:
+            raise self.error
+        return self.payload
+
+
+def terminal_page(*entries):
+    """A `GET /v1/sessions/{id}/resources/terminals` page in the runner's shape."""
+    return {"object": "list", "data": list(entries),
+            "first_id": None, "last_id": None, "has_more": False}
+
+
+def terminal_resource(socket_path, target="main", **over):
+    """One TERMINAL resource, exactly as `terminal_resource_view` projects it.
+
+    The key spellings are the runner's (`tmux_socket` / `tmux_target`), NOT our
+    `tmux.json` ones — the two documents are read by two different functions.
+    """
+    metadata = {"terminal_name": "claude", "session_key": "main"}
+    if socket_path is not None:
+        metadata["tmux_socket"] = socket_path
+    if target is not None:
+        metadata["tmux_target"] = target
+    resource = {"id": "terminal_claude_main", "object": "session.resource",
+                "type": "terminal", "name": "claude:main", "metadata": metadata}
+    resource.update(over)
+    return resource
+
+
+def environment_resource():
+    """An ENVIRONMENT resource from the same page, whose metadata has no socket."""
+    return {"id": "default", "object": "session.resource", "type": "environment",
+            "metadata": {"environment_type": "caller_process", "role": "primary"}}
+
+
+def test_resolve_runner_terminal_reads_the_socket_and_target(short_dir):
+    sock = _bound_socket(short_dir)
+    watcher = FakeRunnerWatcher(terminal_page(terminal_resource(sock)))
+
+    got = og_herdr_launch.resolve_runner_terminal("sess-1", {}, watcher=watcher)
+
+    assert got == (sock, "main")
+    # The route is the runner's own, and the session id is quoted into it.
+    assert watcher.urls == [
+        f"{SERVER}/v1/sessions/sess-1/resources/terminals"], watcher.urls
+
+
+def test_resolve_runner_terminal_quotes_a_session_id_that_needs_it(short_dir):
+    # A session id reaches a URL PATH, so anything path-significant in it has to
+    # be encoded — an unencoded `/` would silently address a different route.
+    sock = _bound_socket(short_dir)
+    watcher = FakeRunnerWatcher(terminal_page(terminal_resource(sock)))
+
+    assert og_herdr_launch.resolve_runner_terminal(
+        "conv/../x", {}, watcher=watcher) == (sock, "main")
+    assert watcher.urls == [
+        f"{SERVER}/v1/sessions/conv%2F..%2Fx/resources/terminals"], watcher.urls
+
+
+def test_resolve_runner_terminal_skips_environment_resources_and_dead_sockets(short_dir):
+    # The page carries environment resources too, and a stale terminal whose
+    # socket is gone is SKIPPED rather than fatal: the live one still resolves.
+    sock = _bound_socket(short_dir)
+    watcher = FakeRunnerWatcher(terminal_page(
+        environment_resource(),
+        terminal_resource(os.path.join(short_dir, "gone.sock")),
+        terminal_resource(None),
+        terminal_resource(sock, target="main")))
+
+    assert og_herdr_launch.resolve_runner_terminal(
+        "sess-1", {}, watcher=watcher) == (sock, "main")
+
+
+def test_resolve_runner_terminal_defaults_a_missing_target_to_main(short_dir):
+    sock = _bound_socket(short_dir)
+    watcher = FakeRunnerWatcher(terminal_page(terminal_resource(sock, target=None)))
+
+    assert og_herdr_launch.resolve_runner_terminal(
+        "sess-1", {}, watcher=watcher) == (sock, "main")
+
+
+def test_resolve_runner_terminal_never_raises(short_dir):
+    # Every way this can go wrong reads as "no terminal", never as an exception:
+    # `og agents` is a view left open all day and must survive a runner that is
+    # down, a reply that is not JSON at all, and a reply in a shape we do not
+    # know. The list is the contract, spelled out.
+    assert og_herdr_launch.resolve_runner_terminal(
+        "s", {}, watcher=FakeRunnerWatcher(error=OSError("connrefused"))) is None
+    assert og_herdr_launch.resolve_runner_terminal(
+        "s", {}, watcher=FakeRunnerWatcher(error=ValueError("not json"))) is None
+    for page in (None, [], {"data": None}, {"data": [None, 3, "x"]},
+                 {"data": [{"type": "terminal"}]},
+                 {"data": [{"type": "terminal", "metadata": "nope"}]},
+                 {"data": [terminal_resource(None)]}):
+        assert og_herdr_launch.resolve_runner_terminal(
+            "s", {}, watcher=FakeRunnerWatcher(page)) is None, page
+
+
+def test_resolve_runner_terminal_without_an_id_asks_nothing():
+    watcher = FakeRunnerWatcher()
+    assert og_herdr_launch.resolve_runner_terminal(None, {}, watcher=watcher) is None
+    assert og_herdr_launch.resolve_runner_terminal("", {}, watcher=watcher) is None
+    assert watcher.urls == []
+
+
+def test_resolve_runner_terminal_builds_a_watcher_when_none_is_injected():
+    # The default path builds the real transport. It is pointed at a port
+    # nothing listens on so the suite never reaches a developer's live server;
+    # the connection is refused and the answer is "no terminal".
+    assert og_herdr_launch.resolve_runner_terminal(
+        "sess-1", {"OG_SERVER": "http://127.0.0.1:1"}) is None
+
+
+def test_resolve_agent_terminal_prefers_the_runner_answer(tmp_path, short_dir):
+    # The runner is authoritative and is asked FIRST: a session with BOTH an
+    # on-disk record and a runner resource resolves to the runner's answer, so
+    # the scan cannot shadow a fresher one.
+    _, session_dir = _native_session(tmp_path, "sess-1")
+    on_disk = _bound_socket(short_dir)
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": on_disk}))
+    runner_sock = os.path.join(short_dir, "runner")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(runner_sock)
+    watcher = FakeRunnerWatcher(terminal_page(terminal_resource(runner_sock)))
+
+    got = og_herdr_launch.resolve_agent_terminal(
+        "sess-1", {"TMPDIR": str(tmp_path)}, watcher=watcher)
+
+    assert got == (runner_sock, "main")
+
+
+def test_resolve_agent_terminal_falls_back_to_the_filesystem_scan(tmp_path, short_dir):
+    # THE ANTI-REGRESSION CASE: a claude-native session must keep resolving when
+    # the runner answers nothing at all (an unreachable runner, an older server,
+    # no terminal resource for the session).
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "sess-1")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+
+    got = og_herdr_launch.resolve_agent_terminal(
+        "sess-1", {"TMPDIR": str(tmp_path)},
+        watcher=FakeRunnerWatcher(error=OSError("runner down")))
+
+    assert got == (sock, "main")
+
+
+def test_resolve_agent_terminal_none_when_neither_answers(tmp_path):
+    assert og_herdr_launch.resolve_agent_terminal(
+        "sess-1", {"TMPDIR": str(tmp_path)}, watcher=FakeRunnerWatcher()) is None
+
+
+def test_runner_base_url_precedence(tmp_path, monkeypatch):
+    # The explicit override wins; then the port bin/og actually reads from
+    # og.env; then the install plan; then the default.
+    home = tmp_path / "omnigent-home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "og-install.json").write_text(json.dumps({"port": 7001}))
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+
+    assert og_herdr_launch.runner_base_url(
+        {"OG_SERVER": "http://127.0.0.1:9999/", "OG_PORT": "7002"}) == \
+        "http://127.0.0.1:9999"
+    assert og_herdr_launch.runner_base_url({"OG_PORT": "7002"}) == \
+        "http://127.0.0.1:7002"
+    assert og_herdr_launch.runner_base_url({}) == "http://127.0.0.1:7001"
+    # A port that is not a port falls through rather than becoming a URL.
+    assert og_herdr_launch.runner_base_url({"OG_PORT": "not-a-port"}) == \
+        "http://127.0.0.1:7001"
+
+
+def test_runner_base_url_defaults_without_an_install(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path / "nothing-here"))
+    assert og_herdr_launch.runner_base_url({}) == \
+        og_herdr_launch.DEFAULT_SERVER
+
+
 def _space_state(state_path, root, **record):
     """Write one live space record for `root`, in the real v2 shape."""
     rec = {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",

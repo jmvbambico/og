@@ -56,6 +56,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -1942,6 +1944,194 @@ def _is_socket(path: str) -> bool:
         return stat.S_ISSOCK(os.stat(path).st_mode)
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# the runner's view of a session's terminals — the AUTHORITATIVE path
+# ---------------------------------------------------------------------------
+# The filesystem scan above resolves `claude-native` and nothing else, and that
+# is measured rather than suspected: the claude-native harness writes a
+# `tmux.json` beside its `bridge.json`, while `codex-native` writes NO
+# `tmux.json` at all — its `bridge.json` is an MCP config — so a codex
+# sub-agent has no on-disk record for the scan to find and is unresolvable by
+# it today (see omnigent/runtime/harnesses/codex_native/bridge.py).
+#
+# The Omnigent web UI never guesses at files. It asks the RUNNER for a
+# session's terminal RESOURCES — `GET /v1/sessions/{id}/resources/terminals`,
+# the route its terminal tabs are built from — and each terminal's metadata
+# carries the tmux socket and target. The runner owns the registry that
+# launched the terminal, so that answer is authoritative; the scan is a
+# FALLBACK kept for the case the runner cannot be reached at all.
+RUNNER_TERMINALS_ROUTE = "/v1/sessions/{0}/resources/terminals"
+# The resource `type` this reads. The same listing carries `environment`
+# resources (the default one and a per-terminal one) whose metadata has no
+# `tmux_socket`; naming the type says so once rather than depending on a
+# missing key.
+TERMINAL_RESOURCE_TYPE = "terminal"
+# Where the runner's terminal metadata carries the tmux coordinates
+# (omnigent.entities.session_resources.terminal_resource_view; measured against
+# a live server). Deliberately NOT `socket_path`/`tmux_target`: that is the
+# spelling of OUR `tmux.json`, and the two schemas are read by two functions
+# because they are two different documents.
+RESOURCE_SOCKET_KEY = "tmux_socket"
+RESOURCE_TARGET_KEY = "tmux_target"
+
+# og's server is reached by URL, and the URL is derived from the install, not
+# invented here: bin/og exports `OG_PORT` from og.env and `og setup` records the
+# same number as `port` in og-install.json. `OG_SERVER` is the explicit override
+# (and the seam a test uses); `OG_PORT` is next because og.env is what bin/og
+# actually reads; the install plan is the fallback for a caller with neither.
+RUNNER_URL_ENV = "OG_SERVER"
+PORT_CONFIG_KEY = "port"
+
+# How long the runner lookup may take before it reads as "no answer". BOUNDED
+# on purpose, and this is the one thing here that is not just a copy of the
+# watcher's transport: `SessionWatcher`'s own opener passes no timeout at all,
+# and this call happens on a keypress in `og agents`, so a server that is up
+# but wedged would hang the pane forever — strictly worse than the mirror not
+# appearing. The timeout is carried by an OPENER rather than by the watcher so
+# the shared transport keeps its own behaviour.
+RUNNER_TIMEOUT_SECONDS = 3.0
+
+
+def runner_base_url(env: Optional[dict] = None) -> str:
+    """The Omnigent server a session's terminal resources are asked of.
+
+    `OG_SERVER` wins outright (the explicit override, and the seam a test uses
+    so it never reaches a developer's live server). `OG_PORT` is next: it is what
+    bin/og sources from og.env and what its own server is started on. The install
+    plan's `port` is the same number for an install that never exported it, and
+    `DEFAULT_SERVER` is the last resort so a caller with no environment at all
+    still asks somewhere plausible rather than raising.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get(RUNNER_URL_ENV)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().rstrip("/")
+    port = env.get("OG_PORT")
+    if isinstance(port, str) and port.strip().isdigit():
+        return "http://127.0.0.1:{0}".format(port.strip())
+    configured = install_config().get(PORT_CONFIG_KEY)
+    if isinstance(configured, int) and not isinstance(configured, bool) \
+            and configured > 0:
+        return "http://127.0.0.1:{0}".format(configured)
+    return DEFAULT_SERVER
+
+
+def _runner_opener(timeout: float):
+    """A urlopen bound to `timeout`, for `SessionWatcher(opener=...)`.
+
+    The transport and the auth stay the watcher's (`_get_json` adds this
+    server's bearer token and nothing else does); only the patience is ours.
+    """
+    def open_request(request):
+        return urllib.request.urlopen(request, timeout=timeout)
+
+    return open_request
+
+
+def _runner_watcher(base_url: str):
+    """A watcher for `base_url`, carrying that server's token. Lazy import."""
+    from og_herdr_watch import SessionWatcher
+
+    return SessionWatcher(
+        base_url=base_url,
+        token=SessionWatcher.discover_token(base_url),
+        opener=_runner_opener(RUNNER_TIMEOUT_SECONDS))
+
+
+def resolve_runner_terminal(session_id: Optional[str],
+                            env: Optional[dict] = None,
+                            watcher=None) -> Optional[tuple]:
+    """`(socket_path, tmux_target)` from the runner's terminal resources, or None.
+
+    NEVER raises, and the contract is absolute: a runner that is absent, an HTTP
+    error, a timeout, malformed JSON, no terminal resource for the session, a
+    `socket_path` that is no longer a socket on disk — every one reads as "no
+    terminal", never as an exception. `og agents` is a view an operator leaves
+    open all day, so this must not be able to kill the pane on a keypress.
+
+    `watcher` is the injection seam: a caller (or a test) can hand in something
+    with `base_url` and `_get_json`, which is the same shape `SessionWatcher`
+    already presents and the same method the launcher's `/v1/hosts` lookup rides
+    (see `online_host_id`) — one transport, one place this server's token is
+    added. None means "build the real one", and a build that fails is "no
+    terminal" like every other miss.
+
+    A stale entry is SKIPPED rather than fatal: a listing that names two
+    terminals, one of them dead, still resolves the live one. The scan checks
+    the socket on disk for exactly this reason (see `_read_terminal`).
+    """
+    if not session_id:
+        return None
+    if watcher is None:
+        try:
+            watcher = _runner_watcher(runner_base_url(env))
+        except Exception:
+            return None
+    try:
+        base = str(getattr(watcher, "base_url", "") or runner_base_url(env))
+        url = base.rstrip("/") + RUNNER_TERMINALS_ROUTE.format(
+            urllib.parse.quote(str(session_id), safe=""))
+        payload = watcher._get_json(url)
+    except Exception:
+        return None
+    return _terminal_from_resources(payload)
+
+
+def _terminal_from_resources(payload: Any) -> Optional[tuple]:
+    """`(socket_path, target)` out of a terminal-resources page, or None.
+
+    The page is a `PaginatedList` (`{"object": "list", "data": [resource, …]}`).
+    Every shape here is read defensively because this parses a document this
+    module does not own: a top level that is not an object, no `data`, an entry
+    that is not an object, metadata that is not one, a `tmux_socket` that is not
+    a non-empty string — each is skipped, and a page with nothing usable in it is
+    `None` rather than an exception.
+    """
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if not isinstance(item, dict) or item.get("type") != TERMINAL_RESOURCE_TYPE:
+            continue
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        socket_path = metadata.get(RESOURCE_SOCKET_KEY)
+        if not isinstance(socket_path, str) or not socket_path:
+            continue
+        if not _is_socket(socket_path):
+            continue
+        target = metadata.get(RESOURCE_TARGET_KEY)
+        if not isinstance(target, str) or not target:
+            target = DEFAULT_TMUX_TARGET
+        return (socket_path, target)
+    return None
+
+
+def resolve_agent_terminal(session_id: Optional[str],
+                           env: Optional[dict] = None,
+                           watcher=None) -> Optional[tuple]:
+    """The harness terminal behind a session: the runner's answer, else the scan.
+
+    THE ORDER IS THE POINT. The runner knows which tmux server it launched for
+    this session and answers for every native harness, codex included; the
+    filesystem scan knows only the harnesses that write a `tmux.json`, so asking
+    it first would leave the codex case broken for no reason. It is kept as the
+    FALLBACK, tried only when the runner gave no answer, because the runner is
+    not always reachable (a bridge running against a server that has since
+    stopped, a `og agents` pane on a machine whose runner is down) and the scan
+    resolves a live `claude-native` session with no network at all.
+
+    Never raises, for the reasons both halves give.
+    """
+    terminal = resolve_runner_terminal(session_id, env, watcher)
+    if terminal is not None:
+        return terminal
+    return resolve_harness_terminal(session_id, env)
 
 
 def read_only_attach_command(socket_path: str, target: str) -> str:
