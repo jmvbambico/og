@@ -329,6 +329,13 @@ Rules:
   alike.
 - **The file is not a lock.** Two processes can write it. Keep writes small and
   last-writer-wins; nothing here is worth a lockfile.
+- **Readers re-read, and merge per key — never wholesale.** The bridge folds the
+  file in at each pass boundary (before `_prune_pending`, which saves) and again
+  at the moment it claims a pending record. A key the bridge has not changed
+  since the file last held it belongs to whoever wrote the file last, *including
+  a launcher that replaced it* under the same directory key. Memory only wins
+  for a key it holds an unsaved change to, and a key the file no longer has is
+  never removed from memory — so an unreadable file changes nothing.
 
 ### The deferred write
 
