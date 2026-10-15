@@ -681,13 +681,17 @@ def test_a_quiet_pane_renders_the_same_lines_and_schedules_no_repaint():
     assert a.frame_working(a.Frame(rows=[header(), rail("working")])) is False
 
 
-def test_the_selection_moves_between_workers_in_the_order_they_are_displayed():
+def test_the_selection_walks_every_agent_row_in_the_order_they_are_displayed():
     """THE HAZARD: grouping by state reorders the rows, so the selection must walk
     them in the order the eye reads — not in tree order. `Frame.rows` is itself
     in display order, which is what makes `move_selection` correct unchanged.
 
+    EVERY agent row is now in the ring, the ROOT included (it used to be stepped
+    over): the operator asked to be able to select the orchestrator, so the walk
+    starts on the root and steps down through its workers.
+
     The walk starts from an ADOPTED selection rather than an assumed one: the
-    pane opens untouched, and the first movement key is what takes a worker."""
+    pane opens untouched, and the first movement key is what takes a row."""
     rows = [header(),
             rail("working"),
             worker("w1", "working", text="one"),
@@ -698,29 +702,38 @@ def test_the_selection_moves_between_workers_in_the_order_they_are_displayed():
     # nothing is selected and every box paints at the same brightness.
     assert a.snap_selection(rows) is None
     assert a.snap_selection(rows, None, None) is None
-    # And the first movement key ADOPTS the first worker in BOTH directions,
-    # rather than being swallowed and costing a second keypress.
-    assert a.move_selection(rows, None, 1) == 2, "down adopts the first WORKER"
-    assert a.move_selection(rows, None, -1) == 2, "up adopts it too, not the top"
+    # And the first movement key ADOPTS the first AGENT row in BOTH directions —
+    # the root, at the top, now that roots are selectable — rather than being
+    # swallowed and costing a second keypress.
+    assert a.move_selection(rows, None, 1) == 0, "down adopts the first agent: the root"
+    assert a.move_selection(rows, None, -1) == 0, "up adopts it too, not the last"
     frame = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))
-    assert frame.selected == 2, "w1, the first worker box"
-    worker_text = {i: row.text for i, row in enumerate(rows) if a._is_box(row)}
+    assert frame.selected == 0, "the root, the first agent row"
+    # Every selectable row's text, by index — the root included (it is not an
+    # `_is_box`: that predicate means "a box that animates", see `_selectable`).
+    row_text = {i: row.text for i, row in enumerate(rows) if a._selectable(row)}
 
     seen = []
-    for step in (1, 1, -1, -1):
+    for step in (1, 1, 1, -1, -1, -1):
         frame.selected = a.move_selection(rows, frame.selected, step)
-        seen.append(worker_text[frame.selected])
+        seen.append(row_text[frame.selected])
         items = a._pane(frame, 48).items
-        # Exactly one box is the selected (bright) one.
+        # Exactly one row is the selected (bright) one.
         assert sum(1 for _t, role in items if role == a.SELECTED) == 1
-    assert seen == ["two", "three", "two", "one"], "display order, not tree order"
+    assert seen == ["one", "two", "three", "two", "one", "conversation"], \
+        "display order (root first), not tree order"
 
-    # No workers at all: there is nothing to adopt and nowhere to move to, so
-    # the state passes through unchanged in both directions rather than crashing
-    # or inventing a selection.
+    # No selectable rows at all: there is nothing to adopt and nowhere to move
+    # to, so the state passes through unchanged in both directions rather than
+    # crashing or inventing a selection.
+    assert a.move_selection([rail()], None, -1) is None, "still untouched"
+    assert a.move_selection([rail()], 0, 1) == 0, "the index is left alone"
+    assert a.snap_selection([rail()], None, 3) == 3, "and so is snap's"
+    # A single ROOT row is itself the whole ring, so both moves clamp onto it.
     assert a.move_selection([header()], 0, 1) == 0
-    assert a.move_selection([header()], None, -1) is None, "still untouched"
-    assert a.snap_selection([header()], None, 3) == 3, "the index is left alone"
+    assert a.move_selection([header()], None, -1) == 0, "it adopts the root"
+    assert a.snap_selection([header()], None, 3) == 0, "the only row to land on"
+
 
 
 def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selected():
@@ -742,7 +755,7 @@ def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selecte
 
     pane = a._pane(a.Frame(rows=rows), 48)
     # The LIST only: it is the selection axis. The tail below it — the access
-    # panel (pane-width, and NORMAL like the root box, since it is not a worker
+    # panel (pane-width, and NORMAL like the root box, since it is not an agent
     # the caret can be on) and the footer — carries no selection either way.
     items = pane.items[:pane.list_rows]
 
@@ -752,12 +765,14 @@ def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selecte
         "and dimming is what says 'not the one your cursor is on'"
     assert {role for _t, role in items} == {a.NORMAL}
 
-    # ONE key, and the pane has a selection: adopted on w1, which now reads
-    # SELECTED on its first row while w2's whole box goes DIM.
+    # ONE key, and the pane has a selection: adopted on the ROOT (the first agent
+    # row now that roots are selectable), which reads SELECTED on its first row
+    # while BOTH workers' boxes go DIM.
     moved = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))
     moved_items = a._pane(moved, 48).items
     assert sum(1 for _t, role in moved_items if role == a.SELECTED) == 1
-    assert moved_items[4][1] == a.SELECTED, "w1's box, first row"
+    assert moved_items[0][1] == a.SELECTED, "the root box, first row"
+    assert [role for _t, role in moved_items[4:7]] == [a.DIM] * 3, "w1's box"
     assert [role for _t, role in moved_items[7:10]] == [a.DIM] * 3, "w2's box"
 
 
@@ -779,20 +794,20 @@ def test_enter_on_an_untouched_pane_focuses_nothing_and_shows_no_notice(monkeypa
     than not moving it at all.
     """
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch)
+    calls = _fake_focus_agent_terminal(monkeypatch)
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
 
     screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=_model(opener))
 
-    assert calls == [], f"nothing was on the wire: {calls}"
+    assert calls == [], f"nothing was focused: {calls}"
     assert screen.painted, "the pane was painted"
     assert not any("focus:" in text for text in screen.painted)
     # Enter changed NOTHING — the frame after it is the frame before it, spinner
-    # aside, so the key did not quietly adopt the first worker either. The
-    # contrast is the point: one DOWN first and the very same Enter focuses.
+    # aside, so the key did not quietly adopt the first row either. The contrast
+    # is the point: one DOWN first and the very same Enter focuses.
     assert _unsprung(screen.frames[-1]) == _unsprung(screen.frames[0])
     focused = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=_model(opener))
-    assert calls == [("agent.focus", {"target": "root"})], calls
+    assert calls == [("root", "claude-native", "")], calls
 
 
 def test_space_on_an_untouched_pane_expands_nothing(monkeypatch):
@@ -816,8 +831,10 @@ def test_space_on_an_untouched_pane_expands_nothing(monkeypatch):
     assert not any(report in text for text in untouched.frames[-1]), \
         "space expanded a row nobody had selected"
 
-    # One arrow key first, and the very same key expands the row it adopted.
-    adopted = _run_tui_capture(monkeypatch, [ord("j"), SPACE, QUIT], model=model())
+    # Two arrow keys first (the first adopts the root, the second w1), and the
+    # very same key expands the row it adopted — the one whose report it is.
+    adopted = _run_tui_capture(monkeypatch,
+                               [ord("j"), ord("j"), SPACE, QUIT], model=model())
     assert any(report in text for text in adopted.frames[-1]), \
         "the adopted row expands exactly as before"
 
@@ -849,25 +866,24 @@ def test_the_selection_follows_its_session_across_a_state_change_reorder():
     assert a.snap_selection(after, "w2", 4) == 2, "the selection follows w2"
 
     # The session GONE (it fell off the listing or the scope moved) falls back to
-    # the box NEAREST the old index — so the selection stays where the operator's
+    # the row NEAREST the old index — so the selection stays where the operator's
     # eye is, rather than teleporting to the top of the pane.
     assert a.snap_selection(after, "no-such-session", 4) == 4
     assert a.snap_selection(after, "no-such-session", 9) == 4, "clamped, not off the end"
-    assert a.snap_selection(after, "no-such-session", 0) == 2, "the first worker"
-    # A tie between the box above and the box below goes to the UPPER one: index 3
+    assert a.snap_selection(after, "no-such-session", 0) == 0, "the root, at the top"
+    # A tie between the row above and the row below goes to the UPPER one: index 3
     # in `before` sits between w1 (2) and w2 (4).
     assert a.snap_selection(before, "no-such-session", 3) == 2
-    # An id that IS on screen but is not a BOX never captures the selection — not
-    # the root's (the initial selection is index 0) and not a rail's, which is the
-    # empty string.
-    assert a.snap_selection(before, before[0].session_id, 0) == 2
+    # The ROOT's id captures the caret now that roots are selectable — index 0
+    # here. A rail's empty string still never does: rails hold no agent.
+    assert a.snap_selection(before, before[0].session_id, 0) == 0
     assert a.snap_selection(before, "", 3) == 2
-    # The no-id first frame is UNTOUCHED, not open-on-the-first-worker: nothing was
+    # The no-id first frame is UNTOUCHED, not open-on-the-first-row: nothing was
     # selected before the refresh, so there is nothing to snap onto and nothing to
     # snap FROM. Every box paints NORMAL and the pane opens with no bar behind any
     # of them — which is the whole point of the fix.
     assert a.snap_selection(after, None, None) is None
-    assert a.snap_selection(after, None, 0) == 2, \
+    assert a.snap_selection(after, None, 0) == 0, \
         "once a selection exists, an unreadable id still falls back to nearest"
 
 
@@ -994,7 +1010,7 @@ def test_a_selection_move_still_repaints_the_pane():
             rail("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    frame = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))   # w1
+    frame = a.Frame(rows=rows, selected=2)   # w1
     before = a._pane(frame, 48).items
 
     frame.selected = a.move_selection(rows, frame.selected, 1)       # w2
@@ -3978,11 +3994,12 @@ def test_a_status_glyph_is_neon_and_undimmed_on_an_unselected_row(monkeypatch):
     """
     for state, glyphs in (("idle", {"✓"}), ("working", set(a.SPIN_FRAMES)),
                           ("failed", {"×"})):
-        # w1 is SELECTED and w2 carries the state under test, so w2's box is the
-        # unselected one. The selection lives in the loop, not on the frame, so
-        # DOWN is what puts it there — which is why a SINGLE-worker frame could
-        # not say this before: with nothing else to move to, the first key adopted
-        # the only box and there was no unselected box to test.
+        # w2 carries the state under test and is UNSELECTED, so its box is the
+        # dimmed one. The selection lives in the loop, not on the frame, so DOWN
+        # is what puts it there — on the root now that every agent row is
+        # selectable, which still leaves BOTH workers unselected. A SINGLE-worker
+        # frame could not say this: with nothing else to move to, the first key
+        # adopted the only row and there was no unselected box to test.
         frame = a.Frame(rows=[header(),
                               worker("w1", "blocked", text="one"),
                               worker("w2", state, text="two", meta="12s")])
@@ -4041,19 +4058,21 @@ def test_bold_roles_still_bold_on_a_monochrome_terminal(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 16. Enter focuses the selected worker in herdr; Space expands its snippet
+# 16. Enter focuses the selected agent in herdr; Esc clears; Space expands
 # ---------------------------------------------------------------------------
 #
-# `focus_in_herdr` imports `og_herdr_client` LAZILY, so a fake module dropped
-# into sys.modules IS the client it reaches — the same trick the curses stub
-# above uses, and here it is what keeps every test off a real socket. HERDR_ENV
-# is set or deleted per test so the "inside herdr" question is never answered by
-# whatever environment the suite happens to run in (an operator running pytest
-# from inside a herdr pane has HERDR_ENV=1 for real).
+# `focus_agent` imports `og_herdr_launch.focus_agent_terminal` LAZILY, so patching
+# that MODULE ATTRIBUTE is the seam the view reaches (the real function ships on
+# the other branch and is not here). The older `focus_in_herdr` imports
+# `og_herdr_client` the same lazy way, so a fake module dropped into sys.modules
+# is the client IT reaches — that trick keeps the remaining tests off a real
+# socket. HERDR_ENV is set or deleted per test so the "inside herdr" question is
+# never answered by whatever environment the suite happens to run in.
 
 ENTER = 13          # what the view treats as Enter (curses.KEY_ENTER, 10 or 13)
 SPACE = 32
 QUIT = ord("q")
+ESC = 27            # Esc: clears the selection, and MUST NOT quit (was q's twin)
 # The pane opens UNTOUCHED, so every test that acts ON a row has to move the caret
 # there first. `j` is one of the two keys the view reads as down (the other is
 # curses.KEY_DOWN, which `FakeCurses` numbers 258).
@@ -4140,12 +4159,33 @@ def _fake_herdr_client(monkeypatch, error=None):
     return calls
 
 
+def _fake_focus_agent_terminal(monkeypatch, notice=None):
+    """Install a fake `og_herdr_launch.focus_agent_terminal`; return its call log.
+
+    `focus_agent` imports it LAZILY (`from og_herdr_launch import
+    focus_agent_terminal`) on the keypress, so patching the MODULE ATTRIBUTE is
+    the seam the view actually reaches. The real function ships on the other
+    branch and is NOT on this one, which is why the attribute is installed with
+    `raising=False` — it does not exist here until this creates it. Each call is
+    recorded as `(session_id, harness, root_session_id)`.
+    """
+    calls = []
+
+    def fake(session_id, harness="", root_session_id=""):
+        calls.append((session_id, harness, root_session_id))
+        return notice
+
+    monkeypatch.setattr(og_herdr_launch, "focus_agent_terminal", fake,
+                        raising=False)
+    return calls
+
+
 def _run_tui_capture(monkeypatch, keys, model=None):
     """Run the live view with a faked curses; return the screen it painted.
 
     Every Enter/Space test needs the frame the loop actually wrote, which the
     stock `FakeScreen` stub does not expose. `model` defaults to the shared
-    `_tui_model()` (root + three running workers, `w1` selected).
+    `_tui_model()` (a root and three running workers, opening UNTOUCHED).
     """
     fake = _fake_curses(monkeypatch)
     screens: list[_KeyScreen] = []
@@ -4161,30 +4201,117 @@ def _run_tui_capture(monkeypatch, keys, model=None):
     return screens[0]
 
 
-def test_enter_on_a_sub_agent_row_focuses_its_root_session(monkeypatch):
-    """REGRESSION: the reported bug was `agent_not_found` for every worker.
+# ---- Esc clears the selection; `q` is the only quit ------------------------
+#
+# The reported defect: pressing an arrow key dims every unselected row, and there
+# was no way back — Esc used to quit alongside `q`, so the list stayed dimmed for
+# the rest of the session. Esc was rebound to clear the selection, which cost it
+# the quit; these tests are the guard on BOTH halves of that trade.
 
-    `w1` is a SUB-AGENT of `root` (`parent_session_id == "root"`), and only the
-    root has a herdr pane record for `agent.focus` to match. So Enter must send
-    the ROOT's id, `root` — not w1's own, which is what used to go on the wire
-    and matched no record.
+def test_esc_clears_the_selection_and_undims_every_row(monkeypatch):
+    """Esc puts the pane back to its freshly-opened look: no agent row dimmed.
+
+    Dim is a PAINT attribute, not a glyph, so it is read off the writes. The
+    agent rows are picked out by their NODE column (`⦿`, the content row of each
+    worker box) so the pane's one permanently dim line — the footer — cannot
+    masquerade as an unselected agent.
+    """
+    screen = _run_tui_capture(monkeypatch, [DOWN, ESC, QUIT])
+    dim = sys.modules["curses"].A_DIM
+
+    def dim_node_rows(frame_writes):
+        rows = _rows_with_attr(frame_writes)
+        return [text for text, attr in rows.values()
+                if text.startswith(a.NODE) and attr & dim]
+
+    # Frames: the untouched paint, then DOWN's — the root selected and all three
+    # worker boxes dimmed to mark them unselected.
+    assert len(dim_node_rows(screen.frame_writes[1])) == 3, \
+        "DOWN dims every unselected agent"
+    # ...and the frame Esc produced is undimmed again.
+    assert dim_node_rows(screen.frame_writes[-1]) == [], \
+        "Esc must return every row to its normal, undimmed appearance"
+    # And Esc did not quit: the q that followed is what ended the loop.
+    assert screen.keys == [], "Esc did not quit"
+
+
+def test_esc_with_no_selection_does_nothing_and_does_not_quit(monkeypatch):
+    """THE REGRESSION GUARD: Esc used to quit, and this is the behaviour removed.
+
+    With nothing selected Esc is a harmless no-op: it changes nothing, so not a
+    single repaint is even scheduled — and, above all, it does NOT quit. The proof
+    it kept running is that the `q` behind it was read and ended the loop. This is
+    the assertion someone "restoring" Esc-quit would break.
+    """
+    # An all-idle frame, so the spinner cannot schedule a repaint either: the only
+    # thing that could paint a second frame here is Esc itself.
+    quiet = a.Frame(rows=[header(state="idle"), rail("idle"),
+                          worker("w1", "idle", text="one")])
+    screen = _run_tui_capture(monkeypatch, [ESC, QUIT], model=_StubModel(quiet))
+
+    assert screen.keys == [], \
+        "Esc must not quit: the q that followed is what ended the loop"
+    assert len(screen.frames) == 1, \
+        "Esc on an untouched pane changed nothing, so it painted nothing new"
+    assert any("conversation" in text for text in screen.painted), \
+        "the pane was painted and is still running"
+
+
+def test_q_quits_unconditionally_even_with_a_row_selected(monkeypatch):
+    """`q` is now the ONLY quit — it must end the loop whatever is selected."""
+    screen = _run_tui_capture(monkeypatch, [DOWN, QUIT])
+
+    assert screen.keys == [], "the q was read: the loop quit on it"
+    assert len(screen.frames) >= 2, "DOWN painted before q ended the loop"
+
+
+
+def test_enter_on_a_sub_agent_row_focuses_its_own_session_not_its_root(monkeypatch):
+    """REGRESSION: Enter used to aim at a worker's ROOT, never the worker.
+
+    `w1` is a SUB-AGENT of `root` (`parent_session_id == "root"`). The reported
+    defect was that selecting a worker and pressing Enter focused the ROOT's tab
+    (`focus_target` resolved a worker to its root) instead of the worker's own —
+    and selecting the orchestrator focused nothing at all. Enter must now hand
+    `focus_agent_terminal` the SELECTED row's OWN session id — `w1`, not `root` —
+    with the worker's own harness and its root alongside.
     """
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch)
+    calls = _fake_focus_agent_terminal(monkeypatch)
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
     model = _model(opener)
 
-    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=model)
+    # DOWN adopts the root (the first agent row), the second DOWN adopts w1.
+    screen = _run_tui_capture(monkeypatch, [DOWN, DOWN, ENTER, QUIT], model=model)
 
-    # DOWN adopts w1, the first worker, so it is the selected row, so the RESOLVED target — its
-    # root — is what went on the wire.
-    assert calls == [("agent.focus", {"target": "root"})], calls
+    # The SELECTED row's own session — w1 — is what went through, with its own
+    # (empty) harness and the root it hangs off. Never the root as the target.
+    assert calls == [("w1", "", "root")], calls
     # Focus is not a reason to refetch: exactly the one listing walk for the
     # first paint, and none from the keypress.
     assert len(opener.listing_requests) == 1, "Enter must not trigger a refetch"
     # A successful focus leaves no notice behind.
     assert screen.painted, "the pane was painted"
     assert not any("focus:" in text for text in screen.painted)
+
+
+def test_enter_on_the_root_row_focuses_the_root_itself(monkeypatch):
+    """The ROOT is selectable and focuses its OWN tab (the `is_root` case).
+
+    Selecting the orchestrator was impossible before — roots were stepped over —
+    so this is the other half of the fix: the root row must reach
+    `focus_agent_terminal` with its own id, its own harness and NO root of its
+    own (`root_session_id` is "" for a root).
+    """
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = _fake_focus_agent_terminal(monkeypatch)
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+
+    _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=_model(opener))
+
+    # One DOWN adopts the root, so the root's own session and harness go through.
+    assert calls == [("root", "claude-native", "")], calls
+
 
 
 def test_focus_target_climbs_to_the_root_not_the_immediate_parent():
@@ -4207,19 +4334,19 @@ def test_focus_target_of_a_root_row_is_its_own_session_id():
     assert a.focus_target(header(sid="abc123")) == "abc123"
 
 
-def test_a_row_whose_root_cannot_be_resolved_declines_and_does_not_call_out(
-        monkeypatch):
-    """No root to resolve -> decline in one line, never send a doomed target.
+def test_enter_focuses_a_worker_whose_listing_carried_no_root(monkeypatch):
+    """A worker with no `root_session_id` is still focused by its OWN id.
 
-    A worker row carrying no `root_session_id` (a malformed listing, say)
-    resolves to nothing; focusing must not guess an id herdr would only answer
-    `agent_not_found` for. It declines locally and calls out not at all.
+    The old path resolved a worker to its root and declined when there was none;
+    Enter now focuses the row's own session, so a missing root no longer blocks
+    anything — `""` is simply what is passed for it.
     """
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch)
-    # `worker()` leaves `root_session_id` empty: a Box with no root.
+    calls = _fake_focus_agent_terminal(monkeypatch)
+    # `worker()` leaves `root_session_id` empty: a worker whose listing carried no
+    # root. It is still its OWN agent, so it is still focusable.
     orphan = worker("w1", "idle", text="one")
-    assert a._is_box(orphan), "the row must be a selectable worker box"
+    assert a._selectable(orphan), "the row must be a selectable agent row"
 
     class OneRow:
         def refresh(self, **kwargs):
@@ -4227,9 +4354,10 @@ def test_a_row_whose_root_cannot_be_resolved_declines_and_does_not_call_out(
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=OneRow())
 
-    assert calls == [], "a row with no resolvable root must not call out"
-    assert any(a.NOTICE_FOCUS_NO_ROOT in text for text in screen.painted), \
-        screen.painted
+    # Enter no longer needs the root to resolve anything: it focuses the row's own
+    # session, passing "" for the root the row does not have.
+    assert calls == [("w1", "", "")], calls
+    assert not any("focus:" in text for text in screen.painted), screen.painted
 
 
 def test_focus_resolution_adds_no_call_beyond_agent_focus():
@@ -4239,22 +4367,32 @@ def test_focus_resolution_adds_no_call_beyond_agent_focus():
     _assert_only_agent_focus(Path(a.__file__).read_text())
 
 
-def test_enter_outside_herdr_makes_no_call_and_shows_a_notice(monkeypatch):
+def test_enter_outside_herdr_paints_the_callee_notice(monkeypatch):
+    """The "not inside herdr" answer the callee returns is shown in the pane.
+
+    The gate lives in `focus_agent_terminal` now (this branch does not have it, so
+    the stub returns it): the TUI's job is to paint whatever notice comes back
+    through the ONE existing notice path — the footer row.
+    """
     monkeypatch.delenv("HERDR_ENV", raising=False)
-    calls = _fake_herdr_client(monkeypatch)
+    calls = _fake_focus_agent_terminal(monkeypatch,
+                                       notice=a.NOTICE_FOCUS_OUTSIDE_HERDR)
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
-    assert calls == [], "no herdr pane, no call"
+    # The callee was reached with the selected row's own id (the root, on a
+    # single DOWN) and its notice was painted.
+    assert calls == [("root", "claude-native", "")], calls
     assert any(a.NOTICE_FOCUS_OUTSIDE_HERDR in text for text in screen.painted), \
         screen.painted
 
 
-def test_focus_degrades_when_the_herdr_client_cannot_be_imported(monkeypatch):
-    # `None` in sys.modules makes `from og_herdr_client import ...` raise
-    # ImportError: a client present in name only. The view still has to run.
+def test_focus_degrades_when_og_herdr_launch_cannot_be_imported(monkeypatch):
+    # `None` in sys.modules makes `from og_herdr_launch import ...` raise
+    # ImportError: the lazy import `focus_agent` does. The view still has to run,
+    # degrading to the "unavailable" notice rather than a traceback.
     monkeypatch.setenv("HERDR_ENV", "1")
-    monkeypatch.setitem(sys.modules, "og_herdr_client", None)
+    monkeypatch.setitem(sys.modules, "og_herdr_launch", None)
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
@@ -4289,12 +4427,11 @@ def test_the_c_key_drives_cli_pane_for_the_selected_row(monkeypatch):
               harness="claude-native", root_session_id="root"),
     ])
     screen = _run_tui_capture(
-        monkeypatch, [DOWN, ord("c"), QUIT],
+        monkeypatch, [DOWN, DOWN, ord("c"), QUIT],
         model=_StubModel(frame))
 
-    # DOWN adopts the first selectable box (w1; the root row is not selectable),
-    # so `c` acts on w1: its own session is the agent to mirror, its root is
-    # the space the pane splits into.
+    # The first DOWN adopts the root, the second w1, so `c` acts on w1: its own
+    # session is the agent to mirror, its root is the space the pane splits into.
     assert calls == [("root", "w1", "claude-native")], calls
     # And a successful toggle paints no notice.
     assert not any("cli:" in text for text in screen.painted), screen.painted
@@ -4303,14 +4440,15 @@ def test_the_c_key_drives_cli_pane_for_the_selected_row(monkeypatch):
 def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(
         monkeypatch):
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch,
-                               error=RuntimeError("connect: no such socket"))
+    calls = _fake_focus_agent_terminal(
+        monkeypatch, notice="focus: connect: no such socket")
 
-    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, ENTER, QUIT])
+    # Enter clears the selection (undims), so a SECOND Enter needs a second DOWN
+    # to re-adopt a row: two presses, two calls, and the loop still takes keys.
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, DOWN, ENTER, QUIT])
 
-    # One Enter per press: the failure neither swallows the key nor retries, and
-    # the loop is still taking keys after the first failure.
-    assert [method for method, _params in calls] == ["agent.focus", "agent.focus"]
+    # One call per press: the failure neither swallows the key nor retries.
+    assert len(calls) == 2, calls
     assert any("focus: " in text for text in screen.painted), screen.painted
 
 
@@ -4357,7 +4495,8 @@ def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
     # End to end through the loop: after a failed Enter the notice IS the pane's
     # last row and the footer's line is gone from that frame.
     monkeypatch.delenv("HERDR_ENV", raising=False)
-    _fake_herdr_client(monkeypatch)
+    _fake_focus_agent_terminal(monkeypatch,
+                               notice=a.NOTICE_FOCUS_OUTSIDE_HERDR)
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
@@ -4379,16 +4518,18 @@ def test_space_expands_and_collapses_the_selected_snippet(monkeypatch):
 
     report = "The work was already committed"
 
-    expanded = _run_tui_capture(monkeypatch, [DOWN, SPACE, QUIT], model=model())
+    # Two DOWNs: the first adopts the root, the second w1 — the row with the
+    # snippet — because every agent row is selectable now.
+    expanded = _run_tui_capture(monkeypatch, [DOWN, DOWN, SPACE, QUIT],
+                                model=model())
     assert any(report in text for text in expanded.frames[-1]), \
         "space expanded the selected snippet"
 
     # A second space collapses it: the report is in the frame the first space
-    # produced and gone from the last one. `frames[0]` is the untouched pane,
-    # `frames[1]` the frame DOWN adopted a row in, `frames[2]` the first expand.
-    collapsed = _run_tui_capture(monkeypatch, [DOWN, SPACE, SPACE, QUIT],
-                               model=model())
-    assert any(report in text for text in collapsed.frames[2]), \
+    # produced and gone from the last one.
+    collapsed = _run_tui_capture(monkeypatch, [DOWN, DOWN, SPACE, SPACE, QUIT],
+                                 model=model())
+    assert any(report in text for text in collapsed.frames[-2]), \
         "the first space expanded the snippet"
     assert not any(report in text for text in collapsed.frames[-1]), \
         "the second space collapsed it"
@@ -4429,10 +4570,11 @@ def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_ref
             seen.append(kwargs.get("selected_id"))
             return inner.refresh(**kwargs)
 
-    # The pane opens UNTOUCHED, so the caret has to be ADOPTED before it can be moved:
-# the first `j` takes w1, the second takes w2. `r` forces the refresh that reorders
-    # the rows; `q` ends the loop after that frame is painted.
-    screen = _run_tui_capture(monkeypatch, [DOWN, DOWN, ord("r"), ord("q")],
+    # The pane opens UNTOUCHED, so the caret has to be ADOPTED before it can be
+    # moved: the first `j` takes the root, the second w1, the third w2. `r` forces
+    # the refresh that reorders the rows; `q` ends the loop after that frame is
+    # painted.
+    screen = _run_tui_capture(monkeypatch, [DOWN, DOWN, DOWN, ord("r"), ord("q")],
                               model=Recording())
 
     # The refresh was handed the SESSION under the selection, not an index.
