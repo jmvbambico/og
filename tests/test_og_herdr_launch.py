@@ -3005,7 +3005,7 @@ def test_cli_pane_toggle_opens_a_read_only_attach_below_the_chat(tmp_path, short
         "env": {"BROWSER": "true"}}
     (typed,) = client.text_typed()
     assert typed.startswith("tmux -S ")
-    assert "-f read-only,ignore-size" in typed, typed
+    assert "-f ignore-size" in typed, typed
     assert "-t main" in typed, typed
     # The pane id is remembered on the space record, so the toggle can close it.
     assert load_state(state)["spaces"]["root-1"][og_herdr.CLI_PANE_FIELD] == "w1:p9"
@@ -3259,10 +3259,9 @@ def test_the_cli_attach_cannot_resize_or_type_into_the_live_session():
     # guards are load-bearing and must be in the command the pane runs.
     command = og_herdr_launch.read_only_attach_command("/tmp/x/tmux.sock", "main")
 
-    assert "-f read-only,ignore-size" in command, command
-    # `-r` is tmux's alias for exactly this pair; spelled out above so the reason
-    # travels with the flags (see og_herdr_launch.TMUX_ATTACH_FLAGS).
-    assert og_herdr_launch.TMUX_ATTACH_FLAGS == "read-only,ignore-size"
+    assert "-f ignore-size" in command, command
+    # `-r` is tmux's alias for read-only,ignore-size; we now attach interactively.
+    assert og_herdr_launch.TMUX_ATTACH_FLAGS == "ignore-size"
     # A socket path with a space must not split the command.
     spaced = og_herdr_launch.read_only_attach_command("/tmp/a b/tmux.sock", "main")
     assert "'/tmp/a b/tmux.sock'" in spaced, spaced

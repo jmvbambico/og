@@ -1784,16 +1784,17 @@ DEFAULT_TMUX_TARGET = "main"
 #     this suite could catch it, because it only happens against a real socket.
 #     `ignore-size` is tmux's own answer: "the client does not affect the size of
 #     other clients", so the running agent's geometry is untouched.
-#   * `read-only` means the mirror cannot TYPE into the agent — only keys bound
-#     to detach-client/switch-client have any effect — so it is a view and never
-#     a second hand on somebody's keyboard.
+#   * The mirror must be INTERACTIVE. Omnigent's web bridge deliberately keeps
+#     `ignore-size` and does NOT pass `-r` (read-only) because tmux >= 3.7
+#     rejects `send-keys` from a read-only client. We want the real vendor CLI
+#     to be typeable; dropping `read-only` gives up the "no second hand" guard
+#     in exchange for interactivity. The sizing guard `ignore-size` remains.
 #
-# Together these are exactly what tmux's `-r` is an alias for; they are spelled
-# out so the reason travels with the flags. Verified against tmux 3.8 (`man
-# tmux`, attach-session): "-f sets a comma-separated list of client flags ...
-# ignore-size the client does not affect the size of other clients ... read-only
-# the client is read-only". See `test_the_cli_attach_cannot_resize_or_type`.
-TMUX_ATTACH_FLAGS = "read-only,ignore-size"
+# `ignore-size` alone is interactive and non-resizing. Verified against tmux
+# 3.8 (`man tmux`, attach-session): "-f sets a comma-separated list of client
+# flags ... ignore-size the client does not affect the size of other clients ...
+# read-only the client is read-only". See `test_the_cli_attach_cannot_resize_or_type`.
+TMUX_ATTACH_FLAGS = "ignore-size"
 
 # The mirror's share when it is split in BELOW the chat. See `_open_cli_pane`
 # for why "down" and not the agents pane's "right".
@@ -1947,9 +1948,10 @@ def read_only_attach_command(socket_path: str, target: str) -> str:
     """The command a CLI pane runs to mirror a harness, read-only.
 
     The flags come from `TMUX_ATTACH_FLAGS` and carry the resize/typing safety
-    property documented there. The socket and target are shell-quoted because
-    both reach a shell in the pane: a `$TMPDIR` with a space in it is unusual but
-    not impossible, and an unquoted path would silently split the command.
+    trade-off documented there (non-resizing via `ignore-size`, interactive).
+    The socket and target are shell-quoted because both reach a shell in the
+    pane: a `$TMPDIR` with a space in it is unusual but not impossible, and an
+    unquoted path would silently split the command.
     """
     return "tmux -S {0} attach -f {1} -t {2}".format(
         shlex.quote(socket_path), TMUX_ATTACH_FLAGS, shlex.quote(target))
