@@ -1838,14 +1838,16 @@ The rule itself is `_memory_decides`, which is where the distinction
             if title and info.get("label") != title:
                 self._pass_notes.extend(
                     self._rename_first_tab(sid, record.get("tab_id"), title))
-        # NOT in a dry run. The claim writes for itself (it has to — that is what
-        # makes it atomic), and this save is for the `cwd` refresh above and for
-        # the plain adopt, neither of which has written yet. It stays guarded
-        # rather than moved into `_save_state` for the reason it always gave: a
-        # dry run that wrote would consume the pending record and leave the NEXT
-        # REAL RUN with nothing to adopt — the same defect that makes a dry-run
-        # `--cleanup` dangerous, arriving through the adopt path instead of the
-        # cleanup one.
+        # NOT in a dry run. In a REAL run the claim has already written for
+        # itself (it has to — that is what makes it atomic), so this save is
+        # for the `cwd` refresh above and for the plain adopt, neither of which
+        # has written yet; and in a dry run there is nothing written at all to
+        # build on, `_claim_pending` having left both maps exactly as it found
+        # them. It stays guarded rather than moved into `_save_state` for the
+        # reason it always gave: a dry run that wrote would consume the pending
+        # record and leave the NEXT REAL RUN with nothing to adopt — the same
+        # defect that makes a dry-run `--cleanup` dangerous, arriving through
+        # the adopt path instead of the cleanup one.
         if not self.dry_run:
             self._save_state()
         return {"workspace_id": ws_id, "action": action, "pane_ok": pane_ok,
@@ -1933,8 +1935,8 @@ The rule itself is `_memory_decides`, which is where the distinction
         `_existing_space`. It is the last point where the record can be moved
         atomically; by the time that method saves, it has asked herdr for the
         workspace listing and maybe renamed a space, and everything in that gap
-        is outside the lock. A dry run still consumes nothing: the memory move
-        happens, the write does not.
+        is outside the lock. A dry run consumes NOTHING — not the write, and not
+        the move either, which is the half that used to be missing here.
         """
         if not cwd:
             return None
@@ -1946,14 +1948,30 @@ The rule itself is `_memory_decides`, which is where the distinction
             record = self._pending.get(cwd)
             if record is None:
                 return None
+            if self.dry_run:
+                # DECIDED BEFORE THE MOVE, not after it. A dry run that moved
+                # the record and then declined to write would leave `_pending`
+                # one key short and `_spaces` one key long with no save, and
+                # `_synced` still holding the old shape — so the next
+                # `_fold_state` reads that as a COMPLETED claim, memory wins
+                # (`_memory_decides`, third case), and the pending record is
+                # never resurrected. A run that changed nothing would have
+                # durably removed a real launcher record from this bridge's
+                # view, and the next real session in that directory would open a
+                # second space. The same defect a dry-run `--cleanup` guards
+                # against, arriving through the claim.
+                #
+                # A COPY, for the same reason one level deeper: the record stays
+                # where it is in `_pending`, so handing out the live object
+                # would let a caller's in-place edit (`_existing_space`
+                # refreshing `record["cwd"]`) write through into memory the dry
+                # run is supposed to have left alone. It is still the record it
+                # would have claimed, which is all the dry-run line needs.
+                claimed = _copy_record(record)
+                return None
             self._pending.pop(cwd, None)
             self._spaces[sid] = record
             claimed = record
-            if self.dry_run:
-                # A dry run that consumed the record would leave the NEXT REAL
-                # RUN with nothing to adopt — the same defect that makes a
-                # dry-run `--cleanup` dangerous, arriving through the claim.
-                return None
             return {"spaces": self._spaces, "pending": self._pending}
 
         state_update(self.state_path, consume, on_saved=self._mark_synced)
