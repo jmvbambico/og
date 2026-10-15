@@ -1898,6 +1898,42 @@ def test_a_history_space_honours_agents_pane_off(seams, tmp_path):
                                                   "og chat --resume dead1")
 
 
+def test_a_history_space_with_the_agents_pane_off_gets_one_when_it_is_resumed(
+        seams, tmp_path, monkeypatch):
+    # THE WHOLE DEFECT, END TO END, and the only test that can catch it. The
+    # pair above is half the story: the setting is read when the space is
+    # CREATED, and the operator can turn it on at any time afterwards. Nothing
+    # re-runs `_add_history_space` for a space that already exists and
+    # `_split_agents` has exactly one caller, so the record that pass left behind
+    # was the only thing that could ever put the pane back — and `og chat`,
+    # running in that pane on the one keystroke this feature exists for, stood
+    # itself down on it and returned 0.
+    #
+    # Both halves are needed and the bridge's record is not one of them: the tab
+    # is asked whether a second pane is actually there.
+    import og_herdr_launch
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
+                      agents_pane=False)
+    bridge.reconcile([Ev("added", "dead1", root_session(
+        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
+    assert "pane.split" not in _names(client)
+
+    # The operator turns the setting on, then presses Enter on the resume line.
+    monkeypatch.chdir(tmp_path)
+    assert og_herdr_launch.chat_pane(
+        client=client,
+        env={"HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "ws1",
+             "HERDR_TAB_ID": "tab1", "HERDR_PANE_ID": "pane1"}) == 0
+
+    assert _names(client).count("pane.split") == 1, _names(client)
+    runs = {c[1][0]: c[1][1] for c in client.calls if c[0] == "pane_run"}
+    assert "og agents" in runs.values()
+    # Not in the pane holding the resume line: that pane is the session, and
+    # `og chat --resume` is what the operator submitted into it.
+    assert "pane1" not in runs, runs
+
+
 def test_the_history_split_is_the_launchers_one_implementation(
         seams, tmp_path, monkeypatch):
     # ONE implementation, called by both. If the bridge ever grew its own copy of
