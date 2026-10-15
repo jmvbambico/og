@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import io
 import json
 import os
 import shlex
@@ -1106,6 +1107,678 @@ def test_a_workers_removal_closes_only_its_tab(seams):
     assert "w2" in bridge._recs
     assert "root" in bridge._recs
     assert bridge._owned == {"ws1": "root"}
+
+
+def test_a_launcher_owned_root_removal_closes_the_whole_space_and_drops_its_workers(seams):
+    # The launcher opened the root's space, so its record owns it False — but
+    # a ROOT still takes the whole space down when it goes, launcher-owned or
+    # not. Before the fix this closed only the root's tab and never reached
+    # `workspace_close` or `_drop_children`, leaving the launcher space open
+    # with orphaned worker tabs still living in it.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+    bridge.reconcile([Ev("added", "w1", sub_session("s1", "coder_zen:fix"))])
+    client.calls.clear()
+
+    lines = bridge.reconcile([Ev("removed", "s1", {})])
+
+    assert _names(client) == ["release_agent", "workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert "w1" not in bridge._recs
+    assert any("remove w1" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_the_orphan_sweep_closes_a_recorded_space_whose_session_is_gone(seams):
+    # The live set lists `root` as gone (it is absent from it). The sweep closes
+    # the space og recorded for it — and drops the worker whose tab lived in it,
+    # the same way a `removed` event would have.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix")),
+    ])
+    client.calls.clear()
+
+    lines = bridge.reconcile([], live_ids=frozenset({"still-alive"}))
+
+    assert _names(client) == ["release_agent", "workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("ws1",)
+    assert "root" not in bridge._recs and "w1" not in bridge._recs
+    assert any("remove root" in ln or "remove w1" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_the_orphan_sweep_sweeps_nothing_when_the_listing_cannot_be_read(seams):
+    # `live_ids` None is a shrug, not an answer. A listing that could not be
+    # read must never read as "every session is gone" and close every space the
+    # operator has.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("T"))])
+    client.calls.clear()
+
+    assert bridge.reconcile([], live_ids=None) == []
+    assert client.calls == []
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_the_orphan_sweep_sweeps_nothing_under_dry_run(seams):
+    # `dry_run` is a shrug the other way: a recorded space is left exactly as
+    # the operator left it, even when its session is provably gone.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "wB", "owner": "bridge"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
+
+    assert bridge._close_orphan_spaces(frozenset()) == []
+    assert "workspace_close" not in _names(client)
+    assert bridge._owned == {"wB": "s1"}
+
+
+def test_the_orphan_sweep_closes_only_recorded_orphans_leaving_live_and_stray(seams):
+    # Three cases in one pass: rootA is live (kept), rootB is gone (closed),
+    # and wStray is an operator workspace og never recorded (never in scope).
+    client = RecordingClient(spaces=[space_info("wStray", "operator's")])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "rootA", root_session("A")),
+        Ev("added", "rootB", root_session("B")),
+    ])
+    client.calls.clear()
+
+    lines = bridge.reconcile([], live_ids=frozenset({"rootA"}))
+
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [("ws2",)]          # only rootB's space; rootA is live
+    assert bridge._owned == {"ws1": "rootA"}   # wStray was never recorded
+    assert any("remove rootB" in ln for ln in lines)
+
+
+def test_the_sweep_defers_a_truncated_listing_that_hides_a_live_session(seams):
+    # COLD-START DISASTER GUARD. A truncated listing is partial, not absent: on
+    # the first poll after a restart `_seen` began empty, so the truncated
+    # merge holds only what was fetched, and a LIVE session that simply was not
+    # fetched reads as absent. The sweep must not close it — it waits for the
+    # next complete listing, where the orphan is still waiting but a closed
+    # operator space is not.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("T"))])
+    client.calls.clear()
+    # `root` is live and recorded, but the partial set does NOT contain it.
+    # TWO things make this reach the truncation guard rather than stopping at
+    # the one before it, and both are load-bearing:
+    #   * `_seen` must be a real DICT, keyed by session id. `{"still-around"}`
+    #     is a SET — it looks like a live set and reads as one — and `_seen` that
+    #     is not a dict is refused earlier, for a reason that has nothing to do
+    #     with truncation. The test would then pass with the guard deleted.
+    #   * the flag is `_last_truncated`, the record of whether the listing WAS
+    #     truncated, which is what the sweep reads. Set on the instance rather
+    #     than on `FakeWatcher`, which must stay silent about it so the test
+    #     below keeps its own premise.
+    bridge.watcher._seen = {"still-around": {}}
+    bridge.watcher._last_truncated = True
+    assert bridge._live_session_ids() is None
+    assert bridge.reconcile([], live_ids=bridge._live_session_ids()) == []
+    assert client.calls == []
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_the_sweep_defers_when_the_watcher_cannot_report_truncation(seams):
+    # A watcher that can hand over a live set but cannot say whether it is
+    # complete (no `_last_truncated` attribute — the FakeWatcher) is treated as
+    # truncated, never as complete. The real path goes through
+    # `_live_session_ids`, so the sweep sees nothing to close. A dict, for the
+    # reason the test above sets out: a `_seen` that is not a dict is refused
+    # earlier and would make this one pass for the wrong reason too.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("T"))])
+    client.calls.clear()
+    bridge.watcher._seen = {"root": {}}   # looks live — but is it the whole set?
+    assert bridge._live_session_ids() is None
+    assert bridge.reconcile([], live_ids=bridge._live_session_ids()) == []
+    assert client.calls == []
+    assert bridge._owned == {"ws1": "root"}
+
+
+# The three helpers below drive a REAL `SessionWatcher` for the single test that
+# follows, so the whole chain is under test rather than just the bridge's half
+# of it. Everything else in this section hands `Bridge` a FakeWatcher with its
+# flags set by hand; that cannot express the case, because the case IS that the
+# two flags disagree, and only the real watcher is what makes them disagree.
+class _Body(io.BytesIO):
+    """What `urlopen` hands back: a context manager with read()."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class _TruncatedListing:
+    """A stub transport that answers EVERY request with one truncated page.
+
+    `has_more` with no continuation cursor is the cheapest honest way to stop
+    the walk short — the watcher's own suite reaches for the page cap, which
+    needs a monkeypatch this file's tests have no other reason to carry. The
+    same page answers the per-session detail fetch, so the row comes back with
+    no workspace on it; that is what a failed detail fetch looks like, and the
+    watcher is built to survive it.
+    """
+
+    def __init__(self, row):
+        self.body = json.dumps(
+            {"object": "list", "data": [row], "has_more": True}).encode()
+
+    def __call__(self, request):
+        return _Body(self.body)
+
+
+class _RefusingStderr:
+    """A stderr every write fails on, so no notice about the truncation lands."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def write(self, text):
+        self.attempts += 1
+        raise OSError(32, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+def test_the_sweep_defers_when_a_truncated_listing_never_got_to_say_so(monkeypatch, seams):
+    # THE REVIEWER CASE, END TO END, and the one shape that closes live spaces.
+    #
+    # Three facts have to line up, and the daemon supplies all three by itself:
+    # a listing that stopped short, a stderr that refuses the notice saying so
+    # (a daemon started with no terminal — stdout piped into a log — swallows it
+    # and retries forever), and a bridge whose state file still remembers the
+    # operator's spaces from before the restart. The listing was truncated, but
+    # the flag that records "was the operator TOLD" stays False, because the
+    # write never landed and is deliberately not recorded.
+    #
+    # Read as "the listing was complete", the partial `_seen` this cold poll
+    # produced — the one session it did fetch, and nothing else — is a confident
+    # answer, and every recorded space absent from it is an orphan. That is the
+    # operator's live workspaces, closed, unrecoverably, by our own ceiling.
+    import og_herdr_watch as w
+
+    monkeypatch.setattr(w, "MAX_SESSION_PAGES", 1)
+    err = _RefusingStderr()
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(opener=_TruncatedListing(
+        {"id": "fetched", "title": "Fetched", "status": "running",
+         "parent_session_id": None, "archived": False}))
+
+    client = RecordingClient()
+    bridge = m.Bridge(watcher, client)
+    bridge.reconcile([Ev("added", "root", root_session("The operator's session"))])
+    client.calls.clear()
+
+    bridge.run_once()
+
+    # The premise, pinned: the poll really was truncated and really was never
+    # announced, so the two records genuinely disagree here.
+    assert watcher._last_truncated is True
+    assert watcher._listing_truncated is False, (
+        "the truncation was announced, so this test is not exercising the "
+        "case where the notice is lost"
+    )
+    assert err.attempts == 1, "the truncation notice was never even attempted"
+
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [], f"a live operator's space was closed: {closes}"
+    assert bridge._owned["ws1"] == "root", (
+        "the operator's recorded space was dropped while its session is running"
+    )
+
+
+# --------------------------------------------------------------------------
+# THE DAEMON, NOT `run_once`: every sweep test above reaches the sweep by calling
+# reconcile (or run_once) directly, which is why the gap this section covers was
+# invisible to all of them. In the daemon the sweep is only reached when
+# reconcile is called at all, and until the fix below nothing called it unless
+# the server produced an event. So every test here drives the real
+# `run_forever` against a real `SessionWatcher`, with the clock stubbed out.
+# --------------------------------------------------------------------------
+
+class _Stopped(Exception):
+    """Raised from the stubbed sleep to end the daemon loop after N polls."""
+
+
+def drive_daemon(monkeypatch, bridge, polls):
+    """Run `Bridge.run_forever` until the `polls`-th sleep, then stop it.
+
+    The watcher sleeps between polls, so sleeping IS the loop: stubbing it to
+    raise is what ends a daemon that otherwise never returns, and it means no
+    test waits on a real clock. Returns the sleeps, so a test can assert the
+    daemon really polled (and how often) rather than trusting one run.
+    """
+    import og_herdr_watch as w
+
+    slept = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        if len(slept) >= polls:
+            raise _Stopped
+
+    monkeypatch.setattr(w.time, "sleep", fake_sleep)
+    with pytest.raises(_Stopped):
+        bridge.run_forever()
+    return slept
+
+
+class _EmptyListing:
+    """A complete listing with nothing on it, for every request.
+
+    The operator's deletion, from the watcher's side: the session is simply not
+    in the listing, so there is no `removed` event to have been — it was never
+    there to begin with. `has_more` False, so this is a COMPLETE answer, which is
+    what makes the absence evidence rather than a shrug.
+    """
+
+    def __init__(self):
+        self.body = json.dumps(
+            {"object": "list", "data": [], "has_more": False}).encode()
+        self.listing_requests = 0
+
+    def __call__(self, request):
+        self.listing_requests += 1
+        return _Body(self.body)
+
+
+class _RefusingListing:
+    """A transport that refuses every connection, so no poll ever completes."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def __call__(self, request):
+        self.attempts += 1
+        raise OSError("connection refused")
+
+
+class _EmptyTruncatedThenComplete:
+    """Truncated for the first N listings, complete and empty thereafter.
+
+    What a busy server looks like to a cold start, and the reason a startup-only
+    sweep is not enough: the truncated listing defers the sweep, and the listing
+    that completes it says nothing happened — which is also to say that the
+    recorded session is gone.
+    """
+
+    def __init__(self, truncated_polls):
+        self.truncated_polls = truncated_polls
+        self.listing_requests = 0
+
+    def __call__(self, request):
+        self.listing_requests += 1
+        has_more = self.listing_requests <= self.truncated_polls
+        return _Body(json.dumps({"object": "list", "data": [],
+                                 "has_more": has_more}).encode())
+
+
+def _bridge_with_one_recorded_space(opener):
+    """A bridge with ONE recorded space, as the daemon finds it after a session
+    has been projected: in `_recs` (the live handle) and in `_spaces` (the file).
+
+    Returns `(bridge, client)`, with the calls the projection made already
+    cleared. Both halves are here because this is the in-process shape; a space
+    recorded by an EARLIER process has no `_recs` entry at all, which is the
+    section below.
+    """
+    import og_herdr_watch as w
+
+    client = RecordingClient()
+    watcher = w.SessionWatcher(poll_interval=0.01, opener=opener)
+    bridge = m.Bridge(watcher, client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("The operator's session"))])
+    client.calls.clear()
+    return bridge, client
+
+
+def test_the_daemon_sweeps_a_recorded_orphan_when_the_watcher_yields_no_events(
+        monkeypatch, seams, capsys):
+    # THE OPERATOR'S BUG, in the shape they hit it. The session is deleted in the
+    # web UI while the bridge is not running; the bridge restarts; the watcher
+    # polls a listing that does not contain the deleted session and therefore has
+    # nothing to report — forever. Before the fix the sweep ran only when an
+    # event arrived, so this daemon produced no events, reconciled nothing, and
+    # left the operator's space on their screen for the life of the process.
+    #
+    # The defect reproduces here rather than being asserted against: with
+    # `run_forever` reconciling per event, no event means no close, and the
+    # assertion on `client.calls` below is what fails.
+    bridge, client = _bridge_with_one_recorded_space(_EmptyListing())
+
+    slept = drive_daemon(monkeypatch, bridge, polls=3)
+
+    # The daemon really did poll, and really did say nothing: three complete
+    # listings, no session in any of them, and no event out of any of them.
+    assert slept == [0.01, 0.01, 0.01]
+    assert bridge.watcher._seen == {}, "the deleted session is still being listed"
+    # Nothing was projected either: with no session in the listing there is no
+    # `added` for the bridge to act on, so every call below is the sweep's.
+    assert [c[0] for c in client.calls] == [
+        "release_agent", "workspace_close"], client.calls
+
+    assert "remove root" in capsys.readouterr().out
+    assert bridge._owned == {}, "the orphan's space is still recorded as ours"
+
+
+def test_the_daemon_sweeps_nothing_while_no_poll_has_ever_read_anything(
+        monkeypatch, seams):
+    # THE CATASTROPHIC CASE, stated as a premise the test can check. A poll that
+    # never completed leaves the watcher exactly as it was constructed: `_seen`
+    # empty, and `_last_truncated` still the `False` it was born with. Read
+    # together that is a CONFIDENT "no session is live" — and swept on it, every
+    # space the operator has is an orphan. So no sweep may run here, and the
+    # guard that would normally stop it cannot: `_live_session_ids` has nothing
+    # to be uncertain about, because the watcher is confidently empty.
+    #
+    # That is the whole argument for the sweep being fired from inside `watch`'s
+    # poll loop rather than by a timer, a start-up pass, or a caller-side guess.
+    refusing = _RefusingListing()
+    bridge, client = _bridge_with_one_recorded_space(refusing)
+
+    drive_daemon(monkeypatch, bridge, polls=3)   # every poll refused
+
+    # The premise, pinned. If this stops holding the test is no longer testing
+    # what it says it is.
+    assert refusing.attempts >= 3, "no poll was even attempted"
+    assert bridge.watcher._seen == {}
+    assert bridge._live_session_ids() == frozenset(), (
+        "the watcher is no longer CONFIDENTLY empty here, so this test is not "
+        "the catastrophe it claims to be"
+    )
+    assert client.calls == [], client.calls
+    assert bridge._owned == {"ws1": "root"}, (
+        "a space was closed on the strength of a poll that never happened"
+    )
+
+
+def test_the_daemon_sweeps_nothing_on_a_truncated_first_listing(monkeypatch, seams):
+    # The same catastrophe by the other road, and the one the guard exists for:
+    # a listing that stopped short is PARTIAL, so on a cold start `_seen` holds
+    # only what was fetched and the recorded session — past the cap, alive — is
+    # absent from it. The sweep must read the truncation, not the absence, and
+    # defer.
+    #
+    # The listing is empty AND truncated, which is the combination that makes the
+    # guard the only thing standing between the sweep and the operator's whole
+    # workspace: `_seen` is empty, so an unguarded sweep would find the recorded
+    # root absent, call it an orphan and close it. Pinned below.
+    bridge, client = _bridge_with_one_recorded_space(
+        _EmptyTruncatedThenComplete(truncated_polls=99))
+
+    drive_daemon(monkeypatch, bridge, polls=3)
+
+    # The premise: every poll really was truncated, so `_live_session_ids` is
+    # None and the sweep has nothing to act on. A poll that produced no events is
+    # not the reason nothing was closed — a deferred sweep is.
+    assert bridge.watcher._seen == {}
+    assert bridge.watcher._last_truncated is True
+    assert bridge._live_session_ids() is None
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [], f"a live operator's space was closed: {closes}"
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_the_daemon_sweeps_once_a_later_poll_completes_after_a_truncated_one(
+        monkeypatch, seams):
+    # The reason this is a recurring tick and not one pass at start-up. The first
+    # listing is truncated, so the sweep defers — correctly — and the poll that
+    # completes it changes nothing, so it produces no event either. The orphan is
+    # still waiting, and only the next quiet poll can say so. A start-up-only
+    # sweep would have deferred once and then never run again.
+    opener = _EmptyTruncatedThenComplete(truncated_polls=2)
+    bridge, client = _bridge_with_one_recorded_space(opener)
+
+    drive_daemon(monkeypatch, bridge, polls=4)
+
+    assert opener.listing_requests == 4
+    assert bridge.watcher._last_truncated is False
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [("ws1",)], (
+        "the sweep never ran on a complete listing, so the orphan survives")
+    assert bridge._owned == {}
+
+
+def test_the_daemon_sweeps_nothing_under_dry_run(monkeypatch, capsys, seams):
+    # A dry run leaves a recorded space exactly as the operator left it, even
+    # once its session is provably gone. Reached here the way an operator reaches
+    # it: a real run recorded the space, and then `og start herdr --dry-run`
+    # brings the daemon up over that same state file.
+    import og_herdr_watch as w
+
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient(spaces=[space_info("wB", "The operator's session")])
+    bridge = m.Bridge(w.SessionWatcher(poll_interval=0.01,
+                                       opener=_EmptyListing()),
+                      client, dry_run=True)
+    # The session is listed once, so the dry run reads the state-file record and
+    # holds a handle on it — the shape a real dry run over a recorded space has.
+    bridge.reconcile([
+        Ev("added", "root", root_session("The operator's session"))])
+    assert "root" in bridge._recs, "the premise: nothing to sweep"
+    client.calls.clear()
+
+    drive_daemon(monkeypatch, bridge, polls=3)
+
+    assert client.calls == [], client.calls
+    assert "root" in bridge._recs, "a dry run retired a recorded space"
+    assert bridge._owned == {"wB": "root"}
+    assert "remove" not in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# THE SAME SWEEP, ACROSS A RESTART. Everything above reaches the sweep with a
+# `_recs` entry behind the space: the same process projected the session, so it
+# holds the handle. The operator's report is the other shape — the session was
+# deleted while the bridge was DOWN, so the only surviving trace of the space is
+# the state file, and the process that finds it holds no handle at all. These
+# drive that shape directly: a state file, a fresh bridge, and a listing the
+# session is absent from.
+# --------------------------------------------------------------------------
+
+def _recorded_before_the_restart(**halves):
+    """A state file holding one space, and nothing in memory to go with it."""
+    return write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1", **halves}})
+
+
+def test_the_daemon_closes_a_space_recorded_before_the_bridge_restarted(
+        monkeypatch, seams, capsys):
+    # THE OPERATOR'S BUG, END TO END, and the whole reason this branch exists.
+    # They delete a session in the web UI while the bridge is down. They start it
+    # again. The space og opened for that session is still on their screen and
+    # still in the state file; the session is gone from the first listing the new
+    # process ever fetches, so no event is ever produced about it.
+    #
+    # The new process has never seen that session, so `_recs` — the live handles,
+    # which every process rebuilds from nothing — is empty, and before the fix
+    # `_removed` was handed the session id and answered with nothing at all. The
+    # sweep ran, found the orphan, and declined: the reported symptom exactly,
+    # and every sweep test above missed it because they all hand the bridge a
+    # record it built itself.
+    import og_herdr_watch as w
+
+    _recorded_before_the_restart()
+    client = RecordingClient()
+    bridge = m.Bridge(w.SessionWatcher(poll_interval=0.01,
+                                       opener=_EmptyListing()), client)
+    # The premise, pinned, because the fix is invisible without it: this process
+    # holds no handle on that space. It can only be closed from the file.
+    assert bridge._spaces == {"root": bridge._spaces["root"]}
+    assert bridge._recs == {}, "the fresh process already holds a handle"
+    assert bridge._owned == {"wB": "root"}, "the state file lost the record"
+
+    drive_daemon(monkeypatch, bridge, polls=2)
+
+    # No `release_agent`: there is no agent string to name one with (see
+    # `_removed`), and nothing else was asked either — no workspace.list, no
+    # re-projection. The close is the only thing this pass did.
+    assert [c[0] for c in client.calls] == ["workspace_close"], client.calls
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert "remove root" in capsys.readouterr().out
+    assert bridge._owned == {}, "the space is still recorded as ours"
+    # And the handle did not outlive the pass: a record left in `_recs` would be
+    # read by `_added` as "already projected" and silently swallow a live session.
+    assert bridge._recs == {}
+    # The state file is pruned too, so a later `--cleanup` does not try again.
+    assert json.loads(Path(os.environ["OMNIGENT_HOME"], m.STATE_FILENAME)
+                      .read_text())["spaces"] == {}
+
+
+def test_a_hydrated_record_decides_what_the_owner_says_it_decides(seams):
+    # The ownership rule must not be re-derived for a hydrated record, or a
+    # launcher space would start being closed whole. `owner` becomes `owns_space`
+    # through the same BRIDGE_OWNED rule `_adopt` uses, and a root removal is
+    # still the space-wide close either way — so both owners close wB, exactly
+    # as they do for a record this process projected (the launcher case is
+    # `test_a_launcher_owned_root_removal_closes_the_whole_space_and_drops_its_
+    # workers`, which asserts the same close against a live handle).
+    for owner, owns in (("bridge", True), ("history", True),
+                        ("launcher", False)):
+        write_state(os.environ["OMNIGENT_HOME"], spaces={
+            "root": {"workspace_id": "wB", "owner": owner, "tab_id": "wB:t1",
+                     "pane_id": "wB:p1"}})
+        client = RecordingClient()
+        bridge = m.Bridge(FakeWatcher([]), client)
+
+        hydrated = bridge._hydrate_for_close("root")
+
+        assert hydrated["owns_space"] is owns, (
+            f"an {owner} record must hydrate to owns_space={owns}, the same "
+            "answer `_adopt` gives it")
+        assert hydrated["workspace_id"] == "wB"
+        assert hydrated["tab_id"] == "wB:t1"
+        assert hydrated["pane_id"] == "wB:p1"
+
+        bridge._discard_hydrated("root", hydrated)
+        assert bridge._recs == {}, "a temporary handle outlived its pass"
+
+
+def test_the_sweep_closes_a_launcher_space_after_a_restart_too(seams):
+    # ...and the whole path, not just the derivation: a launcher-owned space
+    # recorded before the restart is closed as a SPACE, the same call the
+    # in-process launcher removal makes. A tab close here would leave the
+    # launcher space open, held by whatever else is in it — the leak
+    # `_removed`'s root rule exists to prevent.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "launcher", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([], live_ids=frozenset())
+
+    assert [c[0] for c in client.calls] == ["workspace_close"], client.calls
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert any("remove root" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_a_recorded_space_whose_session_is_still_live_is_left_alone(seams):
+    # The gate is unchanged and is still the only gate: an id the listing says
+    # is live is not an orphan, whether or not this process has a handle on it.
+    # Cross-restart, the session comes back in the listing as an `added` event
+    # and gets adopted, but even before that — the sweep is asked with the live
+    # set directly here — the space stays.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    assert bridge.reconcile([], live_ids=frozenset({"root"})) == []
+    assert client.calls == [], client.calls
+    assert bridge._owned == {"wB": "root"}
+    assert bridge._recs == {}, "a live session's space was hydrated for closing"
+
+
+def test_dry_run_neither_closes_a_restart_record_nor_hydrates_it(seams):
+    # `--dry-run` leaves what the operator left, and it leaves MEMORY as it was
+    # too: hydrating into `_recs` under a dry run would mutate state a dry run
+    # exists not to touch, and would leave a handle behind for `_added` to find.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
+
+    assert bridge.reconcile([], live_ids=frozenset()) == []
+    assert client.calls == [], client.calls
+    assert bridge._recs == {}, "a dry run hydrated a record"
+    assert bridge._owned == {"wB": "root"}
+
+
+def test_a_restart_record_with_no_agent_string_still_closes_its_space(seams):
+    # THE MISSING STRING, and the trade. The state file names the pane but not
+    # the agent that claimed it, so the marker cannot be released by name — and
+    # `rec["agent"]` raising a KeyError here would take the whole daemon down
+    # mid-sweep, which is a worse version of the bug this closes. The close is
+    # the operator-visible half and goes ahead regardless; the marker dies with
+    # the pane the close removes.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([], live_ids=frozenset())
+
+    assert "release_agent" not in _names(client)
+    assert _names(client) == ["workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert any("remove root" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_a_close_that_fails_after_a_restart_keeps_the_record_and_retries_it(seams):
+    # A failed close keeps the record so the next pass retries — and after a
+    # restart the retry has nothing to re-hydrate from but the file, which is
+    # exactly why it must still be there. The temporary handle, though, must not
+    # outlive the pass that made it: a record left in `_recs` reads as "already
+    # projected" to `_added`, which would silently swallow a live session that
+    # comes back after the restart.
+    _recorded_before_the_restart()
+    client = RecordingClient()
+    # `fail_always`, not `fail`: a close that fails once and then works would
+    # prove nothing about the record being kept for a retry.
+    client.fail_always["workspace_close"] = FakeHerdrError("boom", "cannot close")
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([], live_ids=frozenset())
+
+    assert sum("error root" in ln for ln in lines) == 1, lines
+    assert _names(client) == ["workspace_close"]
+    assert bridge._owned == {"wB": "root"}, "a failed close forgot the record"
+    assert bridge._recs == {}, "the temporary handle outlived its pass"
+
+    # The retry needs no memory of its own: herdr starts answering, and the next
+    # sweep re-hydrates from the file that survived and closes the space.
+    client.fail_always.clear()
+    bridge.reconcile([], live_ids=frozenset())
+
+    assert _names(client).count("workspace_close") == 2
+    assert bridge._owned == {}
 
 
 def test_a_nested_worker_lands_beside_its_own_parent(seams):
