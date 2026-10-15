@@ -2171,6 +2171,99 @@ def test_a_launcher_record_stands_down_even_before_the_split_lands(
     assert client.text_typed() == []
 
 
+def test_a_launcher_record_stands_down_without_building_a_client(tmp_path,
+                                                                 monkeypatch):
+    """ITEM 1, PINNED: the hot path opens NO socket at all.
+
+    EVERY fresh `og start` pane runs `og chat` in the very pane the launcher is
+    splitting, so every one of them reaches this stand-down. v0.18.1 returned
+    before building a client; a version that built one first would put a herdr
+    connection — and its whole failure surface — on a path that never needs it.
+    The construction is therefore BELOW the stand-down, and this proves it: the
+    builder is spied on, `client=None` so the builder is the only place a client
+    can come from, and a stand-down that asked for one would leave its mark here.
+    """
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {}, "pending": {str(tmp_path): {
+                   "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+                   "owner": "launcher", "cwd": str(tmp_path)}}})
+    probe = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+    built = []
+
+    def tracked(env):
+        built.append(env)
+        return probe
+
+    monkeypatch.setattr(og_herdr_launch, "_chat_client", tracked)
+
+    assert chat_pane(client=None, env=_pane_env()) == 0
+
+    assert built == [], "the launcher stand-down built a herdr client"
+    assert probe.methods == [], "the launcher stand-down made a herdr call"
+
+
+# --- an ownerless matching record is og's pane, so the pane check still applies ---
+# REVIEW FINDING: `og_owns_pane` returned the record's `owner`, so a match with no
+# `owner` came back as the SAME None as no match at all, and the caller skipped the
+# pane check and split — duplicating an agents pane that was already there, which
+# is the exact bug this whole guard exists to kill. The match itself proves og
+# opened the pane, so an unknown owner must fall to the tab check, not past it. It
+# now returns the whole record, and these are the two directions that pins.
+
+@pytest.mark.parametrize("owner", ["absent", None, ""],
+                         ids=["no-key", "null", "empty"])
+def test_a_record_with_no_owner_stands_down_when_a_second_pane_is_there(
+        tmp_path, monkeypatch, owner):
+    """ITEM 2, DIRECTION 1. A record that matched all three ids is og's pane even
+    when its writer left no `owner` — the match proves it — so the tab is asked,
+    and a second pane beside the chat stands the split down. Skipping the check
+    here is how a pane that already exists gets duplicated."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    record = {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+              "cwd": str(tmp_path)}
+    if owner != "absent":
+        record["owner"] = owner
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": record}, "pending": {}})
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" not in client.methods
+    assert client.text_typed() == []
+
+
+@pytest.mark.parametrize("owner", ["absent", None, ""],
+                         ids=["no-key", "null", "empty"])
+def test_a_record_with_no_owner_splits_when_no_second_pane_is_there(
+        tmp_path, monkeypatch, owner):
+    """ITEM 2, DIRECTION 2, and the pair is the point: the tab is ASKED, never
+    assumed. The same ownerless record on a one-pane tab is a space whose agents
+    pane is genuinely missing, so this half makes it — the resume / off-then-on
+    fix, kept for the ownerless record too. An unknown owner is "nobody promised
+    a second half", which is the creation half's situation, not "not og's"."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    record = {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+              "cwd": str(tmp_path)}
+    if owner != "absent":
+        record["owner"] = owner
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": record}, "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+    # Into the pane this split just made, never the one holding the chat.
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
 def test_a_history_record_with_no_second_pane_still_splits(tmp_path,
                                                            monkeypatch):
     """THE CREATION HALF — the mirror of the test above, and the pair IS the
@@ -2234,16 +2327,17 @@ def test_a_client_that_cannot_be_built_costs_the_agents_pane_only(tmp_path,
     `bin/og` reads any non-zero exit from this helper as `exit`, so an exception
     here takes the CHAT down over a cosmetic pane.
 
-    The stand-down path built no client at all and was immune by accident; asking
-    herdr what the tab holds is worth exactly one `pane.list` and not a session.
-    This is the launch-record shape, because that is the one that newly reaches
-    the client."""
+    The shape is the CREATION half on purpose: the launcher's own record stands
+    down ABOVE the construction and never asks for a client at all, so the path
+    that can still fail here is the one that asks herdr what the tab holds — and
+    that is worth exactly one `pane.list`, never a session."""
     monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     save_state(tmp_path / "og-herdr.json",
-               {"spaces": {}, "pending": {str(tmp_path): {
-                   "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
-                   "owner": "launcher", "cwd": str(tmp_path)}}})
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1", "owner": "history",
+                                  "cwd": str(tmp_path)}},
+                "pending": {}})
 
     def no_client(env):
         raise OSError("no herdr socket to resolve")
@@ -2260,12 +2354,28 @@ def test_a_client_that_cannot_be_built_costs_the_agents_pane_only(tmp_path,
 
 def test_og_owns_pane_is_none_for_a_state_file_nobody_wrote(tmp_path):
     """The guard's own default, so the fail-safe direction is pinned where it is
-    decided rather than only where it is used. The return is the matched record's
-    `owner` now — a truthy string when og owns the pane — so "not og's" is None
-    where it used to be False; `if og_owns_pane(...)` reads unchanged, which is
-    the whole reason the owner is returned rather than a (owner, bool) pair."""
+    decided rather than only where it is used. None now means exactly ONE thing —
+    no record matched (or the file could not be read) — which is "not og's", the
+    fail-open direction: og has nothing to say, so the caller splits."""
     assert og_owns_pane(tmp_path / "nothing-here.json", "w1", "w1:t1", "w1:p1") \
         is None
+
+
+def test_og_owns_pane_returns_the_matched_record_so_no_owner_is_distinguishable(
+        tmp_path):
+    """The seam the two-None overload lived on, closed. A match comes back as the
+    whole RECORD, so `chat_pane` can tell "og's pane, writer said no owner" from
+    "no record matched at all" — the first asks the tab, the second splits. A
+    return of the `owner` alone collapsed both to None and let an existing agents
+    pane be duplicated; see the ownerless-record tests above."""
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1"}}, "pending": {}})
+
+    matched = og_owns_pane(tmp_path / "og-herdr.json", "w1", "w1:t1", "w1:p1")
+
+    assert matched == {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1"}
+    assert matched.get("owner") is None
 
 
 def test_chat_pane_outside_herdr_touches_nothing(tmp_path, monkeypatch, capsys):
