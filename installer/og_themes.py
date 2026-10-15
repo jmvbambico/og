@@ -24,7 +24,7 @@ all SEVEN ROLES to a colour:
 
 A role's value is EITHER a `#rrggbb` hex OR the literal string `"default"`,
 which means curses `-1`: allocate no colour, inherit the terminal's own.
-`"default"` is legal in ANY of the seven roles, not only `bg`. That is the single
+`"default"` is legal in ANY of the eight roles, not only `bg`. That is the single
 most important structural decision here — it is what lets one theme reproduce
 exactly what the pane painted before themes existed (`og`: every role either a
 hex that converts back to today's index, or `"default"`), which in turn is what
@@ -54,10 +54,12 @@ from typing import Iterable, Optional
 HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "themes.json"
 
-# The seven roles, in catalog order. Every theme defines ALL of them; there is no
+# The eight roles, in catalog order. Every theme defines ALL of them; there is no
 # partial theme, because a partial one is a theme whose half is still hard-coded
-# somewhere else.
-ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "rail")
+# somewhere else. `failed` joined the seven when the operator asked for a red
+# failed mark: it is a STATUS role beside `idle` and `working`, so it sits with
+# them and every row carries it — the loader refuses a row missing one.
+ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "failed", "rail")
 
 # The one value that is not a colour: curses' `-1`, "allocate nothing, inherit the
 # terminal's own". Legal in every role (see the module docstring).
@@ -95,7 +97,7 @@ class ThemeError(ValueError):
 
 @dataclass(frozen=True)
 class Theme:
-    """One row of the catalog: a slug, a display label, a sort key, seven colours."""
+    """One row of the catalog: a slug, a display label, a sort key, eight colours."""
 
     slug: str
     label: str
@@ -142,6 +144,7 @@ BUILTIN: dict = {
             "sel_bg": "#44475a",
             "idle": "#50fa7b",
             "working": "#f1fa8c",
+            "failed": "#ff5555",
             "rail": "#44475a",
         },
     ),

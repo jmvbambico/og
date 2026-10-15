@@ -322,31 +322,34 @@ def test_no_value_curses_value_returns_can_be_a_packed_rgb_triple():
 # the OG round trip -- today's colours, provably
 # ---------------------------------------------------------------------------
 
-OG = {"meta": "#87afaf", "idle": "#00ff00", "working": "#ffff00"}
+OG = {"meta": "#87afaf", "idle": "#00ff00", "working": "#ffff00",
+      "failed": "#ff0000"}
 
 
 def test_og_hexes_convert_back_to_the_indices_the_pane_already_shipped():
     """IF THIS FAILS, `og` IS NOT TODAY'S COLOURS.
 
-    The three hexes in the `og` row are the exact sRGB of ansi 109 (META_COLOR),
-    46 (idle) and 226 (working). They were resolved from the cube, not eyeballed,
-    and the converter has to reproduce them exactly — otherwise the theme that
-    exists to prove this change costs nothing is a different palette wearing its
-    name, and every "OG looks the same" claim built on it is false.
+    The four hexes in the `og` row are the exact sRGB of ansi 109 (META_COLOR),
+    46 (idle), 226 (working) and 196 (the failed mark's neon red). They were
+    resolved from the cube, not eyeballed, and the converter has to reproduce them
+    exactly — otherwise the theme that exists to prove this change costs nothing
+    is a different palette wearing its name, and every "OG looks the same" claim
+    built on it is false.
     """
     assert th.hex_to_ansi256(OG["meta"]) == 109
     assert th.hex_to_ansi256(OG["idle"]) == 46
     assert th.hex_to_ansi256(OG["working"]) == 226
+    assert th.hex_to_ansi256(OG["failed"]) == 196
     # And the module's own constants ARE those round trips, not literals again:
     # `META_COLOR` and `_STATE_COLOURS` are the `og` theme's rows read back
     # through the converter, so the catalog is the source and these are its
-    # record. They still evaluate to exactly 109 / 46 / 226.
+    # record. They still evaluate to exactly 109 / 46 / 226 / 196.
     og = th.load_catalog()["og"]
     assert a.META_COLOR == th.hex_to_ansi256(og.colour("meta")) == 109
     assert a._STATE_COLOURS == {
         state: th.hex_to_ansi256(og.colour(state))
-        for state in ("idle", "working")
-    } == {"idle": 46, "working": 226}
+        for state in ("idle", "working", "failed")
+    } == {"idle": 46, "working": 226, "failed": 196}
 
 
 def test_the_parchment_round_trips_to_the_cell_the_operator_chose():
@@ -385,6 +388,7 @@ def test_the_og_row_is_todays_colours_including_a_transparent_background():
     assert theme.index("meta") == 109
     assert theme.index("idle") == 46
     assert theme.index("working") == 226
+    assert theme.index("failed") == 196
     # And the module's own record of them matches the catalog row byte for byte.
     assert a._OG_COLOURS == theme.colors
 
@@ -408,13 +412,38 @@ def _good_row(**overrides) -> dict:
     return row
 
 
-def test_the_real_catalog_loads_with_every_theme_defining_all_seven_roles():
+def test_the_real_catalog_loads_with_every_theme_defining_all_eight_roles():
     catalog = th.load_catalog()
     assert len(catalog) == 26
     assert "dracula" in catalog and "og" in catalog
+    # `failed` joined the seven when the operator asked for a red failed mark; it
+    # is a STATUS role, and every row carries it or the loader refuses the catalog.
+    assert "failed" in th.ROLES
     for slug, theme in catalog.items():
         assert theme.slug == slug
         assert set(theme.colors) == set(th.ROLES), slug
+        assert theme.colour("failed") != "default", slug
+
+
+def test_every_theme_defines_a_failed_red_that_resolves_above_the_named_16():
+    """The failed mark is coloured on EVERY theme, and its red is a real cell.
+
+    `_STATE_COLOURS` only knows the `og` red; under any other theme `_role_colour`
+    asks THAT theme's `failed` row, so every row must define one — the loader
+    enforces that, and this is the colour half. The red must convert to a palette
+    index ABOVE 16, because the named 8 are the dull, terminal-remappable colours
+    and a red landing there would fall back to whatever the terminal put there:
+    the gutter would stop painting the colour the catalog chose. `og`'s is 196,
+    the cube's pure-red corner, well past them.
+    """
+    catalog = th.load_catalog()
+    for slug, theme in catalog.items():
+        index = theme.index("failed")
+        assert index > 16, (slug, theme.colour("failed"), index)
+    # And the failed red is its OWN colour, not the idle or working one reused.
+    dracula = catalog["dracula"]
+    assert dracula.index("failed") not in (dracula.index("idle"),
+                                           dracula.index("working"))
 
 
 def test_ordered_themes_sorts_by_the_rows_own_order_not_by_file_order():
@@ -431,7 +460,7 @@ def test_ordered_themes_sorts_by_the_rows_own_order_not_by_file_order():
 
 
 def test_default_is_legal_in_every_role_not_just_bg(tmp_path):
-    """THE STRUCTURAL DECISION. `"default"` in ANY of the seven roles is what
+    """THE STRUCTURAL DECISION. `"default"` in ANY of the eight roles is what
     lets `og` reproduce the pre-theme pane; a loader that only accepted it in `bg`
     could not express "rails paint PLAIN today" and the row would be a fiction."""
     row = _good_row(colors={role: "default" for role in th.ROLES})
