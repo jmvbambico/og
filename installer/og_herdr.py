@@ -814,10 +814,16 @@ class Bridge:
         return {rec["workspace_id"]: sid
                 for sid, rec in self._spaces.items() if rec.get("workspace_id")}
 
-    def reconcile(self, events) -> list:
+    def reconcile(self, events, live_ids=None) -> list:
         """Apply a batch of session events, returning human-readable action
         lines. One bad pane is recorded and skipped, never fatal: the bridge
         must survive a single failing herdr call and keep projecting the rest.
+
+        `live_ids` is the watcher's live session set for the pass that just
+        happened, or None when it could not be obtained. It is what makes the
+        orphan sweep (`_close_orphan_spaces`) safe: None is a shrug, not an
+        answer, and sweeps nothing — a listing that cannot be read must never
+        read as "every session is gone".
         """
         # The workspace listing is a per-PASS snapshot, not a per-call one:
         # adoption, claiming and pending-pruning all ask the same question of
@@ -828,6 +834,7 @@ class Bridge:
         self._ws_error = None
         self._pass_notes = []
         lines: list[str] = list(self._prune_pending())
+        lines.extend(self._close_orphan_spaces(live_ids))
         for event in self._roots_first(events):
             try:
                 lines.extend(self._apply(event))
@@ -885,14 +892,30 @@ class Bridge:
         return sorted(events, key=lambda ev: 1 if _parent_of(
             getattr(ev, "session", None) or getattr(ev, "previous", None)) else 0)
 
+    def _live_session_ids(self):
+        """The watcher's live session set for the pass just observed, or None.
+
+        `poll_once`/`watch` populate the watcher's `_seen` as their final step,
+        so this is only ever read on the path that has just polled. None means
+        "could not ask" — a watcher with no live set (the FakeWatcher in tests,
+        or a watcher that has not polled) — and makes the orphan sweep a no-op.
+        None is a shrug, never "every session is gone": a listing that cannot
+        be read must never close every space the operator has.
+        """
+        seen = getattr(self.watcher, "_seen", None)
+        if not isinstance(seen, dict):
+            return None
+        return frozenset(seen)
+
     def run_once(self) -> list:
         """Poll the watcher once and reconcile whatever it returned."""
-        return self.reconcile(self.watcher.poll_once())
+        events = self.watcher.poll_once()
+        return self.reconcile(events, live_ids=self._live_session_ids())
 
     def run_forever(self) -> None:
         """Consume watcher.watch() indefinitely, reconciling each event."""
         for event in self.watcher.watch():
-            for line in self.reconcile([event]):
+            for line in self.reconcile([event], live_ids=self._live_session_ids()):
                 print(line, flush=True)
 
     def cleanup(self) -> list:
@@ -1802,6 +1825,39 @@ class Bridge:
         return [f"state: pruned {len(stale)} pending launcher record(s) whose "
                 f"workspace no longer exists: {', '.join(sorted(stale))}"]
 
+    def _close_orphan_spaces(self, live_ids) -> list:
+        """Close recorded spaces whose session is no longer live.
+
+        Mirrors the existence rule of `_prune_pending`: a space in `spaces`
+        whose session id is absent from `live_ids` is orphaned — its session
+        died without a `removed` event this pass (a close that failed last
+        time and left the record, or a session gone before the bridge learned
+        otherwise). Each absent id is routed through `_removed`, so the
+        ownership guard it already carries (root vs worker, launcher-owned or
+        not) and the close/forget/drop-children cleanup are reused rather than
+        re-implemented here.
+
+        `live_ids` is None when the live listing could not be read — and that
+        is the one way this goes catastrophically wrong: a shrug must never
+        read as "every session is gone", or this closes every space the
+        operator has. None (and `dry_run`) sweeps nothing, the same safety
+        `_prune_pending` leans on `_workspace_index` for.
+        """
+        if self.dry_run or live_ids is None or not self._spaces:
+            return []
+        gone = [sid for sid in self._spaces if sid not in live_ids]
+        if not gone:
+            return []
+        lines: list[str] = []
+        for sid in list(gone):
+            try:
+                lines.extend(self._removed(sid))
+            except _error_cls() as exc:
+                # A failed close must not take the sweep down: keep the record
+                # and retry next pass, exactly as `_removed`'s own caller would.
+                lines.append(_error_line(sid, exc))
+        return lines
+
     def _space_of(self, parent: str | None) -> str | None:
         """The herdr workspace a sub-agent's tab belongs in, or None.
 
@@ -2264,6 +2320,19 @@ class Bridge:
         if rec is None:
             return []
         owns_space = rec["owns_space"]
+        # WHY: a ROOT session owns the space og recorded for it, even when the
+        # launcher opened it — that record reads `owner: launcher`, which is
+        # what stamps `owns_space` False here. Herdr removes a space with its
+        # last tab, so a SINGLE-tab launcher space already died on tab_close;
+        # the leak was a launcher space HELD OPEN by worker tabs, because
+        # `_drop_children` was skipped when owns_space stayed False and the
+        # close never reached `workspace_close`. Forcing the space-wide close
+        # on a root makes it take its workers down with it, launcher-owned or
+        # not. A WORKER (parent set) is untouched and keeps its tab-only close.
+        if rec.get("parent") is None and \
+                self._spaces.get(sid, {}).get("workspace_id") == \
+                rec["workspace_id"]:
+            owns_space = True
         # A record adopted from the state file may name a pane without naming
         # the tab holding it — a v1 record carries neither, and a record written
         # by hand can name one and not the other. Closing the SPACE is then the

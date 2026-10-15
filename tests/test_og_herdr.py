@@ -1108,6 +1108,98 @@ def test_a_workers_removal_closes_only_its_tab(seams):
     assert bridge._owned == {"ws1": "root"}
 
 
+def test_a_launcher_owned_root_removal_closes_the_whole_space_and_drops_its_workers(seams):
+    # The launcher opened the root's space, so its record owns it False — but
+    # a ROOT still takes the whole space down when it goes, launcher-owned or
+    # not. Before the fix this closed only the root's tab and never reached
+    # `workspace_close` or `_drop_children`, leaving the launcher space open
+    # with orphaned worker tabs still living in it.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+    bridge.reconcile([Ev("added", "w1", sub_session("s1", "coder_zen:fix"))])
+    client.calls.clear()
+
+    lines = bridge.reconcile([Ev("removed", "s1", {})])
+
+    assert _names(client) == ["release_agent", "workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("wB",)
+    assert "w1" not in bridge._recs
+    assert any("remove w1" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_the_orphan_sweep_closes_a_recorded_space_whose_session_is_gone(seams):
+    # The live set lists `root` as gone (it is absent from it). The sweep closes
+    # the space og recorded for it — and drops the worker whose tab lived in it,
+    # the same way a `removed` event would have.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("Alignment")),
+        Ev("added", "w1", sub_session("root", "coder_zen:fix")),
+    ])
+    client.calls.clear()
+
+    lines = bridge.reconcile([], live_ids=frozenset({"still-alive"}))
+
+    assert _names(client) == ["release_agent", "workspace_close"]
+    assert _call(client, "workspace_close")[1] == ("ws1",)
+    assert "root" not in bridge._recs and "w1" not in bridge._recs
+    assert any("remove root" in ln or "remove w1" in ln for ln in lines)
+    assert bridge._owned == {}
+
+
+def test_the_orphan_sweep_sweeps_nothing_when_the_listing_cannot_be_read(seams):
+    # `live_ids` None is a shrug, not an answer. A listing that could not be
+    # read must never read as "every session is gone" and close every space the
+    # operator has.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("T"))])
+    client.calls.clear()
+
+    assert bridge.reconcile([], live_ids=None) == []
+    assert client.calls == []
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_the_orphan_sweep_sweeps_nothing_under_dry_run(seams):
+    # `dry_run` is a shrug the other way: a recorded space is left exactly as
+    # the operator left it, even when its session is provably gone.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "wB", "owner": "bridge"}})
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
+
+    assert bridge._close_orphan_spaces(frozenset()) == []
+    assert "workspace_close" not in _names(client)
+    assert bridge._owned == {"wB": "s1"}
+
+
+def test_the_orphan_sweep_closes_only_recorded_orphans_leaving_live_and_stray(seams):
+    # Three cases in one pass: rootA is live (kept), rootB is gone (closed),
+    # and wStray is an operator workspace og never recorded (never in scope).
+    client = RecordingClient(spaces=[space_info("wStray", "operator's")])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([
+        Ev("added", "rootA", root_session("A")),
+        Ev("added", "rootB", root_session("B")),
+    ])
+    client.calls.clear()
+
+    lines = bridge.reconcile([], live_ids=frozenset({"rootA"}))
+
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [("ws2",)]          # only rootB's space; rootA is live
+    assert bridge._owned == {"ws1": "rootA"}   # wStray was never recorded
+    assert any("remove rootB" in ln for ln in lines)
+
+
 def test_a_nested_worker_lands_beside_its_own_parent(seams):
     # The same lookup by parent_session_id serves a grandchild, so the layout
     # does not need a second index and does not go flat at depth two.
