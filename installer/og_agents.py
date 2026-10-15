@@ -259,16 +259,21 @@ DEFAULT_WIDTH = 80
 # a key: a key with no label is still findable by pressing it, a key clipped off
 # the end is gone.
 #
-# THE FOOTER NAMES ITS KEYS IN ASCII, AND ITS ONE NON-ASCII SEPARATOR IS A KNOWN
-# AMBIGUOUS. The move keys were once ↑/↓ (U+2191/U+2193), East Asian AMBIGUOUS —
-# one column in a Latin locale, TWO in a CJK one. `_display_width` charged them
-# one, so the full form measured exactly 64 and was chosen for a 64-column pane —
-# but a CJK terminal painted 66 and `_clip` cut the trailing keys off. They are
-# ASCII now (`^/v`), and ⏎ (U+23CE) and ␣ (U+2423) are Narrow — checked, not
-# assumed. The ` · ` separator is Ambiguous and is handled rather than avoided:
-# `_footer` picks a form with `_display_width`, which charges it two, so a form is
-# only chosen for a pane it fits under the CJK rule as well. ⏎/␣/· are the only
-# non-ASCII glyphs here and each is charged by that pessimistic ruler. See
+# THE FOOTER NAMES ITS KEYS IN ASCII AND ITS ONE SEPARATOR IN A NARROW GLYPH. The
+# move keys were once ↑/↓ (U+2191/U+2193), East Asian AMBIGUOUS — one column in a
+# Latin locale, TWO in a CJK one. `_display_width` charged them one, so the full
+# form measured exactly 64 and was chosen for a 64-column pane — but a CJK terminal
+# painted 66 and `_clip` cut the trailing keys off. They are ASCII now (`^/v`).
+# The separator is U+2219 BULLET OPERATOR, NARROW — `unicodedata.east_asian_width`
+# reports "N", checked, not assumed — so it costs one column under BOTH locale
+# rules. AN AMBIGUOUS SEPARATOR IS WHAT SILENTLY COST THE PANE ITS LABELS: the
+# earlier ` · ` (U+00B7 MIDDLE DOT) is "A", charged TWO, which pushed the full form
+# to 85 measured columns and the compact form to 63, so the 80-column terminal fell
+# to COMPACT and the ~46-column agents split fell all the way to the bare KEYS
+# form — the labels gone at the width the operator actually runs.
+# `test_the_footer_separator_is_not_ambiguous` is what stops that recurring.
+# ⏎ (U+23CE), ␣ (U+2423) and ∙ are the only non-ASCII glyphs here and each is
+# Narrow, so `_display_width` and a CJK terminal agree on every form. See
 # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
 #
 # `t theme` JOINED ALL THREE FORMS WITHOUT MOVING ANY THRESHOLD, and that took a
@@ -283,27 +288,41 @@ DEFAULT_WIDTH = 80
 # something you cannot guess.
 #
 # THE THREE FORMS ARE BUILT FROM (key, label) PAIRS, not typed out, so a key can
-# never appear in one form without its label and the ` · ` separator can never be
+# never appear in one form without its label and the separator can never be
 # forgotten in one of them: `_footer_form` is the ONE place a form is spelled out,
 # and `_footer_spans` paints the SAME pair list it built from (`_footer_entries`),
-# one span per half. THE SEPARATOR CHANGED EVERY WIDTH: the old double space was
-# 2 columns and ` · ` is 3, so the full form went 73 -> 79 columns, and the
-# Ambiguous `·` costs 2 under `_display_width`, which is the ruler `_footer` picks
-# with, so the MEASURED widths are 85 / 63 / 32. The full form therefore needs 85
-# columns and a plain 80-column terminal shows COMPACT — the deliberate price of a
-# spaced separator, and the reason `test_the_footer_chooses_a_form_by_measured_width`
-# pins the measured numbers rather than the printed ones.
-FOOTER_SEP = " \u00b7 "
+# one span per half. `_footer_sep` is the one place the SEPARATOR that JOINs those
+# pairs is chosen, so the text form and the painted spans can never disagree about
+# it. THE SEPARATOR IS SPACED IN THE LABELLED FORMS AND ABSENT FROM COMPACT: the
+# Ambiguous ` · ` charged two columns per entry, so the MEASURED widths were
+# 85 / 63 / 32 and neither the 80-column terminal nor the ~46-column split got a
+# LABELLED form — the labels vanished at the width the operator actually runs.
+# ` ∙ ` (U+2219, Narrow) charges one, and COMPACT joins its entries with a single
+# space — its pre-separator spelling — so the MEASURED widths become 79 / 45 / 26.
+# That is why `test_the_footer_chooses_a_form_by_measured_width` pins the measured
+# numbers rather than the printed ones.
+FOOTER_SEP = " \u2219 "
 
 
-def _footer_form(entries: Iterable[tuple[str, str]]) -> str:
-    """One footer form from its `(key, label)` pairs: `q quit · r refresh`.
+def _footer_sep(entries: tuple) -> str:
+    """The separator the form spelled by `entries` joins its pairs with.
+
+    `FOOTER_SEP` for the two labelled forms; a single space for COMPACT, which
+    carries no separator of its own — it is already the degraded form and has
+    given up words, so a spaced glyph between its entries buys a lookup nothing
+    and only widens the form away from the ~46-column panes that need it.
+    """
+    return " " if entries is FOOTER_COMPACT_ENTRIES else FOOTER_SEP
+
+
+def _footer_form(entries: Iterable[tuple[str, str]], sep: str = FOOTER_SEP) -> str:
+    """One footer form from its `(key, label)` pairs: `q quit ∙ r refresh`.
 
     A label of "" is a KEY with no label (the compact and keys forms). The
-    separator is `FOOTER_SEP` between entries and a single space inside one, which
-    is exactly what the three constants below have always looked like.
+    separator is `sep` between entries and a single space inside one, which is
+    exactly what the three constants below have always looked like.
     """
-    return FOOTER_SEP.join(
+    return sep.join(
         key + (f" {label}" if label else "") for key, label in entries)
 
 
@@ -319,7 +338,7 @@ FOOTER_KEYS_ENTRIES = (
     ("q", ""), ("r", ""), ("^v", ""), ("⏎", ""), ("␣", ""), ("a", ""), ("t", ""),
 )
 FOOTER = _footer_form(FOOTER_ENTRIES)
-FOOTER_COMPACT = _footer_form(FOOTER_COMPACT_ENTRIES)
+FOOTER_COMPACT = _footer_form(FOOTER_COMPACT_ENTRIES, _footer_sep(FOOTER_COMPACT_ENTRIES))
 FOOTER_KEYS = _footer_form(FOOTER_KEYS_ENTRIES)
 
 # The caveats shown under the address, mirroring bin/og's `show_access`: the
@@ -387,7 +406,7 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              now NO role reached, so the slot was dead. Left PLAIN, `rail` could
 #              not be expressed at all.
 #   FOOTER_KEY    a footer shortcut's KEY half, and FOOTER_LABEL its label half
-#              (and the `·` between entries, and the strip's padding). They are
+#              (and the `∙` between entries, and the strip's padding). They are
 #              two roles rather than one because the KEY is the prominent half —
 #              it takes the `text` slot and is `undim`-exempt — while the label
 #              recedes into `meta`. Both carry the footer's derived background
@@ -2054,7 +2073,8 @@ def _footer(width: int) -> str:
     This is the TEXT of the row (the tests compare painted text to it);
     `_footer_spans` is the painted form.
     """
-    return _footer_form(_footer_entries(width))
+    entries = _footer_entries(width)
+    return _footer_form(entries, _footer_sep(entries))
 
 
 def _pad_footer(spans: list[Span], width: int) -> list[Span]:
@@ -2081,25 +2101,29 @@ def _pad_footer(spans: list[Span], width: int) -> list[Span]:
 
 
 def _footer_spans(width: int) -> list[Span]:
-    """The footer row as SPANS: each key, its label, a `·` between entries, padded
+    """The footer row as SPANS: each key, its label, a `∙` between entries, padded
     to the pane width.
 
     THE KEY AND ITS LABEL ARE DIFFERENT ROLES so the operator can see at a glance
     which half is the thing to press. The KEY takes `text` (the body colour) and is
     hung through `undim`, so it stays at full brightness on a line the pane paints
     DIM — the footer is chrome and its LINE is dim, but the key is the content of
-    that chrome and must not be. The LABEL and the `·` separator both take `meta`,
+    that chrome and must not be. The LABEL and the `∙` separator both take `meta`,
     which is the dimmer of the two, so the separator recedes between the entries
     exactly as a divider should. Both roles carry the derived strip background
     (see `_role_background`).
 
-    ` ` joins a key to its label and `FOOTER_SEP` joins the entries, so the spans
-    JOIN to exactly the string `_footer(width)` chooses — one form, two renderings.
+    ` ` joins a key to its label and `_footer_sep` picks what joins the entries,
+    so the spans JOIN to exactly the string `_footer(width)` chooses — one form,
+    two renderings. COMPACT's separator is the plain space itself, so its spans
+    still carry one between entries; it just paints no `∙` glyph.
     """
+    entries = _footer_entries(width)
+    sep = _footer_sep(entries)
     spans: list[Span] = []
-    for index, (key, label) in enumerate(_footer_entries(width)):
+    for index, (key, label) in enumerate(entries):
         if index:
-            spans.append((FOOTER_SEP, FOOTER_LABEL))
+            spans.append((sep, FOOTER_LABEL))
         spans.append((key, undim(FOOTER_KEY)))
         if label:
             spans.append((f" {label}", FOOTER_LABEL))
@@ -2417,7 +2441,7 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     else:
         # The footer is a span list, not one clipped string: each key is its own
         # span (`undim`, `text` slot) so it stays bright on the DIM chrome line,
-        # each label and the `·` between entries are `meta`, and the row is padded
+        # each label and the `∙` between entries are `meta`, and the row is padded
         # to `width` so the background strip reaches the pane edge. See
         # `_footer_spans`.
         tail.append((_footer_spans(width), DIM))

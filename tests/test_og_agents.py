@@ -191,7 +191,7 @@ def _footer_text(width):
     for `width`, laid out in spans and padded out to `width` columns.
 
     The footer is no longer one clipped string — it is a key span, a label span and
-    a `·` between each entry, all padded with the background strip out to the pane
+    a `∙` between each entry, all padded with the background strip out to the pane
     edge — so a test that wants the painted ROW compares against this. `a.FOOTER`
     and friends remain the form's TEXT, unpadded, and are still the right thing to
     compare when the FORM itself is under test.
@@ -374,10 +374,11 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "⦿ ✓ │ ⌘  docs                            done│",
         "│   ╰────────────────────────────────────────╯",
         "",
-        # The 46-column footer: the ` · ` separator costs the compact form 4
-        # measured columns per entry, so a ~46-column pane now falls through to
-        # the bare KEYS form (see `test_the_footer_chooses_a_form_by_measured_width`).
-        # Whatever form it is, the row is padded out to the pane with the strip.
+        # The 46-column footer: now that the separator is U+2219 (Narrow) and
+        # COMPACT carries none at all, the compact form measures 45 and a
+        # ~46-column pane gets it — the LABELLED form, as it should be (see
+        # `test_the_footer_chooses_a_form_by_measured_width`). Whatever form it is,
+        # the row is padded out to the pane with the strip.
         _footer_text(C2_WIDTH),
     ]
     # Every BOX row — the root's and each worker's — is exactly the pane width.
@@ -2830,14 +2831,13 @@ def test_access_panel_drops_the_qr_when_the_pane_is_too_narrow():
     # has and says where it stopped.
     assert any(line.strip("│ ").startswith("http://192.168.100.17")
                for line in lines)
-    # 26 columns is far below any footer form: it falls to the bare key list
-    # rather than being clipped mid-word (see `_footer`).
+    # 26 columns IS the bare KEYS floor exactly: below both labelled forms, so it
+    # falls to the key list rather than being clipped mid-word (see `_footer`).
     assert lines[0] == "" and lines[-1] == _footer_text(26)
-    # The row is the bare key list padded out to the 26-column pane with the
-    # strip. Under the pane's own ruler that is exactly the pane (`len`);
-    # `_display_width` would read it wider, because the ` · ` separator is East
-    # Asian Ambiguous and is charged two columns there — see
-    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
+    # The row is the bare key list, exactly the KEYS width, so nothing is padded —
+    # and the pane's own ruler (`len`) agrees with `_display_width`, because every
+    # footer glyph including the separator is Narrow now (see
+    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`).
     assert len(lines[-1]) <= 26
     assert len(a.access_lines(acc, 26)) == 4, "borders, address, caveat, borders"
 
@@ -3331,7 +3331,7 @@ def test_a_short_list_paints_its_footer_once(monkeypatch):
     under the last box and one at the pane bottom.
 
     The footer is SEVERAL span writes on ONE row now (each key, each label, the
-    `·` between them and the strip's padding each get their own write), so "once"
+    `∙` between them and the strip's padding each get their own write), so "once"
     is counted per ROW: the row whose reassembled text is the footer form must be
     exactly one, and it must be the pane's bottom row.
     """
@@ -4423,8 +4423,10 @@ def _cjk_width(text: str) -> int:
     """Display columns if AMBIGUOUS is two — the CJK-locale rule.
 
     A footer FORM must fit under BOTH this and the Latin rule, and `_display_width`
-    charges Ambiguous two, so `_footer` choosing with it is what guarantees that —
-    including for the ` · ` separator, which IS Ambiguous. See
+    charges Ambiguous two, so `_footer` choosing with it is what guarantees that.
+    Nothing in the footer is Ambiguous any more — the ` ∙ ` separator is U+2219,
+    Narrow — so the two rulers agree on every form; this stays as the independent
+    check that keeps that true. See
     `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
     """
     import unicodedata
@@ -4464,19 +4466,23 @@ def test_the_footer_chooses_a_form_by_measured_width():
     # that can drift out of step with the strings.
     #
     # THE NUMBERS MOVED TWICE. `t theme` first cost COMPACT the word `refresh` (it
-    # shed a label rather than growing past the ~46-column split). Then the ` · `
-    # separator cost EVERY form 4 MEASURED columns per entry, because U+00B7 is
-    # East Asian AMBIGUOUS and `_display_width` — the ruler `_footer` chooses with
-    # — charges it two. So the full form needs 85 columns and a plain 80-column
-    # terminal now shows COMPACT; the ~46-column split falls to the bare KEYS form.
-    # The key `r` is still in all three forms: only labels degrade.
-    assert a._footer(85) == a.FOOTER
-    assert a._footer(80) == a.FOOTER_COMPACT, "85 measured columns is more than 80"
-    assert a._footer(63) == a.FOOTER_COMPACT
-    assert a._footer(62) == a.FOOTER_KEYS
-    assert a._display_width(a.FOOTER) == 85
-    assert a._display_width(a.FOOTER_COMPACT) == 63
-    assert a._display_width(a.FOOTER_KEYS) == 32
+    # shed a label rather than growing past the ~46-column split). Then a spaced
+    # separator was added and its glyph — U+00B7 MIDDLE DOT, East Asian AMBIGUOUS —
+    # cost TWO measured columns each, which `_display_width` (the ruler `_footer`
+    # chooses with) charged in full: the full form grew to 85, so a plain 80-column
+    # terminal showed COMPACT and the ~46-column split fell all the way to the bare
+    # KEYS form. THE SEPARATOR IS NOW U+2219 BULLET OPERATOR, NARROW — one column
+    # under both rulers — and COMPACT carries none at all (its entries are joined by
+    # a single space, its pre-separator spelling), so the forms measure 79 / 45 / 26
+    # and an 80-column terminal gets the full form back. The key `r` is still in all
+    # three forms: only labels degrade.
+    assert a._footer(79) == a.FOOTER
+    assert a._footer(80) == a.FOOTER, "the full form fits the classic 80 columns again"
+    assert a._footer(45) == a.FOOTER_COMPACT
+    assert a._footer(44) == a.FOOTER_KEYS
+    assert a._display_width(a.FOOTER) == 79
+    assert a._display_width(a.FOOTER_COMPACT) == 45
+    assert a._display_width(a.FOOTER_KEYS) == 26
     # And the boundary is the MEASUREMENT, checked from both sides of each form,
     # so a future edit to the strings cannot quietly move a threshold. FOOTER_KEYS
     # is excluded from the lower side on purpose: it is the FLOOR, and `_footer`
@@ -4488,12 +4494,16 @@ def test_the_footer_chooses_a_form_by_measured_width():
     floor = a._display_width(a.FOOTER_KEYS)
     assert a._footer(floor) == a.FOOTER_KEYS
     assert all(a._footer(w) == a.FOOTER_KEYS for w in range(0, floor + 1))
-    # Only labels degrade: every form names every key, every form names `t`, and
-    # every form carries the ` · ` separator between its entries.
+    # Only labels degrade: every form names every key and every form names `t`.
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
         assert "q" in form and "r" in form and "a" in form and "t" in form, form
         assert ("^/v" in form or "^v" in form), form
+    # THE SEPARATOR IS SPACED IN THE TWO LABELLED FORMS AND ABSENT FROM COMPACT:
+    # COMPACT is the degraded form and has already given up words, so it carries no
+    # separator glyph of its own.
+    for form in (a.FOOTER, a.FOOTER_KEYS):
         assert a.FOOTER_SEP in form, form
+    assert a.FOOTER_SEP not in a.FOOTER_COMPACT, a.FOOTER_COMPACT
 
 
 def test_the_footer_is_measured_the_same_in_a_cjk_locale():
@@ -4503,32 +4513,28 @@ def test_the_footer_is_measured_the_same_in_a_cjk_locale():
     # 64 and chose it for a 64-column pane, but a CJK terminal painted 66 and
     # `_clip` cut "a access" off. That is the bug the three forms exist to end.
     #
-    # THE ` · ` SEPARATOR IS THE ONE AMBIGUOUS GLYPH BACK IN THE FOOTER, and the
-    # guarantee is now about the FORM rather than the whole padded row. `_footer`
-    # measures with `_display_width`, which charges Ambiguous two, so the form it
-    # picks for a pane fits that pane under BOTH rules — and since only LABELS
-    # degrade, the KEYS survive in either locale. The row's trailing strip is
-    # padded out under `len`, the ruler the whole pane is composed for (the box
-    # borders are Ambiguous and composed the same way), so the strip reaches the
-    # pane edge in the western terminal this ships to.
+    # THE SAME TRAP WAS LATER SET BY THE SEPARATOR — ` · ` (U+00B7) is also
+    # AMBIGUOUS, charged two, which pushed the full form to 85 and cost the pane its
+    # labels — and it is now U+2219 BULLET OPERATOR, NARROW. So NO footer glyph
+    # depends on the locale any more, and `_display_width` and the CJK rule agree on
+    # every form; the only disagreement left is against `len`, which is the ruler
+    # the whole pane is composed for (the box borders are Ambiguous and composed the
+    # same way), so the trailing strip reaches the pane edge in the western terminal
+    # this ships to.
     import unicodedata
 
-    # Both rulers charge the separator two, so the two measures agree on every
-    # form — the disagreement is only against `len`.
-    assert unicodedata.east_asian_width("\u00b7") == "A"
-    assert a._display_width(a.FOOTER_SEP) == _cjk_width(a.FOOTER_SEP) == 4
+    # The separator is NARROW, so both rulers charge it the same three columns.
+    assert unicodedata.east_asian_width("\u2219") == "N"
+    assert a._display_width(a.FOOTER_SEP) == _cjk_width(a.FOOTER_SEP) == 3
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
         assert a._display_width(form) == _cjk_width(form), form
-        assert a.FOOTER_SEP in form, form
-        # The separator is the ONLY glyph here whose width depends on the locale:
-        # every other glyph is Narrow, so it measures the same under either rule.
+        # NO footer glyph is Wide, Fullwidth or Ambiguous — the property that keeps
+        # the two rulers in agreement, and the one an Ambiguous separator broke.
         for ch in form:
-            if ch == "\u00b7":
-                continue
             assert unicodedata.east_asian_width(ch) not in ("W", "F", "A"), (ch, form)
 
-    # ⏎ and ␣ stay Narrow — checked, not assumed.
-    for glyph in ("⏎", "␣"):
+    # ⏎, ␣ and ∙ stay Narrow — checked, not assumed.
+    for glyph in ("⏎", "␣", "∙"):
         assert unicodedata.east_asian_width(glyph) == "N", glyph
 
     # Every form `_footer` picks for a pane at least as wide as the KEYS floor
@@ -4538,10 +4544,34 @@ def test_the_footer_is_measured_the_same_in_a_cjk_locale():
         assert _cjk_width(a._footer(width)) <= width, width
 
 
+def test_the_footer_separator_is_not_ambiguous():
+    """THE TEST THAT STOPS THIS RECURRING: the separator glyph must not be East
+    Asian Ambiguous.
+
+    An Ambiguous glyph is one column in a Latin locale and TWO in a CJK one, and
+    `_display_width` — the ruler `_footer` chooses a form with — charges it two.
+    That is not hypothetical: the separator was U+00B7 MIDDLE DOT, "A", so the full
+    form measured 85 and the compact form 63, past both the classic 80-column
+    terminal and the ~46-column agents split, which fell all the way to the bare
+    KEYS form. The labels — the whole point of the footer — disappeared at the
+    width the operator actually runs. U+2219 BULLET OPERATOR is "N", one column
+    under both rules. This asserts the property directly, so a future edit that
+    swaps in another Ambiguous glyph fails HERE rather than silently eating the
+    labels in a CJK terminal.
+    """
+    import unicodedata
+    glyph = a.FOOTER_SEP.strip()
+    assert len(glyph) == 1, a.FOOTER_SEP
+    width = unicodedata.east_asian_width(glyph)
+    assert width != "A", \
+        "an Ambiguous separator silently costs the pane its labels (see the footer comment)"
+    assert width not in ("W", "F"), "a Wide/Fullwidth separator would shear the row"
+
+
 def test_the_footer_key_is_prominent_and_its_label_recedes():
     """1a. Each entry is TWO spans, so the KEY reads as the prominent half: the key
     takes the theme's `text` slot AND is exempt from the footer line's DIM, while
-    the label and the ` · ` separator take `meta` and dim with the chrome."""
+    the label and the ` ∙ ` separator take `meta` and dim with the chrome."""
     spans = a._footer_spans(120)          # wide enough for the full form
 
     key_text = "".join(t for t, role in spans
@@ -5369,9 +5399,9 @@ GOLDEN_FRAME = [
     '⦿ ⠋ │    w3                                                             working│',
     '│   ╰──────────────────────────────────────────────────────────────────────────╯',
     '',
-    # The footer row as `_pane` composes it: the form an 80-column pane gets
-    # (COMPACT, because the Ambiguous ` · ` separator pushes the full form to 85
-    # measured columns), padded with the background strip out to the pane edge.
+    # The footer row as `_pane` composes it: the form an 80-column pane gets —
+    # the FULL form, back now that the separator is U+2219 (Narrow) and the form
+    # measures 79 — padded with the background strip out to the pane edge.
     _footer_text(a.DEFAULT_WIDTH),
 ]
 
