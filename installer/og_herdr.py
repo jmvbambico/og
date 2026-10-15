@@ -703,6 +703,22 @@ def agent_label(session: dict) -> str:
     return harness_labels().get(harness, harness)
 
 
+def _snapshot(records: dict) -> dict:
+    """`{key: an independent copy of the record}`, for `Bridge._synced`.
+
+    One level deep on purpose, and a copy rather than the mapping itself: a
+    record is handed around by reference (`_claim_pending` MOVES one from
+    `pending` into `spaces`, and `_existing_space` edits `record["cwd"]` in
+    place), and `_synced`'s whole job is to answer "is what I hold still what
+    the file last held" — which it cannot do if the thing it is comparing
+    against moves whenever the thing it is comparing does. Records are flat
+    maps of JSON scalars (`_read_spaces` builds them that way), so one level is
+    the whole of the structure.
+    """
+    return {key: dict(rec) if isinstance(rec, dict) else rec
+            for key, rec in records.items()}
+
+
 # ---------------------------------------------------------------------------
 # bridge
 # ---------------------------------------------------------------------------
@@ -783,6 +799,13 @@ class Bridge:
         # that appears in that directory to claim it.
         self._spaces: dict[str, dict] = state["spaces"]
         self._pending: dict[str, dict] = state["pending"]
+        # What the file held the last time this process KNEW it held it: at this
+        # load, and at every save that landed since. The recency signal
+        # `_fold_state` needs to tell a record another process just wrote from a
+        # record this one is holding — see there for why neither "always the
+        # file" nor "always memory" is right.
+        self._synced: dict[str, dict] = {"spaces": _snapshot(self._spaces),
+                                         "pending": _snapshot(self._pending)}
         # `{workspace_id: info}` from workspace.list, for one reconcile pass.
         # None on `_ws_index` means "not asked yet"; `_ws_ok` says whether the
         # fetch SUCCEEDED, because an empty listing and an unreadable one are
@@ -1047,8 +1070,20 @@ class Bridge:
         self._save_state()
 
     def _save_state(self) -> None:
-        save_state(self.state_path, {"spaces": self._spaces,
-                                    "pending": self._pending})
+        """Write both maps, and — only when the write LANDED — remember the copy.
+
+        That snapshot is the recency signal `_fold_state` needs to tell a stale
+        in-memory record from a fresh on-disk one, so it is taken from a write
+        that SUCCEEDED and from nothing else: `save_state` swallows a write it
+        could not complete (a read-only home, a full disk), and a snapshot taken
+        from a failed write would claim the file holds something it never got —
+        which would let that older copy win the next merge, the one direction
+        that is not recoverable by looking at herdr again.
+        """
+        if save_state(self.state_path, {"spaces": self._spaces,
+                                        "pending": self._pending}):
+            self._synced = {"spaces": _snapshot(self._spaces),
+                            "pending": _snapshot(self._pending)}
 
     def _reload_state(self) -> None:
         """Fold the state file as it is NOW into this process's two maps.
@@ -1067,41 +1102,27 @@ class Bridge:
         worked across a bridge RESTART, which is why the duplicate looked like
         it came and went with `og start`.
 
-        WHERE, and why this point. Once per PASS, at the pass boundary, ahead
-        of `_prune_pending`, for three reasons:
+        WHERE, and why this point. Twice per pass, and the two are not the same
+        job. Once at the pass boundary, ahead of `_prune_pending`, because
+        pruning SAVES: it writes this process's whole copy of the file, so a
+        prune run against the construction-time snapshot would not merely miss
+        the launcher's record, it would DELETE it — and a record no process holds
+        any more can never be found by a later pass either. Once more inside
+        `_claim_pending`, immediately before the decision it feeds, because the
+        pass-boundary fold is not new enough by the time it is acted on: between
+        the two sit `_prune_pending`'s `workspace.list` round trip and every
+        event handled before this one, which is easily tens of milliseconds and
+        is exactly how long a launcher's `_record` takes to land. The claim is
+        the only decision in a pass that reads `pending` and it is the one whose
+        miss opens a second space, so it is the one that re-reads. It is also
+        once per claim, not once per event: `_claim_pending` is reached only for
+        a session with no `spaces` record, and the claim puts one there.
 
-          * the ordinary create decision funnels through `_existing_space` —
-            `_added` is its only caller, and `_added` is what decides a root
-            has no space — so the pass that precedes it is the last moment a
-            reload can still inform that decision. The repair path
-            (`_reproject`) can open a space without it, but it only ever runs
-            INSIDE a pass, for a session this bridge is already projecting, and
-            it has had its reload;
-          * it has to precede `_prune_pending`, which SAVES. Pruning writes
-            this process's whole copy of the file, so a prune that ran against
-            the construction-time snapshot would not merely miss the
-            launcher's record, it would DELETE it — and a record no process
-            holds any more can never be found by a later pass either. Reload
-            first and the record is in memory before anything can overwrite
-            it;
-          * per pass, not per event. A batch of ten new sessions must see ONE
-            consistent answer about `pending` rather than ten racing reads of a
-            file the launcher may be writing right now. That is the argument,
-            and the shape, the per-pass `_ws_index` snapshot in `reconcile`
-            already makes for the workspace listing.
-
-        MERGE, never replace. `setdefault` per key, so the file decides for
-        keys this bridge has never heard of and the bridge's own record wins
-        for keys it has. Every mutation it makes to either map is followed by
-        `_save_state` in the same call — `_remember`, `_drop_space_record`,
-        `_prune_pending`, `_forget_workspace`, and the claim at the end of
-        `_existing_space` — so what is in memory is at worst one FAILED write
-        ahead of the file, never behind it, and it is ahead of it on purpose:
-        a wholesale replace would let that failed write roll the bridge back
-        onto the workspace it has already typed an attach command into. (The
-        flip side — a record the bridge deliberately dropped reappearing
-        because its save failed — resolves itself: it names a workspace herdr
-        no longer lists, so the very next pass drops it again.)
+        MERGE, decided per key against the last-known copy — never a wholesale
+        replace, and never a blind `setdefault`. See `_fold_state`, which states
+        the rule; the short form is that a key this process has not changed
+        since the file last held it belongs to whoever wrote the file last,
+        including a writer who REPLACED it.
 
         ADDITIVE ONLY, which is what makes an unreadable file a no-op. Missing,
         empty and unparseable all read back as two empty maps (`load_state`),
@@ -1128,10 +1149,64 @@ class Bridge:
             # behaviour, which is stale but never fatal; a raise here would
             # stop the pass instead.
             return
-        for key, record in (fresh.get("spaces") or {}).items():
-            self._spaces.setdefault(key, record)
-        for key, record in (fresh.get("pending") or {}).items():
-            self._pending.setdefault(key, record)
+        self._fold_state(fresh)
+
+    def _fold_state(self, fresh: dict) -> None:
+        """Merge a freshly-read file in, key by key, `_synced` deciding.
+
+        THREE CASES, and the middle one is why this is not `setdefault`:
+
+          * the file has a key this process holds unchanged since the file last
+            held it — the FILE WINS. There is nothing local to protect, and the
+            writer who put that record there is the more recent writer;
+          * the file has a key this process changed WITHOUT a save landing
+            (`_save_state` only re-snapshots on a write that completed) —
+            MEMORY WINS, because it is ahead on purpose and rolling it back
+            would put this bridge on a workspace it has already typed an attach
+            command into;
+          * the file has a key memory no longer has, dropped here but never
+            written out — MEMORY WINS for the same reason, which is what keeps a
+            just-claimed record from un-claiming itself on the next pass.
+
+        The middle and third cases are both "memory differs from `_synced`", and
+        that is the whole of the recency signal: no clock, no mtime, no version
+        counter in the file, and nothing that can go stale while the daemon
+        runs. `_synced` is one record per live session, refreshed on every save.
+
+        REPLACEMENT is the case a blind `setdefault` cannot see and this one
+        exists for. The launcher keys `pending` by directory and `_record`
+        REPLACES what is under that key (og_herdr_launch._record) — the
+        operator runs `og start herdr` twice in one directory while the first
+        conversation is still appearing, and the second space's record lands
+        under the first one's key. This process is holding the first record, its
+        copy matches `_synced`, and it therefore has no local change to protect:
+        the file's newer record wins, and the session claims the space the
+        operator is actually sitting in. Memory-wins would have claimed the
+        space that record was replaced BY, attaching the conversation into a
+        space nobody is looking at while the live one goes unclaimed.
+
+        A key the file NO LONGER has is never removed from memory. That is the
+        additive half, and it is what makes an unreadable file a no-op: missing,
+        empty and unparseable all read back as two empty maps (`load_state`),
+        and folding two empty maps in changes nothing at all — so a file the
+        bridge cannot read leaves it behaving exactly as it behaves today. The
+        shape does the work rather than a fallback bolted onto it: a reload that
+        CLEARED on failure could convince a live bridge that the space a session
+        already has is recorded nowhere, and the next thing it does with that
+        belief is open a second space. An unreadable file must never be able to
+        cause the very duplicate this exists to prevent. (A record the launcher
+        dropped on purpose — `_unrecord`, after a failed `og chat` — survives in
+        memory for one pass and names a space that was closed with it, so the
+        very next `_prune_pending` drops it again.)
+        """
+        for bucket in ("spaces", "pending"):
+            mine = getattr(self, "_" + bucket)
+            onfile = self._synced[bucket]
+            for key, record in (fresh.get(bucket) or {}).items():
+                if key in onfile and mine.get(key) != onfile[key]:
+                    continue
+                mine[key] = record
+                onfile[key] = record
 
     # -- event handlers -----------------------------------------------------
 
@@ -1648,8 +1723,29 @@ class Bridge:
         `owner` stays whatever it was. The launcher opened this space, so it is
         still the launcher's; claiming it transfers nothing, and a record that
         claimed otherwise would misreport who to blame for a stray space.
+
+        THE SECOND FOLD, HERE, not only at the pass boundary — the one place in
+        a pass that reads the file at the moment it is acted on. The fold that
+        opened the pass was read before `_prune_pending`'s `workspace.list`
+        round trip and before every event handled ahead of this one, and a
+        launcher's `_record` landing anywhere inside that gap is invisible to it.
+        It is invisible to THIS session's record too: the launcher writes before
+        it types `og chat` (`og_herdr_launch._open_space`), so the session this
+        claim is for does not exist yet at the instant the pass began, and the
+        record that explains it cannot be the one being looked up. What CAN
+        arrive in the gap is a record for a DIFFERENT session in this same
+        directory — a launch the operator started while the first conversation
+        was still appearing — and a miss there is the same duplicate as any
+        other.
+
+        Before the lookup, and before the pop: the pop is what makes memory
+        differ from `_synced` for this key, and folding afterwards would let the
+        file hand back the record this call is in the middle of consuming.
         """
-        record = self._pending.get(cwd) if cwd else None
+        if not cwd:
+            return None
+        self._reload_state()
+        record = self._pending.get(cwd)
         if record is None:
             return None
         self._pending.pop(cwd, None)
@@ -2603,13 +2699,19 @@ def _upgrade_v1(raw, path: Path, say) -> dict:
     return {"spaces": spaces, "pending": {}}
 
 
-def save_state(path: Path, state: dict) -> None:
+def save_state(path: Path, state: dict) -> bool:
     """Write the ownership state, atomically, and never raise at the caller.
 
-    A failed write is swallowed: the worst case is a workspace that `--cleanup`
-    does not know about, which the operator can close by hand, and the
-    alternative — refusing to project a session because a local file could not
-    be written — trades a cosmetic bookkeeping failure for a missing pane.
+    Returns whether the file now holds this state. A failed write is swallowed:
+    the worst case is a workspace that `--cleanup` does not know about, which
+    the operator can close by hand, and the alternative — refusing to project a
+    session because a local file could not be written — trades a cosmetic
+    bookkeeping failure for a missing pane.
+
+    The answer matters to exactly one caller: `Bridge._save_state`, which uses
+    it to decide whether its in-memory maps are now in step with the file (see
+    `Bridge._fold_state`). It is a return rather than an exception because the
+    swallowing is deliberate and load-bearing everywhere else.
 
     The file is NOT a lock and does not pretend to be one: the launcher and the
     bridge both write it, whole and last-writer-wins. That is enough for this
@@ -2637,7 +2739,8 @@ def save_state(path: Path, state: dict) -> None:
                 pass
             raise
     except (OSError, ValueError):
-        pass
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
