@@ -91,7 +91,7 @@ from og_themes import (
 DEFAULT_INTERVAL = 3.0
 
 # The static per-state glyph shown in a worker's gutter, the operator's chosen
-# TUI vocabulary: ⏸ blocked, ✗ failed, ✓ finished. `working` has NO entry here —
+# TUI vocabulary: ⏸ blocked, × failed, ✓ finished. `working` has NO entry here —
 # it gets the SPINNER (see SPIN_FRAMES), because the operator's rule is "the
 # spinner before the agent logo is the status": a live row has to visibly
 # animate, and a moving dot is the one glyph that says "this is running" without
@@ -99,15 +99,33 @@ DEFAULT_INTERVAL = 3.0
 # thing must not look busy. This replaces the ASCII `+ ! x ?` the pane used to
 # draw, and keeps the six-dot braille spinner it also already had for working;
 # `?` stays the one honest glyph for a status `display_state` could not name
-# (-> "unknown"). `✓` finished pairs with `✗` failed: same Dingbats block, same
-# weight, and it reads as done rather than merely not-running.
+# (-> "unknown").
+#
+# THE FAILED GLYPH IS `×` (U+00D7 MULTIPLICATION SIGN): heavier than the `✗`
+# BALLOT X it replaced, and Latin-1, so every monospace font demonstrably has it.
+# It is East Asian AMBIGUOUS, which is safe HERE and only here — the gutter
+# composes with the len-based ruler (`_clip` / `_visible_width`, see the GUTTER
+# geometry below), which charges an Ambiguous glyph ONE column, the same single
+# column `✓` costs, so the two state glyphs stay column-neutral against each
+# other. It is NOT safe under `_display_width` (which charges Ambiguous two); do
+# not move this column onto that ruler.
+#
+# THE SALTIRES WERE PASSED OVER FOR THE FONT, NOT THE RULER. U+1F7AB..U+1F7AE
+# (BOLD..EXTREMELY HEAVY SALTIRE) are all measured East Asian NARROW, so they are
+# width-safe under EITHER ruler. But Geometric Shapes Extended is missing from
+# most monospace fonts, so a terminal substitutes a fallback whose ADVANCE WIDTH
+# is not one cell whatever the width table says — the same shear the pane has
+# been bitten by, arriving from the FONT rather than the ruler. `×` cannot be
+# substituted away. To swap the mark, change THIS one constant; the contract is
+# named by `test_the_failed_glyph_costs_the_same_columns_as_finished` and pinned
+# in `test_the_state_glyphs_are_static_and_working_is_the_spinner`.
 #
 # ✓ is East Asian NARROW (measured: `east_asian_width("\u2713") == "N"`), one
 # layout column. ○, the circle it replaced, was AMBIGUOUS and also composed as
 # one column under the len-based ruler, so the swap is width-neutral.
 STATE_GLYPH = {
     "blocked": "\u23f8",   # ⏸
-    "failed": "\u2717",    # ✗
+    "failed": "\u00d7",    # ×  (was \u2717 ✗ before the operator asked for a heavier mark)
     "unknown": "?",
     "idle": "\u2713",      # ✓
 }
@@ -980,11 +998,12 @@ _VENDOR_COLOURS = {
 
 # TODAY'S COLOURS, AS A THEME. `og` reproduces exactly what this pane painted
 # before themes existed — bg, text and sel_bg all `"default"`, so the pane keeps
-# the terminal's own background, and the three coloured roles converted straight
-# back to the indices above. It is the ONLY way back to a transparent pane now
-# that every other theme fills it, which makes it the regression guard for the
-# whole background change rather than a cosmetic extra: with `og` selected the
-# pane spends `init_pair(n, fg, -1)` exactly as it did, and the golden test pins
+# the terminal's own background, and the four coloured roles (meta, idle, working
+# and the failed mark added later) converted straight back to the indices above.
+# It is the ONLY way back to a transparent pane now that every other theme fills
+# it, which makes it the regression guard for the whole background change rather
+# than a cosmetic extra: with `og` selected the pane spends
+# `init_pair(n, fg, -1)` exactly as it did, and the golden test pins
 # `render` byte-for-byte against the pre-theme output.
 #
 # `order: 0` puts it FIRST in the picker. dracula remains the default theme; `og`
@@ -996,6 +1015,7 @@ _OG_COLOURS = {
     "sel_bg": "default",
     "idle": "#00ff00",
     "working": "#ffff00",
+    "failed": "#ff0000",
     "rail": "default",
 }
 
@@ -1010,28 +1030,34 @@ _OG_COLOURS = {
 # asks THAT theme instead, and this is simply what `og` paints.
 META_COLOR = hex_to_ansi256(_OG_COLOURS["meta"])
 
-# THE STATUS GLYPH's colours, asked for by name: the check mark NEON GREEN and the
-# spinner NEON YELLOW, so a pane with four workers running reads as four lit
-# glyphs down the gutter rather than four identical grey ⠋ braille cells at two
-# brightnesses. Only these two states are coloured — `⏸` blocked, `✗` failed and
-# `?` unknown stay PLAIN, because a red `✗` and a grey `⏸` are taste as much as
-# they are meaning and nobody asked for them; the table is the whole of it, and a
-# state absent here paints uncoloured.
+# THE STATUS GLYPH's colours, asked for by name: the check mark NEON GREEN, the
+# spinner NEON YELLOW and the failed mark NEON RED, so a pane with four workers
+# reads as four lit glyphs down the gutter rather than four identical grey ⠋
+# braille cells at two brightnesses. `⏸` blocked and `?` unknown stay PLAIN — a
+# grey pause is a brightness, not a status anyone asked to colour — and the table
+# is the whole of it: a state absent here paints uncoloured. The failed mark was
+# the last hold-out: it stayed PLAIN "because nobody asked for it", and the
+# operator has now asked, so it joins the table and its role wires through
+# `state_role` exactly as `idle` and `working` do.
 #
-# BOTH INDICES ARE PURE HUE AT FULL VALUE ON THE 6x6x6 CUBE, not a pale tint of
-# one: 46 is (0,255,0) and 226 is (255,255,0), the two cells in the cube that are
-# a neon green and a neon yellow with nothing shaded out of them. The cells beside
-# them shade toward white (118, 190, 229) and read as a pastel, which on a gutter
-# reads as "secondary"; the named 8 are duller still. Both indices are > 16, so
-# like every vendor colour here they want a 256-colour terminal and fall back to
-# uncoloured below that (`_Colours.attr`).
+# EVERY INDEX IS PURE HUE AT FULL VALUE ON THE 6x6x6 CUBE, not a pale tint of
+# one: 46 is (0,255,0), 226 is (255,255,0) and 196 is (255,0,0) — the three
+# primary corners of the cube, a neon green, a neon yellow and a neon red with
+# nothing shaded out of them. The cells beside them shade toward white (118, 190,
+# 229) and read as a pastel, which on a gutter reads as "secondary"; the named 8
+# are duller still. Every index is > 16, so like every vendor colour here they
+# want a 256-colour terminal and fall back to uncoloured below that
+# (`_Colours.attr`); the failed red is 196, well clear of the 16 the named
+# palette owns.
 #
 # Like `META_COLOR`, these are the `og` theme's rows read back through the
-# converter, not literals: the mapping is which STATE gets a colour, and that is
-# still the whole table.
+# converter, not literals: under any other theme `_role_colour` asks THAT theme's
+# `failed` row instead, so dracula paints its own #ff5555 (cell 203). The mapping
+# here is which STATE gets a colour, and that is still the whole table.
 _STATE_COLOURS = {
     "idle": hex_to_ansi256(_OG_COLOURS["idle"]),
     "working": hex_to_ansi256(_OG_COLOURS["working"]),
+    "failed": hex_to_ansi256(_OG_COLOURS["failed"]),
 }
 
 
@@ -2381,8 +2407,9 @@ def _role_colour(role: str, theme: Optional[Theme] = None) -> Optional[int]:
                    and box borders, so making PLAIN the theme's text is what makes
                    parchment DOMINANT rather than merely present.
         META    -> `meta`.
-        state:* -> `idle` / `working`, the two states in `_STATE_COLOURS`; a state
-                   with no role paints uncoloured, exactly as before.
+        state:* -> `idle` / `working` / `failed`, the three states in
+                   `_STATE_COLOURS`; a state with no role paints uncoloured,
+                   exactly as before.
         mark:*  -> the vendor's entry in `_VENDOR_COLOURS`, then the READABILITY
                    GUARD (below).
         ORCH    -> None, still: a bold weight and no colour, as it has always been.
