@@ -76,6 +76,13 @@ from og_herdr import (
     # when it creates a tab and read here to move the operator to it. Named in
     # og_herdr so the writer and this reader cannot drift about the file or its
     # shape — see `remember_agent_tab` for why herdr cannot answer it.
+    # The two ROLES a note can be keyed by. `TAB_ROLE_MAIN` is the agent's
+    # Omnigent view (a root's own pane), `TAB_ROLE_CLI` the vendor-CLI tab
+    # `focus_agent_terminal` opens on demand — the distinction that keeps Enter
+    # off a root's chat pane. Named in og_herdr so the writer and this reader
+    # cannot drift.
+    TAB_ROLE_CLI,
+    TAB_ROLE_MAIN,
     agent_tab_record,
     agent_tabs_path,
     attach_command,
@@ -90,6 +97,10 @@ from og_herdr import (
     default_home,
     default_state_path,
     load_state,
+    # The writer of the note `focus_agent_terminal` reads back. Load-bearing
+    # here: the return says whether the write LANDED, and a vendor-CLI tab whose
+    # note did not land is closed again rather than left to be duplicated.
+    remember_agent_tab,
     # The pane environment is stated ONCE, in og_herdr, next to the pane
     # commands it is about — the bridge opens panes too and had no copy of the
     # rule at all, which is how `og start herdr` left panes that opened a
@@ -2413,6 +2424,23 @@ NOTICE_FOCUS_NO_AGENT = "focus: no agent on this row"
 NOTICE_FOCUS_UNKNOWN_HARNESS = ("focus: {0} is not a harness og knows, so its "
                                 "tab is unverified")
 NOTICE_FOCUS_NO_TAB = "focus: no herdr tab recorded for this agent"
+# A NATIVE agent whose harness terminal cannot be resolved: the vendor CLI is
+# gone (the harness exited, the runner is offline, the codex-native record does
+# not exist), so there is no real CLI to show. Distinct from NO_TAB, which is
+# "we never noted a tab", and from the unknown-harness line: this one means "the
+# harness is one you should be able to attach to, and there is nothing there".
+NOTICE_FOCUS_NO_TERMINAL = ("focus: no live terminal for this agent (its harness "
+                            "may have exited)")
+# Nowhere to put the tab: the agent's space is not in og's notes or the state
+# file, so og cannot open a tab for it without guessing at a space id.
+NOTICE_FOCUS_NO_SPACE = "focus: this agent has no herdr space to open a tab in"
+# The tab was opened and the note recording it did NOT land. The tab is closed
+# again before this is returned (see `_open_vendor_cli_tab`), so what the
+# operator reads is the whole story: nothing was left on screen for the next
+# Enter to duplicate. See the commit that fixed the same shape twice before
+# (og-herdr's `cli_pane_id`) — an unrecorded pane is a duplicate waiting to
+# happen.
+NOTICE_FOCUS_NOT_RECORDED = "focus: the new CLI tab could not be recorded"
 NOTICE_FOCUS_FAILED = "focus: {0}"
 
 
@@ -2447,31 +2475,46 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
     for exactly this reason). A TAB ID, unlike a session id, is something herdr
     will act on directly, so `tab.focus` is the one call that can work.
 
-    THE TAB IS FOUND FROM OG'S OWN RECORDS, in this order:
-      1. this session's own note — the sidecar the bridge writes when it CREATES
-         a tab, which covers every worker and every root it opened a space for;
-      2. this session's `tab_id` in the state file, which is where the LAUNCHER
-         records the space it opened for `og chat` (a root whose space the
-         bridge only CLAIMED, so it never created a tab to note);
-      3. `root_session_id`'s tab, for a worker whose own note is gone — the
-         conversation it is working in, which is at least the right space.
-    A note is dropped when its pane goes (see `Bridge._forget_tab`), so a tab id
-    is not aimed at after herdr has re-used it.
+    WHAT IT REACHES, per harness kind, and this is the whole decision:
 
-    THE HARNESS KIND DECIDES NOTHING ABOUT WHETHER TO FOCUS — only whether og
-    can describe what the operator is being sent to. `harness_has_terminal` is
-    True for a native harness (its tab carries the real vendor CLI, attached
-    interactively by `og_herdr.Bridge._pane_command`, which is what makes a
-    vendor's blocking permission prompt answerable from here), and False for an
-    ACP one, whose tab keeps the `omnigent attach` REPL — the same view `og
-    chat`'s down-arrow menu gives, and the correct thing to reach. `None` is the
-    third answer: an unknown harness means the tab's content cannot be described,
-    so the operator gets the honest line and their own screen is left alone.
+      * **native** (`claude-native`, `codex-native`, …) — the agent's REAL vendor
+        CLI, in a tab of its own. If that tab is not there yet it is OPENED HERE,
+        on demand, in the agent's space: a tab the bridge never made, holding the
+        same interactive `tmux attach` a mirror pane would (`read_only_attach_command`).
+        A launcher-created ROOT therefore behaves exactly like a bridge-created
+        one — the operator gets the agent's CLI in a NEW tab and the conversation's
+        own pane is left exactly as it was. THE MAIN PANE IS NEVER REPURPOSED.
+      * **ACP** (`acp:*`) — the agent's own og chat view, `omnigent attach`, which
+        is what that agent's tab already holds (the same view `og chat`'s
+        down-arrow menu gives). Nothing is created.
+      * **unknown** — the third answer from `harness_has_terminal`, NOT collapsed
+        into either branch: og cannot say what the row's tab is, so it declines
+        with its own line and leaves the operator's screen alone.
 
-    The focus is ONE call. Measured against a live server: `tab.focus` also
-    raises the WORKSPACE holding the tab (see `og_herdr_client.tab_focus`), so
-    no `workspace.focus` is sent first — agents routinely live in a space other
-    than the one on screen, and one call moves both.
+    The tab is found from og's own records, keyed by ROLE (`og_herdr.TAB_ROLE_*`):
+    `TAB_ROLE_CLI` is the vendor-CLI tab an agent may have, `TAB_ROLE_MAIN` the
+    tab holding its Omnigent view. For an ACP agent the `main` note is read first,
+    then the state file's `spaces[session_id].tab_id` (a root whose space the
+    LAUNCHER opened — the bridge only CLAIMED it, so it never made a tab to note),
+    then the root's tab for a worker whose own note is gone. For a native agent the
+    `cli` note is read, and the state file's record is NOT used as a fallback: that
+    tab is the Omnigent view (`_pane_command` notes a root's own tab as `main`
+    precisely so this stays true), and sending the operator there is the failure
+    this whole role distinction exists to prevent. Notes are dropped when the panes
+    go (`Bridge._forget_tab`), so a tab id is never aimed at after herdr re-used it.
+
+    IDEMPOTENCE IS THE PROPERTY THAT MATTERS MOST HERE: pressing Enter on the same
+    agent twice must land on the SAME tab. That is what the `cli` note buys — the
+    second call finds the note and focuses it, and `tab.create` is not reached. And
+    the mirror of it: if the note write does NOT land, the tab that was just opened
+    is CLOSED again (`NOTICE_FOCUS_NOT_RECORDED`), because a tab on screen that
+    nothing records is exactly how the next Enter opens a second one — the defect
+    og-herdr's `cli_pane_id` had to be fixed for twice.
+
+    The focus itself is ONE call. Measured against a live server: `tab.focus` also
+    raises the WORKSPACE holding the tab (see `og_herdr_client.tab_focus`), so no
+    `workspace.focus` is sent first — agents routinely live in a space other than
+    the one on screen, and one call moves both.
     """
     environ = dict(os.environ) if env is None else dict(env)
     if not session_id:
@@ -2504,18 +2547,46 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
 
     try:
         state_path = default_state_path()
-        tab_id = _focus_tab_id(state_path, session_id, root_session_id)
+        tabs_path = agent_tabs_path(state_path)
     except Exception:
-        tab_id = None
-    if not tab_id:
         return NOTICE_FOCUS_NO_TAB
+
+    terminal = None
+    tab_id = None
+    if kind is True:
+        tab_id = _noted_tab(tabs_path, session_id, TAB_ROLE_CLI)
+        if not tab_id:
+            # No vendor-CLI tab yet: resolve the terminal FIRST, so an
+            # unresolvable one is an honest notice and never an empty tab.
+            try:
+                terminal = terminal_behind(session_id, environ)
+            except Exception:
+                terminal = None
+            if terminal is None:
+                return NOTICE_FOCUS_NO_TERMINAL
+    else:
+        tab_id = _main_tab_id(tabs_path, state_path, session_id, root_session_id)
+        if not tab_id:
+            return NOTICE_FOCUS_NO_TAB
+
+    # ONE client for the whole call, built only once there is something to do
+    # with it — and closed here when we built it. Constructing one does not
+    # connect (see `_chat_client`).
     try:
         opened = client if client is not None else _chat_client(environ)
     except Exception as exc:
         return _focus_line(NOTICE_FOCUS_FAILED, exc)
     try:
+        if not tab_id:
+            notice, tab_id = _open_vendor_cli_tab(
+                session_id, harness, environ, opened, tabs_path, state_path,
+                terminal)
+            if notice is not None:
+                return notice
         opened.tab_focus(tab_id)
     except Exception as exc:
+        # Belt and braces: every step above turns its own failure into a notice,
+        # and anything that got past them must still not kill the pane.
         return _focus_line(NOTICE_FOCUS_FAILED, exc)
     finally:
         if client is None:
@@ -2526,34 +2597,174 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
     return None
 
 
-def _focus_tab_id(state_path: Path, session_id: str,
-                  root_session_id: str = "") -> Optional[str]:
-    """The herdr tab an og session's pane lives in, or None. Never raises.
-
-    See `focus_agent_terminal` for the order and why there are two sources at
-    all: the sidecar is written by the process that owns the tab's lifetime, the
-    state file's copy is what the LAUNCHER left for a root whose space the bridge
-    only claimed. Both are og's own records — herdr cannot be asked (measured).
-    """
+def _noted_tab(tabs_path: Path, session_id: str, role: str) -> Optional[str]:
+    """The tab id noted for one agent and role, or None. Never raises."""
     try:
-        noted = agent_tab_record(agent_tabs_path(state_path), session_id)
+        record = agent_tab_record(tabs_path, session_id, role)
     except Exception:
-        noted = {}
-    tab_id = noted.get("tab_id") if isinstance(noted, dict) else None
-    if isinstance(tab_id, str) and tab_id:
+        return None
+    tab_id = record.get("tab_id") if isinstance(record, dict) else None
+    return tab_id if isinstance(tab_id, str) and tab_id else None
+
+
+def _main_tab_id(tabs_path: Path, state_path: Path, session_id: str,
+                 root_session_id: str = "") -> Optional[str]:
+    """The tab holding an agent's Omnigent view, or None. Never raises.
+
+    The sidecar first — written by whoever created the tab, and dropped when its
+    pane goes — then the state file, which is where the LAUNCHER records the space
+    it opened for `og chat`. That record is the only trace of a root whose space
+    the bridge merely CLAIMED. `root_session_id` is the last resort, for a worker
+    whose own notes are gone: the conversation it is working in, which is at least
+    the right space. Both are og's own records — herdr cannot be asked (measured;
+    see `og_herdr.remember_agent_tab`).
+    """
+    tab_id = _noted_tab(tabs_path, session_id, TAB_ROLE_MAIN)
+    if tab_id:
         return tab_id
+    try:
+        spaces = load_state(state_path).get("spaces") or {}
+    except Exception:
+        return None
+    if not isinstance(spaces, dict):
+        return None
     for candidate in (session_id, root_session_id):
         if not isinstance(candidate, str) or not candidate:
             continue
-        try:
-            spaces = load_state(state_path).get("spaces") or {}
-        except Exception:
-            return None
-        record = spaces.get(candidate) if isinstance(spaces, dict) else None
+        record = spaces.get(candidate)
         tab_id = record.get("tab_id") if isinstance(record, dict) else None
         if isinstance(tab_id, str) and tab_id:
             return tab_id
     return None
+
+
+def _agent_space(tabs_path: Path, state_path: Path, session_id: str,
+                 root_session_id: str = "") -> tuple:
+    """`(workspace_id, cwd)` of the space an agent's tabs live in, or (None, None).
+
+    The `main` note carries the workspace id, and for a WORKER that IS its root's
+    space (the bridge records a worker's tab against the space it created it in),
+    so the note normally answers this on its own. The state file's record is the
+    fallback for a root whose space the launcher opened; its `cwd` rides along
+    because a tab has to be created with one.
+
+    Never raises: an unreadable state file is "no space known", which the caller
+    turns into a notice rather than a tab in a guessed space.
+    """
+    try:
+        noted = agent_tab_record(tabs_path, session_id, TAB_ROLE_MAIN)
+    except Exception:
+        noted = {}
+    ws_id = noted.get("workspace_id") if isinstance(noted, dict) else None
+    if isinstance(ws_id, str) and ws_id:
+        return ws_id, None
+    try:
+        spaces = load_state(state_path).get("spaces") or {}
+    except Exception:
+        spaces = {}
+    if not isinstance(spaces, dict):
+        spaces = {}
+    for candidate in (session_id, root_session_id):
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        record = spaces.get(candidate)
+        if not isinstance(record, dict):
+            continue
+        ws_id = record.get("workspace_id")
+        if isinstance(ws_id, str) and ws_id:
+            cwd = record.get("cwd")
+            return ws_id, cwd if isinstance(cwd, str) and cwd else None
+    return None, None
+
+
+def _cli_tab_label(harness: Optional[str], session_id: str) -> str:
+    """What the on-demand vendor-CLI tab is called.
+
+    The harness's product name ("Claude Code") when the registry names it, which
+    is the same string the agent column shows, so the new tab reads as that
+    agent's CLI beside it; the session id's short form otherwise. The ` (cli)`
+    suffix is what tells it apart at a glance from the agent's own tab, which
+    carries the conversation title.
+    """
+    name = harness_labels().get(harness) if isinstance(harness, str) else None
+    if not isinstance(name, str) or not name:
+        name = str(session_id)[:8]
+    return "{0} (cli)".format(name)
+
+
+def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
+                         opened, tabs_path: Path, state_path: Path,
+                         terminal: tuple) -> tuple:
+    """Open an agent's vendor-CLI tab, note it, and return `(notice, tab_id)`.
+
+    ONE tab in the agent's space, running the interactive attach that
+    `read_only_attach_command` builds — the same command a mirror pane gets, so
+    there is one spelling of the safety trade-off (`ignore-size`, and NOT `-r`;
+    see `TMUX_ATTACH_FLAGS`).
+
+    `focus=False` on the create and `tab.focus` afterwards, deliberately: the
+    create must not move the operator's screen on its own, and the focus call is
+    also what raises the workspace (measured), so doing both would be two jumps.
+
+    EVERY failure becomes a notice, and a tab that cannot be recorded is CLOSED
+    AGAIN before returning: an on-screen tab nothing records is how the next
+    Enter opens a second one, which is the duplicate-pane defect this project has
+    already paid for once (og-herdr's `cli_pane_id`). The close is best effort —
+    if it also fails the operator is told the tab could not be recorded, which is
+    the honest state of affairs — and a close that fails does not change what is
+    reported.
+    """
+    ws_id, cwd = _agent_space(tabs_path, state_path, session_id)
+    if not ws_id:
+        return NOTICE_FOCUS_NO_SPACE, None
+    command = read_only_attach_command(*terminal)
+    try:
+        created = opened.tab_create(
+            ws_id, cwd or os.getcwd(), _cli_tab_label(harness, session_id),
+            focus=False, env=pane_env_for(environ))
+    except Exception as exc:
+        return _focus_line(NOTICE_FOCUS_FAILED, exc), None
+    if not isinstance(created, dict):
+        created = {}
+    tab_id = _id_of(created.get("tab"), "tab_id")
+    pane_id = _id_of(created.get("root_pane"), "pane_id")
+    if not (tab_id and pane_id):
+        # A tab without a pane is an empty tab og created and cannot use: close
+        # whatever came back, the same rule `_open_space` applies to a partial
+        # create.
+        if tab_id:
+            _close_tab_quietly(opened, tab_id)
+        return _focus_line(NOTICE_FOCUS_FAILED,
+                           "herdr returned no tab or pane id"), None
+    try:
+        opened.pane_run(pane_id, command)
+    except Exception as exc:
+        _close_tab_quietly(opened, tab_id)
+        return _focus_line(NOTICE_FOCUS_FAILED, exc), None
+    if not remember_agent_tab(tabs_path, session_id, tab_id, ws_id,
+                              role=TAB_ROLE_CLI):
+        _close_tab_quietly(opened, tab_id)
+        return NOTICE_FOCUS_NOT_RECORDED, None
+    return None, tab_id
+
+
+def _close_tab_quietly(opened, tab_id: str) -> None:
+    """Close a tab this call just opened, best effort. Never raises.
+
+    Named for its role in `_open_vendor_cli_tab`: the tab is being unmade because
+    the note that would have let the NEXT Enter find it did not land, and a close
+    that itself fails must not replace the real failure with its own.
+
+    NOT `_close_quietly`, which is a different thing that already exists further
+    up this file: the LAUNCHER's own "close the space I just opened", taking a
+    ctx and a workspace id. Two same-named module-level functions would mean the
+    later one silently wins for every caller — the launcher's space cleanup would
+    have started calling `tab.close` on a workspace id.
+    """
+    try:
+        opened.tab_close(tab_id)
+    except Exception:
+        pass
 
 
 def _focus_line(template: str, value) -> str:

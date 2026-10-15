@@ -452,8 +452,9 @@ Which panes can fire it, on omnigent 0.17.0:
 | Pane | Command | Opens a browser? |
 |---|---|---|
 | Launcher's space (case A/D) | `og chat` | **Yes**, at session creation — and `BROWSER` does not stop it on macOS |
-| Bridge's space for a live root (`_add_space`) | a native harness: `tmux … attach` to its vendor CLI; otherwise `omnigent attach …` | No — `attach` resolves `auto_open_conversation` to `False` unless the operator configured it, and a tmux attach runs no omnigent process at all |
-| Bridge's tab for a sub-agent (`_add_tab`) | same routing as above | Same as above |
+| Bridge's space for a live root (`_add_space`) | `omnigent attach …` — a root's own tab is the conversation's MAIN PANE and is never repurposed | No — `attach` resolves `auto_open_conversation` to `False` unless the operator configured it |
+| Bridge's tab for a sub-agent (`_add_tab`) | that agent's own view: a native harness's `tmux … attach`, otherwise `omnigent attach …` | Same as above, and a tmux attach runs no omnigent process at all |
+| An agent's vendor-CLI tab, opened on demand by Enter | `tmux … attach -f ignore-size` | No |
 | Bridge's history space (`_add_history_space`) | `og chat --resume <id>`, **unsubmitted** | Nothing runs until the operator presses Enter; then **yes**, same as the launcher's pane |
 | The `og agents` split | `og agents` | No |
 | An agent's CLI mirror (`c` in `og agents`) | `tmux … attach -f ignore-size` | No |
@@ -466,27 +467,32 @@ The motivating case is a vendor CLI holding a blocking question — a permission
 prompt — that cannot be answered through `og chat`. The web UI answers it by
 attaching to the agent's terminal; `og agents` does the same two ways.
 
-### What a tab runs is decided by the harness KIND
+### The layout, and the one rule that keeps it
 
-`Bridge._pane_command` routes the pane it creates through
-`og_herdr.harness_has_terminal(harness)`, which is `True`/`False`/`None` off the
-registry's `kind`:
+The conversation's **main pane stays `og chat`** (the Omnigent CLI), with the
+`og agents` pane beside it when `herdr_agents_pane` is on. Nothing in this
+feature retypes, repurposes or retargets it. Each agent's own CLI is a **tab of
+its own**:
 
-* **native** (`claude-native`, `codex-native`, …) — the pane attaches to the
-  vendor CLI's own tmux terminal, **interactively** (`-f ignore-size`, no `-r`;
-  see `TMUX_ATTACH_FLAGS`). That is the whole point: the prompt is answerable
-  from the multiplexer.
+* **native** (`claude-native`, `codex-native`, …) — that agent's real vendor CLI,
+  attached **interactively** to Omnigent's own private tmux server
+  (`-f ignore-size`, no `-r`; see `TMUX_ATTACH_FLAGS`). That is the whole point:
+  a blocking permission prompt is answerable from the multiplexer.
 * **ACP** (`acp:*`, and the builtin `grok`/`devin`) — a plain stdio JSON-RPC
-  child with no pty, so there is no terminal to attach to by construction. The
-  pane keeps `omnigent attach`, which is the same view `og chat`'s down-arrow
-  menu gives. Unchanged, and correct.
+  child with no pty, so there is no terminal to attach to by construction. Its
+  tab holds `omnigent attach <session_id>` — the og chat view specific to that
+  ACP agent, the same one `og chat`'s down-arrow menu gives.
 * **`None`** — an unknown harness is the third answer and is not collapsed into
-  either branch: the pane keeps the REPL, which is always valid, and no promise
+  either branch: the tab keeps the REPL, which is always valid, and no promise
   about a vendor CLI is made.
 
-Every failure — no terminal resolvable, no `tmux` on `PATH`, the resolver module
-unavailable — falls back to the REPL, because a pane with nothing running in it
-is the one outcome `_open_space` refuses to leave behind.
+`Bridge._pane_command` decides what the panes the BRIDGE creates run, off
+`og_herdr.harness_has_terminal(harness)` (the registry's `kind`). A **root's own
+tab is the main pane** and always keeps the Omnigent view, whatever its harness:
+its vendor CLI is an ADDITIONAL tab, opened on demand. Every failure — no
+terminal resolvable, no `tmux` on `PATH`, the resolver unavailable — falls back
+to the REPL, because a pane with nothing running in it is the one outcome
+`_open_space` refuses to leave behind.
 
 ### Where a terminal is found: the runner first, the filesystem as fallback
 
@@ -529,20 +535,36 @@ Both of these were measured against a running server rather than assumed:
   which matters because agents routinely live in a space other than the one on
   screen.
 
-The tab is resolved from og's own records, in this order: the sidecar (every
-worker, and every root the bridge opened a space for), then
-`spaces[session_id].tab_id` in the state file (a **root** whose space the
-launcher opened — the bridge only CLAIMED that space, so it never made a tab to
-note), then the root's tab for a worker whose own note is gone.
+Those notes are keyed by **ROLE**, because one agent can have two tabs and Enter
+has to pick the right one: `main` is the tab holding the agent's Omnigent view (a
+root's own pane), `cli` is the vendor-CLI tab beside it. Enter reads, in order:
 
-A ROOT therefore works like any other row: selecting the orchestrator focuses
-its workspace's first tab. What that tab shows depends on who opened the space —
-the launcher's `og chat` pane for a space it created, or the vendor CLI for a
-space the bridge opened.
+* **native** — the `cli` note. If there is none, the terminal is resolved
+  (runner API first, scan as fallback) and a tab is **opened on demand** in the
+  agent's space, running the same interactive attach, before being focused. So a
+  launcher-created ROOT behaves exactly like a bridge-created one: the operator
+  gets the agent's CLI in a NEW tab and the conversation's pane is untouched. An
+  unresolvable terminal is an honest notice and NO tab — never a focus on the
+  chat pane, which would silently show the wrong thing.
+* **ACP** — the `main` note; then `spaces[session_id].tab_id` in the state file
+  (a root whose space the LAUNCHER opened — the bridge only CLAIMED it, so it
+  never made a tab to note); then the root's tab for a worker whose own note is
+  gone.
+
+**Idempotence is the load-bearing property**: pressing Enter on the same agent
+twice lands on the SAME tab, because the second call finds the `cli` note and
+`tab.create` is not reached. And if that note does NOT land, the tab just opened
+is closed again — an on-screen tab nothing records is exactly how the next Enter
+opens a second one, the defect `cli_pane_id` had to be fixed for twice. Notes are
+dropped when the panes go (`Bridge._forget_tab`), and a worker's vendor-CLI tab
+is closed with them (`Bridge._close_cli_tab`) since it is a tab of its own.
 
 The notices are distinct so "this can never work here" reads differently from
 "try again": `focus: not inside herdr (no HERDR_ENV)`, `focus: no agent on this
 row`, `focus: <harness> is not a harness og knows, so its tab is unverified`,
+`focus: no live terminal for this agent (its harness may have exited)`,
+`focus: this agent has no herdr space to open a tab in`,
+`focus: the new CLI tab could not be recorded`,
 `focus: no herdr tab recorded for this agent`, `focus: <error>`.
 
 ---

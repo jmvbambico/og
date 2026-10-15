@@ -14,12 +14,16 @@ sub-agents as TABS inside it. So one space shows one conversation's whole crew:
 
 An ACP session's pane runs `omnigent attach --server <url> <session_id>` — a thin
 co-drive client that streams that session's I/O, so the user can work from herdr
-instead of the browser. A session whose harness is hosted as a real terminal TUI
-(`kind: native`) has a vendor CLI of its own, and its pane ATTACHES to that
-terminal instead, interactively, so a blocking prompt the CLI is holding can be
-answered from here (see `_pane_command`). The agent column reads as a TOOL NAME
-("Claude Code", from installer/registry.json) and the title beside it says which
-worker and which task, which is what makes the list above readable at a glance.
+instead of the browser. A session's OWN tab is a per-agent tab: a harness hosted
+as a real terminal TUI (`kind: native`) has a vendor CLI of its own and that tab
+ATTACHES to it interactively, so a blocking prompt the CLI is holding can be
+answered from here (see `_pane_command`). The one exception is a ROOT's tab,
+which is the conversation's MAIN PANE and keeps the Omnigent view; a root's
+vendor CLI gets a tab of its own, opened on demand when the operator selects that
+row in `og agents` (see `og_herdr_launch.focus_agent_terminal`). The agent column
+reads as a TOOL NAME ("Claude Code", from installer/registry.json) and the title
+beside it says which worker and which task, which is what makes the list above
+readable at a glance.
 
 A sub-agent never gets a space of its own while its parent has one; it goes in
 beside its parent. The exception is a sub-agent whose parent has no space at all
@@ -2709,49 +2713,57 @@ The rule itself is `_memory_decides`, which is where the distinction
         return [f"add {sid} → space {space} tab {tab_id} pane {pane_id} "
                 f"'{title}' '{command}' [{state}]"]
 
-    def _pane_command(self, sid: str, rec: dict) -> str:
-        """What a session's tab RUNS: the real vendor CLI, or the attach REPL.
+    def _pane_command(self, sid: str, rec: dict) -> tuple:
+        """`(command, role)` for the tab this create just made.
 
-        A harness Omnigent hosts as a real terminal TUI (`kind: native` —
-        claude, codex, …) is driven by a vendor CLI that lives in Omnigent's own
-        private tmux server, and that CLI is where a blocking question — a
-        permission prompt — is actually answered. So the pane in that agent's
-        tab is attached to that terminal, interactively, and the operator can
-        answer it from the multiplexer instead of opening a browser. That is the
-        whole point of the feature: `og chat` has no way to answer a prompt the
+        THE MAIN PANE IS NEVER REPURPOSED. A ROOT's own tab is the
+        conversation's Omnigent view — the launcher's `og chat` for a space it
+        opened, `omnigent attach` for one the bridge opened — and it stays that
+        way. The operator's layout (the chat, the agents pane beside it) is not
+        this feature's to rearrange. `TAB_ROLE_MAIN` records it as such, and
+        the root's real vendor CLI gets its OWN tab, opened on demand by
+        `og_herdr_launch.focus_agent_terminal` (see `TAB_ROLE_CLI`).
+
+        A SUB-AGENT's tab is a per-agent tab and nothing else, so for a harness
+        Omnigent hosts as a real terminal TUI (`kind: native` — claude, codex, …)
+        it runs that agent's vendor CLI, attached INTERACTIVELY to Omnigent's own
+        private tmux server. That is where a blocking question — a permission
+        prompt — is actually answered, and `og chat` has no way to answer one the
         vendor CLI is holding.
 
         An ACP harness is a plain stdio JSON-RPC child with NO pty, so it has no
-        terminal to attach to BY CONSTRUCTION; its pane keeps `omnigent attach`,
-        which is the same view `og chat`'s down-arrow menu gives. `None` from
-        `harness_has_terminal` — an unknown harness — is the THIRD answer and is
-        deliberately not collapsed into either branch: the pane keeps the attach
-        REPL, which is always valid, and no promise about a vendor CLI is made.
+        terminal to attach to BY CONSTRUCTION; its tab keeps `omnigent attach`,
+        which is the agent's own og chat view and the same one `og chat`'s
+        down-arrow menu gives. `None` from `harness_has_terminal` — an unknown
+        harness — is the THIRD answer and is deliberately not collapsed into
+        either branch: the tab keeps the attach REPL, which is always valid, and
+        no promise about a vendor CLI is made.
 
         Best effort by construction. Every failure here — no terminal
         resolvable, no tmux on PATH, the launcher module unavailable — falls back
         to the attach command rather than leaving a pane with nothing running in
-        it, which is the one outcome `_open_space` refuses to leave behind. The
-        operator who then selects the row gets the honest reason from
-        `og_herdr_launch.focus_agent_terminal`, which resolves the same terminal
-        and returns a notice instead of focusing a REPL as if it were the CLI.
+        it, which is the one outcome `_open_space` refuses to leave behind.
 
         `rec["harness"]` is the session's own harness id, taken from the detail
         row the watcher enriches every `added` with (measured: a sub-agent's
         detail row carries `harness` just as a root's does). An absent one means
         a session dict from some other source, which resolves as "unknown".
         """
+        attach = attach_command(self.server, sid)
+        # A root's tab IS the main pane (see above); nothing else is decided here.
+        if rec.get("parent") is None:
+            return attach, TAB_ROLE_MAIN
         if harness_has_terminal(rec.get("harness")) is not True:
-            return attach_command(self.server, sid)
+            return attach, TAB_ROLE_MAIN
         if shutil.which("tmux") is None:
-            return attach_command(self.server, sid)
+            return attach, TAB_ROLE_MAIN
         try:
             # Imported HERE, not at module load: the launcher imports this
             # module, so this module must import without it (see `main`).
             from og_herdr_launch import (read_only_attach_command,
                                          terminal_behind)
         except Exception:
-            return attach_command(self.server, sid)
+            return attach, TAB_ROLE_MAIN
         try:
             # Deliberately WITHOUT this bridge's watcher. `SessionWatcher.
             # _get_json` is the transport every listing read in this process
@@ -2763,10 +2775,10 @@ The rule itself is `_memory_decides`, which is where the distinction
             # was.
             terminal = terminal_behind(sid, dict(os.environ))
         except Exception:
-            return attach_command(self.server, sid)
+            return attach, TAB_ROLE_MAIN
         if terminal is None:
-            return attach_command(self.server, sid)
-        return read_only_attach_command(*terminal)
+            return attach, TAB_ROLE_MAIN
+        return read_only_attach_command(*terminal), TAB_ROLE_CLI
 
     def _setup_pane(self, sid: str, rec: dict, state: str) -> None:
         """Run the post-create setup steps for a session's pane.
@@ -2795,14 +2807,6 @@ The rule itself is `_memory_decides`, which is where the distinction
         changes, adoption and removal all take the ordinary path.
         """
         pane_id = rec["pane_id"]
-        # Record which tab shows this agent, BEFORE the pane is typed into. The
-        # tab id comes out of the create reply and is the only place herdr ever
-        # tells us which tab a session's pane landed in — `agent.get` cannot be
-        # asked, from a session id, later (see `remember_agent_tab` for the
-        # measurement). Written for a history space too: its tab is what
-        # selecting that past conversation should reach.
-        remember_agent_tab(self.agent_tabs_path, sid, rec.get("tab_id"),
-                           rec.get("workspace_id"))
         if rec["step"] <= 0:
             if rec.get("history"):
                 # A past conversation's pane gets the resume line UNSENT: typed
@@ -2810,9 +2814,23 @@ The rule itself is `_memory_decides`, which is where the distinction
                 # session is not resurrected until the operator presses Enter.
                 # `pane_run` would append that newline and start it (see
                 # `_add_history_space`).
-                self.client.pane_send_text(pane_id, resume_command(sid))
+                command, role = resume_command(sid), TAB_ROLE_MAIN
             else:
-                self.client.pane_run(pane_id, self._pane_command(sid, rec))
+                command, role = self._pane_command(sid, rec)
+            rec["tab_role"] = role
+            rec["pane_command"] = command
+            # The tab is noted BEFORE the line is typed into it: the tab id comes
+            # out of the create reply and is the only place herdr ever tells us
+            # which tab a session's pane landed in (`agent.get` cannot be asked,
+            # from a session id, later — see `remember_agent_tab`), so the note
+            # must not depend on the pane's command succeeding. The ROLE is what
+            # lets Enter tell an agent's vendor-CLI tab from its Omnigent one.
+            remember_agent_tab(self.agent_tabs_path, sid, rec.get("tab_id"),
+                               rec.get("workspace_id"), role=role)
+            if rec.get("history"):
+                self.client.pane_send_text(pane_id, command)
+            else:
+                self.client.pane_run(pane_id, command)
             rec["step"] = 1
         if rec["step"] <= 1:
             # The agent label is the session's harness product name ("Claude
@@ -2943,14 +2961,42 @@ The rule itself is `_memory_decides`, which is where the distinction
                                                    else "")] + renamed
 
     def _forget_tab(self, sid: str) -> None:
-        """Drop this session's entry from the agent-tab sidecar.
+        """Drop this session's entries from the agent-tab sidecar.
 
-        Never raises and never fails the removal it rides on: an un-dropped note
-        costs a stale tab id that a later `tab.focus` would aim at — a click that
-        goes to the wrong tab, not a lost pane — so the cheap thing to protect is
-        the sweep, not the file. See `forget_agent_tab`.
+        EVERY role goes, because this rides a removal and both tabs it can name
+        are about to be closed. Never raises and never fails the removal it rides
+        on: an un-dropped note costs a stale tab id that a later `tab.focus`
+        would aim at — a click that goes to the wrong tab, not a lost pane — so
+        the cheap thing to protect is the sweep, not the file. See
+        `forget_agent_tab`.
         """
         forget_agent_tab(self.agent_tabs_path, sid)
+
+    def _close_cli_tab(self, sid: str) -> list:
+        """Close the on-demand vendor-CLI tab this agent may have. Returns lines.
+
+        A WORKER's vendor-CLI tab is a tab of its OWN beside the worker's own tab
+        in its parent's space, so closing the worker's tab does not take it: it
+        has to be closed here or it stays on screen with nothing recording it.
+        (For a root the space close already took it, and `tab.close` then answers
+        `not_found` — counted as done, the same rule `_removed` uses.)
+
+        Best effort, and a failure is RETURNED rather than raised: a removal that
+        dies here would leave the mapping in place and retry forever. It is only
+        attempted when a CLI tab is actually noted, so an ordinary removal costs
+        no call at all.
+        """
+        rec = agent_tab_record(self.agent_tabs_path, sid, TAB_ROLE_CLI)
+        tab_id = rec.get("tab_id")
+        if not tab_id:
+            return []
+        try:
+            self.client.tab_close(tab_id)
+        except _error_cls() as exc:
+            if getattr(exc, "code", None) == "not_found":
+                return []
+            return [_error_line(sid, exc)]
+        return []
 
     def _drop_children(self, sid: str, lines: list[str]) -> None:
         """Forget the records of sessions whose pane just went with the space.
@@ -2964,8 +3010,10 @@ The rule itself is `_memory_decides`, which is where the distinction
         for child_id, child in list(self._recs.items()):
             if child.get("parent") == sid:
                 self._recs.pop(child_id, None)
-                # Its tab went with the space, so its note goes too — the same
-                # reason its record does. See `_forget_tab`.
+                # Its note goes with its pane — the same reason its record does.
+                # No `_close_cli_tab` here: the whole SPACE is being closed, so
+                # every tab in it, the child's vendor-CLI tab included, is already
+                # going with it. See `_forget_tab`.
                 self._forget_tab(child_id)
                 lines.append(f"remove {child_id} (pane {child.get('pane_id')}; "
                              f"tab closed with its parent's space)")
@@ -3055,17 +3103,22 @@ The rule itself is `_memory_decides`, which is where the distinction
                 lines = [f"remove {sid} (pane {pane_id}, {what} {target}; "
                          f"already gone)"]
                 self._forget(owns_space, target)
+                lines += self._close_cli_tab(sid)
                 self._forget_tab(sid)
                 return lines
             # As above: any other error keeps the mapping for a later retry.
             raise
         self._recs.pop(sid, None)
-        # The pane is gone, so the tab id this agent was noted under names a tab
+        # The panes are gone, so the tab ids this agent was noted under name tabs
         # herdr may already have re-used. Dropped here — after the close landed,
         # never before it — so a failed close (which keeps the mapping for a
-        # retry) keeps the note it will need for that retry.
+        # retry) keeps the notes it will need for that retry. The vendor-CLI tab
+        # is closed FIRST: it is a tab of its own, so the close above does not
+        # necessarily have taken it with it.
+        lines = []
+        lines += self._close_cli_tab(sid)
         self._forget_tab(sid)
-        lines = [f"remove {sid} (pane {pane_id}, {what} {target})"]
+        lines += [f"remove {sid} (pane {pane_id}, {what} {target})"]
         # A closed workspace took its tabs with it, so its workers' panes are
         # already gone and their records have to go with them; a closed tab
         # affects nothing else.
@@ -3265,6 +3318,28 @@ def _read_spaces(raw) -> dict:
 # change what any existing path does.
 AGENT_TABS_FILENAME = "og-agent-tabs.json"
 
+# An agent can have MORE THAN ONE record, and which one Enter should reach
+# depends on what the operator asked for — so the note is keyed by ROLE, not
+# just by session.
+#
+#   `main` — the tab holding the agent's OMNIGENT view. For a root that is the
+#            conversation's own pane (the launcher's `og chat`, or the
+#            `omnigent attach` the bridge opens when it owns the space), which
+#            the operator must keep. For a worker it is the tab the bridge
+#            creates for it, and on an ACP harness that tab IS the agent's og
+#            chat view — the same view `og chat`'s down-arrow menu gives.
+#   `cli`  — the tab holding the agent's REAL vendor CLI, attached
+#            interactively. Created on demand in the agent's space by
+#            `og_herdr_launch.focus_agent_terminal`, never part of the main
+#            pane, so a native ROOT can have both.
+#
+# Without the role there is no way to tell those two apart for one session, and
+# Enter on a native root would land on the chat pane — which is exactly the
+# wrong tab, and the failure this keying exists to make impossible.
+TAB_ROLE_MAIN = "main"
+TAB_ROLE_CLI = "cli"
+TAB_ROLES = (TAB_ROLE_MAIN, TAB_ROLE_CLI)
+
 
 def agent_tabs_path(state_path: Path) -> Path:
     """The agent-tab sidecar that belongs beside `state_path`.
@@ -3277,15 +3352,40 @@ def agent_tabs_path(state_path: Path) -> Path:
     return state_path.parent / AGENT_TABS_FILENAME
 
 
+def _read_tab_record(entry) -> dict:
+    """One `tab_id`/`workspace_id` record out of the sidecar, or `{}`.
+
+    Only a non-empty string `tab_id` is kept: that is what `tab.focus` needs,
+    and the workspace id is optional because it is only there to make the note
+    readable (`og_herdr_launch` uses it as the space to open a vendor-CLI tab
+    in, and knows how to fall back to the state file's record when it is absent).
+    """
+    if not isinstance(entry, dict):
+        return {}
+    tab_id = entry.get("tab_id")
+    if not isinstance(tab_id, str) or not tab_id:
+        return {}
+    rec = {"tab_id": tab_id}
+    ws_id = entry.get("workspace_id")
+    if isinstance(ws_id, str) and ws_id:
+        rec["workspace_id"] = ws_id
+    return rec
+
+
 def load_agent_tabs(path: Path) -> dict:
-    """`{session_id: {"tab_id":…, "workspace_id":…}}`, or {} — never raises.
+    """`{session_id: {role: {"tab_id":…, "workspace_id":…}}}`, or `{}`.
 
     The same degradation contract as `load_state`, for the same reason: a
     missing, unreadable or malformed file is "we recorded nothing", which costs
-    the operator a tab they have to click by hand — never a pane that fails.
-    Only records carrying a non-empty string `tab_id` survive; the workspace id
-    is optional because a tab id is what `tab.focus` needs and the space is only
-    there to make a note readable.
+    the operator a click on the tab they wanted — never a pane that fails. Only
+    known roles are kept, and a role with no usable tab id is dropped rather
+    than carried as a half-record.
+
+    A FLAT entry — `{"tab_id": …}` with no role level — is read as a `main`
+    note. Nothing in this tree ever wrote that shape (the role level shipped with
+    the feature), but a file that says which tab an agent has should be believed
+    for that much: read as "nothing", it would make the next Enter on a native
+    agent open a SECOND vendor-CLI tab beside the recorded one.
     """
     try:
         data = json.loads(path.read_text())
@@ -3297,68 +3397,106 @@ def load_agent_tabs(path: Path) -> dict:
     for sid, entry in data.items():
         if not isinstance(sid, str) or not sid or not isinstance(entry, dict):
             continue
-        tab_id = entry.get("tab_id")
-        if not isinstance(tab_id, str) or not tab_id:
+        if "tab_id" in entry:
+            flat = _read_tab_record(entry)
+            if flat:
+                tabs[sid] = {TAB_ROLE_MAIN: flat}
             continue
-        rec = {"tab_id": tab_id}
-        ws_id = entry.get("workspace_id")
-        if isinstance(ws_id, str) and ws_id:
-            rec["workspace_id"] = ws_id
-        tabs[sid] = rec
+        roles = {}
+        for role in TAB_ROLES:
+            rec = _read_tab_record(entry.get(role))
+            if rec:
+                roles[role] = rec
+        if roles:
+            tabs[sid] = roles
     return tabs
 
 
-def agent_tab_record(path: Path, session_id: object) -> dict:
-    """The tab record for a session, or `{}`. Never raises."""
+def agent_tab_record(path: Path, session_id: object,
+                     role: str = TAB_ROLE_MAIN) -> dict:
+    """The tab record for one agent and one role, or `{}`. Never raises.
+
+    `role` is `TAB_ROLE_MAIN` (the agent's Omnigent view) or `TAB_ROLE_CLI` (the
+    vendor-CLI tab created on demand). An unknown role names no tab.
+    """
     if not isinstance(session_id, str) or not session_id:
         return {}
-    return load_agent_tabs(path).get(session_id) or {}
+    if role not in TAB_ROLES:
+        return {}
+    return (load_agent_tabs(path).get(session_id) or {}).get(role) or {}
 
 
 def remember_agent_tab(path: Path, session_id: object, tab_id: object,
-                       workspace_id: object = None) -> bool:
-    """Record which tab shows this session's pane. Never raises.
+                       workspace_id: object = None,
+                       role: str = TAB_ROLE_MAIN) -> bool:
+    """Record which tab shows this session's pane, under `role`. Never raises.
 
     One locked read-modify-write, through the SAME `state_lock` the state file
     uses, on a different path — `state_lock` takes any path and locks a sidecar
     beside it, so two bridges on one machine serialise here exactly as they do
     there. `state_update` itself is not reused because it parses the state file's
-    `{version, spaces, pending}` shape, and this is a flat map.
+    `{version, spaces, pending}` shape, and this is a small nested map.
 
-    The return says whether the write LANDED. Nothing destructive depends on it
-    (an unrecorded tab costs the operator a click), but a failed write must not
-    be reported as a recorded one.
+    THE RETURN IS LOAD-BEARING, and this is the PR #38/#39 lesson: a caller that
+    creates a tab must know whether the note LANDED. `focus_agent_terminal`
+    closes the tab it just opened when this says False, because an on-screen tab
+    with nothing recording it is exactly how the next Enter opens a second one.
+
+    Writing one role never disturbs the other: the entry is merged, so a `cli`
+    note added later leaves the `main` note (and its workspace id) in place.
     """
     if not isinstance(session_id, str) or not session_id:
         return False
     if not isinstance(tab_id, str) or not tab_id:
+        return False
+    if role not in TAB_ROLES:
         return False
 
     def put(tabs: dict) -> dict:
         rec = {"tab_id": tab_id}
         if isinstance(workspace_id, str) and workspace_id:
             rec["workspace_id"] = workspace_id
-        tabs[session_id] = rec
+        entry = tabs.get(session_id)
+        if not isinstance(entry, dict):
+            entry = {}
+        entry[role] = rec
+        tabs[session_id] = entry
         return tabs
 
     return _update_agent_tabs(path, put)
 
 
-def forget_agent_tab(path: Path, session_id: object) -> bool:
-    """Drop a session's tab record. Never raises; a missing key is success.
+def forget_agent_tab(path: Path, session_id: object,
+                     role: object = None) -> bool:
+    """Drop a session's tab record — one role, or all of them. Never raises.
 
-    Called when the pane goes, so a later `agent.focus` on a reaped agent cannot
-    target a tab herdr has already reused. `decide` returns the state to write,
-    or None to write NOTHING: removing the last entry leaves `{}`, which is a
-    real state to save (the file must stop naming the dead tab) and must not be
-    confused with "nothing to do" — that is the one distinction the two return
-    values carry.
+    Called when the panes go, so a later Enter on a reaped agent cannot target a
+    tab herdr has already reused. `role=None` (the default) drops EVERY role for
+    the session, which is what a removal wants: every tab it noted is about to be
+    closed. Naming a role drops only that one, leaving the others alone.
+
+    `decide` returns the state to write, or None to write NOTHING: removing the
+    last entry leaves `{}`, which is a real state to save (the file must stop
+    naming the dead tab) and must not be confused with "nothing to do" — that is
+    the one distinction the two return values carry.
     """
     if not isinstance(session_id, str) or not session_id:
         return False
+    wanted = TAB_ROLES if role is None else (role,)
+    if any(entry not in TAB_ROLES for entry in wanted):
+        return False
 
     def drop(tabs: dict):
-        return tabs if tabs.pop(session_id, None) is not None else None
+        entry = tabs.get(session_id)
+        if not isinstance(entry, dict):
+            return None
+        changed = False
+        for name in wanted:
+            if entry.pop(name, None) is not None:
+                changed = True
+        if not entry:
+            tabs.pop(session_id, None)
+        return tabs if changed else None
 
     return _update_agent_tabs(path, drop)
 

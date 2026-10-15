@@ -122,13 +122,22 @@ class FakeClient:
     """
 
     def __init__(self, workspaces=(), create=None, split=None, panes=None,
-                 pings_before_up=0, state_path=None):
+                 pings_before_up=0, state_path=None, tab_create=None):
         self.calls = []
         self.socket_path = "/tmp/fake-herdr/herdr.sock"
         self.closed = False
         self._workspaces = list(workspaces)
         self._create = create if create is not None else create_reply()
         self._split = split if split is not None else {"type": "ok"}
+        # The reply `tab.create` gives — the second tab of a space, which is what
+        # `focus_agent_terminal` opens for a vendor CLI. Distinct ids from the
+        # workspace's own first tab so an assertion can tell them apart.
+        self._tab_create = tab_create if tab_create is not None else {
+            "type": "tab_created",
+            "tab": {"tab_id": "w1:t9", "workspace_id": "w1"},
+            "root_pane": {"pane_id": "w1:p9", "tab_id": "w1:t9",
+                          "workspace_id": "w1"},
+        }
         self._panes = panes if panes is not None else [
             {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
             {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1"},
@@ -150,6 +159,8 @@ class FakeClient:
             return {"type": "workspace_list", "workspaces": self._workspaces}
         if method == "workspace.create":
             return self._create
+        if method == "tab.create":
+            return self._tab_create
         if method == "pane.split":
             self.split_params = params
             return self._split
@@ -195,6 +206,18 @@ class FakeClient:
 
     def pane_close(self, pane_id):
         self.call("pane.close", {"pane_id": pane_id})
+
+    def tab_create(self, workspace_id, cwd, label, focus=False, env=None):
+        # Mirrors the real wrapper (including the `env` rule: present only when
+        # one was asked for), so a test sees the frame herdr receives.
+        params = {"workspace_id": workspace_id, "cwd": cwd, "label": label,
+                  "focus": focus}
+        if env:
+            params["env"] = env
+        return self.call("tab.create", params)
+
+    def tab_close(self, tab_id):
+        self.call("tab.close", {"tab_id": tab_id})
 
     def tab_rename(self, tab_id, label):
         # The real wrapper, mirrored so an assertion on the recorded frame sees
@@ -3487,49 +3510,77 @@ def test_read_only_attach_quotes_the_target_too():
 
 
 # ---------------------------------------------------------------------------
-# focus_agent_terminal — Enter in `og agents` reaches the agent's tab
+# focus_agent_terminal — Enter in `og agents` reaches the AGENT'S OWN tab
 # ---------------------------------------------------------------------------
+#
+# The model these tests pin, in the operator's words: the main pane stays
+# `og chat` with the agents pane beside it, and every agent's CLI is a tab of
+# its own. So for a NATIVE agent Enter reaches that agent's vendor-CLI tab —
+# opening it in the agent's space if it is not there yet — and NEVER the
+# conversation's main pane. For an ACP agent it reaches that agent's own
+# `omnigent attach` tab, which is what it already has.
 
-def _note_tab(session_id, tab_id, workspace_id="w1"):
-    """Write one agent-tab note, the way the bridge does when it makes a tab.
+def _focus_env(**over):
+    """The environ a pane's `og agents` runs with: herdr's flag, plus overrides.
 
-    At the path the CODE resolves — `default_state_path()`, from $OMNIGENT_HOME
-    (redirected to a scratch home by the autouse fixture) — not at one this test
-    picks, so the resolution under test is the production one.
+    Hermetic on purpose, BOTH halves. `OG_SERVER` points at a port nothing
+    listens on and `TMPDIR` at a directory that does not exist, so neither half
+    of `terminal_behind` can reach anything real: a test that WANTS a terminal
+    resolved injects one (`_cli_terminal`), and a test that wants none gets none
+    deterministically rather than depending on what is on the machine.
     """
-    tabs = og_herdr.agent_tabs_path(og_herdr_launch.default_state_path())
-    assert og_herdr.remember_agent_tab(tabs, session_id, tab_id, workspace_id)
-    return tabs
+    # TMPDIR is derived from $OMNIGENT_HOME directly rather than through
+    # `default_state_path()`, so a test that monkeypatches THAT seam (the
+    # "home cannot be resolved" case) can still build this environ.
+    home = os.environ.get("OMNIGENT_HOME") or str(Path.home() / ".omnigent")
+    env = {"HERDR_ENV": "1", "OG_SERVER": "http://127.0.0.1:1",
+           "TMPDIR": str(Path(home) / "no-terminals-here")}
+    env.update(over)
+    return env
 
 
-class RaisingFocusClient:
+def _notes_path():
+    """The sidecar path the CODE resolves — never one this test picks."""
+    return og_herdr.agent_tabs_path(og_herdr_launch.default_state_path())
+
+
+def _note_tab(session_id, tab_id, workspace_id="w1", role=None):
+    """Write one agent-tab note, the way the writer that owns it does."""
+    assert og_herdr.remember_agent_tab(
+        _notes_path(), session_id, tab_id, workspace_id,
+        role=role or og_herdr.TAB_ROLE_MAIN)
+    return tab_id
+
+
+def _cli_terminal(monkeypatch, terminal=("/tmp/x/tmux.sock", "main")):
+    """Make `terminal_behind` answer without touching a runner or the disk."""
+    calls = []
+
+    def fake(session_id, env=None, watcher=None):
+        calls.append(session_id)
+        return terminal
+
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind", fake)
+    return calls
+
+
+class RaisingFocusClient(FakeClient):
     """A herdr client whose `tab.focus` fails, the way a down socket would."""
 
-    def __init__(self, exc=None):
-        self.exc = exc or OSError("herdr is gone")
+    def __init__(self, exc=None, **kwargs):
+        super().__init__(**kwargs)
+        self.exc = exc or OSError("connect: cannot reach herdr")
         self.focused = []
 
     def tab_focus(self, tab_id):
         self.focused.append(tab_id)
         raise self.exc
 
-    def close(self):
-        pass
 
-
-def _focus_env(**over):
-    """The environ a pane's `og agents` runs with: herdr's own flag, plus overrides."""
-    env = {"HERDR_ENV": "1"}
-    env.update(over)
-    return env
-
-
-def test_focus_agent_terminal_focuses_the_tab_noted_for_the_agent(tmp_path):
-    # THE WHOLE POINT: a worker's tab — the pane running its REAL vendor CLI,
-    # where a permission prompt is waiting — is one `tab.focus` away. herdr
-    # cannot be asked which tab that is (measured: `agent.get` resolves names and
-    # pane ids, never a session id), so og reads the note it wrote itself.
-    _note_tab("worker-1", "w1:t7")
+def test_focus_agent_terminal_focuses_the_recorded_cli_tab(tmp_path):
+    # A native agent whose vendor-CLI tab is already noted: ONE `tab.focus`, and
+    # nothing is created. This is the shape every later Enter takes.
+    _note_tab("worker-1", "w1:t9", role=og_herdr.TAB_ROLE_CLI)
     client = FakeClient()
 
     notice = og_herdr_launch.focus_agent_terminal(
@@ -3537,117 +3588,204 @@ def test_focus_agent_terminal_focuses_the_tab_noted_for_the_agent(tmp_path):
         env=_focus_env(), client=client)
 
     assert notice is None
-    assert client.params_of("tab.focus") == [{"tab_id": "w1:t7"}]
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t9"}]
     # ONE call, no `workspace.focus`: measured against a live server, tab.focus
-    # raises the workspace holding the tab as well.
+    # raises the workspace holding the tab too.
     assert client.methods == ["tab.focus"], client.methods
 
 
-def test_focus_agent_terminal_reaches_a_root_through_its_spaces_record(tmp_path):
-    # THE ROOT CASE (Task 4). A root has no per-agent tab — it has the workspace
-    # whose first tab the launcher labelled, and whose id lives in the state
-    # file's `spaces` record (the launcher wrote it; the bridge only claimed the
-    # space, so it never made a tab to note). Selecting the orchestrator must
-    # still land the operator on the real Claude Code CLI.
-    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
+def test_focus_agent_terminal_opens_the_cli_tab_once_and_then_reuses_it(
+        tmp_path, monkeypatch):
+    # TASK A: the tab is opened ON DEMAND in the agent's space, running the
+    # interactive attach — and IDEMPOTENCE IS THE POINT. Pressing Enter a second
+    # time must land on the SAME tab: exactly one `tab.create` across both
+    # presses, and the note is what makes that true.
+    _note_tab("worker-1", "w1:t1", workspace_id="w1")   # the worker's own tab
+    _cli_terminal(monkeypatch)
+    client = FakeClient()
+
+    first = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+    second = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert (first, second) == (None, None)
+    assert client.methods.count("tab.create") == 1, client.methods
+    # The tab landed in the agent's space, was NOT created focused (the create
+    # must not move the screen on its own), and the attach was typed into it.
+    assert client.params_of("tab.create")[0]["workspace_id"] == "w1"
+    assert client.params_of("tab.create")[0]["focus"] is False
+    assert client.params_of("pane.send_text")[0]["pane_id"] == "w1:p9"
+    assert client.text_typed()[0].startswith("tmux -S /tmp/x/tmux.sock attach")
+    assert "-f ignore-size" in client.text_typed()[0]
+    # Both presses focused the SAME tab — the one `tab.create` returned.
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t9"},
+                                             {"tab_id": "w1:t9"}]
+    # ...and that tab is what the note now records, as the CLI role.
+    assert og_herdr.agent_tab_record(
+        _notes_path(), "worker-1", og_herdr.TAB_ROLE_CLI)["tab_id"] == "w1:t9"
+
+
+def test_focus_agent_terminal_opens_the_cli_tab_for_a_launcher_root(
+        tmp_path, monkeypatch):
+    # THE ROOT CASE, and the gap it closes. A launcher-created root has no
+    # sidecar notes at all — the launcher recorded its space in the STATE FILE
+    # and the bridge only claimed it — so there is nothing to focus and its chat
+    # pane must not be touched. The vendor-CLI tab is opened in that recorded
+    # space instead, which makes a launcher root behave exactly like a
+    # bridge-created one.
+    _space_state(og_herdr_launch.default_state_path(), "root-1",
+                 workspace_id="w1", tab_id="w1:t1", cwd="/work")
+    _cli_terminal(monkeypatch)
     client = FakeClient()
 
     notice = og_herdr_launch.focus_agent_terminal(
         "root-1", "claude-native", env=_focus_env(), client=client)
 
     assert notice is None
-    assert client.params_of("tab.focus") == [{"tab_id": "w1:t1"}]
+    assert client.params_of("tab.create")[0]["workspace_id"] == "w1"
+    assert client.params_of("tab.create")[0]["cwd"] == "/work"
+    # The chat tab is never focused: the new tab is.
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t9"}]
+    assert "w1:t1" not in [p["tab_id"] for p in client.params_of("tab.focus")]
 
 
-def test_focus_agent_terminal_prefers_the_sidecar_over_the_state_file_for_a_root(tmp_path):
-    # A root can be recorded in BOTH places: the launcher writes the state file's
-    # `spaces` record when it opens the space, and the bridge notes the tab when
-    # IT creates one. The note wins — it is written by the process that owns the
-    # tab's lifetime and dropped when the pane goes, while the state file's copy
-    # can outlive a tab herdr has already re-used.
-    _note_tab("root-1", "w1:t5")
+def test_focus_agent_terminal_never_opens_or_touches_the_main_pane(
+        tmp_path, monkeypatch):
+    # THE ANTI-REPURPOSING PROPERTY. A native root whose terminal cannot be
+    # resolved gets an honest notice — NOT a focus on its chat pane and NOT a
+    # new tab. Silently showing the wrong thing is worse than a notice.
     _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
-    client = FakeClient()
-
-    assert og_herdr_launch.focus_agent_terminal(
-        "root-1", "claude-native", env=_focus_env(), client=client) is None
-    assert client.params_of("tab.focus") == [{"tab_id": "w1:t5"}]
-
-
-def test_focus_agent_terminal_reaches_an_acp_root(tmp_path):
-    # A root on an ACP or builtin harness has a tab too (its `omnigent attach`
-    # REPL), and it is the correct view to reach — the kind is never a reason to
-    # refuse a row the operator selected.
-    _note_tab("root-1", "w1:t5")
-    client = FakeClient()
-
-    assert og_herdr_launch.focus_agent_terminal(
-        "root-1", "grok", env=_focus_env(), client=client) is None
-    assert client.params_of("tab.focus") == [{"tab_id": "w1:t5"}]
-
-
-def test_focus_agent_terminal_declines_a_root_with_no_recorded_tab(tmp_path):
-    # A record can name a space and no tab: a v1-upgraded one carries neither tab
-    # nor pane and invents neither (see og_herdr._upgrade_v1). There is nothing
-    # to aim at, so the operator is told rather than sent to a tab id herdr may
-    # have re-used.
-    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id=None)
-    client = FakeClient()
+    client = FakeClient()          # `_focus_env()` resolves nothing
 
     notice = og_herdr_launch.focus_agent_terminal(
         "root-1", "claude-native", env=_focus_env(), client=client)
 
-    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TAB
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TERMINAL
     assert client.calls == []
 
 
-def test_focus_agent_terminal_prefers_the_agents_own_note_over_the_roots(tmp_path):
-    # A root's recorded tab is the FALLBACK for a worker, never the answer when
-    # the worker's own tab is known: the worker's CLI is where its prompt is.
-    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
+def test_focus_agent_terminal_declines_when_it_cannot_record_the_new_tab(
+        tmp_path, monkeypatch):
+    # THE DUPLICATE-TAB HAZARD, and the rule that kills it: a tab on screen with
+    # nothing recording it is how the next Enter opens a SECOND one. So the tab
+    # opened here is CLOSED again and the operator is told.
+    _note_tab("worker-1", "w1:t1")
+    _cli_terminal(monkeypatch)
+    client = FakeClient()
+    monkeypatch.setattr(og_herdr_launch, "remember_agent_tab",
+                        lambda *a, **k: False)
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NOT_RECORDED
+    assert client.params_of("tab.close") == [{"tab_id": "w1:t9"}]
+    assert client.params_of("tab.focus") == [], "an unrecorded tab is not focused"
+    # Nothing was left noted, so a later Enter (with the write working) can open
+    # the tab again rather than finding a phantom record.
+    assert og_herdr.agent_tab_record(
+        _notes_path(), "worker-1", og_herdr.TAB_ROLE_CLI) == {}
+
+
+def test_focus_agent_terminal_declines_when_there_is_nowhere_to_open_it(
+        tmp_path, monkeypatch):
+    # A native agent with a resolvable terminal but no recorded space: og cannot
+    # name the space to put the tab in, so it declines rather than guessing one.
+    _cli_terminal(monkeypatch)
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", root_session_id="root-1",
+        env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_SPACE
+    assert client.calls == []
+
+
+def test_focus_agent_terminal_never_raises_when_the_new_tab_cannot_be_made(
+        tmp_path, monkeypatch):
+    # `tab.create` itself fails: the notice comes back, nothing is focused, and
+    # nothing is recorded.
+    _note_tab("worker-1", "w1:t1")
+    _cli_terminal(monkeypatch)
+    client = FakeClient()
+
+    def boom(*args, **kwargs):
+        raise OSError("herdr refused the create")
+
+    client.tab_create = boom
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice is not None and notice.startswith("focus: ")
+    assert "herdr refused the create" in notice
+    assert client.params_of("tab.focus") == []
+    assert og_herdr.agent_tab_record(
+        _notes_path(), "worker-1", og_herdr.TAB_ROLE_CLI) == {}
+
+
+def test_focus_agent_terminal_focuses_an_acp_agents_own_tab(tmp_path):
+    # An ACP harness has no pty, so nothing is created: its tab — the
+    # `omnigent attach` view, "the og chat specific to the acp connected agent"
+    # — is what Enter reaches.
     _note_tab("worker-1", "w1:t7")
     client = FakeClient()
 
     assert og_herdr_launch.focus_agent_terminal(
-        "worker-1", "claude-native", root_session_id="root-1",
-        env=_focus_env(), client=client) is None
+        "worker-1", "acp:cline", env=_focus_env(), client=client) is None
     assert client.params_of("tab.focus") == [{"tab_id": "w1:t7"}]
+    assert client.methods == ["tab.focus"], client.methods
 
 
-def test_focus_agent_terminal_falls_back_to_the_roots_tab_for_a_worker(tmp_path):
-    # The worker's own note is gone (its pane was reaped and the note dropped),
-    # but the row names its root: the operator is sent to the conversation the
-    # worker is in rather than told nothing can be done.
+def test_focus_agent_terminal_reaches_an_acp_root_through_its_spaces_record(
+        tmp_path):
+    # A ROOT the launcher opened a space for: the state file's record is the only
+    # trace of its tab, and for an ACP harness that tab IS the right view.
+    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "root-1", "grok", env=_focus_env(), client=client)
+
+    assert notice is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t1"}]
+
+
+def test_focus_agent_terminal_prefers_the_cli_note_over_the_agents_own_tab(
+        tmp_path):
+    # An agent with BOTH notes: Enter wants the vendor CLI, not the Omnigent
+    # view. This is the role distinction doing its job.
+    _note_tab("worker-1", "w1:t1", role=og_herdr.TAB_ROLE_MAIN)
+    _note_tab("worker-1", "w1:t9", role=og_herdr.TAB_ROLE_CLI)
+    client = FakeClient()
+
+    assert og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client) is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t9"}]
+
+
+def test_focus_agent_terminal_falls_back_to_the_roots_tab_for_an_acp_worker(
+        tmp_path):
+    # The worker's own note is gone (its pane was reaped), but the row names its
+    # root: the operator is sent to the conversation the worker is in rather than
+    # told nothing can be done.
     _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
     client = FakeClient()
 
     assert og_herdr_launch.focus_agent_terminal(
-        "worker-1", "claude-native", root_session_id="root-1",
+        "worker-1", "acp:cline", root_session_id="root-1",
         env=_focus_env(), client=client) is None
     assert client.params_of("tab.focus") == [{"tab_id": "w1:t1"}]
 
 
-def test_focus_agent_terminal_focuses_an_acp_agents_tab_too(tmp_path):
-    # An ACP harness has no pty, so its tab keeps the `omnigent attach` REPL —
-    # which is the CORRECT view to reach (`og chat`'s down-arrow menu gives the
-    # same one). The kind decides what the operator will find, not whether the
-    # row can be selected.
-    _note_tab("worker-1", "w1:t9")
-    client = FakeClient()
-
-    assert og_herdr_launch.focus_agent_terminal(
-        "worker-1", "acp:cline", env=_focus_env(),
-        client=client) is None
-    assert client.params_of("tab.focus") == [{"tab_id": "w1:t9"}]
-
-
 def test_focus_agent_terminal_outside_herdr_says_so_and_touches_nothing(tmp_path):
-    _note_tab("worker-1", "w1:t7")
+    _note_tab("worker-1", "w1:t9", role=og_herdr.TAB_ROLE_CLI)
     client = FakeClient()
 
     notice = og_herdr_launch.focus_agent_terminal(
-        "worker-1", "claude-native", env={},
-        client=client)
+        "worker-1", "claude-native", env={}, client=client)
 
     assert notice == og_herdr_launch.NOTICE_FOCUS_OUTSIDE_HERDR
     assert client.calls == []
@@ -3661,12 +3799,14 @@ def test_focus_agent_terminal_without_a_session_declines(tmp_path):
     assert client.calls == []
 
 
-def test_focus_agent_terminal_refuses_an_unknown_harness_distinctly(tmp_path):
+def test_focus_agent_terminal_refuses_an_unknown_harness_distinctly(tmp_path,
+                                                                    monkeypatch):
     # `harness_has_terminal` has THREE answers and None is not one of the two
-    # branches: with an unknown harness og cannot say whether this tab runs the
-    # real CLI or a REPL, so it declines with its own line rather than moving the
-    # operator somewhere it cannot describe.
-    _note_tab("worker-1", "w1:t7")
+    # branches: with an unknown harness og cannot say whether the row's tab runs
+    # a vendor CLI or a REPL, so it declines with its own line rather than
+    # opening a tab it cannot describe.
+    _note_tab("worker-1", "w1:t9", role=og_herdr.TAB_ROLE_CLI)
+    _cli_terminal(monkeypatch)
     client = FakeClient()
 
     notice = og_herdr_launch.focus_agent_terminal(
@@ -3679,13 +3819,11 @@ def test_focus_agent_terminal_refuses_an_unknown_harness_distinctly(tmp_path):
 
 
 def test_focus_agent_terminal_without_a_recorded_tab_says_so(tmp_path):
-    # A finished agent whose tab was reaped: the note goes with the pane (see
-    # `Bridge._forget_tab`), so there is nothing to aim at and the operator is
-    # told rather than sent to a tab id herdr may have re-used.
+    # An ACP agent with nothing recorded and no root to fall back to.
     client = FakeClient()
 
     notice = og_herdr_launch.focus_agent_terminal(
-        "gone-1", "claude-native", root_session_id="also-gone",
+        "gone-1", "acp:cline", root_session_id="also-gone",
         env=_focus_env(), client=client)
 
     assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TAB
@@ -3693,7 +3831,7 @@ def test_focus_agent_terminal_without_a_recorded_tab_says_so(tmp_path):
 
 
 def test_focus_agent_terminal_never_raises_when_herdr_fails(tmp_path):
-    _note_tab("worker-1", "w1:t7")
+    _note_tab("worker-1", "w1:t9", role=og_herdr.TAB_ROLE_CLI)
     client = RaisingFocusClient(OSError("connect: cannot reach herdr"))
 
     notice = og_herdr_launch.focus_agent_terminal(
@@ -3701,14 +3839,14 @@ def test_focus_agent_terminal_never_raises_when_herdr_fails(tmp_path):
 
     assert notice is not None and notice.startswith("focus: ")
     assert "cannot reach herdr" in notice
-    assert client.focused == ["w1:t7"]
+    assert client.focused == ["w1:t9"]
 
 
 def test_focus_agent_terminal_never_raises_when_the_home_cannot_be_resolved(
         tmp_path, monkeypatch):
     # `default_state_path()` goes through `Path.home()`, which a sandboxed pane
     # can leave unresolvable. "NEVER raises" covers that too, and its answer is
-    # the same as any other "no tab can be found".
+    # "no tab can be found".
     def unresolvable():
         raise RuntimeError("Could not determine home directory")
 
@@ -3731,7 +3869,7 @@ def test_focus_agent_terminal_never_raises_when_the_catalog_is_unreadable(
         raise OSError("registry is not readable")
 
     monkeypatch.setattr(og_herdr_launch, "harness_has_terminal", unreadable)
-    _note_tab("worker-1", "w1:t7")
+    _note_tab("worker-1", "w1:t9", role=og_herdr.TAB_ROLE_CLI)
     client = FakeClient()
 
     notice = og_herdr_launch.focus_agent_terminal(
@@ -3751,24 +3889,30 @@ def test_focus_agent_terminal_survives_a_broken_state_file(tmp_path):
     (home / "og-agent-tabs.json").write_text("{ also not json")
     client = FakeClient()
 
-    notice = og_herdr_launch.focus_agent_terminal(
-        "worker-1", "claude-native", env=_focus_env(), client=client)
+    assert og_herdr_launch.focus_agent_terminal(
+        "worker-1", "acp:cline", env=_focus_env(),
+        client=client) == og_herdr_launch.NOTICE_FOCUS_NO_TAB
+    # ...and a native one cannot resolve a terminal either, so it declines the
+    # same honest way rather than creating a tab it cannot describe.
+    assert og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(),
+        client=client) == og_herdr_launch.NOTICE_FOCUS_NO_TERMINAL
+    assert client.calls == []
 
-    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TAB
 
-
-def test_focus_agent_terminal_ignores_a_note_with_no_tab_id(tmp_path):
+def test_focus_agent_terminal_ignores_a_note_with_no_usable_tab_id(tmp_path):
     # The note is read defensively, like every other document og does not own: a
     # record with no usable tab id names no tab.
     home = og_herdr_launch.default_state_path().parent
     home.mkdir(parents=True, exist_ok=True)
     (home / "og-agent-tabs.json").write_text(json.dumps(
-        {"worker-1": {"workspace_id": "w1"}, "worker-2": {"tab_id": None},
-         "worker-3": "w1:t7"}))
+        {"worker-1": {"main": {"workspace_id": "w1"}},
+         "worker-2": {"main": {"tab_id": None}},
+         "worker-3": {"main": "w1:t7"}}))
     client = FakeClient()
 
     for sid in ("worker-1", "worker-2", "worker-3"):
         assert og_herdr_launch.focus_agent_terminal(
-            sid, "claude-native", env=_focus_env(),
+            sid, "acp:cline", env=_focus_env(),
             client=client) == og_herdr_launch.NOTICE_FOCUS_NO_TAB
     assert client.calls == []

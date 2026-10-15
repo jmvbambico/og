@@ -4968,27 +4968,69 @@ def _tmux_on_path(monkeypatch):
     monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/" + name)
 
 
-def test_a_native_agents_tab_attaches_the_real_vendor_cli(seams, _tmux_on_path,
+def test_a_native_workers_tab_attaches_its_own_vendor_cli(seams, _tmux_on_path,
                                                           monkeypatch):
-    # THE MOTIVATING CASE: a vendor CLI holding a permission prompt is reachable
-    # from the multiplexer, so the operator does not have to open a browser to
-    # answer it. `harness_has_terminal` says native, so the pane attaches to the
-    # harness's own tmux terminal instead of typing `omnigent attach`.
+    # A WORKER's tab is a per-agent tab and nothing else, so a native harness's
+    # goes straight to that agent's vendor CLI — where a permission prompt is
+    # answered — instead of typing `omnigent attach`.
     monkeypatch.setattr(og_herdr_launch, "terminal_behind",
                         lambda sid, env=None, watcher=None: ("/tmp/x/tmux.sock",
                                                              "main"))
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
 
+    _worker_in_a_space(client, bridge, "claude-native")
+
+    worker_tab = bridge._recs["worker-1"]["tab_id"]
+    typed = _typed_by_pane(client)
+    assert typed[bridge._recs["worker-1"]["pane_id"]] == (
+        "tmux -S /tmp/x/tmux.sock attach -f ignore-size -t main")
+    # ...and it is noted as the CLI role, so Enter reaches it and not something
+    # else this agent has.
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1",
+                              m.TAB_ROLE_CLI)["tab_id"] == worker_tab
+
+
+def test_a_ROOTS_own_tab_keeps_the_omnigent_view_never_repurposed(
+        seams, _tmux_on_path, monkeypatch):
+    # THE CORRECTED MODEL, and the property that matters most to the operator:
+    # the main pane stays the Omnigent view. A root's own tab is the chat — the
+    # launcher's `og chat`, or this `omnigent attach` for a space the bridge
+    # opened — and the vendor CLI gets a tab of its OWN, on demand, from
+    # `focus_agent_terminal`. So the root's tab is noted as `main`, and nothing
+    # here resolves a terminal at all.
+    def must_not_be_called(*args, **kwargs):
+        raise AssertionError("a root's own pane is not the vendor CLI")
+
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind", must_not_be_called)
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
     bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
 
     assert _call(client, "pane_run")[1] == (
-        "pane1", "tmux -S /tmp/x/tmux.sock attach -f ignore-size -t main")
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
+    assert m.agent_tab_record(bridge.agent_tabs_path, "s1",
+                              m.TAB_ROLE_MAIN)["tab_id"] == "tab1"
+    assert m.agent_tab_record(bridge.agent_tabs_path, "s1",
+                              m.TAB_ROLE_CLI) == {}, (
+        "no vendor-CLI tab is opened eagerly for a root")
 
 
 def _typed_commands(client):
     """Every command typed into a pane, in order."""
     return [args[1] for name, args, _ in client.calls if name == "pane_run"]
+
+
+def _typed_by_pane(client):
+    """`{pane_id: command}` for every line typed into a pane.
+
+    A space's panes are created in their own order, so keying by pane id is how
+    a test says WHICH agent's tab got which command rather than relying on
+    position in a list.
+    """
+    return {args[0]: args[1] for name, args, _ in client.calls
+            if name == "pane_run"}
 
 
 def _worker_in_a_space(client, bridge, harness):
@@ -5071,3 +5113,128 @@ def test_a_native_agents_tab_falls_back_when_no_terminal_resolves(seams,
     typed = _typed_commands(client)
     assert typed, client.calls
     assert "omnigent attach" in typed[0], typed
+
+
+def test_agent_tab_roles_are_independent(tmp_path):
+    # ONE agent can have both notes — its Omnigent view (`main`) and its
+    # vendor-CLI tab (`cli`) — and writing one must not disturb the other. That
+    # is what lets Enter tell a root's chat pane from the CLI tab it opened
+    # beside it.
+    path = tmp_path / "og-agent-tabs.json"
+    m.remember_agent_tab(path, "root-1", "w1:t1", "w1", role=m.TAB_ROLE_MAIN)
+    m.remember_agent_tab(path, "root-1", "w1:t9", "w1", role=m.TAB_ROLE_CLI)
+
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_MAIN)["tab_id"] == "w1:t1"
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_CLI)["tab_id"] == "w1:t9"
+
+    # Dropping ONE role leaves the other exactly where it was...
+    assert m.forget_agent_tab(path, "root-1", m.TAB_ROLE_CLI) is True
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_CLI) == {}
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_MAIN)["tab_id"] == "w1:t1"
+
+    # ...and the default drop takes every role for the session, entry included.
+    assert m.forget_agent_tab(path, "root-1") is True
+    assert json.loads(path.read_text()) == {}
+
+
+def test_agent_tab_record_with_no_role_says_main(tmp_path):
+    # The default role is the agent's own tab, so a caller that has not learned
+    # about roles yet reads what it always did.
+    path = tmp_path / "og-agent-tabs.json"
+    m.remember_agent_tab(path, "worker-1", "w1:t7")
+    assert m.agent_tab_record(path, "worker-1") == m.agent_tab_record(
+        path, "worker-1", m.TAB_ROLE_MAIN)
+
+
+def test_an_unknown_role_is_refused_rather_than_written(tmp_path):
+    # A role is a closed set: a typo must not create a third slot nothing reads.
+    path = tmp_path / "og-agent-tabs.json"
+    assert m.remember_agent_tab(path, "worker-1", "w1:t7", role="bogus") is False
+    assert m.forget_agent_tab(path, "worker-1", "bogus") is False
+    assert not path.exists()
+    assert m.agent_tab_record(path, "worker-1", "bogus") == {}
+
+
+def test_a_flat_note_from_before_the_roles_reads_as_the_main_tab(tmp_path):
+    # Nothing in this tree ever wrote the flat shape, but a file that says which
+    # tab an agent has should be believed for that much: read as "nothing", the
+    # next Enter on a native agent would open a SECOND vendor-CLI tab beside the
+    # recorded one.
+    path = tmp_path / "og-agent-tabs.json"
+    path.write_text(json.dumps({"worker-1": {"tab_id": "w1:t7",
+                                             "workspace_id": "w1"}}))
+
+    assert m.agent_tab_record(path, "worker-1", m.TAB_ROLE_MAIN) == {
+        "tab_id": "w1:t7", "workspace_id": "w1"}
+    assert m.agent_tab_record(path, "worker-1", m.TAB_ROLE_CLI) == {}
+
+
+def test_removing_a_worker_closes_the_vendor_cli_tab_beside_it_too(seams):
+    # A worker's vendor-CLI tab is a tab of its OWN beside the worker's own tab
+    # in its parent's space, so closing the worker's tab does not take it: it has
+    # to be closed here, or it stays on screen with nothing recording it. This is
+    # the "reaped like the others" half of opening one on demand.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    bridge.reconcile([Ev("added", "worker-1", sub_session("root-1",
+                                                          harness="acp:cline"))])
+    # The tab `focus_agent_terminal` would have opened for this worker.
+    assert m.remember_agent_tab(bridge.agent_tabs_path, "worker-1", "ws1:t99",
+                                "ws1", role=m.TAB_ROLE_CLI)
+
+    bridge.reconcile([Ev("removed", "worker-1", {})])
+
+    assert ("tab_close", ("ws1:t99",), {}) in client.calls, client.calls
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1",
+                              m.TAB_ROLE_CLI) == {}
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1",
+                              m.TAB_ROLE_MAIN) == {}
+
+
+def test_removing_a_root_closes_its_vendor_cli_tab_and_its_notes(seams):
+    # A root's space close takes its tabs with it, so the CLI tab is attempted
+    # anyway — `not_found` is the answer, counted as done — and both notes go.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    assert m.remember_agent_tab(bridge.agent_tabs_path, "root-1", "ws1:t99",
+                                "ws1", role=m.TAB_ROLE_CLI)
+
+    bridge.reconcile([Ev("removed", "root-1", {})])
+
+    assert ("tab_close", ("ws1:t99",), {}) in client.calls, client.calls
+    assert m.agent_tab_record(bridge.agent_tabs_path, "root-1",
+                              m.TAB_ROLE_CLI) == {}
+    assert m.agent_tab_record(bridge.agent_tabs_path, "root-1",
+                              m.TAB_ROLE_MAIN) == {}
+
+
+def test_a_not_found_when_closing_the_cli_tab_is_not_an_error(seams):
+    # The space close usually got there first, so `not_found` is the ordinary
+    # answer here and must not be reported as a failure.
+    client = RecordingClient()
+    client.fail = {"tab_close": FakeHerdrError("not_found")}
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    m.remember_agent_tab(bridge.agent_tabs_path, "root-1", "ws1:t99", "ws1",
+                         role=m.TAB_ROLE_CLI)
+
+    lines = bridge.reconcile([Ev("removed", "root-1", {})])
+
+    assert not [line for line in lines if line.startswith("error")], lines
+    assert m.agent_tab_record(bridge.agent_tabs_path, "root-1",
+                              m.TAB_ROLE_CLI) == {}
+
+
+def test_an_ordinary_removal_costs_no_cli_tab_call(seams):
+    # The close is attempted ONLY when a vendor-CLI tab is noted, so a removal
+    # that never opened one makes no extra call.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("removed", "root-1", {})])
+
+    assert "tab_close" not in [name for name, _, _ in client.calls], client.calls
