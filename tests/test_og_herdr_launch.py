@@ -2028,6 +2028,183 @@ def test_the_same_pane_id_in_a_different_tab_does_not_suppress_the_split(
     assert client.text_typed() == ["og agents"]
 
 
+# ---------------------------------------------------------------------------
+# the stand-down needs BOTH halves: og's record AND a pane that is demonstrably
+# there
+# ---------------------------------------------------------------------------
+# THE DEFECT THIS BLOCK COVERS. `og_owns_pane` was the whole guard, and it is a
+# question about a RECORD — which is written when a space is CREATED, before the
+# split that is supposed to follow it, and says nothing whatever about whether
+# that split happened. `og_herdr._add_history_space` remembers the pane and then
+# splits best-effort: `_split_agents` returns early when `herdr_agents_pane` is
+# off, which the operator can turn on at any time afterwards, and a split that
+# fails becomes a reconcile line nobody reads. The record still claims the pane,
+# the tab still holds one pane, and so an operator who pressed Enter on a history
+# space's `og chat --resume <id>` got a chat and NO agents pane — for good, since
+# `_split_agents` has one caller and none of them ever looks at a space again.
+#
+# Note what the tests ABOVE all have in common: every one writes
+# `owner: "launcher"`. That is the launch record, where the split really is in
+# flight and standing down is right. Not one of them writes the `history` record
+# — the exact input that fails — which is how this survived review.
+
+
+def test_a_resume_into_a_history_space_with_no_agents_pane_gets_one(tmp_path,
+                                                                   monkeypatch):
+    """THE FAILING INPUT, AND THE BUG. `owner: "history"` in `spaces` is what a
+    space opened for a past conversation carries, and it is written whether or
+    not the split after it happened. The tab holds ONE pane, so no agents pane is
+    there whatever the record says — most often because the setting was off when
+    the space opened and the operator has since turned it on. A guard that reads
+    the record alone stands this down, and the operator loses the pane silently
+    and permanently."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1", "owner": "history",
+                                  "cwd": str(tmp_path)}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods, (
+        "a tab with one pane in it has no agents pane, whatever the record says")
+    assert client.text_typed() == ["og agents"]
+    # In the pane this split just made, never in the one holding the resume.
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
+def test_a_resume_into_a_history_space_that_has_one_still_stands_down(tmp_path,
+                                                                     monkeypatch):
+    """THE OTHER HALF, AND THE v0.18.1 DEFECT IT MUST NOT COME BACK AS. The same
+    history record in a tab that really does hold a second pane is a space whose
+    split DID happen, and splitting again is the three-pane defect — now on the
+    resume path instead of the launch one. `pane.list` carries no command and no
+    process, so og cannot tell a live `og agents` from a dead one; existence
+    beside og's own record is the strongest claim available, and it is the one
+    taken. The price is stated in `_agents_pane_already_split`: a pane whose
+    `og agents` crashed is not recovered by this."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1", "owner": "history",
+                                  "cwd": str(tmp_path)}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" not in client.methods
+    assert client.text_typed() == []
+
+
+def test_a_second_pane_on_its_own_never_stands_the_split_down(tmp_path,
+                                                              monkeypatch):
+    """EXISTENCE IS NOT THE GUARD; it can only ever ADD to the record. A tab the
+    operator split themselves holds a pane beside this one and no record says og
+    opened anything, so the split still happens — into a pane of its own, not
+    into theirs. Read the other way round ("the tab already holds two panes, so
+    stand down") every `og chat` an operator runs by hand loses its agents pane,
+    which is the case `known_panes` exists to protect."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p3"
+
+
+def test_a_launch_record_still_stands_down_once_the_split_has_landed(tmp_path,
+                                                                    monkeypatch):
+    """THE FRESH LAUNCH, pinned at the unit. The record a launch writes sits in
+    `pending` until the bridge claims it, so that is the shape `og start`'s own
+    `og chat` finds: running in the very pane `_open_space` is splitting beside,
+    in a tab that already holds the `og agents` pane. Both halves are present, so
+    it stands down — and two panes stay two panes."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {}, "pending": {str(tmp_path): {
+                   "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+                   "owner": "launcher", "cwd": str(tmp_path)}}})
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" not in client.methods
+    assert client.text_typed() == []
+
+
+def test_an_unreadable_pane_listing_never_stands_an_og_pane_down(tmp_path,
+                                                                 monkeypatch,
+                                                                 capsys):
+    """THE FAIL-SAFE DIRECTION, which is the opposite of the one taken one screen
+    below it, and both are right because they are two different questions.
+    "Could not read this tab" must never be read as "the agents pane is already
+    there": that would stand the split down with nothing said, which is the same
+    silent and permanent loss as the defect above. So an og-owned record with no
+    readable listing degrades LOUDLY — and still splits nowhere, because guessing
+    at a pane puts `og agents` in somebody's shell, which is the one cost this
+    code refuses to pay (see `tab_pane_ids`)."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1", "owner": "history",
+                                  "cwd": str(tmp_path)}},
+                "pending": {}})
+    client = UnreadableOnceClient(
+        [{"pane_id": "w1:p1", "tab_id": "w1:t1"},
+         {"pane_id": "w1:p2", "tab_id": "w1:t1"}])
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" not in client.methods
+    assert client.text_typed() == []
+    assert "could not read this tab's panes" in capsys.readouterr().err
+
+
+def test_a_client_that_cannot_be_built_costs_the_agents_pane_only(tmp_path,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """THE COST OF ASKING, and it is bounded. Building a client connects to
+    nothing — it resolves a socket path and waits — but it can still raise (an
+    unimportable `og_herdr_client`, a home `Path.home()` cannot resolve), and
+    `bin/og` reads any non-zero exit from this helper as `exit`, so an exception
+    here takes the CHAT down over a cosmetic pane.
+
+    The stand-down path built no client at all and was immune by accident; asking
+    herdr what the tab holds is worth exactly one `pane.list` and not a session.
+    This is the launch-record shape, because that is the one that newly reaches
+    the client."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {}, "pending": {str(tmp_path): {
+                   "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+                   "owner": "launcher", "cwd": str(tmp_path)}}})
+
+    def no_client(env):
+        raise OSError("no herdr socket to resolve")
+
+    monkeypatch.setattr(og_herdr_launch, "_chat_client", no_client)
+
+    assert chat_pane(client=None, env=_pane_env()) == 0
+
+    assert "no herdr socket" in capsys.readouterr().err
+    # The chat is still recorded — that record is what stops the bridge opening
+    # a second space for it, and it is worth more than the pane.
+    assert os.getcwd() in load_state(tmp_path / "og-herdr.json")["pending"]
+
+
 def test_og_owns_pane_is_false_for_a_state_file_nobody_wrote(tmp_path):
     """The guard's own default, so the fail-safe direction is pinned where it is
     decided rather than only where it is used."""
