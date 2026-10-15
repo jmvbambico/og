@@ -18,6 +18,15 @@
 #   og restart [mode]   og stop, then og start with the same arguments
 #   og setup            re-run the installer (change agents, models, reviewer)
 #   og chat [args...]   open an orchestrator session in this terminal (no picker)
+#                       --dir <path> roots the session there: absolute paths are
+#                       used as given, a relative one resolves against the
+#                       install's projects root (default ~/projects), and an
+#                       empty or nonexistent path is refused. Every other
+#                       argument goes to `omnigent run` verbatim, which is how
+#                       --resume works.
+#                       Inside a herdr pane it also records the pane (so the
+#                       bridge renames the space to the conversation) and opens
+#                       the `og agents` split when the install asks for one.
 #   og attach           re-attach the host daemon to a running server
 #   og login            store server credentials (Keychain / keyring / 0600 file), once
 #   og status           what is running, and the public URL
@@ -2367,6 +2376,42 @@ cmd_attach() {
   return 0
 }
 
+# `og chat`'s end of the multiplexer handshake: record THIS pane so og_herdr's
+# bridge adopts the space the operator opened by hand (and renames it to the
+# conversation), and open the `og agents` split beside it when the install asks
+# for one. The same record `_open_space` writes for `og start <mux>` — the
+# launcher's problem is that it cannot know which pane `og chat` will run in
+# until it types the line; this one is already in it.
+#
+# $1 is the operator's --dir, which may be EMPTY, and $2 says whether the flag
+# was given at all — `--dir ""` is a value somebody typed, not the absence of
+# one, and treating it as absent would quietly run the conversation in the
+# directory they were already standing in.
+#
+# The RESOLVED directory is the only thing on stdout (bin/og captures it and
+# cds), so the helper prints every human-facing line to stderr. A non-zero exit
+# is one thing only: --dir naming something that is not a directory (empty
+# included), which is a refusal and not a degradation.
+og_chat_handshake() {
+  local dir="$1" given="$2" repo="" script="" py
+  repo="$(og_repo_dir 2>/dev/null)" || repo=""
+  [[ -n "$repo" ]] && script="$repo/installer/og_herdr_launch.py"
+  py="$(command -v python3 2>/dev/null || true)"
+  if [[ -z "$script" || ! -f "$script" || -z "$py" ]]; then
+    if [[ "$given" == "1" ]]; then
+      printf '\033[0;31merror:\033[0m cannot find the og checkout or python3, so --dir cannot be resolved.\n  Set OG_REPO=/path/to/og in %s\n' "$CONF_FILE" >&2
+      return 2
+    fi
+    printf '\033[0;33m!\033[0m og chat: og_herdr_launch.py is not available, so this pane was not recorded in herdr (the bridge may open its own space)\n' >&2
+    return 0
+  fi
+  if [[ "$given" == "1" ]]; then
+    "$py" "$script" chat-pane --dir "$dir"
+  else
+    "$py" "$script" chat-pane
+  fi
+}
+
 # Open a terminal session ON dev-lead against the running server, skipping the
 # web picker entirely. This is the answer to "which of the two Claude Code rows
 # is mine": with the agent named on the command line there is nothing to pick.
@@ -2374,7 +2419,45 @@ cmd_attach() {
 # `omnigent run <AGENT> --server <url>` binds the session to that bundle. The
 # bare form would also work (config's default_agent points here), but naming the
 # path makes the command self-describing and immune to a changed default.
+#
+# `--dir <path>` is OURS and is consumed here; everything else in "$@" is
+# forwarded to `omnigent run` VERBATIM, which is the whole contract with the
+# rest of og — `og chat --resume <id>` is how og_herdr resumes a past
+# conversation in a history space, and every other omnigent run flag belongs to
+# omnigent. That is also why there is no POSITIONAL directory: a bare argument
+# would collide with the forwarded ones rather than join them.
 cmd_chat() {
+  local chat_dir="" chat_dir_given=0 chat_root="" chat_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dir)
+        [[ $# -ge 2 ]] || die "--dir needs a directory (e.g. --dir ~/projects/og)"
+        chat_dir="$2"; chat_dir_given=1; shift 2 ;;
+      --dir=*)
+        chat_dir="${1#--dir=}"; chat_dir_given=1; shift ;;
+      *) chat_args+=("$1"); shift ;;
+    esac
+  done
+  # A --dir that cannot be resolved is a refusal, not a degradation: the session
+  # would be rooted somewhere the operator did not ask for, with no error
+  # anywhere. The `chat_dir_given` test rather than `-n "$chat_dir"` because an
+  # EMPTY --dir is a value somebody typed, and dropping it would run the chat in
+  # the directory they were already in — the exact silent misreading this flag
+  # exists to avoid. Everything else about the handshake is best effort, because
+  # the chat IS the session (see og_chat_handshake).
+  if [[ "$chat_dir_given" == "1" || "${HERDR_ENV:-}" == "1" ]]; then
+    # HERDR_ENV is herdr's own flag for "this process is in a managed pane", so
+    # a plain `og chat` in an ordinary terminal does not even start python here.
+    # The helper checks it again anyway: it owns the handshake, and a direct
+    # call to it must be safe on its own.
+    chat_root="$(og_chat_handshake "$chat_dir" "$chat_dir_given")" || exit $?
+    if [[ -n "$chat_root" ]]; then
+      # `omnigent run` roots the session at its own cwd (omnigent cli.py), so the
+      # cd IS the --dir; the handshake above is what keys the pending record to
+      # the same directory.
+      cd -- "$chat_root" || die "cannot enter $chat_root"
+    fi
+  fi
   server_running || die "the omnigent server is not running — run 'og start' first"
   [[ -d "$AGENT_DIR" ]] || die "agent bundle not found at $AGENT_DIR"
   # Same scoping the host daemon gets (see export_worker_scoping).
@@ -2395,7 +2478,11 @@ cmd_chat() {
       show_access
     fi
   fi
-  exec omnigent run "$AGENT_DIR" --server "http://127.0.0.1:$PORT" "$@"
+  # ${arr[@]+"${arr[@]}"} rather than "${chat_args[@]}": an empty array under
+  # `set -u` is an error in bash 3.2, which is the oldest shell this script
+  # supports. `og chat` with no arguments is the common case, so it has to work.
+  exec omnigent run "$AGENT_DIR" --server "http://127.0.0.1:$PORT" \
+    ${chat_args[@]+"${chat_args[@]}"}
 }
 
 cmd_url() {
@@ -2444,11 +2531,11 @@ case "${1:-}" in
   ""|-h|--help|help)
     # The usage block is the comment header, so the RANGE has to track it: every
     # command added above without widening this quietly drops off the end of
-    # `og help`, which is how `og version` went missing once already. 2,32 is the
+    # `og help`, which is how `og version` went missing once already. 2,41 is the
     # last line of the command list (the prose below it is not help).
     # tests/test_og_start_mux.py::test_help_block_lists_every_dispatched_command
     # is the guard that cannot rot the way a number does.
-    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac
