@@ -2089,7 +2089,14 @@ cmd_agents() {
     printf '\033[0;31merror:\033[0m og agents is not installed (missing %s); re-run og setup\n' "$viewer" >&2
     exit 2
   }
-  exec python3 "$viewer" "$@"
+  # --server so an install whose og.env moved the server off 6767 still talks
+  # to its own server, exactly as `og sessions` and the herdr bridge are
+  # launched. Without it `og agents` falls back to the hardcoded 6767 and, when
+  # 6767 is held by an unrelated listener (the installer moves og's OWN server to
+  # 6768 when 6767 is taken), reads that stranger's 404. It is placed BEFORE
+  # "$@" on purpose: argparse keeps the LAST `--server`, so an explicit one the
+  # operator typed still wins.
+  exec python3 "$viewer" --server "http://127.0.0.1:$PORT" "$@"
 }
 
 # `og sessions` — the terminal's answer to the web UI's session "..." menu.

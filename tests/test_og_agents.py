@@ -20,7 +20,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -5147,3 +5147,107 @@ def test_the_pane_scroll_offset_survives_a_theme_change(monkeypatch, tmp_path):
              [(l, a.line_text(l)) for l in a._pane(frame, 46, 10).items]
              if "t0" in row]
     assert after, "the tree still shows its first worker after a cancelled pick"
+
+
+# ---------------------------------------------------------------------------
+# 17. a failing listing DEGRADES the pane; it must not kill it
+# ---------------------------------------------------------------------------
+#
+# `refresh` makes exactly ONE wire call `og_herdr_watch` does not already swallow
+# — `fetch_listing` (every detail fetch returns None on failure, see its
+# docstring) — and a transient non-200 from it used to escape into
+# `curses.wrapper` and take the whole screen down. The measured failure was a 404
+# at the WRONG port: `og agents` asked a hardcoded 6767 while og's own server ran
+# on 6768. The pane must keep the last good rows, say so on the footer, and heal
+# on the next tick. These drive the real `_run_tui` loop, because the previous
+# frame the pane has to fall back to lives in the loop, not in the model.
+
+def _listing_404():
+    return HTTPError("http://x/v1/sessions", 404, "Not Found", {}, None)
+
+
+def test_a_failed_listing_fetch_still_raises_out_of_refresh():
+    """The watcher is RIGHT to raise; the LOOP is what copes (see below).
+
+    `refresh` must not start swallowing wire errors — an unreachable server is a
+    fact it has no previous frame to report against. Pinned so a future "fix" does
+    not quietly move the swallow down here and lose the previous rows on the way.
+    """
+    opener = RoutingOpener([_listing_404()], details={"root": ROOT_DETAIL})
+    with pytest.raises(HTTPError):
+        _model(opener).refresh()
+
+
+def test_a_failed_listing_keeps_the_last_rows_and_names_the_server_and_status(
+        monkeypatch):
+    """The pane survives a failed poll: prior rows stay, the footer explains it."""
+    opener = RoutingOpener([_live_listing(), _listing_404()],
+                           details={"root": ROOT_DETAIL})
+    # `r` forces the poll that fails; the startup poll succeeded, so there ARE
+    # prior rows to keep.
+    screen = _run_tui_capture(monkeypatch, [ord("r"), QUIT], model=_model(opener))
+
+    assert screen.frames, "the pane kept painting"
+    last = "\n".join(screen.frames[-1])
+    assert "w1" in last, "the last good rows are still on screen"
+    assert "http://x" in last, "the notice names the server it tried"
+    assert "HTTP 404" in last, "and the status, so a wrong port is diagnosable"
+
+
+def test_the_pane_recovers_on_the_next_tick_once_the_server_answers(monkeypatch):
+    """A server that comes back heals the pane with no restart: rows, no notice."""
+    opener = RoutingOpener([_listing_404(), _live_listing()],
+                           details={"root": ROOT_DETAIL})
+    screen = _run_tui_capture(monkeypatch, [ord("r"), QUIT], model=_model(opener))
+
+    assert screen.frames
+    first, after = screen.frames[0], screen.frames[-1]
+    assert any("HTTP 404" in t for t in first), first
+    assert not any("w1" in t for t in first), "the failed poll had no rows to show"
+    assert any("w1" in t for t in after), "the recovered poll paints the tree"
+    assert not any("HTTP 404" in t for t in after), "and the outage notice is gone"
+
+
+def test_a_healthy_empty_listing_is_empty_and_not_an_outage(monkeypatch):
+    """The rule the whole change turns on: an empty pane and an unreachable server
+    must not look the same. A server that answers with NO sessions renders an empty
+    pane with the normal footer — no notice."""
+    opener = RoutingOpener([[]], details={})
+    screen = _run_tui_capture(monkeypatch, [QUIT], model=_model(opener))
+
+    assert screen.frames, "the pane painted"
+    painted = "\n".join(screen.painted)
+    assert "HTTP" not in painted and "server http" not in painted, painted
+    assert "╭" not in painted, "no session renders no box"
+
+
+def test_the_listing_notice_names_the_url_and_the_http_status():
+    err = HTTPError("http://x/v1/sessions", 404, "Not Found", {}, None)
+    text = a.listing_failure_notice("http://127.0.0.1:6767", err)
+    assert text == "server http://127.0.0.1:6767: HTTP 404 Not Found (retrying)"
+
+
+def test_the_listing_notice_falls_back_to_a_url_error_reason():
+    text = a.listing_failure_notice("http://x", URLError("Connection refused"))
+    assert text == "server http://x: Connection refused (retrying)"
+
+
+def test_the_listing_notice_never_raises_when_the_error_cannot_be_rendered():
+    class Unrenderable(BaseException):
+        reason = None
+
+        def __str__(self):
+            raise RuntimeError("no text")
+
+    assert a.listing_failure_notice("http://x", Unrenderable()) \
+        == "server unreachable: http://x"
+
+
+def test_the_operator_supplied_server_flag_wins_over_bin_og_forwarding():
+    """bin/og puts its `--server` FIRST (see `cmd_agents`), and argparse keeps the
+    LAST occurrence — so the flag the operator typed is the one that wins. This is
+    the ordering `cmd_agents`' comment relies on, pinned where it can be checked
+    without a shell."""
+    args = a.build_parser().parse_args(
+        ["--server", "http://127.0.0.1:6768", "--server", "http://example:9999"])
+    assert args.server == "http://example:9999"
