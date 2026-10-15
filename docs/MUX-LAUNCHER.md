@@ -187,10 +187,12 @@ second one.
 - If that session has a space: `workspace.focus(ws)`, then `exec herdr`.
 - If it does not: adopt it (§4), then focus and attach.
 
-**Known gap, unfixed.** TWO things open the `og agents` pane, and neither is this
-case: `_open_space` (a fresh launch) and `og_herdr._add_history_space` (a history
-space for a past conversation, resumed from the spaces list). Both go through the
-one implementation, `og_herdr_launch.split_agents_pane`; there is deliberately no
+**Known gap, unfixed.** THREE things open the `og agents` pane, and none is this
+case: `_open_space` (a fresh launch), `og_herdr._add_history_space` (a history
+space for a past conversation, resumed from the spaces list), and `og chat` in a
+pane nobody else opened (which stands down whenever the first of them already
+owns that pane — the rule in §2). All three go through the one implementation,
+`og_herdr_launch.split_agents_pane`; there is deliberately no
 second copy of the split to drift. ADOPTING AN EXISTING SPACE is still the case
 that never splits — and says nothing when the space it attaches to has no agents
 pane (closed by hand, or created before the feature). At the keyboard that is
@@ -261,6 +263,20 @@ from (A)–(D) rather than a copy of it:
   theirs. The chat path passes the tab's panes as they were *before* the split,
   and when no new pane can be identified it starts `og agents` nowhere rather
   than guessing into one of theirs.
+- **The split is skipped when og already made this pane.** `og start` types
+  `og chat` into the pane it is about to split, so on a fresh launch this path
+  IS the launcher's second half and splitting here as well opened three panes
+  where the operator expects two. The launcher keeps the split — it is the half
+  that still holds the pane if `og chat` never reaches its own — and this half
+  stands down when the state file already names this workspace/tab/pane, which
+  `_open_space` wrote before it typed the line and which therefore cannot be
+  raced. That guard keys on og's own record rather than on the tab's pane count
+  because `pane.list` returns no command and no process: "this tab already holds
+  the `og agents` pane" and "this tab already holds a pane the operator split
+  themselves" are otherwise the same answer, and reading the second as the
+  first would take the agents pane away from every `og chat` run by hand. A
+  state file that cannot be read is no answer rather than a negative one, and
+  the split is attempted.
 
 `og chat --dir <path>` sets the directory the session is rooted in without
 `cd`-ing first. An absolute path is used as-is; a relative one resolves against
@@ -277,10 +293,46 @@ equals `$PWD`, and which is live:
 - not `archived`
 - `runner_online` is true
 - `status` in (`running`, `idle`)
+- **`host_id` is this machine's**, when both ids are known
 
 `idle` counts deliberately: an idle root is one waiting for the human to type,
 which is precisely the session they want to be returned to. A failed or
 runner-offline session must not block a fresh start.
+
+The host rule exists because `workspace` is a path, not a machine: a session on
+a work-mac whose checkout of the same repo is at the same path is a real shape,
+and it passes every filter above — including `runner_online`, which says nothing
+at all about a machine that is merely not here. Attaching to it types an attach
+that dies with `no online runner … its host is offline`.
+
+**Which machine am I** is answered in this order, and the first source is the
+one that identifies rather than infers:
+
+1. **this machine's own daemon record** — `$OMNIGENT_HOME/daemons/*.json`, written
+   by this machine's host daemon, stating `host_id` directly (`omnigent host
+   status` prints the same value). The filename is a config signature, so there
+   may be several; only records whose `server_url` / `target` /
+   `resolved_server_url` name this server count, and several that agree are one
+   answer while several that **disagree** are unknown.
+2. **`GET /v1/hosts`, only when exactly one host is online.** This endpoint
+   describes every host the *account* has, across every machine, so "the first
+   online entry" is a position in a list this process has no stake in. A user who
+   runs two machines would have had their own sessions skipped — every start
+   opening a new space. Ask `/v1/hosts` when it can actually identify, not when it
+   can merely enumerate.
+
+Both ids are **detail** facts: the listing row carries neither `workspace` nor
+`host_id` (measured), so `og_herdr_watch` forwards both out of the one
+`GET /v1/sessions/{id}` fetch it already makes per session. The watcher emits a
+sub-agent's `host_id: null` as no key at all, which is the unknown case below.
+
+The rule is deliberately asymmetric: a session is skipped **only** when both ids
+are known and differ. A hosts endpoint that errors, answers nothing, or reports
+no online host, and a session row with no `host_id`, all leave the session alone —
+because a skip we could not justify is the mistake nothing undoes (a second space
+and a second `og chat` in a conversation the operator already had), while the
+opposite error is a message on screen they can act on. That is also why an
+ambiguous "which machine am I" resolves to unknown rather than to a guess.
 
 `workspace` is on the **detail** row only — the listing row does not carry it.
 The check therefore costs one detail fetch per live root, which is a handful.
@@ -327,8 +379,26 @@ Rules:
 - **`owner` records who created the space**, so a future `--cleanup` can offer
   "only what the bridge opened" if that ever matters. Today both are cleaned
   alike.
-- **The file is not a lock.** Two processes can write it. Keep writes small and
-  last-writer-wins; nothing here is worth a lockfile.
+- **The file is not a lock, but every read-modify-write takes one.** Both
+  processes write it whole, so any operation that means something is a
+  read-modify-write, and re-reading immediately before writing (which both
+  sides do) narrows the race without closing it — a second read only moves it.
+  So load, change and save happen inside one `og_herdr.state_update`, holding
+  `og_herdr.state_lock` — an advisory `flock` on a `og-herdr.json.lock` SIDECAR,
+  never the state file itself, because `os.replace` swaps the inode a lock would
+  ride on. Whoever commits first, the second writer reads the first's file and
+  lands on top of it. It is advisory: a writer that ignores it is still
+  last-writer-wins, which is what this file has always been.
+- **Readers re-read, and merge per key — never wholesale.** The bridge folds the
+  file in at each pass boundary (before `_prune_pending`, which saves), inside
+  every save, and again at the moment it claims a pending record — the last of
+  those *is* the save, in one transaction. A key the bridge has not changed
+  since the file last held it belongs to whoever wrote the file last, *including
+  a launcher that replaced it* under the same directory key. Memory wins for a
+  key it holds an unsaved change to, and for a key it has finished with whose
+  record the file still shows unchanged — that second half is what stops a
+  claimed record from being offered to the next session. A key the file no
+  longer has is never removed from memory, so an unreadable file changes nothing.
 
 ### The deferred write
 

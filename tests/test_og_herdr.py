@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shlex
+import threading
 from pathlib import Path
 
 import pytest
@@ -3337,6 +3338,487 @@ def test_a_pending_record_for_a_different_directory_is_never_claimed(seams):
     assert set(bridge._pending) == {"/repo/og"}
 
 
+# --- 4/5. the SAME handshake, but the launcher writes the file LATER ----------
+#
+# `og start herdr` starts the bridge BEFORE it execs the launcher (see `bin/og`),
+# and the launcher writes its record and exits. So on a fresh `og start` the
+# launcher's record is, by construction, newer than anything the bridge has read
+# — and a bridge that reads the file once, at construction, cannot see it. The
+# dedupe misses, the bridge concludes the session has no space, and opens a
+# second one: one operator's file held three spaces for one directory, two of
+# them the bridge's own. Adoption only ever worked across a bridge RESTART,
+# which is exactly why the duplicate looked like it came and went.
+
+def test_a_pending_record_the_launcher_wrote_after_the_bridge_started_is_claimed(
+        seams):
+    # The live failure, in the order it happens. No state file at all when the
+    # bridge starts; the launcher writes one while the bridge is already
+    # running, exactly as `og start` does it.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    assert not Path(bridge.state_path).exists()
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1", "pane_id": "wB:p1",
+                     "owner": "launcher", "cwd": "/repo/og"}})
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    # The whole point: one space for the directory, the launcher's, and no
+    # `workspace_create` anywhere in the pass.
+    assert _names(client).count("workspace_create") == 0
+    assert _names(client).count("tab_create") == 0
+    assert lines[0].startswith("claim s1 → space wB"), lines
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["pending"] == {}
+    assert saved["spaces"]["s1"]["workspace_id"] == "wB"
+    assert saved["spaces"]["s1"]["owner"] == "launcher"
+    assert bridge._recs["s1"]["owns_space"] is False
+
+
+def test_a_spaces_record_the_launcher_wrote_after_the_bridge_started_is_adopted(
+        seams):
+    # The resume path writes `spaces`, not `pending` (og_herdr_launch opens the
+    # space itself once the session id is known), so the same staleness made a
+    # second space there too — the `w13 owner=history` half of the same file.
+    client = RecordingClient(spaces=[space_info("wA", "og")])
+    bridge = m.Bridge(FakeWatcher([]), client)
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "wA", "tab_id": "wA:t1", "pane_id": "wA:p1",
+               "owner": "launcher", "cwd": "/repo/og"}}, pending={})
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("adopt s1 → space wA tab wA:t1 pane wA:p1"), lines
+
+
+def test_pruning_a_dead_record_does_not_delete_the_one_written_after_it(seams):
+    # WHY the reload sits where it does. `_prune_pending` SAVES, and it saves
+    # this process's whole copy of the file. Run against the construction-time
+    # snapshot, a prune of one dead record would write out a `pending` map that
+    # never contained the launcher's — deleting a record no process would then
+    # hold, so the session that follows opens a duplicate and the next restart
+    # finds nothing to adopt either.
+    client = RecordingClient(spaces=[space_info("wNEW", "og")])
+    # The bridge starts holding a record for a space the operator has closed.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/gone": {"workspace_id": "wGone", "tab_id": "wGone:t1",
+                       "pane_id": "wGone:p1", "owner": "launcher"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    # The launcher then writes a fresh space for this directory.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/gone": {"workspace_id": "wGone", "tab_id": "wGone:t1",
+                       "pane_id": "wGone:p1", "owner": "launcher"},
+        "/repo/og": {"workspace_id": "wNEW", "tab_id": "wNEW:t1",
+                     "pane_id": "wNEW:p1", "owner": "launcher",
+                     "cwd": "/repo/og"}})
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert any("pruned 1 pending" in ln for ln in lines), lines
+    assert _names(client).count("workspace_create") == 0
+    assert lines[-1].startswith("claim s1 → space wNEW"), lines
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["pending"] == {}
+    assert saved["spaces"]["s1"]["workspace_id"] == "wNEW"
+
+
+def test_the_bridges_own_record_outranks_a_file_that_has_lost_it(seams):
+    # MERGE, not replace. Memory is allowed to be AHEAD of the file — `save_state`
+    # swallows a write that cannot complete, and the launcher's whole-file writes
+    # land last-writer-wins — and a replacing reload would then hand this bridge
+    # a session it had already put a live pane on, which is a duplicate space
+    # for a conversation the operator is already watching.
+    client = RecordingClient(spaces=[space_info("w1", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge._remember("s1", "w1", tab_id="w1:t1", pane_id="w1:p1",
+                     cwd="/repo/og")
+    # The file no longer carries the record the bridge just wrote.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={})
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("adopt s1 → space w1 tab w1:t1 pane w1:p1"), lines
+
+
+def test_a_state_file_that_vanished_changes_nothing(seams):
+    # A reload has to fail TOWARD the view the bridge already holds. A file it
+    # cannot read is not evidence that a space is recorded nowhere, and believing
+    # that is precisely what opens the second space.
+    client = RecordingClient(spaces=[space_info("w1", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+               "owner": "bridge", "cwd": "/repo/og"}}, pending={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    Path(bridge.state_path).unlink()
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("adopt s1 → space w1 tab w1:t1 pane w1:p1"), lines
+    # ...and the save at the end of the adopt path put the file back.
+    assert json.loads(Path(bridge.state_path).read_text())["spaces"]["s1"][
+        "workspace_id"] == "w1"
+
+
+def test_a_corrupt_state_file_does_not_erase_what_the_bridge_already_knew(seams):
+    # The other unreadable case. `load_state` reads a file that is not JSON as
+    # "we recorded nothing" — correct for `--cleanup`, which then closes nothing
+    # rather than closing the operator's own workspaces. For a LIVE bridge the
+    # same answer must not be allowed to reach its maps, and the additive merge
+    # is what guarantees it: two empty maps merged in change nothing at all.
+    client = RecordingClient(spaces=[space_info("w1", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+               "owner": "bridge", "cwd": "/repo/og"}}, pending={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    Path(bridge.state_path).write_text("{ this is not json at all")
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("adopt s1 → space w1 tab w1:t1 pane w1:p1"), lines
+
+
+def test_an_empty_state_file_changes_nothing(seams):
+    # Truncated to nothing by whatever wrote it last. Same answer as missing.
+    client = RecordingClient(spaces=[space_info("w1", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+               "owner": "bridge", "cwd": "/repo/og"}}, pending={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    Path(bridge.state_path).write_text("")
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("adopt s1 → space w1 tab w1:t1 pane w1:p1"), lines
+
+
+# --- 4/6. two writers on ONE key: who decides, and how old is the answer -----
+#
+# The fold is per key, and a key is not one writer's. The launcher keys
+# `pending` by DIRECTORY and `_record` replaces whatever is under that key
+# (og_herdr_launch._record) — so a second `og start herdr` in a directory whose
+# first conversation has not appeared yet lands a second launcher record on top
+# of the first, under the identical key, with the first space still open and
+# still listed. "I already hold this key" is not a reason to keep what I hold.
+
+def test_a_pending_record_replaced_under_the_same_directory_is_not_the_old_one(
+        seams):
+    # The double `og start`, in the order it happens. The operator starts a
+    # conversation in /repo/og; `og chat` takes a moment to register the session,
+    # and they start again — so the launcher's second space is the one whose
+    # record survives, and the first space is now a record nobody will claim.
+    client = RecordingClient(spaces=[space_info("wOld", "og"),
+                                     space_info("wNew", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wOld", "tab_id": "wOld:t1",
+                     "pane_id": "wOld:p1", "owner": "launcher",
+                     "cwd": "/repo/og"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    # `_record` writes the whole map: the SECOND record replaces the first under
+    # the same key, it does not join it.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wNew", "tab_id": "wNew:t1",
+                     "pane_id": "wNew:p1", "owner": "launcher",
+                     "cwd": "/repo/og"}})
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    # The space the operator is SITTING in, not the one whose record it
+    # replaced. Claiming wOld would have opened a second client on one session in
+    # a pane they are not looking at, which is the same co-drive race
+    # `_existing_space` refuses to enter anywhere else.
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("claim s1 → space wNew tab wNew:t1"), lines
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["spaces"]["s1"]["workspace_id"] == "wNew"
+
+
+def test_a_record_this_process_could_not_write_out_outranks_the_file(
+        seams, monkeypatch):
+    # THE OTHER SIDE of the same rule, and the reason it is not "the file wins".
+    # `save_state` swallows a write it could not complete, so memory can be
+    # ahead of the file — a record here names the space this bridge has already
+    # typed an attach command into, and the file's copy is the one that lost the
+    # race. Rolling back to it would put the session on a workspace the operator
+    # never asked for.
+    #
+    # `_write_state` is stubbed to report a write that did not land, which is the
+    # only honest way to reach this: `_save_state` re-snapshots precisely when it
+    # is told the write completed, and `_write_state` is where every write now
+    # lands (`save_state` and `state_update` only decide and lock around it).
+    client = RecordingClient(spaces=[space_info("wOld", "og"),
+                                     space_info("wNew", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "s1": {"workspace_id": "wOld", "tab_id": "wOld:t1", "pane_id": "wOld:p1",
+               "owner": "bridge", "cwd": "/repo/og"}}, pending={})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    monkeypatch.setattr(m, "_write_state", lambda path, state: False)
+    # The bridge adopts a fresh space for this session. Nothing reaches the file.
+    bridge._remember("s1", "wNew", tab_id="wNew:t1", pane_id="wNew:p1",
+                     cwd="/repo/og")
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("adopt s1 → space wNew tab wNew:t1"), lines
+    # ...and the file still says what it said before, which is the point: memory
+    # is ahead of it and knows that it is.
+    assert json.loads(Path(bridge.state_path).read_text())["spaces"]["s1"][
+        "workspace_id"] == "wOld"
+
+
+def test_a_record_the_launcher_writes_mid_pass_is_still_claimed(seams):
+    # THE RACE INSIDE A PASS. The fold at the pass boundary is read before
+    # `_prune_pending`'s `workspace.list` round trip and before every event ahead
+    # of this one; a launcher that writes inside that gap is invisible to it. In
+    # production that gap is the whole of `run_forever`'s single-event pass
+    # (og_herdr_watch.watch yields one event at a time), so "the batch" is one
+    # event and the window is the pass's own herdr call.
+    #
+    # The write is therefore fired from the fake's `workspace_list` — the exact
+    # instant the launcher would land it, which is after the bridge has read the
+    # file and before it has decided.
+    class LateWrite(RecordingClient):
+        def workspace_list(self):
+            write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+                "/repo/other": {"workspace_id": "wOther", "tab_id": "wOther:t1",
+                                "pane_id": "wOther:p1", "owner": "launcher",
+                                "cwd": "/repo/other"},
+                "/repo/og": {"workspace_id": "wNew", "tab_id": "wNew:t1",
+                             "pane_id": "wNew:p1", "owner": "launcher",
+                             "cwd": "/repo/og"}})
+            return super().workspace_list()
+
+    client = LateWrite(spaces=[space_info("wOther", "other"),
+                               space_info("wNew", "og")])
+    # The bridge starts already holding one pending record — so `_prune_pending`
+    # asks herdr for the listing at all, which is what fires the write.
+    write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/other": {"workspace_id": "wOther", "tab_id": "wOther:t1",
+                        "pane_id": "wOther:p1", "owner": "launcher",
+                        "cwd": "/repo/other"}})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "Fix the bridge", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("claim s1 → space wNew tab wNew:t1"), lines
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["spaces"]["s1"]["workspace_id"] == "wNew"
+    # The record that was already there is untouched by the pass that read a
+    # later version of the file.
+    assert saved["pending"]["/repo/other"]["workspace_id"] == "wOther"
+
+
+# --- 4/7. a CLAIM is not an unsaved edit --------------------------------------
+#
+# The claim MOVES `pending[cwd]` into `spaces[sid]`, so for that key memory
+# stops holding what `_synced` says it held — exactly what an unflushed local
+# edit looks like from the other side of `Bridge._memory_decides`. If that
+# difference is read as "protect my edit", the bridge cannot honour the
+# launcher's next record for a directory it has already claimed the first record
+# of, and the session for that launch opens a second space. The write that would
+# have told the file about the claim is what separates the two situations, so
+# these tests break the write on purpose: a claim whose save never landed is
+# indistinguishable from an edit unless the rule looks at the RECORD.
+
+FIRST_LAUNCH = {"workspace_id": "wOld", "tab_id": "wOld:t1",
+                "pane_id": "wOld:p1", "owner": "launcher", "cwd": "/repo/og"}
+SECOND_LAUNCH = {"workspace_id": "wNew", "tab_id": "wNew:t1",
+                 "pane_id": "wNew:p1", "owner": "launcher", "cwd": "/repo/og"}
+
+
+def test_a_launcher_replacement_after_a_claim_that_could_not_be_saved_is_claimed(
+        seams, monkeypatch):
+    # The bridge claims the first record for /repo/og; the write that would say so
+    # fails (a read-only home, a full disk), so `_synced` still lists that key.
+    # The operator starts a SECOND conversation in the same directory, and
+    # `_record` REPLACES the record under the identical key.
+    client = RecordingClient(spaces=[space_info("wOld", "og"),
+                                     space_info("wNew", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={},
+                pending={"/repo/og": dict(FIRST_LAUNCH)})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    real_write = m._write_state
+    failing = {"on": True}
+    monkeypatch.setattr(m, "_write_state",
+                        lambda path, state: False if failing["on"]
+                        else real_write(path, state))
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "First", workspace="/repo/og"))])
+
+    assert lines[0].startswith("claim s1 → space wOld"), lines
+    # The claim is complete in memory and the file never heard about it.
+    assert bridge._pending == {}
+    assert "/repo/og" in bridge._synced["pending"]
+    assert json.loads(Path(bridge.state_path).read_text())["pending"][
+        "/repo/og"]["workspace_id"] == "wOld"
+
+    # The second launch, with writes working again.
+    failing["on"] = False
+    write_state(os.environ["OMNIGENT_HOME"], spaces={},
+                pending={"/repo/og": dict(SECOND_LAUNCH)})
+    lines = bridge.reconcile([Ev("added", "s2", root_session(
+        "Second", workspace="/repo/og"))])
+
+    # wNew is what the operator is sitting in. Refusing it because the key is
+    # "already dealt with" opens a second space for a directory that has one.
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("claim s2 → space wNew"), lines
+
+
+def test_a_claimed_record_whose_save_never_landed_is_not_offered_again(
+        seams, monkeypatch):
+    # THE OTHER SIDE, and the reason the rule cannot simply say "a key memory no
+    # longer holds belongs to whoever wrote the file last". Here the file's copy
+    # IS the record this process just claimed: memory dropped it because it moved
+    # it into `spaces[s1]`, and the save that would have said so failed. Folding
+    # it back would put the space s1 now holds into `pending` again, where the
+    # next session in this directory claims it — a second client on one session,
+    # which is the co-drive race `_existing_space` refuses to enter anywhere.
+    client = RecordingClient(spaces=[space_info("wOld", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={},
+                pending={"/repo/og": dict(FIRST_LAUNCH)})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    monkeypatch.setattr(m, "_write_state", lambda path, state: False)
+
+    bridge.reconcile([Ev("added", "s1", root_session("First",
+                                                     workspace="/repo/og"))])
+
+    lines = bridge.reconcile([Ev("added", "s2", root_session(
+        "Second", workspace="/repo/og"))])
+
+    # s2 gets a space of its own rather than s1's.
+    assert lines[0].startswith("add s2 → space ws1"), lines
+    assert bridge._pending == {}
+    assert bridge._spaces["s1"]["workspace_id"] == "wOld"
+
+
+def test_a_launcher_record_written_after_a_claimed_one_is_still_claimable(seams):
+    # The same rule with the write landing, which is the ordinary shape: the
+    # claim's save succeeds, `_synced` no longer lists the key, and the
+    # launcher's next record for the directory is simply a new key to this
+    # process. Written so the two tests above cannot be satisfied by a rule that
+    # only ever folds fresh keys — the case above needs the memory-lacks-key
+    # branch to look at the record, and this one needs it to let go.
+    client = RecordingClient(spaces=[space_info("wOld", "og"),
+                                     space_info("wNew", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={},
+                pending={"/repo/og": dict(FIRST_LAUNCH)})
+    bridge = m.Bridge(FakeWatcher([]), client)
+
+    bridge.reconcile([Ev("added", "s1", root_session("First",
+                                                     workspace="/repo/og"))])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={},
+                pending={"/repo/og": dict(SECOND_LAUNCH)})
+    lines = bridge.reconcile([Ev("added", "s2", root_session(
+        "Second", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("claim s2 → space wNew"), lines
+
+
+def test_a_launcher_write_landing_inside_a_claim_is_not_erased_by_it(seams,
+                                                                    monkeypatch):
+    # THE WINDOW BETWEEN THE RE-READ AND THE POP. Re-reading before the lookup
+    # does not close it, it moves it: a launcher that replaces `pending[cwd]`
+    # after the claim's read has still lost, because the claim then pops the key
+    # it read and its save writes a `pending` map with no record for that
+    # directory at all. The space the operator was just given a pane in belongs
+    # to nothing, and the next session there opens a second one.
+    #
+    # The launcher here is a THREAD rather than a process, which is the same
+    # thing as far as the lock goes: `flock` rides the open file description, and
+    # two opens exclude each other inside one process exactly as they do across
+    # two (measured). The write is fired from the claim's own READ — the only
+    # instant in the pass that reproduces the window, and the one a mid-pass
+    # `workspace_list` write cannot reach.
+    attempted = threading.Event()
+    writer = []
+    client = RecordingClient(spaces=[space_info("wOld", "og"),
+                                     space_info("wNew", "og")])
+    write_state(os.environ["OMNIGENT_HOME"], spaces={},
+                pending={"/repo/og": dict(FIRST_LAUNCH)})
+    bridge = m.Bridge(FakeWatcher([]), client)
+    reads = {"n": 0, "raced_at": None}
+    real_load = m.load_state
+
+    def load_and_race(path, note=None):
+        state = real_load(path, note)
+        reads["n"] += 1
+        if reads["n"] == 2:
+            # The second read of the pass is the claim's; the first is the pass
+            # boundary's. Start the launcher and wait until it has ATTEMPTED its
+            # write — not until it finishes, which under the lock it cannot do
+            # until this pass lets it, and waiting for that here is the deadlock
+            # the lock exists to prevent.
+            reads["raced_at"] = reads["n"]
+
+            def replace(state):
+                state.setdefault("pending", {})["/repo/og"] = dict(SECOND_LAUNCH)
+                return state
+
+            def launch():
+                attempted.set()
+                m.state_update(Path(bridge.state_path), replace)
+
+            thread = threading.Thread(target=launch, daemon=True)
+            writer.append(thread)
+            thread.start()
+            assert attempted.wait(5), "the launcher never reached its write"
+            if not getattr(m._state_lock_depth, "depth", 0):
+                # The bridge is NOT holding the file here, so the launcher can
+                # and does finish its write inside the window — which is what
+                # makes the interleaving a fact rather than a race. When the
+                # bridge DOES hold it, this join would deadlock (it cannot pass
+                # the lock the hook is inside), so it is not taken: the launcher
+                # is then queued behind the lock and lands on top of the
+                # committed claim, which is the outcome under test.
+                thread.join(timeout=5)
+        return state
+
+    monkeypatch.setattr(m, "load_state", load_and_race)
+
+    lines = bridge.reconcile([Ev("added", "s1", root_session(
+        "First", workspace="/repo/og"))])
+
+    assert reads["raced_at"] == 2, reads
+    assert lines[0].startswith("claim s1 → space wOld"), lines
+    # Joined, not slept on: what is under assertion is the file's FINAL state,
+    # and the launcher's write is entitled to land after the pass it raced.
+    writer[0].join(timeout=10)
+    assert not writer[0].is_alive(), "the launcher's write never completed"
+    # The launcher's record SURVIVED the claim. Whoever commits first, the second
+    # writer reads the first's file and lands on top of it.
+    saved = json.loads(Path(bridge.state_path).read_text())
+    assert saved["pending"]["/repo/og"]["workspace_id"] == "wNew", saved
+
+    # And the consequence, which is a space an operator has to notice and close
+    # by hand: the next session in that directory claims the launcher's second
+    # space instead of opening a third one for a directory that already has two.
+    lines = bridge.reconcile([Ev("added", "s2", root_session(
+        "Second", workspace="/repo/og"))])
+
+    assert _names(client).count("workspace_create") == 0
+    assert lines[0].startswith("claim s2 → space wNew"), lines
+
+
 def test_a_claimed_space_is_renamed_to_the_session_title(seams):
     # The launcher's whole reason for labelling a space from the DIRECTORY is
     # that no session existed when it made one. The rename is the handoff.
@@ -3884,6 +4366,54 @@ def test_a_dry_run_never_rewrites_the_state_file(seams):
     assert path.read_text() == before
 
     # Control: the real run claims it, and the file says so.
+    live = RecordingClient(spaces=[space_info("wB", "og")])
+    m.Bridge(FakeWatcher([]), live).reconcile(
+        [Ev("added", "s1", root_session("T", workspace="/repo/og"))])
+    saved = json.loads(path.read_text())
+    assert saved["pending"] == {}
+    assert saved["spaces"]["s1"]["workspace_id"] == "wB"
+
+
+def test_a_dry_run_claim_moves_nothing_in_memory_either(seams):
+    # The file is only HALF of what a dry run must leave alone, and the half
+    # that mattered here was the other one. `pending` and `spaces` are the
+    # in-memory copies `_synced` is measured against, so a move between them
+    # that never reaches the file is not neutral: `_memory_decides` reads a key
+    # memory no longer holds, carrying the very record memory consumed, as a
+    # COMPLETED claim (its third case) and refuses to let the file put it back.
+    # A dry run that moved the record and skipped the write therefore retired a
+    # real launcher record for good — and the next session in that directory
+    # opens a second space, which is the entire class of bug this state file
+    # exists to end, reached through `--dry-run`.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    path = write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1",
+                     "pane_id": "wB:p1", "owner": "launcher"}})
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
+    before = dict(bridge._pending)
+
+    lines = bridge.reconcile([
+        Ev("added", "s1", root_session("T", workspace="/repo/og"))])
+
+    # It still SAYS what it would have claimed: the claim is decidable from the
+    # file alone, and a dry run that reported nothing would be useless. What
+    # changed is that saying it costs nothing.
+    assert any("dry-run: claim 'T' → space wB" in ln for ln in lines), lines
+    assert bridge._pending == before, \
+        "a dry-run claim consumed the pending record in memory"
+    assert bridge._spaces == {}, \
+        "a dry-run claim created a space record in memory"
+
+    # And the fold at the next pass boundary has to be a no-op against an
+    # unchanged file — otherwise the un-saved move above would be what the fold
+    # reads as finished, which is the mechanism the two assertions above deny.
+    bridge._reload_state()
+    assert bridge._pending == before, \
+        "the next fold read the dry run as a completed claim"
+
+    # Control: the claim this dry run declined still works, against the same
+    # file. Without it "nothing was consumed" would also be satisfied by a claim
+    # that cannot happen at all — the wrong reason to be green.
     live = RecordingClient(spaces=[space_info("wB", "og")])
     m.Bridge(FakeWatcher([]), live).reconcile(
         [Ev("added", "s1", root_session("T", workspace="/repo/og"))])

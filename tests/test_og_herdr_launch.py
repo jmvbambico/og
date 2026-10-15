@@ -13,16 +13,23 @@ empty value" are told apart.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "installer"))
 
+import og_herdr  # noqa: E402  (the shared state-file discipline, tested from here)
+import og_herdr_launch  # noqa: E402
 from og_herdr import DEFAULT_SPACE_CAP, load_state, save_state  # noqa: E402  (the bridge's own readers)
 from og_herdr_launch import (  # noqa: E402
     AGENTS_PANE_RATIO,
@@ -39,22 +46,54 @@ from og_herdr_launch import (  # noqa: E402
     launch,
     launch_log_path,
     live_session,
+    local_host_id,
     main,
+    og_owns_pane,
     pane_env_for,
     projects_dir,
     record_chat_pane,
     resolve_chat_dir,
     session_space_cap,
 )
-from og_herdr_watch import SessionEvent  # noqa: E402
+from og_herdr_watch import SessionEvent, SessionWatcher  # noqa: E402
 
 SERVER = "http://127.0.0.1:6767"
 CWD = "/Users/someone/projects/og"
+
+# The two machines in every host test below: this one, which the server calls
+# online, and the work-mac whose sessions share the SAME project path.
+LOCAL_HOST = "host_this_mac"
+WORK_HOST = "host_work_mac"
+
+# A `/v1/hosts` payload in the measured shape. The offline host is listed FIRST
+# on purpose: the read picks the ONLINE entry by status, not by position.
+HOSTS = {"hosts": [{"host_id": WORK_HOST, "status": "offline"},
+                   {"host_id": LOCAL_HOST, "status": "online"}]}
 
 
 # ---------------------------------------------------------------------------
 # fakes
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _redirect_the_omnigent_home(tmp_path, monkeypatch):
+    """Point `$OMNIGENT_HOME` at an empty directory for every test in this file.
+
+    `local_host_id` reads this machine's OWN daemon record out of
+    `<OMNIGENT_HOME>/daemons/*.json` — which is the point: it is the one source
+    that says "this machine" rather than inferring it from a list of every host
+    the account has. The cost is that on a developer who has actually installed
+    og, the suite would read the REAL one: the launcher's host id would come out
+    of the operator's live `~/.omnigent`, and the tests below would both depend
+    on this machine's state and fail outright against it (CI has no
+    `~/.omnigent` at all, so they would go green there and red here — the exact
+    asymmetry the PYTHONPATH fixture in conftest.py exists to prevent).
+
+    Redirecting the variable is the documented way to move that home (see
+    og_herdr.default_home), so this changes where the answer is read from and
+    nothing else. A test that WANTS a record writes one under `tmp_path`.
+    """
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path / "omnigent-home"))
 
 def create_reply(ws="w1", tab="w1:t1", pane="w1:p1", **over):
     """A `workspace.create` result in the shape herdr actually sends.
@@ -177,23 +216,89 @@ class FakeClient:
 
 
 class FakeWatcher:
-    """A SessionWatcher stand-in: `poll_once` returns what the test scripted."""
+    """A SessionWatcher stand-in: `poll_once` returns what the test scripted.
+
+    `_get_json` answers the OTHER request the launcher makes of a watcher — the
+    `/v1/hosts` lookup behind `local_host_id` — and records the URLs it was asked
+    for, so a test can prove that lookup rides the watcher's own path (which owns
+    the server and its token) and happens once per launch. `hosts` overrides the
+    payload; `hosts_error` makes the endpoint fail the way a server that is down
+    would.
+    """
 
     base_url = SERVER
 
-    def __init__(self, sessions=()):
+    def __init__(self, sessions=(), hosts=None, hosts_error=None):
         self.base_url = SERVER
         self.events = [
             SessionEvent("added", session.get("id", "s?"), session)
             for session in sessions]
+        self.hosts = HOSTS if hosts is None else hosts
+        self.hosts_error = hosts_error
+        self.urls = []
 
     def poll_once(self):
         return list(self.events)
+
+    def _get_json(self, url):
+        self.urls.append(url)
+        if self.hosts_error is not None:
+            raise self.hosts_error
+        return self.hosts
 
 
 class UnreadableWatcher(FakeWatcher):
     def poll_once(self):
         raise OSError("connection refused")
+
+
+class _Body(io.BytesIO):
+    """What a stub opener's `urlopen` hands back: a context manager with read()."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class RoutingOpener:
+    """A stub HTTP layer for a REAL `SessionWatcher`, routed by path.
+
+    `FakeWatcher` can hand `live_session` a session the real watcher would never
+    emit — which is precisely how the host rule shipped green while being unable
+    to fire: the launcher tests put `host_id` on the session dict, and nothing
+    ever proved the real `_enrich` forwards it from the detail row. This answers
+    by URL instead of by call order: the listing, one `/v1/sessions/{id}` detail
+    fetch per session, and the `/v1/hosts` lookup behind `local_host_id` — which
+    also pins that the hosts request travels the watcher's own authenticated
+    path rather than a second opener of its own.
+    """
+
+    def __init__(self, rows, details, hosts=None):
+        self.rows = list(rows)
+        self.details = dict(details)
+        self.hosts = HOSTS if hosts is None else hosts
+        self.requests = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        path = urllib.parse.urlsplit(request.full_url).path
+        if path == "/v1/hosts":
+            body = self.hosts
+        elif path == "/v1/sessions":
+            body = {"object": "list", "data": self.rows, "has_more": False}
+        else:
+            body = self.details[urllib.parse.unquote(path.rsplit("/", 1)[-1])]
+        return _Body(json.dumps(body).encode())
+
+
+def real_watcher(rows, details, hosts=None):
+    """The REAL watcher over a stubbed HTTP layer: no network, and no fake able
+    to report a shape the enrichment path does not actually produce."""
+    return SessionWatcher(base_url=SERVER,
+                          opener=RoutingOpener(rows, details, hosts))
 
 
 class NoSplitClient(FakeClient):
@@ -214,6 +319,35 @@ def root_session(sid="s1", cwd=CWD, status="idle", **extra):
     return session
 
 
+def listed(sid="s1", status="idle", **extra):
+    """A LISTING row in the MEASURED shape — the keys `GET /v1/sessions?kind=any`
+    actually returns, which is to say no `host_id`, no `workspace` and no
+    `runner_online`. Anything the launcher reads beyond these three has to have
+    been merged in from the detail fetch, which is the whole point of building
+    the fixture from the API's shape rather than from what the code wants."""
+    row = {"id": sid, "agent_id": "a1", "agent_name": "hivemind",
+           "archived": False, "comments_count": 0, "created_at": 1791566251,
+           "external_session_id": "ses_" + sid, "labels": {}, "owner": "cryogenix",
+           "parent_session_id": None, "pending_elicitations_count": 0,
+           "permission_level": 4, "runner_id": "runner_token_b6d2",
+           "status": status, "title": "the conversation",
+           "updated_at": 1791566384, "viewer_unread": False}
+    row.update(extra)
+    return row
+
+
+def detail_of(sid="s1", workspace=CWD, host_id=None, **extra):
+    """A `GET /v1/sessions/{id}` row: the directory, the machine, and the rest
+    the listing does not carry."""
+    row = {"id": sid, "workspace": workspace, "parent_session_id": None,
+           "kind": "default", "harness": "opencode-native",
+           "sub_agent_name": None, "host_id": host_id, "git_branch": None,
+           "pending_elicitations": [], "runner_online": True, "status": "idle",
+           "title": "the conversation"}
+    row.update(extra)
+    return row
+
+
 def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
              agents_pane=True, spawn=None, pane_env=None):
     environment = {"HOME": str(tmp_path)} if env is None else dict(env)
@@ -226,6 +360,34 @@ def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
                   pane_env={} if pane_env is None else pane_env,
                   spawn=spawn if spawn is not None else (lambda: None),
                   log_path=tmp_path / "logs" / "herdr-server.log")
+
+
+def daemon_home(tmp_path, records):
+    """An `$OMNIGENT_HOME` whose `daemons/` holds `records` — a signature ->
+    record mapping, written as the host daemon writes it.
+
+    Under the same path the autouse fixture redirects the variable to, so a test
+    that builds one here also exercises the `launch` path that reads the
+    environment rather than the `home` argument.
+    """
+    home = tmp_path / "omnigent-home"
+    (home / "daemons").mkdir(parents=True, exist_ok=True)
+    for signature, record in records.items():
+        (home / "daemons" / "{0}.json".format(signature)).write_text(
+            json.dumps(record))
+    return home
+
+
+def daemon_record(signature=None, host_id=LOCAL_HOST, server_url=SERVER, **over):
+    """One `daemons/*.json` row, shaped like the real one (`omnigent host status`
+    prints the same `host_id`). `resolved_server_url` is null on a server-mode
+    record, which is why every URL key is exercised separately below."""
+    row = {"config_sig": signature or "18fa469718d9c868", "host_id": host_id,
+           "log_path": None, "mode": "server", "pid": 59562,
+           "resolved_server_url": None, "server_url": server_url,
+           "started_at": 1791941709, "target": server_url}
+    row.update(over)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +480,466 @@ def test_a_dead_root_in_another_directory_does_not_interfere(tmp_path):
     watcher = FakeWatcher([root_session("s-dead", cwd="/elsewhere",
                                         runner_online=False)])
     assert live_session(watcher, CWD) is None
+
+
+# --- the host rule: a session on ANOTHER machine is not this directory's ---
+# THE REGRESSION THIS PINS: a session running on a work-mac, in the SAME project
+# path as this one (`~/projects/og` is not an unusual directory to have checked
+# out twice), turned up in the local `kind=any` listing, matched
+# `workspace == cwd`, passed the status and runner checks, and was handed back as
+# "the live session" — so `launch` took case (B), `_adopt` typed the attach, and
+# the pane said:
+#
+#     Error: Session … has no online runner on … - its host is offline.
+#
+# `runner_is_offline` cannot catch that, by design: it is True only for an
+# explicit `runner_online: False`, and a session on a machine that is simply not
+# here reports nothing at all. The answer exists though — `/v1/hosts` already
+# says which host this machine is — so this is a real comparison, not a heuristic.
+
+def test_a_session_on_another_machine_is_not_the_live_session():
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)])
+    assert live_session(watcher, CWD, host_id=LOCAL_HOST) is None
+
+
+def test_a_session_on_this_machine_is_still_the_live_session():
+    """The other side of the pair: a filter that refused everything would pass
+    the test above and lose case (B) entirely, which looks exactly like a launch
+    that worked."""
+    watcher = FakeWatcher([root_session(host_id=LOCAL_HOST)])
+    assert live_session(watcher, CWD, host_id=LOCAL_HOST)["id"] == "s1"
+
+
+def test_a_session_naming_no_host_is_not_assumed_to_be_another_machines():
+    """Unknown is not "not mine". The rule needs BOTH ids known and different;
+    one side unreadable leaves the session alone, for the reason the runner rule
+    reads an unreadable answer as live: a skip we could not justify opens a second
+    space and types a second `og chat` into a conversation the operator already
+    had, and the opposite error is a line on screen they can act on."""
+    for extra in ({}, {"host_id": None}, {"host_id": ""}, {"host_id": 7}):
+        watcher = FakeWatcher([root_session(**extra)])
+        assert live_session(watcher, CWD, host_id=LOCAL_HOST)["id"] == "s1", extra
+
+
+def test_a_session_on_another_machine_does_not_mask_this_one_behind_it():
+    """The skip CONTINUES the scan, like every other filter here: a foreign row
+    listed first (the listing is newest-first) must not hide the real one."""
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST),
+                           root_session("s-mine", host_id=LOCAL_HOST)])
+    assert live_session(watcher, CWD, host_id=LOCAL_HOST)["id"] == "s-mine"
+
+
+def test_the_skip_says_which_session_and_whose_host_it_was(capsys):
+    """A silently skipped session is indistinguishable from a launch that simply
+    found nothing, and the operator has no way to tell that a conversation on
+    another machine is the reason they got a new one."""
+    live_session(FakeWatcher([root_session("s-work", host_id=WORK_HOST)]),
+                 CWD, host_id=LOCAL_HOST)
+    out = capsys.readouterr().out
+    assert "s-work" in out and WORK_HOST in out and "not this machine" in out
+
+
+def test_a_foreign_session_opens_a_new_space_instead_of_a_doomed_attach(tmp_path):
+    """THE REGRESSION, end to end: the case the bug produced. A session from the
+    work-mac in this directory must fall through to case (A) — open a space, run
+    `og chat`, split the agents pane — rather than adopt and type an attach that
+    dies with "its host is offline"."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)])
+
+    assert launch(make_ctx(tmp_path, client, watcher)) == "attach"
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert ("omnigent attach --server {0} s-work".format(SERVER)
+            not in client.text_typed())
+
+
+def test_a_hosts_endpoint_that_cannot_be_read_still_attaches(tmp_path):
+    """THE CHOSEN DIRECTION for OUR side of the comparison. The very session the
+    test above refuses is attached when the lookup that would have refused it
+    could not be answered: a hosts endpoint we could not read is not evidence that
+    anything is foreign. Refusing on that evidence is the outcome that cannot be
+    undone — a second space, and a second `og chat` typed into a conversation the
+    operator already had."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)],
+                          hosts_error=OSError("connection refused"))
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-work".format(SERVER)]
+
+
+def test_no_online_host_means_this_machine_is_unknown_not_foreign(tmp_path):
+    """The same session again, with a payload that answers the request and still
+    cannot say who we are: every host is offline (this one included — it is what
+    a machine that has not brought its host up looks like). "No online host" is
+    an absence, not a verdict, so nothing is filtered."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)],
+                          hosts={"hosts": [{"host_id": LOCAL_HOST,
+                                            "status": "offline"}]})
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-work".format(SERVER)]
+
+
+def test_the_host_lookup_rides_the_watchers_own_request_and_happens_once(
+        tmp_path):
+    """ONE request per launch, asked of the watcher — and only when this
+    machine's daemon record has nothing to say (the autouse fixture points
+    `$OMNIGENT_HOME` at an empty directory, which is the single-machine-install
+    case). The watcher is the only holder of the base URL and the per-server
+    token, and `--server` can name a server we were not handed one for — a second
+    urllib call would be a second opinion about which server we are talking to,
+    and would present a credential to a host it was not issued for. Counted once
+    even with several candidates to judge."""
+    watcher = FakeWatcher([root_session("s1"),
+                           root_session("s-elsewhere", cwd="/elsewhere"),
+                           root_session("s-dead", runner_online=False),
+                           root_session("s-work", host_id=WORK_HOST)])
+
+    launch(make_ctx(tmp_path, FakeClient(), watcher))
+
+    assert watcher.urls == [SERVER + "/v1/hosts"]
+
+
+def test_the_local_host_is_the_one_the_server_calls_online():
+    """`/v1/hosts` answers a LIST and the machine we are is the entry whose status
+    is online — the same read `ensure_project` in bin/og makes before it pins a
+    project to a host, deliberately in the same shape, so the pin and this filter
+    cannot disagree about which machine og is on."""
+    assert local_host_id(FakeWatcher()) == LOCAL_HOST
+    # Order is the server's, not ours: the first entry listed is not the answer.
+    watcher = FakeWatcher(hosts={"hosts": [
+        {"host_id": "host_asleep", "status": "offline"},
+        {"host_id": LOCAL_HOST, "status": "online"}]})
+    assert local_host_id(watcher) == LOCAL_HOST
+
+
+def test_an_answer_that_does_not_name_this_machine_leaves_it_unknown():
+    """Everything /v1/hosts can fail to say, in one list. None means UNKNOWN and
+    unknown filters nothing; the launch must never die here over a lookup whose
+    only job is to make one filter sharper."""
+    for payload in ({},                                   # no hosts key
+                    {"hosts": []},                       # nothing connected
+                    {"hosts": [{"host_id": LOCAL_HOST, "status": "offline"}]},
+                    {"hosts": [{"status": "online"}]},    # online, but no id
+                    {"hosts": [{"host_id": 7, "status": "online"}]},
+                    {"hosts": [{"host_id": "", "status": "online"}]},
+                    {"hosts": "nonsense"},                # not a list
+                    [],                                  # not an object
+                    "nonsense"):
+        assert local_host_id(FakeWatcher(hosts=payload)) is None, payload
+    assert local_host_id(FakeWatcher(hosts_error=OSError("refused"))) is None
+
+
+def test_the_host_rule_runs_against_the_real_enrichment_path(tmp_path):
+    """THE TEST THAT WAS MISSING, end to end, and the reason the first version
+    of this fix could not work: the launcher tests drove a FAKE watcher, which
+    could put `host_id` on a session the real `_enrich` never emits — because
+    the listing row does not carry it and nothing forwarded the detail's. The
+    rule passed its tests and could never fire in production.
+
+    Everything here is real except the socket: a LISTING row in the measured
+    shape (no `host_id` anywhere in it) plus a DETAIL fetch per session, through
+    the real `SessionWatcher`, into the real `live_session`. The work-mac session
+    must be skipped and a fresh space opened."""
+    rows = [listed("s-work")]
+    details = {"s-work": detail_of("s-work", host_id=WORK_HOST)}
+    client = FakeClient()
+
+    assert launch(make_ctx(tmp_path, client, real_watcher(rows, details))) == "attach"
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert ("omnigent attach --server {0} s-work".format(SERVER)
+            not in client.text_typed())
+
+
+def test_a_session_on_this_machine_still_attaches_through_the_real_watcher(
+        tmp_path):
+    """The other direction through the same real path, so the test above cannot
+    be satisfied by a filter that refuses everything. This session came off the
+    same detail row, from the same fetch, carrying THIS machine's host."""
+    rows = [listed("s-mine")]
+    details = {"s-mine": detail_of("s-mine", host_id=LOCAL_HOST)}
+    client = FakeClient()
+
+    assert launch(make_ctx(tmp_path, client, real_watcher(rows, details))) == "attach"
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_a_real_detail_row_with_no_host_still_attaches(tmp_path):
+    """The unknown direction, through the real path: a detail row whose
+    `host_id` is null (a sub-agent's shape) reaches the launcher with NO key at
+    all — not a null — and the rule must leave it alone rather than read the
+    absence as "somewhere else"."""
+    rows = [listed("s-nohost")]
+    details = {"s-nohost": detail_of("s-nohost", host_id=None)}
+    client = FakeClient()
+
+    assert launch(make_ctx(tmp_path, client, real_watcher(rows, details))) == "attach"
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-nohost".format(SERVER)]
+
+
+def test_the_hosts_lookup_rides_the_same_authenticated_path(tmp_path):
+    """With a real watcher in hand, the fallback request is provably the
+    watcher's own: same opener, same base URL, and the token that was handed to
+    it — `--server` can name a server we hold no token for, and a second opener
+    would be a second opinion about which server we are on. (On a machine with a
+    daemon record there is no request at all; see
+    `test_a_daemon_record_skips_the_hosts_request_entirely`.)"""
+    opener = RoutingOpener([listed("s-mine")],
+                           {"s-mine": detail_of("s-mine", host_id=LOCAL_HOST)})
+    watcher = SessionWatcher(base_url=SERVER, token="secret", opener=opener)
+
+    launch(make_ctx(tmp_path, FakeClient(), watcher))
+
+    hosts = [r for r in opener.requests
+             if urllib.parse.urlsplit(r.full_url).path == "/v1/hosts"]
+    assert [r.full_url for r in hosts] == [SERVER + "/v1/hosts"]
+    assert all(r.get_header("Authorization") == "Bearer secret" for r in hosts)
+
+
+# --- which machine am I? the daemon record first, the API only if unambiguous ---
+# THE REVIEW FINDING, which is the second bug in this story and the more
+# expensive one: `/v1/hosts` describes every host the ACCOUNT has, across every
+# machine, so "the first online entry" is a position in a list this process has
+# no stake in. On a user who genuinely runs two machines — the user this whole
+# bug came from — the other one sorts first, and every `og start herdr` then
+# judged THIS machine's own session foreign: skipped, and a brand new space
+# opened. That is the unrecoverable direction (a second space, and a second `og
+# chat` into a conversation the operator already had) arriving through the very
+# filter added to prevent it.
+#
+# So: this machine's own daemon record decides, and an ambiguous answer is
+# unknown rather than a guess.
+
+def test_a_daemon_record_beats_another_machine_listed_first_and_online(tmp_path):
+    """THE REGRESSION GUARD for that finding, and it fails against the version
+    that took the first online host: `/v1/hosts` answers with exactly one online
+    entry, it is the WRONG machine, and the record this machine's own daemon
+    wrote says so."""
+    home = daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    hosts = {"hosts": [{"host_id": WORK_HOST, "status": "online"}]}
+
+    assert local_host_id(FakeWatcher(hosts=hosts), home=home) == LOCAL_HOST
+    # …and what the API alone says, which is precisely what the record exists to
+    # correct. Pinned so the fallback can never quietly grow back into "first
+    # online wins".
+    assert local_host_id(FakeWatcher(hosts=hosts),
+                         home=tmp_path / "no-daemon-home") == WORK_HOST
+
+
+def test_two_online_hosts_and_no_daemon_record_is_unknown_not_the_first(tmp_path):
+    """The finding's direct answer: the list cannot say who we are, so we do not
+    say. Guessing would skip the operator's own sessions on a machine that has
+    both online."""
+    hosts = {"hosts": [{"host_id": WORK_HOST, "status": "online"},
+                       {"host_id": LOCAL_HOST, "status": "online"}]}
+    assert local_host_id(FakeWatcher(hosts=hosts),
+                         home=tmp_path / "no-daemon-home") is None
+
+
+def test_a_local_session_still_attaches_when_the_hosts_list_cannot_say(tmp_path):
+    """…and the consequence of that unknown, end to end. The session below IS on
+    this machine, so a filter that guessed would skip it and open a second space
+    in a conversation the operator already had. Unknown filters nothing."""
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)],
+                          hosts={"hosts": [{"host_id": WORK_HOST, "status": "online"},
+                                           {"host_id": LOCAL_HOST,
+                                            "status": "online"}]})
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_one_online_host_and_no_daemon_record_is_used(tmp_path):
+    """The fallback's precondition, and the case it is still good for: ONE
+    online host leaves nothing to confuse it with. This is the shape a
+    single-machine install is in, which is why the fallback exists at all."""
+    assert local_host_id(FakeWatcher(), home=tmp_path / "no-daemon-home") == LOCAL_HOST
+
+
+@pytest.mark.parametrize("url_key", ["server_url", "target",
+                                     "resolved_server_url"])
+def test_a_record_counts_as_ours_under_any_of_its_three_url_keys(tmp_path, url_key):
+    """Which key is populated depends on mode and age — `resolved_server_url` is
+    null on a server-mode record — so reading only one would make the record
+    invisible for half the daemons this codebase starts."""
+    record = daemon_record(**{url_key: SERVER})
+    home = daemon_home(tmp_path, {"sig": record})
+
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+def test_a_record_for_another_server_is_not_ours(tmp_path):
+    """`--server` can name a server this launch is not talking to, and a daemon
+    record for THAT one says nothing about us."""
+    home = daemon_home(tmp_path, {"sig": daemon_record(
+        server_url="http://10.0.0.9:6767")})
+
+    assert local_host_id(FakeWatcher(), home=tmp_path / "no-daemon-home") == LOCAL_HOST
+    assert local_host_id(FakeWatcher(hosts={"hosts": []}),
+                         home=home) is None
+
+
+@pytest.mark.parametrize("shape", ["no_daemon_dir", "unreadable", "not_json",
+                                   "not_an_object", "no_host_id", "null_host_id",
+                                   "empty_host_id", "numeric_host_id",
+                                   "another_server_only"])
+def test_a_daemon_record_that_cannot_answer_falls_through_to_the_api(tmp_path,
+                                                                     shape):
+    """Every way a record can fail to say anything, and NONE of them may raise:
+    this lookup only ever sharpens a filter, so it must not be able to stop a
+    launch. Each one falls through to the unambiguous single-online answer, which
+    is what the pre-record behaviour was."""
+    home = tmp_path / "omnigent-home"
+    if shape == "no_daemon_dir":
+        home = tmp_path / "never-created"
+    elif shape == "unreadable":
+        # A DIRECTORY named like a record: read_text raises IsADirectoryError,
+        # which is the portable stand-in for "the file could not be read" (a
+        # chmod-000 file is not, under a runner that may be root).
+        (home / "daemons").mkdir(parents=True)
+        (home / "daemons" / "sig.json").mkdir()
+    elif shape == "not_json":
+        home = daemon_home(tmp_path, {})
+        (home / "daemons" / "sig.json").write_text("{not json")
+    elif shape == "not_an_object":
+        home = daemon_home(tmp_path, {})
+        (home / "daemons" / "sig.json").write_text('["a", "list"]')
+    elif shape == "no_host_id":
+        record = daemon_record()
+        del record["host_id"]
+        home = daemon_home(tmp_path, {"sig": record})
+    elif shape == "null_host_id":
+        home = daemon_home(tmp_path, {"sig": daemon_record(host_id=None)})
+    elif shape == "empty_host_id":
+        home = daemon_home(tmp_path, {"sig": daemon_record(host_id="")})
+    elif shape == "numeric_host_id":
+        home = daemon_home(tmp_path, {"sig": daemon_record(host_id=7)})
+    else:
+        home = daemon_home(tmp_path, {"sig": daemon_record(
+            server_url="http://10.0.0.9:6767")})
+
+    # Falls through to the API's single online host rather than raising or
+    # returning a half-answer.
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+@pytest.mark.parametrize("spelling", ["http://127.0.0.1:6767/",
+                                      "HTTP://127.0.0.1:6767"])
+def test_a_record_counts_as_ours_when_the_urls_differ_only_in_spelling(tmp_path,
+                                                                      spelling):
+    """The match goes through `og_herdr_watch._server_key`, the same canonical
+    form that decides which token belongs to which server, so a trailing slash or
+    a shouted scheme is one server rather than two — and a userinfo in the URL
+    cannot reach the comparison, the same reason that function strips it."""
+    home = daemon_home(tmp_path, {"sig": daemon_record(server_url=spelling)})
+
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+def test_a_record_naming_another_port_is_not_ours(tmp_path):
+    """Canonicalisation must not be so aggressive that it merges servers: the
+    port is part of the identity, exactly as it is for the token."""
+    home = daemon_home(tmp_path, {"sig": daemon_record(
+        server_url="http://127.0.0.1:6768")})
+
+    assert local_host_id(FakeWatcher(hosts={"hosts": []}), home=home) is None
+
+
+def test_two_records_for_this_server_that_agree_are_one_answer(tmp_path):
+    """The filename is a config signature, so a restarted daemon writes a second
+    one. Agreement is not ambiguity — it is the same machine, twice."""
+    home = daemon_home(tmp_path, {
+        "21c1ba0105d3dd34": daemon_record(),
+        "9f0c1122aabbccdd": daemon_record(signature="deadbeefdeadbeef"),
+    })
+
+    assert local_host_id(FakeWatcher(), home=home) == LOCAL_HOST
+
+
+def test_two_records_for_this_server_that_disagree_are_unknown(tmp_path):
+    """And disagreement IS ambiguity, and it is NOT a fall-through to the API:
+    two daemons on this machine claiming this server with two different machines
+    is our own evidence contradicting itself, and that is precisely when letting
+    the account-wide list answer instead would be worst. Unknown even though
+    `/v1/hosts` would have offered a tidy single online host."""
+    home = daemon_home(tmp_path, {
+        "21c1ba0105d3dd34": daemon_record(),
+        "9f0c1122aabbccdd": daemon_record(host_id=WORK_HOST),
+    })
+
+    assert local_host_id(FakeWatcher(hosts=HOSTS), home=home) is None
+
+
+def test_contested_records_still_attach_rather_than_skipping(tmp_path):
+    """…and unknown still means unknown: the session below is on this machine,
+    so the contested lookup must cost the operator nothing."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record(),
+                           "9f0c1122aabbccdd": daemon_record(host_id=WORK_HOST)})
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)])
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_a_daemon_record_still_lets_a_foreign_session_be_skipped(tmp_path):
+    """(f) The behaviour the rule exists for, with the id now coming from the
+    record rather than the API. A work-mac session in this directory must not be
+    adopted just because the identity is now certain."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-work", host_id=WORK_HOST)])
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == ["og chat", "og agents"]
+    assert ("omnigent attach --server {0} s-work".format(SERVER)
+            not in client.text_typed())
+
+
+def test_a_daemon_record_still_attaches_this_machines_own_session(tmp_path):
+    """The other side of that pair, and the regression guard for the finding in
+    its worst shape: a session on THIS host must never be skipped just because
+    another machine exists."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    client = FakeClient()
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)],
+                          hosts={"hosts": [{"host_id": WORK_HOST, "status": "online"},
+                                           {"host_id": LOCAL_HOST,
+                                            "status": "online"}]})
+
+    launch(make_ctx(tmp_path, client, watcher))
+
+    assert client.text_typed() == [
+        "omnigent attach --server {0} s-mine".format(SERVER)]
+
+
+def test_a_daemon_record_skips_the_hosts_request_entirely(tmp_path):
+    """With an identity in hand there is nothing left for `/v1/hosts` to answer,
+    so the launch makes no request at all."""
+    daemon_home(tmp_path, {"21c1ba0105d3dd34": daemon_record()})
+    watcher = FakeWatcher([root_session("s-mine", host_id=LOCAL_HOST)])
+
+    launch(make_ctx(tmp_path, FakeClient(), watcher))
+
+    assert watcher.urls == []
 
 
 def test_is_inside_reads_herdr_env():
@@ -475,6 +1097,54 @@ def test_case_d_writes_the_pending_record_before_it_types_chat(tmp_path):
 
     assert client.text_typed() == ["og chat", "og agents"]
     assert CWD in client.pending_at_send[0]
+
+
+def test_a_record_waits_for_the_lock_the_bridge_holds_and_lands_on_top(tmp_path):
+    """BOTH WRITERS TAKE THE SAME LOCK, which is the whole of the discipline.
+
+    `_record` re-reads before it writes, and that used to be enough to argue it
+    could not erase what the bridge wrote. It is not enough, because the bridge
+    now reads, decides and writes inside one transaction: a launcher whose write
+    lands between the bridge's read and its claim is erased by the claim's own
+    save, taking the operator's freshly opened space out of the file. So both
+    sides hold `og_herdr.state_lock`, and this asserts the launcher side really
+    does — it cannot get in while the bridge holds the file, and when it gets in
+    it reads the bridge's committed state and writes on top of it.
+
+    The competitor is a thread, which is the same thing to `flock` as a second
+    process: the lock rides the open file description, and two opens exclude
+    each other within one process exactly as they do across two.
+    """
+    path = ctx_path(tmp_path)
+    path.write_text(json.dumps(
+        {"version": 2,
+         "spaces": {"s1": {"workspace_id": "w7", "tab_id": "w7:t1",
+                           "pane_id": "w7:p1", "owner": "bridge"}},
+         "pending": {}}))
+    ctx = make_ctx(tmp_path, FakeClient(), FakeWatcher())
+    record = {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+              "owner": "launcher", "cwd": CWD}
+    done = threading.Event()
+
+    def write_it():
+        og_herdr_launch._record(ctx.state_path, "pending", CWD, record)
+        done.set()
+
+    with og_herdr.state_lock(path):
+        writer = threading.Thread(target=write_it, daemon=True)
+        writer.start()
+        # Short on purpose, and it can only fail this way if the lock is not
+        # being taken: `_record` has no other reason to take a tenth of a second
+        # to write a 200-byte file.
+        assert not done.wait(0.1), "_record wrote while the bridge held the file"
+
+    writer.join(timeout=10)
+    assert done.is_set(), "_record never completed once the lock was released"
+    state = load_state(path)
+    # The bridge's record is still there: the re-read happened INSIDE the lock,
+    # not before it was taken.
+    assert state["spaces"]["s1"]["workspace_id"] == "w7"
+    assert state["pending"][CWD] == record
 
 
 def test_a_chat_that_fails_to_start_leaves_no_pending_record(tmp_path):
@@ -1184,6 +1854,185 @@ def test_chat_pane_inside_herdr_records_the_pane_and_splits_it(tmp_path,
     assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
     assert client.split_params["target_pane_id"] == "w1:p1"
     assert client.split_params["ratio"] == AGENTS_PANE_RATIO
+
+
+# ---------------------------------------------------------------------------
+# the two halves of one split: `og start` splits the pane it types `og chat` into
+# ---------------------------------------------------------------------------
+# `og start` runs `pane_run(pane_id, "og chat")` and THEN splits that same pane
+# for `og agents`. Since `og chat` splits the pane it finds itself in, both
+# halves were doing one job and a fresh `og start` came up with THREE panes — the
+# chat, the launcher's `og agents`, and `og chat`'s. The tests below run both
+# halves, in the order the operator meets them, against one client and one state
+# file, so what is asserted is the tab's final shape rather than either half
+# alone.
+
+def test_a_fresh_og_start_opens_two_panes_and_not_three(tmp_path, monkeypatch):
+    """THE OPERATOR'S COMPLAINT, ON THE PATH THAT PRODUCES IT. Two panes is the
+    whole answer: the chat, and `og agents` beside it."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+    ctx = replace(make_ctx(tmp_path, client, FakeWatcher()), cwd=str(tmp_path))
+
+    launch(ctx)
+    # Then the `og chat` the launch typed runs, in the pane it was typed into,
+    # seeing the tab exactly as the launcher left it.
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert client.methods.count("pane.split") == 1, client.methods
+    assert client.text_typed().count("og agents") == 1, client.text_typed()
+    # And the chat is still recorded for the bridge, and `og chat` still stands
+    # up inside the launcher's space — it stands down from the SPLIT only.
+    assert str(tmp_path) in load_state(tmp_path / "og-herdr.json")["pending"]
+    assert client.text_typed()[0] == "og chat"
+
+
+def test_a_tab_the_operator_split_theirself_still_gets_a_fresh_agents_pane(
+        tmp_path, monkeypatch):
+    """WHAT MUST NOT REGRESS, and the trap the fix could have walked into.
+
+    The tempting guard is "decline when the tab already holds a pane that is not
+    mine". `pane.list` returns no command and no process, so that guard reads
+    "a pane the operator split themselves" as "the `og agents` pane og already
+    made" — and takes the agents pane away from every `og chat` an operator runs
+    by hand, which is the case `known_panes` exists to protect. So the guard
+    keys on what og can actually tell: whether og itself opened THIS pane. No
+    record, no claim, split as it always was."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+    # In a pane og made, never in the one the operator was already using.
+    typed_into = [params["pane_id"]
+                  for params in client.params_of("pane.send_text")]
+    assert typed_into == ["w1:p3"]
+
+
+def test_a_state_file_that_cannot_be_read_still_attempts_the_split(tmp_path,
+                                                                  monkeypatch):
+    """THE FAIL-SAFE DIRECTION, which cuts the other way from `tab_pane_ids`.
+
+    The guard reads og's own state file, and a file it cannot read is og having
+    nothing to say — not og having said "mine". Of the two ways to be wrong, a
+    cosmetic extra agents pane costs the operator one split to close and a
+    missing one costs them the pane they asked for, so the guard fails OPEN and
+    the split is attempted."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "og-herdr.json").write_text("{ this is not json")
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
+def test_a_launch_record_the_bridge_has_claimed_still_suppresses_the_split(
+        tmp_path, monkeypatch):
+    """The launcher writes `pending`; the bridge claims it the moment the session
+    appears and moves it into `spaces` unchanged (`_claim_pending`). The answer
+    has to be the same after the claim as before it — a guard reading `pending`
+    alone would answer "nobody opened this pane" once the record moved, and the
+    third pane would come back. A history space, which og opens and the operator
+    resumes with `og chat`, is remembered in `spaces` from the start and gets
+    the same answer for the same reason."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1", "owner": "launcher",
+                                  "cwd": str(tmp_path)}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" not in client.methods
+    assert client.text_typed() == []
+
+
+def test_a_record_for_another_pane_in_the_same_space_does_not_suppress_the_split(
+        tmp_path, monkeypatch):
+    """The question is about a PANE, not a space or a tab. og opening some other
+    pane says nothing about this one, and a guard that read it as "og owns this
+    tab" would take the agents pane away from the second chat an operator starts
+    in a pane of the same space."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p9", "owner": "launcher"}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
+def test_a_record_with_no_tab_does_not_suppress_the_split(tmp_path, monkeypatch):
+    """THE HAZARD AN EXACT TAB MATCH EXISTS FOR, found in review.
+
+    A record carrying no `tab_id` names no tab, so reading it as "mine in
+    whichever tab is asking" makes og's own guard answer yes in EVERY tab — and
+    one stale or legacy record then stands `og chat` down in a tab the launcher
+    never touched. Standing down when nobody is splitting is the one wrong
+    answer that costs the operator the agents pane itself, with nothing
+    degraded to show for it.
+
+    Nothing current writes such a record, and a v1 file upgraded in place cannot
+    match on `pane_id` either, so this state is stale or hand-edited. That is
+    still not evidence about any tab, and it is exactly the record the guard has
+    to refuse rather than honour."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "pane_id": "w1:p1",
+                                  "owner": "launcher"}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
+def test_the_same_pane_id_in_a_different_tab_does_not_suppress_the_split(
+        tmp_path, monkeypatch):
+    """The tab is not decoration on the match, and pane ids are not assumed to be
+    unique across tabs — nothing here establishes that they are, and the guard
+    must not be the thing that finds out the hard way. A record for `w1:t9`
+    saying og owns `w1:p1` is not a claim about the pane in `w1:t1`, so it cannot
+    stand this split down."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t9",
+                                  "pane_id": "w1:p1", "owner": "launcher"}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
+def test_og_owns_pane_is_false_for_a_state_file_nobody_wrote(tmp_path):
+    """The guard's own default, so the fail-safe direction is pinned where it is
+    decided rather than only where it is used."""
+    assert og_owns_pane(tmp_path / "nothing-here.json", "w1", "w1:t1", "w1:p1") \
+        is False
 
 
 def test_chat_pane_outside_herdr_touches_nothing(tmp_path, monkeypatch, capsys):
