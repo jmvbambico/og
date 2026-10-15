@@ -68,9 +68,14 @@ DRY_RUN_SPACE = "dry-run-space:"
 #
 #     {"version": 2,
 #      "spaces":  {"<session_id>": {"workspace_id": …, "tab_id": …,
-#                                   "pane_id": …, "owner": …, "cwd": …}},
+#                                   "pane_id": …, "owner": …, "cwd": …,
+#                                   "cli_pane_id": … (optional)}},
 #      "pending": {"<cwd>":         {"workspace_id": …, "tab_id": …,
 #                                   "pane_id": …, "owner": "launcher", …}}}
+#
+# `cli_pane_id` is the one OPTIONAL extra: the id of the read-only pane that
+# mirrors the native harness TUI (see og_herdr_launch). Absent on every record
+# written before that feature, which is exactly what "no such pane is open" means.
 #
 # v2 is keyed by SESSION ID where v1 was keyed by workspace id, because the two
 # callers want opposite lookups. `--cleanup` asks "is this space ours?" and is
@@ -97,6 +102,16 @@ STATE_VERSION = 2
 # screen right now, and throwing it away orphans them from `--cleanup` — which
 # leaves the operator closing spaces by hand, one per conversation.
 STATE_VERSION_V1 = 1
+
+# The OPTIONAL space-record key naming an agent's read-only CLI-mirror pane.
+# PRESENT means the pane is open and holds its id; ABSENT means none is. Named
+# HERE rather than in og_herdr_launch because `_read_spaces` below is the reader
+# that must CARRY it through a load: a field that whitelist does not name is
+# silently dropped, and then the launcher's own toggle would read back "closed"
+# after opening, and open a SECOND pane on the next keypress — a real defect a
+# draft of this feature shipped with. Additive by design: a record written before
+# the feature has no key and reads as closed, so no version bump, no migration.
+CLI_PANE_FIELD = "cli_pane_id"
 
 # Who opened the space. Recorded, not enforced: the sides differ in where a
 # session's pane comes from (the bridge types `omnigent attach` into a pane it
@@ -516,6 +531,72 @@ def harness_vendors() -> dict[str, str]:
             vendors[harness] = vendor
     _REGISTRY_VENDORS = vendors
     return vendors
+
+
+# The THIRD sibling of `_REGISTRY_LABELS` / `_REGISTRY_VENDORS`, read from the
+# same catalog for the same reason: whether a harness has a TERMINAL to mirror is
+# a registry fact (its `kind`), not something to re-derive from the harness id's
+# spelling. `og agents` asks this to tell a native harness — hosted as a real TUI
+# in a private tmux server — from an ACP one, which is a plain stdio child with
+# no pty and so nothing to show, without a second kind table that could drift
+# from the catalog.
+_REGISTRY_KINDS: dict[str, str] | None = None
+
+
+def harness_kinds() -> dict[str, str]:
+    """`{harness id: kind}` from installer/registry.json, cached.
+
+    The same degradation contract as its two siblings, and for the same reason:
+    never raises and never returns a half-read table. A missing, unreadable or
+    malformed catalog yields `{}`, and a harness absent from it reads as no kind
+    — the caller then treats it as neither native nor ACP, which is the honest
+    "unknown" and never a guess that would open a pane with nothing behind it. A
+    broken catalog must cost a cosmetic detail, never a pane.
+    """
+    global _REGISTRY_KINDS
+    if _REGISTRY_KINDS is not None:
+        return _REGISTRY_KINDS
+    kinds: dict[str, str] = {}
+    try:
+        catalog = json.loads(REGISTRY_PATH.read_text())
+    except (OSError, ValueError):
+        catalog = None
+    rows = catalog.get("agents") if isinstance(catalog, dict) else None
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        harness, kind = row.get("harness"), row.get("kind")
+        if isinstance(harness, str) and harness and \
+                isinstance(kind, str) and kind:
+            kinds[harness] = kind
+    _REGISTRY_KINDS = kinds
+    return kinds
+
+
+# The registry kinds Omnigent hosts WITHOUT a pty: `acp-builtin` and `acp-user`
+# are plain stdio JSON-RPC children (see docs/HERDR.md), so there is no terminal
+# to mirror, by construction. Named as a set so the membership is stated once.
+ACP_KINDS = frozenset({"acp-builtin", "acp-user"})
+
+
+def harness_has_terminal(harness: object) -> "bool | None":
+    """Whether `harness` is one Omnigent hosts as a real terminal TUI.
+
+    True for a `native` registry kind, False for an ACP one, and None when the
+    harness is unknown (no id, or not in the catalog). None is a THIRD answer on
+    purpose: "I do not know this harness" must not be read as either "it has a
+    terminal" (which would try to attach to nothing) or "it is ACP" (which would
+    print the wrong reason to the operator). The caller reports the honest
+    "no terminal found" for None.
+    """
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    kind = harness_kinds().get(harness.strip())
+    if kind in ACP_KINDS:
+        return False
+    if kind == "native":
+        return True
+    return None
 
 
 # The harness an installed sub-agent ACTUALLY runs on, read from the spec
@@ -3042,7 +3123,10 @@ def _read_spaces(raw) -> dict:
         if not isinstance(ws_id, str) or not ws_id:
             continue
         rec = {"workspace_id": ws_id}
-        for field in ("tab_id", "pane_id", "owner", "cwd"):
+        # `CLI_PANE_FIELD` is listed so the optional CLI-mirror pane SURVIVES a
+        # load — it is written through `state_update`, and a field this whitelist
+        # omits would be dropped on the very next read. See its definition.
+        for field in ("tab_id", "pane_id", "owner", "cwd", CLI_PANE_FIELD):
             value = entry.get(field)
             if isinstance(value, str) and value:
                 rec[field] = value
