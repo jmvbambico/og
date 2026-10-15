@@ -140,7 +140,10 @@ STATE_GLYPH = {
 SPIN_FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834"
 SPIN_TICK = 0.12
 
-# --- the C2 pane geometry (docs/proto/tui_chosen.py, variant C2) ---------------
+# --- the C2 pane geometry, the approved variant C2 -----------------------------
+#
+# The TUI prototypes that proposed the C2 variant were retired, so this block is
+# now the record of the choice rather than a pointer at one.
 #
 # A GUTTER runs down the pane's left edge: the NODE column (the rail `│`, or `⦿`
 # where an agent's box hangs off it), a space, the STATE glyph column, a space —
@@ -838,7 +841,8 @@ def harness_label(harness: Any) -> str:
 
 
 # The operator's chosen one-cell brand mark per VENDOR, ported unchanged from
-# the approved tier-0 table in docs/proto/tui_marks.py. Keyed by vendor, not by
+# the approved tier-0 table — the prototype that carried it was retired, so this
+# table is now that record rather than a pointer at one. Keyed by vendor, not by
 # harness, because the registry puts two harnesses on one vendor (agy and gemini
 # are both `google`) and a per-harness table would hand one company two
 # different glyphs. The harness -> vendor hop is read from installer/registry.json
