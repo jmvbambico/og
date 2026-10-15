@@ -49,20 +49,33 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from og_herdr import (
+    # The shared state-record key for the optional CLI-mirror pane. Defined in
+    # og_herdr so this launcher and `_read_spaces` — the loader that would
+    # otherwise DROP it as an unknown field — name it with ONE spelling. See
+    # og_herdr.CLI_PANE_FIELD for why the whitelist has to carry it.
+    CLI_PANE_FIELD,
     DEFAULT_SPACE_CAP,
     OWNER_LAUNCHER,
     SPACE_LIVE,
     _id_of,
     attach_command,
+    # Whether a harness is hosted as a real terminal TUI is a REGISTRY fact
+    # (`kind`), so it is read from the registry rather than inferred from the
+    # harness id's spelling — one source, no drift. See og_herdr.harness_kinds.
+    harness_has_terminal,
+    harness_labels,
     # The Omnigent home is resolved by ONE function in og_herdr, so this
     # launcher's daemon records and its state file cannot be read from two
     # different homes by a sandboxed test that redirected only one of them.
@@ -1726,6 +1739,386 @@ def _chat_degrade(line: str) -> None:
     """
     print("! " + line, file=sys.stderr)
     _append_log(launcher_log_path(), line)
+
+
+# ---------------------------------------------------------------------------
+# the agent's own terminal: a READ-ONLY mirror of the native harness TUI
+# ---------------------------------------------------------------------------
+# herdr gives an agent ONE pane, the Omnigent chat view. The ACTUAL harness (the
+# real Claude Code / codex / opencode TUI) is hosted by Omnigent as an
+# interactive terminal inside a PRIVATE tmux server, one server per harness
+# session, and is invisible from herdr. This section opens a second, read-only
+# pane that mirrors it.
+#
+# `OMNIGENT_TMUX_SOCK` is popped from the environment for security, so the only
+# handle left is on disk, under
+#
+#     <tmp>/omnigent-<uid>/<harness>/<internal_id>/bridge.json
+#     <tmp>/omnigent-<uid>/<harness>/<internal_id>/tmux.json
+#
+# `bridge.json` names the og session (`conversation_id` / `active_session_id`);
+# its SIBLING `tmux.json` carries the socket path and the tmux target. The
+# `<internal_id>` directory is OPAQUE — NOT the og session id — so a session can
+# only be resolved to its terminal by SCANNING, which is what
+# `resolve_harness_terminal` does. There is no registry of these anywhere else,
+# and `<tmp>` is read from `$TMPDIR` at call time (never frozen at import) so a
+# test can redirect it — the same rule `install_config` follows for
+# `$OMNIGENT_HOME`.
+OMNIGENT_TMP_PREFIX = "omnigent-"
+BRIDGE_FILENAME = "bridge.json"
+TMUX_FILENAME = "tmux.json"
+# The `bridge.json` keys that name the og session, tried in this order.
+BRIDGE_SESSION_KEYS = ("conversation_id", "active_session_id")
+# `tmux.json` omits a target only if its writer changes; `main` is what every
+# record measured so far carries, so it is the honest default rather than a guess.
+DEFAULT_TMUX_TARGET = "main"
+
+# The client flags the mirror attaches with. SPELLED OUT HERE BECAUSE THEY ARE
+# THE SAFETY PROPERTY, not a cosmetic choice — this is the one thing in this
+# feature that can harm a LIVE agent:
+#
+#   * THE SIZING HAZARD. tmux sizes a window to the clients attached to it, and
+#     the live harness sessions run at the operator's own terminal size. An
+#     ordinary client attaching from our (usually smaller) pane WOULD resize the
+#     window and visibly corrupt the display of a working agent — and no test in
+#     this suite could catch it, because it only happens against a real socket.
+#     `ignore-size` is tmux's own answer: "the client does not affect the size of
+#     other clients", so the running agent's geometry is untouched.
+#   * `read-only` means the mirror cannot TYPE into the agent — only keys bound
+#     to detach-client/switch-client have any effect — so it is a view and never
+#     a second hand on somebody's keyboard.
+#
+# Together these are exactly what tmux's `-r` is an alias for; they are spelled
+# out so the reason travels with the flags. Verified against tmux 3.8 (`man
+# tmux`, attach-session): "-f sets a comma-separated list of client flags ...
+# ignore-size the client does not affect the size of other clients ... read-only
+# the client is read-only". See `test_the_cli_attach_cannot_resize_or_type`.
+TMUX_ATTACH_FLAGS = "read-only,ignore-size"
+
+# The mirror's share when it is split in BELOW the chat. See `_open_cli_pane`
+# for why "down" and not the agents pane's "right".
+CLI_PANE_RATIO = 0.5
+
+# The OPTIONAL state key naming the CLI pane on an agent's space record. Its
+# absence is the whole point of adding it additively: a record written before
+# this feature has no such key and reads as "no CLI pane open". The key itself
+# lives in og_herdr (imported above) so the loader that must CARRY it and this
+# launcher name it once. See `cli_pane_toggle`.
+
+# What the pane says when there is nothing to mirror. Kept short so they survive
+# `_clip` in a narrow pane, and kept DISTINCT so the operator can tell "this can
+# never work here" (an ACP harness has no terminal by construction) from "try
+# again" (a native session whose record is gone).
+NOTICE_CLI_OUTSIDE_HERDR = "cli: not inside herdr (no HERDR_ENV)"
+NOTICE_CLI_FAILED = "cli: {0}"
+NOTICE_CLI_NO_SPACE = "cli: no herdr space recorded for this agent"
+NOTICE_CLI_NO_TAB = "cli: could not read this tab's panes from herdr"
+NOTICE_CLI_NO_PANE = "cli: herdr split but reported no new pane id"
+NOTICE_CLI_NOT_FOUND = "cli: no live terminal found (the session may have ended)"
+NOTICE_CLI_NO_TMUX = "cli: tmux is not on PATH to mirror the terminal"
+NOTICE_CLI_ACP = "{0} runs on an ACP harness, which has no terminal to show"
+
+
+def omnigent_tmp_root(environ: Optional[dict] = None) -> Optional[Path]:
+    """`<tmp>/omnigent-<uid>`, the per-user root of Omnigent's runtime records.
+
+    Read from `$TMPDIR` NOW rather than frozen at import, exactly as
+    `install_config` reads `$OMNIGENT_HOME`: a test (or an operator in a sandbox)
+    redirects the variable, and a constant could not follow it. None when the uid
+    cannot be read at all (a non-POSIX platform), which the caller reads as "no
+    terminal", never as an error.
+    """
+    env = os.environ if environ is None else environ
+    tmp = env.get("TMPDIR") or tempfile.gettempdir()
+    try:
+        uid = os.getuid()
+    except AttributeError:  # pragma: no cover - POSIX only in practice
+        return None
+    if not tmp:
+        return None
+    return Path(tmp) / (OMNIGENT_TMP_PREFIX + str(uid))
+
+
+def resolve_harness_terminal(session_id: Optional[str],
+                             environ: Optional[dict] = None) -> Optional[tuple]:
+    """`(socket_path, tmux_target)` for the native harness TUI behind a session.
+
+    None when there is nothing to attach to, and NEVER an exception: a missing
+    directory, an unreadable or malformed `bridge.json`/`tmux.json`, no session
+    match, a missing target, or a socket path that is no longer a socket on disk
+    all read as "no terminal". A STALE record — a `tmux.json` whose socket is
+    gone — is treated as ABSENT rather than attached to, because attaching to a
+    dead socket is exactly how a pane opens onto nothing.
+    """
+    if not session_id:
+        return None
+    root = omnigent_tmp_root(environ)
+    if root is None:
+        return None
+    try:
+        harness_dirs = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return None
+    for harness_dir in harness_dirs:
+        try:
+            session_dirs = sorted(p for p in harness_dir.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for session_dir in session_dirs:
+            if not _bridge_names_session(session_dir / BRIDGE_FILENAME, session_id):
+                continue
+            terminal = _read_terminal(session_dir / TMUX_FILENAME)
+            if terminal is not None:
+                return terminal
+    return None
+
+
+def _bridge_names_session(path: Path, session_id: str) -> bool:
+    """Whether the `bridge.json` at `path` names `session_id`. Never raises."""
+    record = _read_json(path)
+    if not isinstance(record, dict):
+        return False
+    return any(record.get(key) == session_id for key in BRIDGE_SESSION_KEYS)
+
+
+def _read_terminal(path: Path) -> Optional[tuple]:
+    """`(socket_path, target)` from a `tmux.json`, or None. Never raises.
+
+    The socket is checked ON DISK, not merely present in the record: a stale
+    `tmux.json` names a socket the harness server has already unlinked, and that
+    is indistinguishable from a usable one until you try to attach to it.
+    """
+    record = _read_json(path)
+    if not isinstance(record, dict):
+        return None
+    socket_path = record.get("socket_path")
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    if not _is_socket(socket_path):
+        return None
+    target = record.get("tmux_target")
+    if not isinstance(target, str) or not target:
+        target = DEFAULT_TMUX_TARGET
+    return (socket_path, target)
+
+
+def _read_json(path: Path) -> Any:
+    """One JSON file, or None for anything unreadable. Never raises."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_socket(path: str) -> bool:
+    """Whether `path` is a socket on disk RIGHT NOW — the stale-record test."""
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def read_only_attach_command(socket_path: str, target: str) -> str:
+    """The command a CLI pane runs to mirror a harness, read-only.
+
+    The flags come from `TMUX_ATTACH_FLAGS` and carry the resize/typing safety
+    property documented there. The socket and target are shell-quoted because
+    both reach a shell in the pane: a `$TMPDIR` with a space in it is unusual but
+    not impossible, and an unquoted path would silently split the command.
+    """
+    return "tmux -S {0} attach -f {1} -t {2}".format(
+        shlex.quote(socket_path), TMUX_ATTACH_FLAGS, shlex.quote(target))
+
+
+def cli_terminal_notice(harness: Optional[str]) -> str:
+    """The honest line for "there is no terminal to mirror", keyed on the kind.
+
+    An ACP harness is TERMINAL-LESS BY CONSTRUCTION — a plain stdio JSON-RPC
+    child with no pty — so the operator is told that rather than sent hunting for
+    a pane that can never exist. Any other harness (native but with no live
+    record, or a harness this build cannot classify) gets the "may have ended"
+    line, which is the truth for a session that is gone and a shrug for one we
+    cannot name. NEVER opens an empty pane for either.
+    """
+    if harness_has_terminal(harness) is False:
+        label = harness_labels().get(harness, harness) if harness else "this agent"
+        return NOTICE_CLI_ACP.format(label)
+    return NOTICE_CLI_NOT_FOUND
+
+
+def cli_pane_toggle(root_session_id: str, session_id: str,
+                    harness: Optional[str] = None, *,
+                    environ: Optional[dict] = None, client=None,
+                    state_path: Optional[Path] = None) -> Optional[str]:
+    """Open the read-only CLI pane for an agent, or close it if it is open.
+
+    Returns None when the toggle happened, or a short one-line notice saying why
+    it did not (the caller shows it in the pane, like the focus notices). NEVER
+    raises: `og agents` is a view an operator leaves open all day, so a herdr or
+    tmux that is absent, a socket that is down, or a state file that cannot be
+    read must each become a notice rather than a traceback that kills the pane.
+
+    ONE RECORD, ADDITIVE. herdr has no method to ask what a pane is RUNNING
+    (`pane.list` returns only pane_id/tab_id/workspace_id — no command, no
+    process), so og must itself remember whether the CLI pane is open. That
+    memory is one extra OPTIONAL key on the agent's space record: PRESENT means
+    open (and is the pane id to close), ABSENT means closed. A record written
+    before this feature has no such key and reads as closed — which is why the
+    field is additive and never a version bump. Because the record is the only
+    memory, opening twice cannot open two panes: the second toggle closes.
+
+    `root_session_id` keys the SPACE (a worker's own id addresses no space, so
+    the caller passes its ROOT — see `focus_target`), while `session_id` is the
+    agent whose TUI is mirrored (the selected row's OWN). They are equal for a
+    root. Splitting the two is what lets Enter's rule — only a root has a pane —
+    coexist with mirroring whichever agent is selected.
+    """
+    env = os.environ if environ is None else environ
+    if not is_inside(env):
+        return NOTICE_CLI_OUTSIDE_HERDR
+    if not root_session_id or not session_id:
+        return NOTICE_CLI_NO_SPACE
+    path = state_path if state_path is not None else default_state_path()
+
+    record = _space_record(path, root_session_id)
+    if not record or not record.get("workspace_id"):
+        return NOTICE_CLI_NO_SPACE
+
+    open_pane = record.get(CLI_PANE_FIELD)
+    if open_pane:
+        return _close_cli_pane(path, root_session_id, open_pane, client)
+
+    terminal = resolve_harness_terminal(session_id, env)
+    if terminal is None:
+        return cli_terminal_notice(harness)
+    if shutil.which("tmux") is None:
+        return NOTICE_CLI_NO_TMUX
+    return _open_cli_pane(path, root_session_id, record, terminal, env, client)
+
+
+def _space_record(state_path: Path, session_id: str) -> dict:
+    """The `spaces` record for a session, or `{}`. Never raises."""
+    try:
+        state = load_state(state_path)
+    except Exception:
+        return {}
+    record = (state.get("spaces") or {}).get(session_id)
+    return record if isinstance(record, dict) else {}
+
+
+def _open_cli_pane(state_path: Path, root_session_id: str, record: dict,
+                   terminal: tuple, env: dict, client) -> Optional[str]:
+    """Split a pane in beside the chat and run the read-only attach there.
+
+    The split is "down", NOT the agents pane's "right". The agents pane's whole
+    job is its WIDTH — `AGENTS_PANE_RATIO` exists to keep its footer readable —
+    so a right-split of the chat would squeeze it below the columns it needs,
+    while a down-split in the chat column gives the mirror the FULL width of that
+    column, which is what a terminal TUI wants. The chat is the anchor (the
+    record's own `pane_id`), which is the pane `split_agents_pane` already splits
+    to place the agents pane.
+    """
+    ws_id = record.get("workspace_id")
+    tab_id = record.get("tab_id")
+    anchor = record.get("pane_id")
+    if not (tab_id and anchor):
+        return NOTICE_CLI_NO_SPACE
+    socket_path, target = terminal
+    command = read_only_attach_command(socket_path, target)
+    if client is None:
+        try:
+            from og_herdr_client import HerdrClient
+            client = HerdrClient()
+        except Exception as exc:
+            return _cli_failure(exc)
+    # Read BEFORE the split so the pane it makes can be told from the ones the
+    # operator already had in this tab (see `tab_pane_ids`); a listing that
+    # cannot be read refuses rather than splitting onto an unknown baseline.
+    baseline = tab_pane_ids(client, ws_id, tab_id)
+    if baseline is None:
+        return NOTICE_CLI_NO_TAB
+    params = {"target_pane_id": anchor, "direction": "down", "focus": False,
+              "ratio": CLI_PANE_RATIO}
+    cwd = record.get("cwd")
+    if cwd:
+        params["cwd"] = cwd
+    pane_env = pane_env_for(env)
+    if pane_env:
+        params["env"] = pane_env
+    try:
+        reply = client.call("pane.split", params)
+    except Exception as exc:
+        return _cli_failure(exc)
+    pane_id = _split_pane_id(client, ws_id, tab_id, anchor, reply, baseline)
+    if not pane_id:
+        return NOTICE_CLI_NO_PANE
+    try:
+        client.pane_run(pane_id, command)
+    except Exception as exc:
+        # No command in the pane means an empty pane og created and left behind
+        # — the exact thing `_open_space` refuses to leave. Close it.
+        try:
+            client.pane_close(pane_id)
+        except Exception:
+            pass
+        return _cli_failure(exc)
+    _set_cli_pane(state_path, root_session_id, pane_id)
+    return None
+
+
+def _close_cli_pane(state_path: Path, root_session_id: str, pane_id: str,
+                    client) -> Optional[str]:
+    """Close the recorded CLI pane and clear the field.
+
+    The close is best effort: the pane may already be gone (the operator closed
+    it, or the attach exited), and a record naming a dead pane would make the
+    next toggle try to close a pane that is not there instead of opening one — so
+    the field is cleared either way.
+    """
+    if client is None:
+        try:
+            from og_herdr_client import HerdrClient
+            client = HerdrClient()
+        except Exception as exc:
+            return _cli_failure(exc)
+    try:
+        client.pane_close(pane_id)
+    except Exception:
+        pass
+    _set_cli_pane(state_path, root_session_id, None)
+    return None
+
+
+def _set_cli_pane(state_path: Path, session_id: str, pane_id: Optional[str]) -> None:
+    """Set (or clear) the CLI pane field on a space record, ADDITIVELY.
+
+    A merge into the existing record through `og_herdr.state_update` — never a
+    wholesale replace — so the workspace/tab/chat pane ids the record already
+    holds survive, and a record for a session that is not there is left alone.
+    Clearing REMOVES the key rather than setting it null, so a closed toggle
+    leaves the v2 record shaped exactly as one written before this feature.
+    """
+    def put(state: dict) -> dict:
+        record = (state.get("spaces") or {}).get(session_id)
+        if isinstance(record, dict):
+            if pane_id:
+                record[CLI_PANE_FIELD] = pane_id
+            else:
+                record.pop(CLI_PANE_FIELD, None)
+        return state
+
+    try:
+        state_update(state_path, put)
+    except Exception:
+        pass
+
+
+def _cli_failure(exc: BaseException) -> str:
+    """One notice line for a herdr failure. NEVER raises — even formatting it."""
+    try:
+        return NOTICE_CLI_FAILED.format(exc)
+    except Exception:
+        return NOTICE_CLI_FAILED
 
 
 # ---------------------------------------------------------------------------

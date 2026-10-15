@@ -16,8 +16,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -2787,3 +2789,299 @@ def test_an_empty_dir_is_refused_by_the_helper_on_its_own(tmp_path, monkeypatch,
 
     with pytest.raises(LaunchError):
         resolve_chat_dir("", {})
+
+
+# ---------------------------------------------------------------------------
+# the agent's own terminal: resolving it, then mirroring it read-only
+# ---------------------------------------------------------------------------
+# Every test here builds a FAKE `<tmp>/omnigent-<uid>/…` tree and points the code
+# at it through the `environ` argument, so nothing reads the operator's real
+# record tree or attaches to a live socket — which is the one thing this feature
+# must never do by accident (see og_herdr_launch.TMUX_ATTACH_FLAGS).
+
+
+@pytest.fixture
+def short_dir():
+    """A very short temp directory to bind an AF_UNIX socket in.
+
+    A socket path is capped near 104 bytes on macOS and a pytest `tmp_path` is
+    already most of that, so the JSON tree lives under `tmp_path` (any length)
+    while only the SOCKET is bound here.
+    """
+    return tempfile.mkdtemp(prefix="ogterm-")
+
+
+def _native_session(tmp_path, session_id, *, harness="claude-native",
+                    bridge_key="conversation_id", internal_id="opaque-id"):
+    """A `<tmp>/omnigent-<uid>/<harness>/<internal_id>/` dir with a bridge.json.
+
+    Returns `(root, session_dir)`. `internal_id` is deliberately opaque and NOT
+    the session id — the whole reason the resolver has to SCAN rather than look
+    the session id up as a directory name.
+    """
+    root = tmp_path / f"omnigent-{os.getuid()}"
+    session_dir = root / harness / internal_id
+    session_dir.mkdir(parents=True)
+    (session_dir / "bridge.json").write_text(json.dumps({bridge_key: session_id}))
+    return root, session_dir
+
+
+def _bound_socket(short_dir):
+    """A real AF_UNIX socket on disk, so `S_ISSOCK` is true for it."""
+    path = os.path.join(short_dir, "s")
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    return path
+
+
+def test_resolve_harness_terminal_finds_the_native_socket(tmp_path, short_dir):
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "sess-1")
+    (session_dir / "tmux.json").write_text(json.dumps(
+        {"socket_path": sock, "tmux_target": "main"}))
+
+    got = og_herdr_launch.resolve_harness_terminal(
+        "sess-1", {"TMPDIR": str(tmp_path)})
+
+    assert got == (sock, "main")
+
+
+def test_resolve_harness_terminal_matches_active_session_id_too(tmp_path, short_dir):
+    # bridge.json names the og session under EITHER key; a record carrying only
+    # `active_session_id` must resolve, and a missing tmux_target defaults to the
+    # one every measured record carries.
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "sess-2", bridge_key="active_session_id")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-2", {"TMPDIR": str(tmp_path)}) == (sock, "main")
+
+
+def test_resolve_harness_terminal_reads_tmpdir_now_not_at_import(tmp_path, short_dir):
+    # The redirect is the ENVIRONMENT, read at call time (the install_config
+    # precedent), not a constant frozen at import: the SAME session id resolves
+    # against whichever root the caller names.
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    sock = _bound_socket(short_dir)
+    _, da = _native_session(a, "sess-x")
+    (da / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+    (b / f"omnigent-{os.getuid()}").mkdir(parents=True)
+
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-x", {"TMPDIR": str(a)}) == (sock, "main")
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-x", {"TMPDIR": str(b)}) is None
+
+
+def test_resolve_harness_terminal_treats_a_stale_record_as_absent(tmp_path):
+    # A tmux.json naming a socket that is NOT on disk is a session that has
+    # ended; attaching to it is how a pane opens onto nothing.
+    _, session_dir = _native_session(tmp_path, "sess-3")
+    (session_dir / "tmux.json").write_text(json.dumps(
+        {"socket_path": str(tmp_path / "gone.sock"), "tmux_target": "main"}))
+
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-3", {"TMPDIR": str(tmp_path)}) is None
+
+
+def test_resolve_harness_terminal_needs_a_socket_not_just_a_path(tmp_path):
+    # A REGULAR FILE at socket_path is not attachable either — the same stale
+    # verdict, decided by S_ISSOCK rather than by the path merely existing.
+    _, session_dir = _native_session(tmp_path, "sess-4")
+    plain = tmp_path / "plain.sock"
+    plain.write_text("not a socket")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": str(plain)}))
+
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-4", {"TMPDIR": str(tmp_path)}) is None
+
+
+def test_resolve_harness_terminal_none_when_tmux_json_is_missing(tmp_path):
+    _native_session(tmp_path, "sess-5")
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-5", {"TMPDIR": str(tmp_path)}) is None
+
+
+def test_resolve_harness_terminal_survives_malformed_json(tmp_path):
+    _, session_dir = _native_session(tmp_path, "sess-6")
+    (session_dir / "tmux.json").write_text("{ not json")
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-6", {"TMPDIR": str(tmp_path)}) is None
+
+    # A malformed BRIDGE is skipped, not fatal: the scan keeps looking.
+    (session_dir / "bridge.json").write_text("{ also not json")
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-6", {"TMPDIR": str(tmp_path)}) is None
+
+
+def test_resolve_harness_terminal_none_when_no_bridge_matches(tmp_path, short_dir):
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "someone-else")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-9", {"TMPDIR": str(tmp_path)}) is None
+
+
+def test_resolve_harness_terminal_none_without_an_id_or_a_tree(tmp_path):
+    assert og_herdr_launch.resolve_harness_terminal(None, {"TMPDIR": str(tmp_path)}) is None
+    assert og_herdr_launch.resolve_harness_terminal("", {"TMPDIR": str(tmp_path)}) is None
+    # a $TMPDIR that does not exist is "no terminal", never an exception
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-1", {"TMPDIR": str(tmp_path / "nope")}) is None
+
+
+def _space_state(state_path, root, **record):
+    """Write one live space record for `root`, in the real v2 shape."""
+    rec = {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+           "owner": "launcher", "cwd": "/work"}
+    rec.update(record)
+    save_state(state_path, {"spaces": {root: rec}, "pending": {}})
+    return rec
+
+
+def test_cli_pane_toggle_opens_a_read_only_attach_below_the_chat(tmp_path, short_dir):
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "root-1")
+    (session_dir / "tmux.json").write_text(json.dumps(
+        {"socket_path": sock, "tmux_target": "main"}))
+    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state)
+
+    assert notice is None
+    # BELOW the chat (`direction: down`), not beside it: the agents pane's
+    # right-split is where the WIDTH lives, so the mirror takes the chat column.
+    # The split carries the browser-suppression map the pane env rule requires.
+    assert client.split_params == {
+        "target_pane_id": "w1:p1", "direction": "down", "focus": False,
+        "ratio": og_herdr_launch.CLI_PANE_RATIO, "cwd": "/work",
+        "env": {"BROWSER": "true"}}
+    (typed,) = client.text_typed()
+    assert typed.startswith("tmux -S ")
+    assert "-f read-only,ignore-size" in typed, typed
+    assert "-t main" in typed, typed
+    # The pane id is remembered on the space record, so the toggle can close it.
+    assert load_state(state)["spaces"]["root-1"][og_herdr.CLI_PANE_FIELD] == "w1:p9"
+
+
+def test_cli_pane_toggle_a_second_press_closes_and_never_doubles(tmp_path, short_dir):
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "root-1")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    assert og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state) is None
+    assert og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state) is None
+
+    # Opening twice must NOT open two panes: the second toggle CLOSES the first.
+    assert client.methods.count("pane.split") == 1, client.methods
+    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls
+    # and clearing REMOVES the field, so the record reads as a fresh closed one
+    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
+
+
+def test_cli_pane_toggle_degrades_for_an_acp_harness_without_splitting(tmp_path):
+    # An ACP harness is a plain stdio child with no pty — there is nothing to
+    # mirror, by construction. The line must say so and no pane is opened.
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    client = FakeClient()
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "acp:cline", environ=env, client=client,
+        state_path=state)
+
+    assert notice == "Cline runs on an ACP harness, which has no terminal to show"
+    assert "pane.split" not in client.methods
+
+
+def test_cli_pane_toggle_reports_no_terminal_for_a_native_session_with_none(tmp_path):
+    # Native harness, but no live record (the session ended, or the layout
+    # changed): the honest "no terminal" line, and still no pane.
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    client = FakeClient()
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state)
+
+    assert notice == og_herdr_launch.NOTICE_CLI_NOT_FOUND
+    assert "pane.split" not in client.methods
+
+
+def test_cli_pane_toggle_outside_herdr_says_so_and_touches_nothing(tmp_path):
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    client = FakeClient()
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ={"TMPDIR": str(tmp_path)},
+        client=client, state_path=state)
+
+    assert notice == og_herdr_launch.NOTICE_CLI_OUTSIDE_HERDR
+    assert client.calls == []
+
+
+def test_cli_pane_toggle_refuses_when_no_space_is_recorded(tmp_path):
+    state = tmp_path / "og-herdr.json"  # nothing recorded for this session
+    client = FakeClient()
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state)
+
+    assert notice == og_herdr_launch.NOTICE_CLI_NO_SPACE
+    assert "pane.split" not in client.methods
+
+
+def test_the_optional_cli_pane_id_survives_a_state_reload(tmp_path):
+    # THE REGRESSION this pins: `_read_spaces` is a WHITELIST, so a field it does
+    # not name is dropped on load. `cli_pane_id` is written through `state_update`
+    # and read back through `load_state`; were it not in the whitelist, the
+    # launcher's own toggle would read back "closed" after opening and open a
+    # SECOND pane on the next keypress.
+    state = tmp_path / "og-herdr.json"
+    save_state(state, {"spaces": {"root-1": {
+        "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+        "cli_pane_id": "w1:p9", "made-up": "x"}}, "pending": {}})
+
+    rec = load_state(state)["spaces"]["root-1"]
+
+    assert rec["cli_pane_id"] == "w1:p9"
+    assert rec["pane_id"] == "w1:p1"
+    assert "made-up" not in rec, "the whitelist must still drop unknown fields"
+
+
+def test_the_cli_attach_cannot_resize_or_type_into_the_live_session():
+    # The one property that can HARM a live agent: tmux sizes a window to its
+    # attached clients, so a plain attach from a (usually narrower) pane would
+    # resize and corrupt a working agent's display, and could type into it. Both
+    # guards are load-bearing and must be in the command the pane runs.
+    command = og_herdr_launch.read_only_attach_command("/tmp/x/tmux.sock", "main")
+
+    assert "-f read-only,ignore-size" in command, command
+    # `-r` is tmux's alias for exactly this pair; spelled out above so the reason
+    # travels with the flags (see og_herdr_launch.TMUX_ATTACH_FLAGS).
+    assert og_herdr_launch.TMUX_ATTACH_FLAGS == "read-only,ignore-size"
+    # A socket path with a space must not split the command.
+    spaced = og_herdr_launch.read_only_attach_command("/tmp/a b/tmux.sock", "main")
+    assert "'/tmp/a b/tmux.sock'" in spaced, spaced
