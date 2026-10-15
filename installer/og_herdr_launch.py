@@ -1015,6 +1015,55 @@ def record_chat_pane(state_path: Path, cwd: str, workspace_id: str,
     return record
 
 
+def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
+                 pane_id: str) -> bool:
+    """Is this pane one og opened for a chat, rather than one the operator made?
+
+    `og chat` asks this to stay out of the launcher's way. `og start` types
+    `og chat` into a pane `_open_space` has just made and then splits that same
+    pane for `og agents` — so the process `pane_run` started runs the very code
+    that splits beside it. Both halves doing it is how `og start` came to open
+    THREE panes where the operator expects two.
+
+    Both halves of the question are already written down before either acts:
+    `_open_space` records the pane it is about to type into, and
+    `_add_history_space` remembers it, keyed by ids a human typing in herdr
+    cannot collide with. So the answer is a lookup in og's own state file, not a
+    second opinion about panes.
+
+    A pane listing cannot answer it, and the reason is worth keeping in view
+    because it is the trap this function exists to avoid: `pane.list` returns
+    only pane_id, tab_id and workspace_id — no command, no process — so "this
+    tab already holds the `og agents` pane" and "this tab already holds a pane
+    the operator split themselves" are the SAME answer. Reading the second as
+    the first is how a guard would silently take the agents pane away from every
+    `og chat` an operator runs in a tab they made, which is the case
+    `known_panes` exists to protect. `og chat` can still tell panes apart from
+    one another; it cannot tell what a pane is running.
+
+    It fails OPEN. A state file that cannot be read — missing, truncated, a
+    version this code does not know — is og having nothing to say, not og having
+    said "mine", so the answer is no and the caller splits. That direction costs
+    a cosmetic extra pane rather than a missing one, the same trade
+    `split_agents_pane` makes when the listing fails after a split has already
+    been issued.
+    """
+    try:
+        state = load_state(state_path)
+    except Exception:
+        return False
+    for bucket in ("pending", "spaces"):
+        for record in (state.get(bucket) or {}).values():
+            if not isinstance(record, dict):
+                continue
+            if (record.get("workspace_id") == workspace_id
+                    and record.get("pane_id") == pane_id
+                    and (not record.get("tab_id")
+                         or record.get("tab_id") == tab_id)):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # `og chat`'s end of the same handshake — the other way a space gets a session
 # ---------------------------------------------------------------------------
@@ -1023,7 +1072,10 @@ def record_chat_pane(state_path: Path, cwd: str, workspace_id: str,
 # — and the bridge, seeing a root session appear in a directory it has no space
 # for, opens a SECOND space for the conversation already on screen. So `og
 # chat` writes the record itself, for the pane it is running in, and puts the
-# agents pane beside it the way `_open_space` does.
+# agents pane beside it the way `_open_space` does — EXCEPT when the record says
+# the launcher already opened this pane, because then the launcher is splitting
+# it too and two halves doing one job is what opened three panes in a tab the
+# operator expects to hold two. See `og_owns_pane` and `chat_pane`.
 #
 # It is a NO-OP outside a herdr pane — a plain `og chat` in an ordinary terminal
 # must behave exactly as it always has, including never touching the state file.
@@ -1085,6 +1137,12 @@ def chat_pane(argv=None, client=None, env=None) -> int:
     `client` is the herdr client, injected so no test opens a real socket; None
     means "build one if a split is actually needed".
 
+    The agents pane is NOT opened unconditionally. On a fresh `og start` this
+    process is running in the very pane `_open_space` is about to split, so
+    splitting here as well left the operator a third pane; the launcher keeps the
+    split and this half stands down when `og_owns_pane` says the pane is already
+    og's. An operator-made pane has no such record and is split as it always was.
+
     Exit codes: 0 for the ordinary case, INCLUDING every degradation — the chat
     is the session and a cosmetic second pane must not be able to stop it, which
     is the trade `report`/`_split_agents` already makes. 2 only for `--dir`
@@ -1129,14 +1187,39 @@ def chat_pane(argv=None, client=None, env=None) -> int:
     # `str(Path.cwd().resolve())` (cli.py) — a physical path, where a shell's
     # `$PWD` is a logical one and the two part company under a symlink.
     here = cwd or os.getcwd()
+    # Asked BEFORE the record below, which would otherwise answer it for us:
+    # `record_chat_pane` writes exactly this record, so a lookup after it says
+    # "og owns this pane" on every run, the operator's included.
+    state = default_state_path()
+    og_opened = og_owns_pane(state, ws_id, tab_id, pane_id)
     try:
-        record_chat_pane(default_state_path(), here, ws_id, tab_id, pane_id)
+        record_chat_pane(state, here, ws_id, tab_id, pane_id)
     except Exception as exc:
         # The record is what stops a second space appearing; failing to write it
         # is not worth refusing the chat over, but it must never be silent.
         _chat_degrade("could not record this pane for the bridge ({0})".format(exc))
 
     if not agents_pane_enabled(config):
+        return 0
+
+    if og_opened:
+        # Somebody else is already splitting THIS pane. `og start` writes the
+        # record above before it types `og chat`, and types `og chat` into the
+        # pane it is about to split — so on a fresh launch this process is the
+        # launcher's own second half, and both halves splitting is what put three
+        # panes in a tab the operator expects to hold two. The launcher keeps the
+        # split: it is the half that still holds the pane if this process never
+        # reaches its own, and the half whose degradation reaches the operator
+        # before the terminal is handed to herdr.
+        #
+        # Ordered, not raced: the record is on disk before `pane_run` can start
+        # this process at all, so finding it here means the launcher is already
+        # past `pane_run` and about to split. Not finding it means nobody wrote
+        # one — an operator-made pane has no record until the line below writes
+        # it, which is the split this half still owes.
+        #
+        # Checked before the client is built, so a launch pays for no socket at
+        # all on this path.
         return 0
 
     opened = client if client is not None else _chat_client(environ)

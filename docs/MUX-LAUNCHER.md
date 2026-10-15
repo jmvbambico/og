@@ -187,10 +187,12 @@ second one.
 - If that session has a space: `workspace.focus(ws)`, then `exec herdr`.
 - If it does not: adopt it (§4), then focus and attach.
 
-**Known gap, unfixed.** TWO things open the `og agents` pane, and neither is this
-case: `_open_space` (a fresh launch) and `og_herdr._add_history_space` (a history
-space for a past conversation, resumed from the spaces list). Both go through the
-one implementation, `og_herdr_launch.split_agents_pane`; there is deliberately no
+**Known gap, unfixed.** THREE things open the `og agents` pane, and none is this
+case: `_open_space` (a fresh launch), `og_herdr._add_history_space` (a history
+space for a past conversation, resumed from the spaces list), and `og chat` in a
+pane nobody else opened (which stands down whenever the first of them already
+owns that pane — the rule in §2). All three go through the one implementation,
+`og_herdr_launch.split_agents_pane`; there is deliberately no
 second copy of the split to drift. ADOPTING AN EXISTING SPACE is still the case
 that never splits — and says nothing when the space it attaches to has no agents
 pane (closed by hand, or created before the feature). At the keyboard that is
@@ -261,6 +263,20 @@ from (A)–(D) rather than a copy of it:
   theirs. The chat path passes the tab's panes as they were *before* the split,
   and when no new pane can be identified it starts `og agents` nowhere rather
   than guessing into one of theirs.
+- **The split is skipped when og already made this pane.** `og start` types
+  `og chat` into the pane it is about to split, so on a fresh launch this path
+  IS the launcher's second half and splitting here as well opened three panes
+  where the operator expects two. The launcher keeps the split — it is the half
+  that still holds the pane if `og chat` never reaches its own — and this half
+  stands down when the state file already names this workspace/tab/pane, which
+  `_open_space` wrote before it typed the line and which therefore cannot be
+  raced. That guard keys on og's own record rather than on the tab's pane count
+  because `pane.list` returns no command and no process: "this tab already holds
+  the `og agents` pane" and "this tab already holds a pane the operator split
+  themselves" are otherwise the same answer, and reading the second as the
+  first would take the agents pane away from every `og chat` run by hand. A
+  state file that cannot be read is no answer rather than a negative one, and
+  the split is attempted.
 
 `og chat --dir <path>` sets the directory the session is rooted in without
 `cd`-ing first. An absolute path is used as-is; a relative one resolves against

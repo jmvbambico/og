@@ -17,6 +17,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,7 @@ from og_herdr_launch import (  # noqa: E402
     launch_log_path,
     live_session,
     main,
+    og_owns_pane,
     pane_env_for,
     projects_dir,
     record_chat_pane,
@@ -1184,6 +1186,136 @@ def test_chat_pane_inside_herdr_records_the_pane_and_splits_it(tmp_path,
     assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
     assert client.split_params["target_pane_id"] == "w1:p1"
     assert client.split_params["ratio"] == AGENTS_PANE_RATIO
+
+
+# ---------------------------------------------------------------------------
+# the two halves of one split: `og start` splits the pane it types `og chat` into
+# ---------------------------------------------------------------------------
+# `og start` runs `pane_run(pane_id, "og chat")` and THEN splits that same pane
+# for `og agents`. Since `og chat` splits the pane it finds itself in, both
+# halves were doing one job and a fresh `og start` came up with THREE panes — the
+# chat, the launcher's `og agents`, and `og chat`'s. The tests below run both
+# halves, in the order the operator meets them, against one client and one state
+# file, so what is asserted is the tab's final shape rather than either half
+# alone.
+
+def test_a_fresh_og_start_opens_two_panes_and_not_three(tmp_path, monkeypatch):
+    """THE OPERATOR'S COMPLAINT, ON THE PATH THAT PRODUCES IT. Two panes is the
+    whole answer: the chat, and `og agents` beside it."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+    ctx = replace(make_ctx(tmp_path, client, FakeWatcher()), cwd=str(tmp_path))
+
+    launch(ctx)
+    # Then the `og chat` the launch typed runs, in the pane it was typed into,
+    # seeing the tab exactly as the launcher left it.
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert client.methods.count("pane.split") == 1, client.methods
+    assert client.text_typed().count("og agents") == 1, client.text_typed()
+    # And the chat is still recorded for the bridge, and `og chat` still stands
+    # up inside the launcher's space — it stands down from the SPLIT only.
+    assert str(tmp_path) in load_state(tmp_path / "og-herdr.json")["pending"]
+    assert client.text_typed()[0] == "og chat"
+
+
+def test_a_tab_the_operator_split_theirself_still_gets_a_fresh_agents_pane(
+        tmp_path, monkeypatch):
+    """WHAT MUST NOT REGRESS, and the trap the fix could have walked into.
+
+    The tempting guard is "decline when the tab already holds a pane that is not
+    mine". `pane.list` returns no command and no process, so that guard reads
+    "a pane the operator split themselves" as "the `og agents` pane og already
+    made" — and takes the agents pane away from every `og chat` an operator runs
+    by hand, which is the case `known_panes` exists to protect. So the guard
+    keys on what og can actually tell: whether og itself opened THIS pane. No
+    record, no claim, split as it always was."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+    # In a pane og made, never in the one the operator was already using.
+    typed_into = [params["pane_id"]
+                  for params in client.params_of("pane.send_text")]
+    assert typed_into == ["w1:p3"]
+
+
+def test_a_state_file_that_cannot_be_read_still_attempts_the_split(tmp_path,
+                                                                  monkeypatch):
+    """THE FAIL-SAFE DIRECTION, which cuts the other way from `tab_pane_ids`.
+
+    The guard reads og's own state file, and a file it cannot read is og having
+    nothing to say — not og having said "mine". Of the two ways to be wrong, a
+    cosmetic extra agents pane costs the operator one split to close and a
+    missing one costs them the pane they asked for, so the guard fails OPEN and
+    the split is attempted."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "og-herdr.json").write_text("{ this is not json")
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
+def test_a_launch_record_the_bridge_has_claimed_still_suppresses_the_split(
+        tmp_path, monkeypatch):
+    """The launcher writes `pending`; the bridge claims it the moment the session
+    appears and moves it into `spaces` unchanged (`_claim_pending`). The answer
+    has to be the same after the claim as before it — a guard reading `pending`
+    alone would answer "nobody opened this pane" once the record moved, and the
+    third pane would come back. A history space, which og opens and the operator
+    resumes with `og chat`, is remembered in `spaces` from the start and gets
+    the same answer for the same reason."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1", "owner": "launcher",
+                                  "cwd": str(tmp_path)}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" not in client.methods
+    assert client.text_typed() == []
+
+
+def test_a_record_for_another_pane_in_the_same_space_does_not_suppress_the_split(
+        tmp_path, monkeypatch):
+    """The question is about a PANE, not a space or a tab. og opening some other
+    pane says nothing about this one, and a guard that read it as "og owns this
+    tab" would take the agents pane away from the second chat an operator starts
+    in a pane of the same space."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p9", "owner": "launcher"}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+
+
+def test_og_owns_pane_is_false_for_a_state_file_nobody_wrote(tmp_path):
+    """The guard's own default, so the fail-safe direction is pinned where it is
+    decided rather than only where it is used."""
+    assert og_owns_pane(tmp_path / "nothing-here.json", "w1", "w1:t1", "w1:p1") \
+        is False
 
 
 def test_chat_pane_outside_herdr_touches_nothing(tmp_path, monkeypatch, capsys):
