@@ -28,8 +28,9 @@ SELECTION IS BRIGHTNESS: the selected worker's box paints normal while every
 other box paints dim — there is no caret glyph. Inside the box the harness brand
 mark and the title sit flush left with the meta flush right; the WORKING glyph is
 a braille spinner (see SPIN_FRAMES), so a live row visibly animates while
-blocked, failed and finished rows stay static. A boxed access panel sized to its
-own content and a one-line footer pin to the bottom. `render` is a pure function
+blocked, failed and finished rows stay static. A boxed access panel — pane-width
+and bright like the root box, since it belongs to the pane rather than to the
+selection — and a one-line footer pin to the bottom. `render` is a pure function
 from state to a list of lines and curses only paints them; that separation is
 what lets the view be tested with `--once`, with no tty in sight.
 
@@ -216,15 +217,18 @@ MAX_ROOT_DETAILS = 32
 MAX_SNIPPETS = 256
 
 # The access panel (the `a` toggle). It is pinned to the bottom of the pane and
-# sized to its own content — the QR block, one URL line and one caveat — never to
-# a fraction of the terminal. The list above it shrinks to make room but keeps at
-# least ACCESS_LIST_FLOOR rows, so the toggle can never squeeze the tree out of
-# view entirely. Three is the smallest number that still shows a header and a
-# worker or two, which is enough to stay oriented on a short pane.
+# spans its FULL width, like the root box — it holds the QR block, one URL line
+# and one caveat, and its HEIGHT alone is its content's. The list above it shrinks
+# to make room but keeps at least ACCESS_LIST_FLOOR rows, so the toggle can never
+# squeeze the tree out of view entirely. Three is the smallest number that still
+# shows a header and a worker or two, which is enough to stay oriented on a short
+# pane.
 ACCESS_LIST_FLOOR = 3
 
 # Two borders plus one space of padding on each side: what a box costs around
-# its widest line. The panel is sized to this, not to the pane.
+# what it holds. It is the box's own margin, not the pane's — an access panel that
+# FILLS the pane still spends its rows' width here, and it is the room a content-
+# sized box (the theme picker) measures its widest line against.
 BOX_PADDING = 4
 
 ACCESS_TITLE = "access"
@@ -1469,25 +1473,48 @@ def _display_width(text: str) -> int:
 
 
 def _boxed(lines: Iterable[str], width: int,
-           title: str = ACCESS_TITLE) -> list[str]:
+           title: str = ACCESS_TITLE, fill: bool = False) -> list[str]:
     """`lines` in a box as wide as their widest row, never wider than `width`.
 
-    Content-sized, not pane-sized: a QR boxed out to eighty columns is mostly
-    border, and the border is what the eye lands on when scanning for the code.
+    CONTENT-sized by default, not pane-sized: a QR boxed out to eighty columns is
+    mostly border, and the border is what the eye lands on when scanning for the
+    code. That is the theme picker's look, and it stays.
 
-    `title` defaults to the access panel's own so the one existing caller is
-    unchanged; the theme picker passes its own, because a box that says "access"
-    while listing twenty-six themes is worse than no title. An EMPTY title drops
-    the `┌─ ` rule with it — four columns the picker cannot always spend on a pane
-    narrow enough to need the untitled form in the first place.
+    `fill=True` is the access panel's opt-in to the OTHER rule — the box spans the
+    pane's full width, exactly as the root box does (`_round_box_lines`). The
+    panel is the pane's own bottom panel rather than one row among many, so an
+    inset rectangle under a full-width tree reads as a stray box; the root box and
+    the panel are the two things that speak for the whole pane. The QR is NOT
+    stretched by this: the box grows, the code inside it does not.
+
+    `title` defaults to the access panel's own so the picker caller passes its own
+    — a box that says "access" while listing twenty-six themes is worse than no
+    title. An EMPTY title drops the `┌─ ` rule with it — four columns the picker
+    cannot always spend on a pane narrow enough to need the untitled form in the
+    first place, and, when filling, columns that would push the border past the
+    pane (see below).
     """
-    rows = [_clip(text, max(1, width - BOX_PADDING)) for text in lines]
-    # Never narrower than the title rule, or the box loses its rectangle. An
-    # UNTITLED box has no rule to be narrower than, so it is sized to its content
-    # alone -- four columns of `┌─ ` that buy nothing at a width narrow enough to
-    # need the untitled form.
-    inner = max(max((len(row) for row in rows), default=0),
-                len(title) + 3 if title else 0) + 2
+    if fill:
+        # Pane-width, floored at the narrowest width a rectangle still closes in
+        # -- the same floor `_round_box_lines` gives the root box. Rows are clipped
+        # to what the FIXED inner leaves: BOX_PADDING is exactly the two borders
+        # and their two padding spaces, so `inner - 2` is this, and the `ljust`
+        # below can then only pad. A box wider than the pane is the one thing this
+        # must never draw, so the title is DROPPED when its rule would not fit
+        # rather than widening the box (the picker's rule, same reason).
+        width = max(BOX_MIN, width)
+        inner = width - 2
+        rows = [_clip(text, max(0, width - BOX_PADDING)) for text in lines]
+        if title and len(title) + 3 > inner:
+            title = ""
+    else:
+        rows = [_clip(text, max(1, width - BOX_PADDING)) for text in lines]
+        # Never narrower than the title rule, or the box loses its rectangle. An
+        # UNTITLED box has no rule to be narrower than, so it is sized to its
+        # content alone -- four columns of `┌─ ` that buy nothing at a width narrow
+        # enough to need the untitled form.
+        inner = max(max((len(row) for row in rows), default=0),
+                    len(title) + 3 if title else 0) + 2
     head = (f"┌─ {title} " + "─" * (inner - len(title) - 3) + "┐") if title \
         else "┌" + "─" * inner + "┐"
     body = [f"│ {row.ljust(inner - 2)} │" for row in rows]
@@ -1495,7 +1522,13 @@ def _boxed(lines: Iterable[str], width: int,
 
 
 def access_lines(access: Access, width: int) -> list[str]:
-    """The access panel, as a titled box sized to its own content.
+    """The access panel, as a titled box spanning the pane's FULL width.
+
+    PANE-width, not content-width (`fill=True`): it is the pane's own bottom panel,
+    so it lines up with the root box above it instead of insetting itself under a
+    full-width tree. The content inside is unchanged and still flush left — that is
+    how the root box's own row sits, one space in from the border — so the QR is
+    not stretched by the wider box, merely given more room to its right.
 
     Flush LEFT on purpose: it is not a worker, so a tree spine in front of it
     would read as one more agent in the tree — and the operator has been reading
@@ -1511,7 +1544,7 @@ def access_lines(access: Access, width: int) -> list[str]:
     pane rather than as a colour.
     """
     if access.url is None:
-        return _boxed([access.note or NO_ADDRESS_NOTE], width)
+        return _boxed([access.note or NO_ADDRESS_NOTE], width, fill=True)
     content: list[str] = []
     qr = [_ANSI_SGR.sub("", line) for line in access.qr]
     # Measured with `_visible_width` rather than `len`: "does the code fit" is a
@@ -1525,7 +1558,7 @@ def access_lines(access: Access, width: int) -> list[str]:
     content.append(access.url)
     if access.note:
         content.append(access.note)
-    return _boxed(content, width)
+    return _boxed(content, width, fill=True)
 
 
 # --- span composition --------------------------------------------------------
@@ -2206,8 +2239,15 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     blocks = _blocks(frame, width)
 
     tail: list[Line] = [([("", PLAIN)], NORMAL)]
+    # THE PANEL IS NOT A WORKER, so it is NOT hung at DIM. It used to be the one
+    # box hard-hung dim, on the reading that the tail is chrome — but the panel is
+    # a box beside the root box, and the root's box paints NORMAL, so the dim made
+    # the URL and the QR the least readable thing in the pane, which is the
+    # opposite of what a panel you opened for the code should do. Brightness is
+    # selection's axis and it applies to worker boxes; the footer below is the
+    # chrome and is still DIM.
     if frame.access is not None:
-        tail.extend(([(line, PLAIN)], DIM)
+        tail.extend(([(line, PLAIN)], NORMAL)
                     for line in access_lines(frame.access, width))
         tail.append(([("", PLAIN)], NORMAL))
     # The focus notice, while it is up, TAKES the footer's row rather than adding
