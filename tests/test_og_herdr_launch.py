@@ -2947,22 +2947,29 @@ def test_resolve_harness_terminal_bridge_json_as_a_list_is_absent(tmp_path, shor
         "sess-7", {"TMPDIR": str(tmp_path)}) is None
 
 
-def test_resolve_harness_terminal_survives_an_unreadable_bridge_json(tmp_path, short_dir):
-    # A `bridge.json` that cannot be read (PermissionError) is "no terminal" for
-    # that session: the scan skips it, the exception never escapes, and the
-    # socket recorded in tmux.json never gets attached to.
+def test_resolve_harness_terminal_survives_an_unreadable_bridge_json(tmp_path, short_dir, monkeypatch):
+    # An unreadable `bridge.json` (PermissionError) is "no terminal" for that
+    # session: the scan skips it, the exception never escapes, and the socket
+    # recorded in tmux.json never gets attached to. Inject the error at the
+    # `_read_json` seam so the result is deterministic regardless of the
+    # process's privileges (chmod 000 does not raise for root).
     sock = _bound_socket(short_dir)
     _, session_dir = _native_session(tmp_path, "sess-8")
     bridge = session_dir / "bridge.json"
     bridge.write_text(json.dumps({"conversation_id": "sess-8"}))
     (session_dir / "tmux.json").write_text(json.dumps(
         {"socket_path": sock, "tmux_target": "main"}))
-    bridge.chmod(0o000)
-    try:
-        assert og_herdr_launch.resolve_harness_terminal(
-            "sess-8", {"TMPDIR": str(tmp_path)}) is None
-    finally:
-        bridge.chmod(0o600)
+    real_read_json = og_herdr_launch._read_json
+
+    def failing_read_json(path):
+        if path == bridge:
+            raise PermissionError("permission denied")
+        return real_read_json(path)
+
+    monkeypatch.setattr(og_herdr_launch, "_read_json", failing_read_json)
+
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-8", {"TMPDIR": str(tmp_path)}) is None
 
 
 def _space_state(state_path, root, **record):
@@ -3137,6 +3144,94 @@ def test_cli_pane_toggle_state_write_raising_never_propagates(tmp_path, short_di
     assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED
     assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
     assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
+
+
+def test_set_cli_pane_absent_record_setting_writes_nothing_and_returns_false(tmp_path):
+    # No space record for this session: setting a pane id records nothing, so
+    # `put` returns falsey, `state_update` writes NOTHING (the file is byte-for
+    # byte unchanged), and `_set_cli_pane` returns False. `_open_cli_pane`
+    # therefore closes the pane it opened and declines.
+    state_path = tmp_path / "og-herdr.json"
+    save_state(state_path, {"spaces": {"other": {
+        "workspace_id": "w2", "tab_id": "w2:t1", "pane_id": "w2:p1",
+        "owner": "launcher", "cwd": "/work"}}, "pending": {}})
+    before = state_path.read_bytes()
+
+    assert og_herdr_launch._set_cli_pane(state_path, "root-1", "w1:p9") is False
+    assert state_path.read_bytes() == before, "state_update must not write when the record is absent"
+
+
+def test_set_cli_pane_absent_record_clearing_returns_true(tmp_path):
+    # No space record: clearing has nothing stale left to remove, which is the
+    # goal, so `_set_cli_pane` returns True and `_close_cli_pane` stays silent
+    # rather than warning the operator about a non-problem. The asymmetry with
+    # setting is the point.
+    state_path = tmp_path / "og-herdr.json"
+    save_state(state_path, {"spaces": {}, "pending": {}})
+
+    assert og_herdr_launch._set_cli_pane(state_path, "root-1", None) is True
+
+
+def test_cli_pane_toggle_record_vanished_between_read_and_write_closes_and_declines(tmp_path, short_dir, monkeypatch):
+    # A space record exists when `_space_record` reads it (so the toggle passes
+    # NO_SPACE and opens a pane), but another writer removes it before
+    # `_set_cli_pane` writes: `state_update`'s `put` sees no record, returns
+    # falsey, writes nothing, and `_set_cli_pane` returns False. The toggle
+    # closes the pane it opened and declines — never reports success with no
+    # cli_pane_id recorded.
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "root-1")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    def fake_state_update(path, decide, on_saved=None):
+        # Simulate the record being gone by the time the write decides.
+        return bool(decide({"spaces": {}, "pending": {}}))
+
+    monkeypatch.setattr(og_herdr_launch, "state_update", fake_state_update)
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state)
+
+    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED
+    assert client.methods.count("pane.split") == 1, client.methods
+    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
+    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
+
+
+def test_cli_pane_toggle_state_write_and_recovery_close_both_fail(tmp_path, short_dir, monkeypatch):
+    # The state write fails AND the recovery `pane_close` raises: the pane is
+    # open, unrecorded, and og cannot close it. Return a distinct notice so the
+    # operator knows to close it by hand — a mitigation, not a cure; og cannot
+    # force a pane herdr will not release.
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "root-1")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    monkeypatch.setattr(og_herdr_launch, "state_update",
+                        lambda path, decide, on_saved=None: False)
+
+    def raising_close(pane_id):
+        client.calls.append(("pane.close", {"pane_id": pane_id}))
+        raise OSError("herdr is gone")
+
+    client.pane_close = raising_close
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state)
+
+    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED_OR_CLOSED
+    assert client.methods.count("pane.split") == 1, client.methods
+    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
 
 
 def test_the_optional_cli_pane_id_survives_a_state_reload(tmp_path):

@@ -1826,6 +1826,12 @@ NOTICE_CLI_ACP = "{0} runs on an ACP harness, which has no terminal to show"
 # closing the unrecorded pane, and from `_close_cli_pane` when the clear itself
 # failed and the record still names a dead pane.
 NOTICE_CLI_NOT_RECORDED = "cli: the mirror pane was not recorded"
+# The state write failed AND the recovery `pane_close` failed: an unrecorded
+# mirror pane stays on screen, and the next c press can split a second one
+# beside it. og cannot force a pane herdr will not release, so this is a
+# mitigation — tell the operator explicitly so they can close it by hand — not
+# a cure. Comments state the real failure; this is it.
+NOTICE_CLI_NOT_RECORDED_OR_CLOSED = "cli: the mirror pane was not recorded and could not be closed"
 
 
 def omnigent_tmp_root(environ: Optional[dict] = None) -> Optional[Path]:
@@ -1883,8 +1889,18 @@ def resolve_harness_terminal(session_id: Optional[str],
 
 
 def _bridge_names_session(path: Path, session_id: str) -> bool:
-    """Whether the `bridge.json` at `path` names `session_id`. Never raises."""
-    record = _read_json(path)
+    """Whether the `bridge.json` at `path` names `session_id`. Never raises.
+
+    `_read_json` keeps the never-raise contract (it swallows OSError and
+    ValueError), but discovery must not crash even if a read seam fails — the
+    test injects a `PermissionError` at that seam to prove the resolver never
+    raises. A bridge we cannot read names no session, so it is skipped and the
+    scan keeps looking.
+    """
+    try:
+        record = _read_json(path)
+    except Exception:
+        return False
     if not isinstance(record, dict):
         return False
     return any(record.get(key) == session_id for key in BRIDGE_SESSION_KEYS)
@@ -2081,7 +2097,12 @@ def _open_cli_pane(state_path: Path, root_session_id: str, record: dict,
         try:
             client.pane_close(pane_id)
         except Exception:
-            pass
+            # The state write failed AND the recovery close failed: an
+            # unrecorded mirror pane stays on screen, and the next c press can
+            # split a second one beside it. Say so explicitly so the operator
+            # can close it by hand — a mitigation, not a cure; og cannot force
+            # a pane herdr will not release.
+            return NOTICE_CLI_NOT_RECORDED_OR_CLOSED
         return NOTICE_CLI_NOT_RECORDED
     return None
 
@@ -2125,21 +2146,41 @@ def _set_cli_pane(state_path: Path, session_id: str,
     Clearing REMOVES the key rather than setting it null, so a closed toggle
     leaves the v2 record shaped exactly as one written before this feature.
 
-    Returns True when the write landed, False when `state_update` returned
-    falsey or raised. NEVER-RAISING by design: `_open_cli_pane` and
-    `_close_cli_pane` convert a failed write into a notice, and a notice is
-    always better than killing the `og agents` pane over a state-file write.
-    The return is load-bearing: `_open_cli_pane` closes a pane whose write did
-    not land, because a mirror on screen with no record naming it is exactly
-    how the next `c` press splits a SECOND mirror.
+    `state_update`'s contract: `decide(state)` returns the state to write, or a
+    falsy value to write nothing at all — "a claim that found no record". We
+    use it deliberately, and the asymmetry is the point:
+
+    * record present — set or clear: `put` returns the updated state and the
+      write lands; `_set_cli_pane` reports whether `_write_state` succeeded.
+    * record absent and SETTING: nothing exists to record the pane under, so
+      `put` returns falsey and `state_update` writes NOTHING — an unchanged
+      file, not a pointless rewrite — and `_set_cli_pane` returns False.
+      `_open_cli_pane` therefore closes the pane it just opened and declines,
+      so an unrecorded mirror can never sit on screen and the next c press
+      cannot split a second one.
+    * record absent and CLEARING: there is nothing stale left to remove, which
+      is exactly the goal, so `_set_cli_pane` returns True and `_close_cli_pane`
+      stays silent rather than warning the operator about a non-problem.
+
+    NEVER-RAISING by design: `_open_cli_pane` and `_close_cli_pane` convert a
+    failed write into a notice, and a notice is always better than killing the
+    `og agents` pane over a state-file write. The return is load-bearing:
+    `_open_cli_pane` closes a pane whose write did not land, because a mirror
+    on screen with no record naming it is exactly how the next `c` press splits
+    a SECOND mirror — the defect this whole function exists to kill.
     """
-    def put(state: dict) -> dict:
+    def put(state: dict) -> Optional[dict]:
         record = (state.get("spaces") or {}).get(session_id)
-        if isinstance(record, dict):
-            if pane_id:
-                record[CLI_PANE_FIELD] = pane_id
-            else:
-                record.pop(CLI_PANE_FIELD, None)
+        if not isinstance(record, dict):
+            # No space record for this session. A set records nothing: return
+            # falsey so state_update writes nothing rather than rewriting an
+            # unchanged file. A clear has nothing left to remove: return the
+            # state unchanged so it reports success (nothing stale remains).
+            return state if pane_id is None else None
+        if pane_id:
+            record[CLI_PANE_FIELD] = pane_id
+        else:
+            record.pop(CLI_PANE_FIELD, None)
         return state
 
     try:
