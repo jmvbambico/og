@@ -781,9 +781,19 @@ def launch(ctx: Launch) -> str:
         if session:
             return _close_here(ctx, session)
         return _open_space(ctx, attach=False)
+    # The server is ensured BEFORE the session branch, not after it. Case (B)
+    # reads herdr's workspace listing (`_attach_there` -> `space_for` ->
+    # `live_workspaces`) to find the session's recorded space, and that listing
+    # needs the socket: with the server down it raises, and `live_workspaces`
+    # turns that into "could not list herdr workspaces: ...". When this call sat
+    # below the `if session:` return, a case-(B) launch — outside the
+    # multiplexer, a live session already in $PWD — took the attach and died on
+    # that unreadable listing without ever starting the server it was invoked to
+    # start. Case (A) is unaffected: no session means the same two statements
+    # run in the same order.
+    ensure_server(ctx)
     if session:
         return _attach_there(ctx, session)
-    ensure_server(ctx)
     _open_space(ctx, attach=True)
     return "attach"
 
@@ -1725,10 +1735,9 @@ def _chat_degrade(line: str) -> None:
 def ensure_server(ctx: Launch) -> None:
     """Make sure the multiplexer's server is answering, starting it if not.
 
-    Only reached when we are OUTSIDE it, where there is nothing to attach to.
-    Bounded: a `herdr server` that never opens its socket is reported, never
-    waited on, because an `og start` that hangs forever here would look like a
-    hang in og rather than in herdr.
+    Only reached when we are OUTSIDE it. Bounded: a `herdr server` that never
+    opens its socket is reported, never waited on, because an `og start` that
+    hangs forever here would look like a hang in og rather than in herdr.
     """
     if _ping(ctx.client):
         return
