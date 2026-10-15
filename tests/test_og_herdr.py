@@ -3701,6 +3701,54 @@ def test_a_dry_run_never_rewrites_the_state_file(seams):
     assert saved["spaces"]["s1"]["workspace_id"] == "wB"
 
 
+def test_a_dry_run_claim_moves_nothing_in_memory_either(seams):
+    # The file is only HALF of what a dry run must leave alone, and the half
+    # that mattered here was the other one. `pending` and `spaces` are the
+    # in-memory copies `_synced` is measured against, so a move between them
+    # that never reaches the file is not neutral: `_memory_decides` reads a key
+    # memory no longer holds, carrying the very record memory consumed, as a
+    # COMPLETED claim (its third case) and refuses to let the file put it back.
+    # A dry run that moved the record and skipped the write therefore retired a
+    # real launcher record for good — and the next session in that directory
+    # opens a second space, which is the entire class of bug this state file
+    # exists to end, reached through `--dry-run`.
+    client = RecordingClient(spaces=[space_info("wB", "og")])
+    path = write_state(os.environ["OMNIGENT_HOME"], spaces={}, pending={
+        "/repo/og": {"workspace_id": "wB", "tab_id": "wB:t1",
+                     "pane_id": "wB:p1", "owner": "launcher"}})
+    bridge = m.Bridge(FakeWatcher([]), client, dry_run=True)
+    before = dict(bridge._pending)
+
+    lines = bridge.reconcile([
+        Ev("added", "s1", root_session("T", workspace="/repo/og"))])
+
+    # It still SAYS what it would have claimed: the claim is decidable from the
+    # file alone, and a dry run that reported nothing would be useless. What
+    # changed is that saying it costs nothing.
+    assert any("dry-run: claim 'T' → space wB" in ln for ln in lines), lines
+    assert bridge._pending == before, \
+        "a dry-run claim consumed the pending record in memory"
+    assert bridge._spaces == {}, \
+        "a dry-run claim created a space record in memory"
+
+    # And the fold at the next pass boundary has to be a no-op against an
+    # unchanged file — otherwise the un-saved move above would be what the fold
+    # reads as finished, which is the mechanism the two assertions above deny.
+    bridge._reload_state()
+    assert bridge._pending == before, \
+        "the next fold read the dry run as a completed claim"
+
+    # Control: the claim this dry run declined still works, against the same
+    # file. Without it "nothing was consumed" would also be satisfied by a claim
+    # that cannot happen at all — the wrong reason to be green.
+    live = RecordingClient(spaces=[space_info("wB", "og")])
+    m.Bridge(FakeWatcher([]), live).reconcile(
+        [Ev("added", "s1", root_session("T", workspace="/repo/og"))])
+    saved = json.loads(path.read_text())
+    assert saved["pending"] == {}
+    assert saved["spaces"]["s1"]["workspace_id"] == "wB"
+
+
 # --- a worker never claims a space, before its root or otherwise --------------
 
 def test_a_worker_never_claims_the_launchers_space(seams):
