@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import io
 import json
 import os
 import shlex
@@ -1234,6 +1235,102 @@ def test_the_sweep_defers_when_the_watcher_cannot_report_truncation(seams):
     assert bridge.reconcile([], live_ids=bridge._live_session_ids()) == []
     assert client.calls == []
     assert bridge._owned == {"ws1": "root"}
+
+
+# The three helpers below drive a REAL `SessionWatcher` for the single test that
+# follows, so the whole chain is under test rather than just the bridge's half
+# of it. Everything else in this section hands `Bridge` a FakeWatcher with its
+# flags set by hand; that cannot express the case, because the case IS that the
+# two flags disagree, and only the real watcher is what makes them disagree.
+class _Body(io.BytesIO):
+    """What `urlopen` hands back: a context manager with read()."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+class _TruncatedListing:
+    """A stub transport that answers EVERY request with one truncated page.
+
+    `has_more` with no continuation cursor is the cheapest honest way to stop
+    the walk short — the watcher's own suite reaches for the page cap, which
+    needs a monkeypatch this file's tests have no other reason to carry. The
+    same page answers the per-session detail fetch, so the row comes back with
+    no workspace on it; that is what a failed detail fetch looks like, and the
+    watcher is built to survive it.
+    """
+
+    def __init__(self, row):
+        self.body = json.dumps(
+            {"object": "list", "data": [row], "has_more": True}).encode()
+
+    def __call__(self, request):
+        return _Body(self.body)
+
+
+class _RefusingStderr:
+    """A stderr every write fails on, so no notice about the truncation lands."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def write(self, text):
+        self.attempts += 1
+        raise OSError(32, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+def test_the_sweep_defers_when_a_truncated_listing_never_got_to_say_so(monkeypatch, seams):
+    # THE REVIEWER CASE, END TO END, and the one shape that closes live spaces.
+    #
+    # Three facts have to line up, and the daemon supplies all three by itself:
+    # a listing that stopped short, a stderr that refuses the notice saying so
+    # (a daemon started with no terminal — stdout piped into a log — swallows it
+    # and retries forever), and a bridge whose state file still remembers the
+    # operator's spaces from before the restart. The listing was truncated, but
+    # the flag that records "was the operator TOLD" stays False, because the
+    # write never landed and is deliberately not recorded.
+    #
+    # Read as "the listing was complete", the partial `_seen` this cold poll
+    # produced — the one session it did fetch, and nothing else — is a confident
+    # answer, and every recorded space absent from it is an orphan. That is the
+    # operator's live workspaces, closed, unrecoverably, by our own ceiling.
+    import og_herdr_watch as w
+
+    monkeypatch.setattr(w, "MAX_SESSION_PAGES", 1)
+    err = _RefusingStderr()
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(opener=_TruncatedListing(
+        {"id": "fetched", "title": "Fetched", "status": "running",
+         "parent_session_id": None, "archived": False}))
+
+    client = RecordingClient()
+    bridge = m.Bridge(watcher, client)
+    bridge.reconcile([Ev("added", "root", root_session("The operator's session"))])
+    client.calls.clear()
+
+    bridge.run_once()
+
+    # The premise, pinned: the poll really was truncated and really was never
+    # announced, so the two records genuinely disagree here.
+    assert watcher._last_truncated is True
+    assert watcher._listing_truncated is False, (
+        "the truncation was announced, so this test is not exercising the "
+        "case where the notice is lost"
+    )
+    assert err.attempts == 1, "the truncation notice was never even attempted"
+
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [], f"a live operator's space was closed: {closes}"
+    assert bridge._owned["ws1"] == "root", (
+        "the operator's recorded space was dropped while its session is running"
+    )
 
 
 def test_a_nested_worker_lands_beside_its_own_parent(seams):

@@ -908,13 +908,27 @@ class Bridge:
         conclude a session is gone; a partial one defers to the next pass,
         where the orphan is still waiting but a closed operator space is not.
         A watcher that cannot say whether it was truncated (no
-        `_listing_truncated` attribute — the FakeWatcher in tests, or a watcher
+        `_last_truncated` attribute — the FakeWatcher in tests, or a watcher
         that has not polled) is treated as truncated, never as complete.
+
+        The signal is `_last_truncated`, the watcher's record of whether the
+        listing was ACTUALLY truncated — and NOT `_listing_truncated`, which
+        looks interchangeable and is not. That flag answers "has the operator
+        been TOLD?", and it is set only on a write that landed, so that a
+        failed notice is retried rather than swallowed (see the watcher's
+        `_announce_listing`). The two agree only while every write succeeds.
+        The moment stderr refuses one — a daemon started with no terminal to
+        write to, an operator who redirected it away — a cold start whose first
+        listing was truncated left `_listing_truncated` False while `_seen` held
+        a partial set, and the sweep read that partial set as a complete answer
+        and closed the spaces of sessions that were still running. Unrecoverable:
+        a space is where the operator's open workspace lives. So the fact is
+        recorded unconditionally in `poll_once`, and this reads the fact.
         """
         seen = getattr(self.watcher, "_seen", None)
         if not isinstance(seen, dict):
             return None
-        if getattr(self.watcher, "_listing_truncated", True):
+        if getattr(self.watcher, "_last_truncated", True):
             return None
         return frozenset(seen)
 

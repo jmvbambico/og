@@ -2240,6 +2240,69 @@ def test_a_broken_stderr_is_not_mistaken_for_a_bug_by_poll_once(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# `_last_truncated` is the FACT, and is recorded whatever the notice does. The
+# orphan sweep reads it to decide whether `_seen` may be trusted as a complete
+# live set, so a failed notice must not be able to make a truncated listing
+# look like a whole one: it would close the spaces of sessions still running.
+# --------------------------------------------------------------------------
+
+def test_a_truncation_that_could_not_be_announced_is_still_recorded_as_a_fact(monkeypatch):
+    # The half that loses live spaces. `_listing_truncated` is deliberately left
+    # False here — the write failed, so the notice is owed and must be retried —
+    # but the listing WAS truncated and only `_last_truncated` says so. A reader
+    # that took the other flag as "the listing was complete" would hand a
+    # partial `_seen` to the sweep as a confident answer.
+    cap_pages(monkeypatch)
+    page = envelope([session("s1")], has_more=True, last_id="s1")
+    err = RecordingStderr(fail_times=10_000)
+    monkeypatch.setattr(w.sys, "stderr", err)
+    watcher = w.SessionWatcher(opener=StubOpener(page))
+
+    watcher.poll_once()
+
+    assert err.text == "", "the notice reached a stderr that refused it"
+    assert watcher._listing_truncated is False, (
+        "the notice was recorded as announced, so the premises below no longer "
+        "describe a watcher whose stderr refused it"
+    )
+    assert watcher._last_truncated is True, (
+        "the listing WAS truncated and nothing said otherwise — a sweep "
+        "trusting _seen here closes live sessions on partial knowledge"
+    )
+
+
+def test_the_fact_turns_over_on_the_complete_path_even_without_a_notice(monkeypatch):
+    # The other half, and the one that lets the sweep RESUME. Coming back to a
+    # complete listing is also a transition, so it too goes out as a notice — and
+    # that write can fail the same way. If the fact were only recorded on a
+    # write that landed, a watcher that went truncated and came back would stay
+    # "truncated" for as long as stderr was broken, and the sweep would defer
+    # forever while real orphans piled up behind it.
+    cap_pages(monkeypatch)
+    truncated_page = envelope([session("s1")], has_more=True, last_id="s1")
+    opener = StubOpener(truncated_page,
+                        envelope([session("s1")]))   # poll 2's listing is complete
+    talking = RecordingStderr()
+    monkeypatch.setattr(w.sys, "stderr", talking)
+    watcher = w.SessionWatcher(opener=opener)
+
+    watcher.poll_once()
+    assert watcher._last_truncated is True
+    assert watcher._listing_truncated is True, "the premise: it was announced"
+
+    monkeypatch.setattr(w.sys, "stderr", RecordingStderr(fail_times=10_000))
+    watcher.poll_once()
+
+    assert watcher._last_truncated is False, (
+        "the listing came back complete and the sweep was never told, so it "
+        "keeps deferring and no orphan is ever closed"
+    )
+    # The notice is still owed, which is the retry behaviour above and not a
+    # consequence of this change — pinned so the two are not confused.
+    assert watcher._listing_truncated is True
+
+
+# --------------------------------------------------------------------------
 # watch() stops on what can only be a bug, and keeps retrying everything else
 # --------------------------------------------------------------------------
 

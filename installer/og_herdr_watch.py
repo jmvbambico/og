@@ -634,9 +634,22 @@ class SessionWatcher:
         self.opener = opener or urllib.request.urlopen
         # session id -> last seen session object. Populated by poll_once.
         self._seen: dict[str, dict] = {}
-        # Whether the last listing was truncated, so the notice written about
-        # it is written once per transition rather than once per poll.
+        # Whether the operator has been TOLD the last listing was truncated, so
+        # the notice about it is written once per transition rather than once
+        # per poll. Because it is set only on a write that landed (see
+        # `_announce_listing`), it is NOT a record of whether the listing was
+        # actually truncated — that is `_last_truncated` below, and the two
+        # stop agreeing the moment a write fails.
         self._listing_truncated = False
+        # Whether the last poll's listing was truncated at the source — the
+        # FACT, recorded unconditionally, independent of any notice. A reader
+        # that must know whether a listing was COMPLETE (the orphan sweep,
+        # which would otherwise close a live operator's space from a partial
+        # set) reads this one. Reading `_listing_truncated` instead is the bug
+        # this exists to prevent: on a cold start with a truncated first
+        # listing and a stderr that refuses the notice, that flag stays False,
+        # and a partial set would be handed over as a confident answer.
+        self._last_truncated = False
         # parent session id -> the directory that parent reported, for the
         # parent lookups a sub-agent needs. Bounded (MAX_PARENT_WORKSPACES);
         # see _parent_workspace_for for why it exists and why it is not a
@@ -934,6 +947,11 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
             events.append(SessionEvent("removed", sid, {}, dict(session)))
 
         if truncated:
+            # The FACT first, unconditionally, then the notice: `_last_truncated`
+            # must be right whether or not `_announce_listing` manages to write,
+            # because the orphan sweep reads it and a partial set read as
+            # complete closes a live operator's space.
+            self._last_truncated = truncated
             self._announce_listing(len(rows), truncated)
             # Merge over what we already knew rather than replacing it: what is
             # missing from this poll is missing from the FETCH, and the only
@@ -945,6 +963,7 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
                 self._seen.pop(sid, None)
             return events
 
+        self._last_truncated = truncated
         self._announce_listing(len(rows), truncated)
         self._seen = fresh
         return events
@@ -973,6 +992,15 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         permanently broken stderr means every poll tries, every try fails, and
         so nothing is written, nothing is raised and nothing is recorded — no
         spam, no poll-failure retry loop, cost one failed syscall per poll.
+
+        This is exactly why `_listing_truncated` cannot be the signal the orphan
+        sweep reads. It answers "has the operator been TOLD?", and by the design
+        above it stays False when a write fails — deliberately, so the notice is
+        retried. Whether the listing was actually COMPLETE is a different fact,
+        recorded unconditionally as `_last_truncated` in `poll_once`. The two
+        are the same only while every write succeeds; the first refused write
+        pulls them apart, and reading this flag as if it still meant "complete"
+        hands a partial `_seen` to the sweep, which then closes live spaces.
         """
         if truncated == self._listing_truncated:
             return
