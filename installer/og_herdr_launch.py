@@ -70,8 +70,8 @@ from og_herdr import (
     # rule at all, which is how `og start herdr` left panes that opened a
     # browser. Imported here, not redefined: see og_herdr.pane_env_for.
     pane_env_for,
-    save_state,
     space_status,
+    state_update,
     workspace_index,
 )
 
@@ -966,31 +966,44 @@ def _load(ctx: Launch) -> dict:
 def _record(state_path: Path, bucket: str, key: str, record: dict) -> None:
     """Put one record into the shared state file, through og_herdr's writer.
 
-    Re-read immediately before writing: the file is not a lock and both this
-    process and the bridge write it, whole and last-writer-wins (see
-    og_herdr.save_state). A load at the top of the launch and a save here would
-    silently drop whatever the bridge wrote in between.
+    Takes the PATH rather than a `Launch` because the record has two writers —
+    the launcher's `_open_space` and `og chat`'s own pane (`record_chat_pane`)
+    — and the rule below has to hold for both of them, not be re-implemented
+    for whichever caller was written second.
 
-    Takes the PATH rather than a `Launch` because the record now has two
-    writers — the launcher's `_open_space` and `og chat`'s own pane
-    (`record_chat_pane`) — and the re-read rule has to hold for both of them,
-    not be re-implemented for whichever caller was written second.
+    ONE TRANSACTION, re-read included: load, change, save, all under the lock
+    `og_herdr.state_lock` takes (see `state_update`). The re-read is the old half
+    of this rule and it is not enough on its own — it stops a load taken at the
+    top of the launch from erasing what the bridge wrote in between, and it
+    leaves a window between the load and the save that a writer in the middle of
+    its own read-decide-write can fall into, which is exactly what the bridge's
+    claim now is. Taking the same lock here is what makes the two serialise:
+    whichever commits first, the second reads the first's file and writes on top
+    of it. Nothing here is long — no herdr call, no HTTP — so holding it costs
+    the other process microseconds, not a round trip.
     """
-    state = load_state(state_path)
-    state.setdefault(bucket, {})[key] = record
-    save_state(state_path, state)
+    def put(state: dict) -> dict:
+        state.setdefault(bucket, {})[key] = record
+        return state
+
+    state_update(state_path, put)
 
 
 def _unrecord(state_path: Path, bucket: str, key: str) -> None:
-    """Drop one record, re-reading first for the same reason `_record` does.
+    """Drop one record, in the same locked transaction `_record` uses.
 
     Used when a record names a space that turned out to be unusable — the chat
     never started, so no session will ever claim it. Missing key is not an
-    error: the bridge may have claimed it already, which is also a fine outcome.
+    error: the bridge may have claimed it already, which is also a fine outcome
+    and the one the lock makes certain of — a drop cannot land between the
+    bridge's read and its claim and erase a record the bridge is about to move
+    into `spaces`.
     """
-    state = load_state(state_path)
-    state.setdefault(bucket, {}).pop(key, None)
-    save_state(state_path, state)
+    def drop(state: dict) -> dict:
+        state.setdefault(bucket, {}).pop(key, None)
+        return state
+
+    state_update(state_path, drop)
 
 
 def record_chat_pane(state_path: Path, cwd: str, workspace_id: str,
