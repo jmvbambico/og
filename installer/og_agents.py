@@ -2782,6 +2782,14 @@ def _mark_colour(vendor: str, theme: Optional[Theme] = None) -> Optional[int]:
 # separates them, it falls back to a palette neighbour, which is a different cell
 # by construction. The test that pins this across every shipped theme is the
 # point of the guard; without it a theme could ship the strip invisible.
+#
+# THE SAME CELL TRAP ARRIVES ONE ROLE OVER, AT `sel_bg`, so the guard covers that
+# cell too: a strip that snapped to the SELECTION's cell would paint the footer
+# exactly as a selected row, and the footer would read as if it were chosen — the
+# very thing the background-derived approach was chosen to avoid. Where a theme
+# cannot have the strip clear of BOTH cells, `bg` wins: an invisible strip does
+# nothing at all, while one that merely resembles the selection is the lesser evil
+# (see `footer_strip`).
 STRIP_STEP = 0.12
 STRIP_STEPS = 8
 
@@ -2806,11 +2814,15 @@ def footer_strip(theme: Optional[Theme]) -> Optional[str]:
     Otherwise a shade of the theme's `bg`, moved AWAY from it — lighter on a dark
     pane, darker on a light one — because a shade that moved toward the background
     would BE the background. Each candidate is resolved to its 256-cell and
-    rejected while it equals `bg`'s cell (see the block comment above: that is the
-    whole reason this is a loop and not one multiplication). If no step separates
-    them, a DEFINED NEIGHBOUR of the background's own cell — the next palette index
-    — is returned, so the strip can never come back as the background it is meant
-    to sit on. `max(16, ...)` keeps that neighbour out of the terminal's own first
+    rejected while it lands on a FORBIDDEN cell (see the block comment above: that
+    is the whole reason this is a loop and not one multiplication). Two cells are
+    forbidden — `bg`'s, because a strip that IS the background is invisible, and
+    `sel_bg`'s, because a strip that IS the selection makes the footer read as a
+    chosen row. If no step clears both, a DEFINED NEIGHBOUR of the background's own
+    cell is returned: the neighbour walk takes the nearest cell clear of BOTH, and
+    only where that is impossible does it give up the `sel_bg` requirement — never
+    the `bg` one, because an invisible strip is worse than one that resembles the
+    selection. `[16, 256)` keeps any neighbour out of the terminal's own first
     sixteen ANSI slots, whose colours are the terminal's and not the catalog's.
     """
     if theme is None:
@@ -2819,13 +2831,26 @@ def footer_strip(theme: Optional[Theme]) -> Optional[str]:
     if base is None:
         return None
     base_cell = hex_to_ansi256(base)
+    avoid = {base_cell}
+    if not theme.is_default("sel_bg"):
+        avoid.add(hex_to_ansi256(theme.colour("sel_bg")))
     source = hex_to_rgb(base)
     direction = 1.0 if relative_luminance(base) < 0.5 else -1.0
     for step in range(1, STRIP_STEPS + 1):
         candidate = rgb_to_hex(_shade(source, direction * STRIP_STEP * step))
-        if hex_to_ansi256(candidate) != base_cell:
+        if hex_to_ansi256(candidate) not in avoid:
             return candidate
-    neighbour = base_cell + 1 if base_cell + 1 < 256 else base_cell - 1
+    # No step cleared both cells. Walk the palette OUT from the background's own
+    # cell for the nearest neighbour that is clear of both; the second pass drops
+    # only the `sel_bg` requirement, so separation from `bg` survives even then.
+    # (With at most two forbidden cells among 240 defined ones the first walk
+    # always succeeds; the second is the precedence made explicit, not a live path.)
+    for forbidden in (avoid, {base_cell}):
+        for offset in range(1, 256):
+            for neighbour in (base_cell + offset, base_cell - offset):
+                if 16 <= neighbour < 256 and neighbour not in forbidden:
+                    return rgb_to_hex(ansi256_rgb(neighbour))
+    neighbour = base_cell - 1 if base_cell == 255 else base_cell + 1
     return rgb_to_hex(ansi256_rgb(max(16, neighbour)))
 
 
@@ -2849,11 +2874,11 @@ def _role_background(role: str, theme: Optional[Theme] = None, *,
     render is unaffected.
 
     AND EXCEPT THE FOOTER'S TWO ROLES, which take the STRIP — a shade of the same
-    `bg`, derived per theme by `footer_strip` so it is never the cell `bg` is.
-    That is the second thing `_role_background` is a per-span property for: the
-    footer is chrome, and a chrome band has to read as a band rather than vanish
-    into the pane. The strip is a bare 12% away from `bg`, so text and labels
-    chosen for `bg` keep their contrast on it.
+    `bg`, derived per theme by `footer_strip` so it is never the cell `bg` is, nor
+    the cell `sel_bg` is. That is the second thing `_role_background` is a per-span
+    property for: the footer is chrome, and a chrome band has to read as a band
+    rather than vanish into the pane OR into the selection. The strip is a bare 12%
+    away from `bg`, so text and labels chosen for `bg` keep their contrast on it.
     """
     if theme is None:
         return None

@@ -4661,9 +4661,9 @@ def test_the_themes_background_reaches_init_pair_as_the_second_argument(monkeypa
     theme = _theme("dracula")
     selected_bg = a.hex_to_ansi256(theme.colour("sel_bg"))
     # The footer's strip is a THIRD background the pane spends — a shade of `bg`
-    # again, on its own row (see `_role_background`). On dracula it happens to snap
-    # to the SAME cell as `sel_bg`, so it is named here explicitly rather than
-    # relied on to coincide.
+    # again, on its own row (see `_role_background`). On dracula it lands on a cell
+    # clear of both `bg` and `sel_bg` (the strip's guard requires it), so it is
+    # named here explicitly rather than relied on to coincide with either.
     strip_bg = a.hex_to_ansi256(a.footer_strip(theme))
     allowed = {DRACULA_BG, selected_bg, strip_bg}
     for _pair, fg, bg in fake.init_pair_calls:
@@ -4908,13 +4908,17 @@ def test_only_the_selected_row_gets_a_background(monkeypatch):
 
 
 def test_the_footer_strip_is_a_different_cell_from_the_background_of_every_theme():
-    """THE WHOLE POINT OF THE STRIP GUARD. A strip is derived as a HEX, but the
-    terminal paints a CELL — and two different hexes snap to the same 256-colour
-    cell all the time. This terminal reports COLORS=256 and can redefine none (no
-    `ccc`), so a strip whose shade resolved to the background's OWN cell would be
-    invisible and the feature would do nothing at all, silently. Every theme the
-    catalog ships is checked here, and `og` — whose `bg` is the terminal's own — is
-    checked to have NO strip, because there is no colour to shade."""
+    """THE WHOLE POINT OF THE STRIP GUARD, on BOTH cells it must avoid. A strip is
+    derived as a HEX, but the terminal paints a CELL — and two different hexes snap
+    to the same 256-colour cell all the time. This terminal reports COLORS=256 and
+    can redefine none (no `ccc`), so a strip whose shade resolved to the
+    background's OWN cell would be invisible and the feature would do nothing at
+    all, silently — and one that resolved to `sel_bg`'s cell would paint the footer
+    exactly as a SELECTED row. Every theme the catalog ships is checked for both
+    separations here, and `og` — whose `bg` is the terminal's own — is checked to
+    have NO strip, because there is no colour to shade. Before the guard covered
+    `sel_bg`, six shipped themes (ayu-dark, bearded-dark, dracula, github-dark,
+    monokai-dark, one-dark) put the strip on the selection's own cell."""
     themes = th.ordered_themes(th.load_catalog())
     opaque = 0
     for theme in themes:
@@ -4923,8 +4927,13 @@ def test_the_footer_strip_is_a_different_cell_from_the_background_of_every_theme
             assert strip is None, theme.slug
             continue
         opaque += 1
-        assert a.hex_to_ansi256(strip) != a.hex_to_ansi256(theme.colour("bg")), \
+        cell = a.hex_to_ansi256(strip)
+        assert cell != a.hex_to_ansi256(theme.colour("bg")), \
             f"{theme.slug}: the strip IS the background it is meant to sit on"
+        if not theme.is_default("sel_bg"):
+            assert cell != a.hex_to_ansi256(theme.colour("sel_bg")), \
+                f"{theme.slug}: the strip IS the selection's cell, so the footer " \
+                "reads as a selected row"
     assert opaque >= 25, opaque
 
 
@@ -4977,7 +4986,7 @@ def test_an_og_footer_has_no_strip_and_spends_no_pair_for_one():
 
 
 def test_an_opaque_theme_spends_no_sel_bg_pair_while_the_pane_is_untouched(monkeypatch):
-    """THE THEME CONSEQUENCE OF THE UNTOUCHED PANE, on `catppuccin-mocha`.
+    """THE THEME CONSEQUENCE OF THE UNTOUCHED PANE, on `github-dark`.
 
     `sel_bg` is only ever reached through `attr_for`'s `on_selected`, which is
     False on every span of every line while nothing is selected — so the painter
@@ -4985,18 +4994,18 @@ def test_an_opaque_theme_spends_no_sel_bg_pair_while_the_pane_is_untouched(monke
     load-bearing: a phantom selection is no longer a subtle brightness
     difference, it is a coloured bar on a row the operator never chose.
 
-    THE THEME IS CHOSEN FOR A REASON. The footer's strip is a shade of `bg` and
-    here it lands on a cell of its own — clear of both `bg` and `sel_bg` — so a
-    background genuinely says whether `sel_bg` was spent. On the theme this used
-    to name (github-dark) the strip snaps to the SAME cell as `sel_bg`, and the
-    cell could no longer tell a spent strip from a spent selection: that is the
-    collision the strip's own guard is about, arriving one role over.
+    THE THEME READS A BACKGROUND HONESTLY. github-dark tints its selection and its
+    strip lands on a cell of its own — clear of both `bg` and `sel_bg`, which the
+    strip's guard now enforces for every theme — so a background genuinely says
+    whether `sel_bg` was spent. github-dark used to put the strip on `sel_bg`'s OWN
+    cell, which is why this test briefly named another theme; the extended guard
+    fixed that, so it is named here again.
     """
     rows = [header(),
             rail("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    theme = _theme("catppuccin-mocha")
+    theme = _theme("github-dark")
     sel_bg = theme.colour("sel_bg")
     assert sel_bg != theme.colour("bg"), "the theme really does tint its selection"
     strip = a.hex_to_ansi256(a.footer_strip(theme))
