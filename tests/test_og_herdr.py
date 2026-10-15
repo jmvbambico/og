@@ -1345,6 +1345,249 @@ def test_the_sweep_defers_when_a_truncated_listing_never_got_to_say_so(monkeypat
     )
 
 
+# --------------------------------------------------------------------------
+# THE DAEMON, NOT `run_once`: every sweep test above reaches the sweep by calling
+# reconcile (or run_once) directly, which is why the gap this section covers was
+# invisible to all of them. In the daemon the sweep is only reached when
+# reconcile is called at all, and until the fix below nothing called it unless
+# the server produced an event. So every test here drives the real
+# `run_forever` against a real `SessionWatcher`, with the clock stubbed out.
+# --------------------------------------------------------------------------
+
+class _Stopped(Exception):
+    """Raised from the stubbed sleep to end the daemon loop after N polls."""
+
+
+def drive_daemon(monkeypatch, bridge, polls):
+    """Run `Bridge.run_forever` until the `polls`-th sleep, then stop it.
+
+    The watcher sleeps between polls, so sleeping IS the loop: stubbing it to
+    raise is what ends a daemon that otherwise never returns, and it means no
+    test waits on a real clock. Returns the sleeps, so a test can assert the
+    daemon really polled (and how often) rather than trusting one run.
+    """
+    import og_herdr_watch as w
+
+    slept = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        if len(slept) >= polls:
+            raise _Stopped
+
+    monkeypatch.setattr(w.time, "sleep", fake_sleep)
+    with pytest.raises(_Stopped):
+        bridge.run_forever()
+    return slept
+
+
+class _EmptyListing:
+    """A complete listing with nothing on it, for every request.
+
+    The operator's deletion, from the watcher's side: the session is simply not
+    in the listing, so there is no `removed` event to have been — it was never
+    there to begin with. `has_more` False, so this is a COMPLETE answer, which is
+    what makes the absence evidence rather than a shrug.
+    """
+
+    def __init__(self):
+        self.body = json.dumps(
+            {"object": "list", "data": [], "has_more": False}).encode()
+        self.listing_requests = 0
+
+    def __call__(self, request):
+        self.listing_requests += 1
+        return _Body(self.body)
+
+
+class _RefusingListing:
+    """A transport that refuses every connection, so no poll ever completes."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    def __call__(self, request):
+        self.attempts += 1
+        raise OSError("connection refused")
+
+
+class _EmptyTruncatedThenComplete:
+    """Truncated for the first N listings, complete and empty thereafter.
+
+    What a busy server looks like to a cold start, and the reason a startup-only
+    sweep is not enough: the truncated listing defers the sweep, and the listing
+    that completes it says nothing happened — which is also to say that the
+    recorded session is gone.
+    """
+
+    def __init__(self, truncated_polls):
+        self.truncated_polls = truncated_polls
+        self.listing_requests = 0
+
+    def __call__(self, request):
+        self.listing_requests += 1
+        has_more = self.listing_requests <= self.truncated_polls
+        return _Body(json.dumps({"object": "list", "data": [],
+                                 "has_more": has_more}).encode())
+
+
+def _bridge_with_one_recorded_space(opener):
+    """A bridge with ONE recorded space, as the daemon finds it after a session
+    has been projected: in `_recs` (the live handle) and in `_spaces` (the file).
+
+    Both halves are needed and neither alone is enough: `_close_orphan_spaces`
+    finds the orphan by scanning `_spaces`, while `_removed` can only act on a
+    `_recs` entry — releasing a pane needs the agent string the in-memory record
+    carries and the state file does not. Returns `(bridge, client)`, with the
+    calls the projection made already cleared.
+    """
+    import og_herdr_watch as w
+
+    client = RecordingClient()
+    watcher = w.SessionWatcher(poll_interval=0.01, opener=opener)
+    bridge = m.Bridge(watcher, client)
+    bridge.reconcile([
+        Ev("added", "root", root_session("The operator's session"))])
+    client.calls.clear()
+    return bridge, client
+
+
+def test_the_daemon_sweeps_a_recorded_orphan_when_the_watcher_yields_no_events(
+        monkeypatch, seams, capsys):
+    # THE OPERATOR'S BUG, in the shape they hit it. The session is deleted in the
+    # web UI while the bridge is not running; the bridge restarts; the watcher
+    # polls a listing that does not contain the deleted session and therefore has
+    # nothing to report — forever. Before the fix the sweep ran only when an
+    # event arrived, so this daemon produced no events, reconciled nothing, and
+    # left the operator's space on their screen for the life of the process.
+    #
+    # The defect reproduces here rather than being asserted against: with
+    # `run_forever` reconciling per event, no event means no close, and the
+    # assertion on `client.calls` below is what fails.
+    bridge, client = _bridge_with_one_recorded_space(_EmptyListing())
+
+    slept = drive_daemon(monkeypatch, bridge, polls=3)
+
+    # The daemon really did poll, and really did say nothing: three complete
+    # listings, no session in any of them, and no event out of any of them.
+    assert slept == [0.01, 0.01, 0.01]
+    assert bridge.watcher._seen == {}, "the deleted session is still being listed"
+    # Nothing was projected either: with no session in the listing there is no
+    # `added` for the bridge to act on, so every call below is the sweep's.
+    assert [c[0] for c in client.calls] == [
+        "release_agent", "workspace_close"], client.calls
+
+    assert "remove root" in capsys.readouterr().out
+    assert bridge._owned == {}, "the orphan's space is still recorded as ours"
+
+
+def test_the_daemon_sweeps_nothing_while_no_poll_has_ever_read_anything(
+        monkeypatch, seams):
+    # THE CATASTROPHIC CASE, stated as a premise the test can check. A poll that
+    # never completed leaves the watcher exactly as it was constructed: `_seen`
+    # empty, and `_last_truncated` still the `False` it was born with. Read
+    # together that is a CONFIDENT "no session is live" — and swept on it, every
+    # space the operator has is an orphan. So no sweep may run here, and the
+    # guard that would normally stop it cannot: `_live_session_ids` has nothing
+    # to be uncertain about, because the watcher is confidently empty.
+    #
+    # That is the whole argument for the sweep being fired from inside `watch`'s
+    # poll loop rather than by a timer, a start-up pass, or a caller-side guess.
+    refusing = _RefusingListing()
+    bridge, client = _bridge_with_one_recorded_space(refusing)
+
+    drive_daemon(monkeypatch, bridge, polls=3)   # every poll refused
+
+    # The premise, pinned. If this stops holding the test is no longer testing
+    # what it says it is.
+    assert refusing.attempts >= 3, "no poll was even attempted"
+    assert bridge.watcher._seen == {}
+    assert bridge._live_session_ids() == frozenset(), (
+        "the watcher is no longer CONFIDENTLY empty here, so this test is not "
+        "the catastrophe it claims to be"
+    )
+    assert client.calls == [], client.calls
+    assert bridge._owned == {"ws1": "root"}, (
+        "a space was closed on the strength of a poll that never happened"
+    )
+
+
+def test_the_daemon_sweeps_nothing_on_a_truncated_first_listing(monkeypatch, seams):
+    # The same catastrophe by the other road, and the one the guard exists for:
+    # a listing that stopped short is PARTIAL, so on a cold start `_seen` holds
+    # only what was fetched and the recorded session — past the cap, alive — is
+    # absent from it. The sweep must read the truncation, not the absence, and
+    # defer.
+    #
+    # The listing is empty AND truncated, which is the combination that makes the
+    # guard the only thing standing between the sweep and the operator's whole
+    # workspace: `_seen` is empty, so an unguarded sweep would find the recorded
+    # root absent, call it an orphan and close it. Pinned below.
+    bridge, client = _bridge_with_one_recorded_space(
+        _EmptyTruncatedThenComplete(truncated_polls=99))
+
+    drive_daemon(monkeypatch, bridge, polls=3)
+
+    # The premise: every poll really was truncated, so `_live_session_ids` is
+    # None and the sweep has nothing to act on. A poll that produced no events is
+    # not the reason nothing was closed — a deferred sweep is.
+    assert bridge.watcher._seen == {}
+    assert bridge.watcher._last_truncated is True
+    assert bridge._live_session_ids() is None
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [], f"a live operator's space was closed: {closes}"
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_the_daemon_sweeps_once_a_later_poll_completes_after_a_truncated_one(
+        monkeypatch, seams):
+    # The reason this is a recurring tick and not one pass at start-up. The first
+    # listing is truncated, so the sweep defers — correctly — and the poll that
+    # completes it changes nothing, so it produces no event either. The orphan is
+    # still waiting, and only the next quiet poll can say so. A start-up-only
+    # sweep would have deferred once and then never run again.
+    opener = _EmptyTruncatedThenComplete(truncated_polls=2)
+    bridge, client = _bridge_with_one_recorded_space(opener)
+
+    drive_daemon(monkeypatch, bridge, polls=4)
+
+    assert opener.listing_requests == 4
+    assert bridge.watcher._last_truncated is False
+    closes = [c[1] for c in client.calls if c[0] == "workspace_close"]
+    assert closes == [("ws1",)], (
+        "the sweep never ran on a complete listing, so the orphan survives")
+    assert bridge._owned == {}
+
+
+def test_the_daemon_sweeps_nothing_under_dry_run(monkeypatch, capsys, seams):
+    # A dry run leaves a recorded space exactly as the operator left it, even
+    # once its session is provably gone. Reached here the way an operator reaches
+    # it: a real run recorded the space, and then `og start herdr --dry-run`
+    # brings the daemon up over that same state file.
+    import og_herdr_watch as w
+
+    write_state(os.environ["OMNIGENT_HOME"], spaces={
+        "root": {"workspace_id": "wB", "owner": "bridge", "tab_id": "wB:t1",
+                 "pane_id": "wB:p1"}})
+    client = RecordingClient(spaces=[space_info("wB", "The operator's session")])
+    bridge = m.Bridge(w.SessionWatcher(poll_interval=0.01,
+                                       opener=_EmptyListing()),
+                      client, dry_run=True)
+    # The session is listed once, so the dry run reads the state-file record and
+    # holds a handle on it — the shape a real dry run over a recorded space has.
+    bridge.reconcile([
+        Ev("added", "root", root_session("The operator's session"))])
+    assert "root" in bridge._recs, "the premise: nothing to sweep"
+    client.calls.clear()
+
+    drive_daemon(monkeypatch, bridge, polls=3)
+
+    assert client.calls == [], client.calls
+    assert "root" in bridge._recs, "a dry run retired a recorded space"
+    assert bridge._owned == {"wB": "root"}
+    assert "remove" not in capsys.readouterr().out
+
+
 def test_a_nested_worker_lands_beside_its_own_parent(seams):
     # The same lookup by parent_session_id serves a grandchild, so the layout
     # does not need a second index and does not go flat at depth two.

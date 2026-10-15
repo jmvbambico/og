@@ -901,6 +901,14 @@ class Bridge:
         gone": a listing that cannot be read must never close every space the
         operator has.
 
+        Which paths those are: every event pass, and the idle pass `run_forever`
+        runs when a poll produced no events at all. The idle pass is not a hole
+        in that rule, because it is handed to `watch` as the `on_idle` callback
+        and fires from inside the poll loop — so it cannot arrive before a poll
+        has written `_seen`, which is the one case where `_seen` is empty,
+        `_last_truncated` still reads False from `__init__`, and a confident
+        answer would be "no session is live" on a daemon that has not looked yet.
+
         A TRUNCATED listing is the subtle half of that, not the absent one. On
         a cold start `_seen` began empty, so the truncated merge yields only
         what was partially fetched — a LIVE session that simply was not fetched
@@ -938,10 +946,53 @@ class Bridge:
         return self.reconcile(events, live_ids=self._live_session_ids())
 
     def run_forever(self) -> None:
-        """Consume watcher.watch() indefinitely, reconciling each event."""
-        for event in self.watcher.watch():
-            for line in self.reconcile([event], live_ids=self._live_session_ids()):
-                print(line, flush=True)
+        """Consume watcher.watch() indefinitely, reconciling each event — and
+        reconciling the polls that produced NONE, which is the only thing that
+        reaches the orphan sweep in the case it exists for.
+
+        `run_once` always reconciles, and every test that exercises the sweep
+        goes through it or through `reconcile` directly, so nothing here was
+        ever driven the way an operator drives the bridge: as a daemon, for days,
+        against a listing that has stopped changing. In that daemon this method
+        used to reconcile strictly per event, so the sweep ran only when the
+        server said something — and the one deletion that never reaches the
+        server's history (a session deleted in the web UI while the bridge was
+        down, then a restart) produces no event ever: `_seen` began empty, so
+        the deleted session is simply not in the first listing, `watch()` yields
+        nothing, and the recorded space is never closed. Not "closed late" —
+        never, for the life of the process. That defeats both causes the sweep
+        exists for, so a sweep that is correct and never reached is not a
+        feature.
+
+        Hence the idle callback, which is why this is a scheduling fix at the
+        one place where the schedule lives rather than a change to what the sweep
+        decides. `on_idle` fires only after a poll that returned (see
+        `SessionWatcher.watch`), so the pass below always reads a `_seen` that a
+        real poll wrote and the truncation guard in `_live_session_ids` still has
+        the last word on it. It also covers the second half of the gap, which a
+        startup-only sweep would leave open: a first listing that is TRUNCATED
+        defers the sweep, and the listing that completes it afterwards may well
+        produce no events — so the orphan is still waiting on the very next quiet
+        poll, which is exactly what this runs.
+
+        The watcher must therefore accept `on_idle` — `SessionWatcher` does, and
+        `FakeWatcher` in the tests predates it, which is why no test here drives
+        this loop through that fake.
+        """
+        for event in self.watcher.watch(
+                on_idle=lambda: self._reconcile_pass([])):
+            self._reconcile_pass([event])
+
+    def _reconcile_pass(self, events) -> None:
+        """One reconcile pass, reported on stdout. The daemon's only output.
+
+        Split out of `run_forever` so the event path and the idle path are the
+        same call — an empty batch and a one-event batch differ in nothing else,
+        and two hand-written copies of this loop is how the two paths would come
+        to disagree about what a pass is.
+        """
+        for line in self.reconcile(events, live_ids=self._live_session_ids()):
+            print(line, flush=True)
 
     def cleanup(self) -> list:
         """Close every workspace this bridge recorded, report, and return.

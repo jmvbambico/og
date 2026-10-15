@@ -1210,8 +1210,13 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         parent = session.get("parent_session_id") if isinstance(session, dict) else None
         return parent is None or parent == ""
 
-    def watch(self):
+    def watch(self, on_idle=None):
         """Yield events forever, sleeping poll_interval between polls.
+
+        `on_idle`, when given, is called after a poll that produced NO events —
+        a poll the consumer will never hear about, because there is nothing in
+        it to yield. See "THE POLL THAT SAYS NOTHING" below for why that is a
+        thing a consumer needs to be told about rather than inferred.
 
         poll_once() is strict — a refused connection, a 500, or a listing that
         is not JSON raises out of it — and it stays that way: a caller that
@@ -1242,6 +1247,35 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         Otherwise every live session would be reported removed and re-added on
         each outage, and the consumer would thrash rebuilding tabs it already
         has.
+
+        THE POLL THAT SAYS NOTHING. An event stream reports CHANGE, so a poll
+        that finds nothing changed is invisible to a consumer iterating this
+        generator — and a consumer that acts only on events therefore never
+        re-reads what it already knows. That is correct for a consumer whose job
+        is to react to changes, and it is exactly wrong for one that also has to
+        conclude something from an ABSENCE: og_herdr.py's orphan sweep decides a
+        recorded space's session is gone, which is a fact a quiet poll is the
+        only evidence of. A session deleted while the bridge was down is missing
+        from the first listing after the restart, so it never produces a
+        `removed` event at all; with events as the only trigger, `watch()` yields
+        nothing for the life of the process and the space survives forever.
+
+        So `on_idle` is called from HERE, in the loop body, immediately after a
+        poll that returned — never before the first poll and never after a failed
+        one. That placement is the whole point and it is load-bearing: before any
+        poll this watcher cannot say what is live, and a sweep reading "nothing
+        is live" then would close every space the operator has. Emitted from the
+        same statement as the events, the tick cannot be wrong about whether a
+        poll happened, which a timer or a caller-side guess would be.
+
+        Only a poll with NO events calls it: a poll that produced events is
+        already being handled, with the same `_seen`, so calling it there would
+        buy a second identical pass. A consumer that stops iterating the
+        generator never gets the callback — the same as never seeing an event —
+        and an exception raised by the callback propagates exactly as one raised
+        by the consumer's own loop body does: it is the consumer's code, not this
+        module's poll path, and wrapping it here would hide it from whoever
+        launched the daemon.
         """
         backoff = self.poll_interval
         while True:
@@ -1277,6 +1311,11 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
                 continue
             for event in events:
                 yield event
+            if on_idle is not None and not events:
+                # Reached only here: after a poll that RETURNED, and only when it
+                # had nothing to say. See THE POLL THAT SAYS NOTHING for why the
+                # position in this loop is the safety property, not a detail.
+                on_idle()
             time.sleep(self.poll_interval)
             backoff = self.poll_interval
 
