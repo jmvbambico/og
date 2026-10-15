@@ -35,6 +35,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import sys
 import tempfile
 import threading
@@ -917,6 +918,10 @@ class Bridge:
         # construction rather than at import so a test can point $OMNIGENT_HOME
         # somewhere disposable.
         self.state_path = state_path or default_state_path()
+        # Where this bridge notes which herdr tab shows which agent — derived
+        # from the state path so a redirected install moves both files together.
+        # See `remember_agent_tab` for why herdr itself cannot answer this.
+        self.agent_tabs_path = agent_tabs_path(self.state_path)
         # Whatever `load_state` wants to say about the file it read. A list, not
         # a string, because there can be no note at all (a clean file) or exactly
         # one (missing, stale, unparseable) and the caller prints whichever.
@@ -1629,9 +1634,11 @@ The rule itself is `_memory_decides`, which is where the distinction
 
         if space is None:
             return filed + self._add_space(sid, title, cwd, agent, state,
-                                           command, parent)
+                                           command, parent,
+                                           harness=session.get("harness"))
         return filed + self._add_tab(sid, title, space, cwd, agent, state,
-                                     command, parent)
+                                     command, parent,
+                                     harness=session.get("harness"))
 
     # -- past conversations: a space for every non-archived ROOT -------------
     #
@@ -1731,7 +1738,7 @@ The rule itself is `_memory_decides`, which is where the distinction
         return self._add_history_space(sid, title, cwd, agent, state)
 
     def _add_history_space(self, sid: str, title, cwd: str, agent: str,
-                           state: str) -> list:
+                           state: str, harness: str | None = None) -> list:
         """Open a space for a past conversation, holding the resume line typed
         but UNSENT.
 
@@ -1777,7 +1784,7 @@ The rule itself is `_memory_decides`, which is where the distinction
         rec = {"workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
                "title": title, "agent": agent, "parent": None,
                "owns_space": True, "step": 0, "ready": False, "cwd": cwd,
-               "history": True}
+               "history": True, "harness": harness}
         self._recs[sid] = rec
         self._remember(sid, ws_id, tab_id=tab_id, pane_id=pane_id, cwd=cwd,
                        owner=OWNER_HISTORY)
@@ -2555,14 +2562,20 @@ The rule itself is `_memory_decides`, which is where the distinction
 
         # The old pane is gone either way, so setup restarts from the beginning
         # on the new one rather than resuming onto a pane herdr has closed.
+        # The harness the pane routing reads: the RECORD's first, because the
+        # event that triggers a repair is usually a `changed`, whose LISTING row
+        # carries no `harness` (exactly why the title and label above do the
+        # same).
+        harness = (rec or {}).get("harness") or session.get("harness")
         if history and space is None:
-            lines = self._add_history_space(sid, title, cwd, agent, state)
+            lines = self._add_history_space(sid, title, cwd, agent, state,
+                                            harness=harness)
         elif space is None:
             lines = self._add_space(sid, title, cwd, agent, state, command,
-                                    parent)
+                                    parent, harness=harness)
         else:
             lines = self._add_tab(sid, title, space, cwd, agent, state, command,
-                                  parent, history=history)
+                                  parent, history=history, harness=harness)
             owned = self._spaces.get(sid) or {}
             if owned.get("workspace_id") == space and \
                     owned.get("owner") in BRIDGE_OWNED:
@@ -2597,7 +2610,8 @@ The rule itself is `_memory_decides`, which is where the distinction
             self._drop_space_record(sid, ws_id)
 
     def _add_space(self, sid: str, title, cwd: str, agent: str, state: str,
-                   command: str, parent: str | None) -> list:
+                   command: str, parent: str | None,
+                   harness: str | None = None) -> list:
         """Open a workspace for a session, and record it as ours.
 
         One `workspace.create` brings the space AND its first tab together —
@@ -2623,7 +2637,8 @@ The rule itself is `_memory_decides`, which is where the distinction
             return self._reject_partial_create(sid, ws_id, tab_id, pane_id)
         rec = {"workspace_id": ws_id, "tab_id": tab_id, "pane_id": pane_id,
                "title": title, "agent": agent, "parent": parent,
-               "owns_space": True, "step": 0, "ready": False, "cwd": cwd}
+               "owns_space": True, "step": 0, "ready": False, "cwd": cwd,
+               "harness": harness}
         self._recs[sid] = rec
         self._remember(sid, ws_id, tab_id=tab_id, pane_id=pane_id, cwd=cwd)
         # The pass's listing is a SNAPSHOT, taken before this space existed, so
@@ -2643,7 +2658,7 @@ The rule itself is `_memory_decides`, which is where the distinction
 
     def _add_tab(self, sid: str, title, space: str, cwd: str, agent: str,
                  state: str, command: str, parent: str | None,
-                 history: bool = False) -> list:
+                 history: bool = False, harness: str | None = None) -> list:
         """Put a sub-agent's pane in a TAB inside its parent's space.
 
         This is the whole point of the layout: the operator clicks one space and
@@ -2673,6 +2688,7 @@ The rule itself is `_memory_decides`, which is where the distinction
         rec = {"workspace_id": space, "tab_id": tab_id, "pane_id": pane_id,
                "title": title, "agent": agent, "parent": parent,
                "owns_space": False, "step": 0, "ready": False, "cwd": cwd,
+               "harness": harness,
                **({"history": True} if history else {})}
         self._recs[sid] = rec
         # A tab created INSIDE an adopted space: the space was already recorded
@@ -2689,6 +2705,65 @@ The rule itself is `_memory_decides`, which is where the distinction
         self._setup_pane(sid, rec, state)
         return [f"add {sid} → space {space} tab {tab_id} pane {pane_id} "
                 f"'{title}' '{command}' [{state}]"]
+
+    def _pane_command(self, sid: str, rec: dict) -> str:
+        """What a session's tab RUNS: the real vendor CLI, or the attach REPL.
+
+        A harness Omnigent hosts as a real terminal TUI (`kind: native` —
+        claude, codex, …) is driven by a vendor CLI that lives in Omnigent's own
+        private tmux server, and that CLI is where a blocking question — a
+        permission prompt — is actually answered. So the pane in that agent's
+        tab is attached to that terminal, interactively, and the operator can
+        answer it from the multiplexer instead of opening a browser. That is the
+        whole point of the feature: `og chat` has no way to answer a prompt the
+        vendor CLI is holding.
+
+        An ACP harness is a plain stdio JSON-RPC child with NO pty, so it has no
+        terminal to attach to BY CONSTRUCTION; its pane keeps `omnigent attach`,
+        which is the same view `og chat`'s down-arrow menu gives. `None` from
+        `harness_has_terminal` — an unknown harness — is the THIRD answer and is
+        deliberately not collapsed into either branch: the pane keeps the attach
+        REPL, which is always valid, and no promise about a vendor CLI is made.
+
+        Best effort by construction. Every failure here — no terminal
+        resolvable, no tmux on PATH, the launcher module unavailable — falls back
+        to the attach command rather than leaving a pane with nothing running in
+        it, which is the one outcome `_open_space` refuses to leave behind. The
+        operator who then selects the row gets the honest reason from
+        `og_herdr_launch.focus_agent_terminal`, which resolves the same terminal
+        and returns a notice instead of focusing a REPL as if it were the CLI.
+
+        `rec["harness"]` is the session's own harness id, taken from the detail
+        row the watcher enriches every `added` with (measured: a sub-agent's
+        detail row carries `harness` just as a root's does). An absent one means
+        a session dict from some other source, which resolves as "unknown".
+        """
+        if harness_has_terminal(rec.get("harness")) is not True:
+            return attach_command(self.server, sid)
+        if shutil.which("tmux") is None:
+            return attach_command(self.server, sid)
+        try:
+            # Imported HERE, not at module load: the launcher imports this
+            # module, so this module must import without it (see `main`).
+            from og_herdr_launch import (read_only_attach_command,
+                                         terminal_behind)
+        except Exception:
+            return attach_command(self.server, sid)
+        try:
+            # Deliberately WITHOUT this bridge's watcher. `SessionWatcher.
+            # _get_json` is the transport every listing read in this process
+            # shares, so a terminal lookup riding it would count as a POLL — and
+            # against a test's scripted opener it would consume a scripted
+            # response and change what the NEXT poll sees. The lookup therefore
+            # opens its own bounded connection (see og_herdr_launch.
+            # RUNNER_TIMEOUT_SECONDS) and the poll count stays exactly what it
+            # was.
+            terminal = terminal_behind(sid, dict(os.environ))
+        except Exception:
+            return attach_command(self.server, sid)
+        if terminal is None:
+            return attach_command(self.server, sid)
+        return read_only_attach_command(*terminal)
 
     def _setup_pane(self, sid: str, rec: dict, state: str) -> None:
         """Run the post-create setup steps for a session's pane.
@@ -2717,6 +2792,14 @@ The rule itself is `_memory_decides`, which is where the distinction
         changes, adoption and removal all take the ordinary path.
         """
         pane_id = rec["pane_id"]
+        # Record which tab shows this agent, BEFORE the pane is typed into. The
+        # tab id comes out of the create reply and is the only place herdr ever
+        # tells us which tab a session's pane landed in — `agent.get` cannot be
+        # asked, from a session id, later (see `remember_agent_tab` for the
+        # measurement). Written for a history space too: its tab is what
+        # selecting that past conversation should reach.
+        remember_agent_tab(self.agent_tabs_path, sid, rec.get("tab_id"),
+                           rec.get("workspace_id"))
         if rec["step"] <= 0:
             if rec.get("history"):
                 # A past conversation's pane gets the resume line UNSENT: typed
@@ -2726,7 +2809,7 @@ The rule itself is `_memory_decides`, which is where the distinction
                 # `_add_history_space`).
                 self.client.pane_send_text(pane_id, resume_command(sid))
             else:
-                self.client.pane_run(pane_id, attach_command(self.server, sid))
+                self.client.pane_run(pane_id, self._pane_command(sid, rec))
             rec["step"] = 1
         if rec["step"] <= 1:
             # The agent label is the session's harness product name ("Claude
@@ -2856,6 +2939,16 @@ The rule itself is `_memory_decides`, which is where the distinction
         return [f"update {sid} → state={state}" + (" (title)" if title_changed
                                                    else "")] + renamed
 
+    def _forget_tab(self, sid: str) -> None:
+        """Drop this session's entry from the agent-tab sidecar.
+
+        Never raises and never fails the removal it rides on: an un-dropped note
+        costs a stale tab id that a later `tab.focus` would aim at — a click that
+        goes to the wrong tab, not a lost pane — so the cheap thing to protect is
+        the sweep, not the file. See `forget_agent_tab`.
+        """
+        forget_agent_tab(self.agent_tabs_path, sid)
+
     def _drop_children(self, sid: str, lines: list[str]) -> None:
         """Forget the records of sessions whose pane just went with the space.
 
@@ -2868,6 +2961,9 @@ The rule itself is `_memory_decides`, which is where the distinction
         for child_id, child in list(self._recs.items()):
             if child.get("parent") == sid:
                 self._recs.pop(child_id, None)
+                # Its tab went with the space, so its note goes too — the same
+                # reason its record does. See `_forget_tab`.
+                self._forget_tab(child_id)
                 lines.append(f"remove {child_id} (pane {child.get('pane_id')}; "
                              f"tab closed with its parent's space)")
 
@@ -2956,10 +3052,16 @@ The rule itself is `_memory_decides`, which is where the distinction
                 lines = [f"remove {sid} (pane {pane_id}, {what} {target}; "
                          f"already gone)"]
                 self._forget(owns_space, target)
+                self._forget_tab(sid)
                 return lines
             # As above: any other error keeps the mapping for a later retry.
             raise
         self._recs.pop(sid, None)
+        # The pane is gone, so the tab id this agent was noted under names a tab
+        # herdr may already have re-used. Dropped here — after the close landed,
+        # never before it — so a failed close (which keeps the mapping for a
+        # retry) keeps the note it will need for that retry.
+        self._forget_tab(sid)
         lines = [f"remove {sid} (pane {pane_id}, {what} {target})"]
         # A closed workspace took its tabs with it, so its workers' panes are
         # already gone and their records have to go with them; a closed tab
@@ -3132,6 +3234,167 @@ def _read_spaces(raw) -> dict:
                 rec[field] = value
         kept[key] = rec
     return kept
+
+
+# ---------------------------------------------------------------------------
+# which herdr TAB shows which agent: $OMNIGENT_HOME/og-agent-tabs.json
+# ---------------------------------------------------------------------------
+# WHY A FILE OF ITS OWN. herdr's `agent.get`/`agent.list` DO carry a `tab_id`,
+# but herdr exposes no way to travel from an OMNIGENT session id to that record,
+# and that is measured rather than assumed (live server, three probes):
+#   * `agent.get {target}` resolves a target that is a live agent NAME
+#     (registered by `agent.start`) or the PANE id hosting the agent. A session
+#     id, a session title, a tab id and a terminal id all answer
+#     `agent_not_found`.
+#   * the `agent_session_id` that `pane.report_agent` accepts IS stored, but it
+#     is surfaced NOWHERE — not in `agent.get`, not in `agent.list`, not in
+#     `pane.get` (all three checked).
+# So a view cannot look an agent's tab up after the fact; og has to write it
+# down at the one moment both ids are in its hands, which is when it creates the
+# tab. This file is that note.
+#
+# A SIDECAR and not a field on the space record, and the reason is destructive:
+# `--cleanup` closes the `workspace_id` of every record in the state file, while
+# a WORKER's tab belongs to its PARENT's space — recording a worker there would
+# put the parent's space in the cleanup set under a second key and make the
+# file's answer to "which space is this session's?" ambiguous for every
+# adoption. Nothing but this feature reads this file, so adding to it cannot
+# change what any existing path does.
+AGENT_TABS_FILENAME = "og-agent-tabs.json"
+
+
+def agent_tabs_path(state_path: Path) -> Path:
+    """The agent-tab sidecar that belongs beside `state_path`.
+
+    Derived from the state path rather than from `$OMNIGENT_HOME`, so one
+    redirect (a sandbox, a test's tmp home, the launcher's own `--state`) moves
+    both files together — the reason `launch_log_path` derives from the launch's
+    own log directory instead of from $HOME.
+    """
+    return state_path.parent / AGENT_TABS_FILENAME
+
+
+def load_agent_tabs(path: Path) -> dict:
+    """`{session_id: {"tab_id":…, "workspace_id":…}}`, or {} — never raises.
+
+    The same degradation contract as `load_state`, for the same reason: a
+    missing, unreadable or malformed file is "we recorded nothing", which costs
+    the operator a tab they have to click by hand — never a pane that fails.
+    Only records carrying a non-empty string `tab_id` survive; the workspace id
+    is optional because a tab id is what `tab.focus` needs and the space is only
+    there to make a note readable.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    tabs: dict = {}
+    for sid, entry in data.items():
+        if not isinstance(sid, str) or not sid or not isinstance(entry, dict):
+            continue
+        tab_id = entry.get("tab_id")
+        if not isinstance(tab_id, str) or not tab_id:
+            continue
+        rec = {"tab_id": tab_id}
+        ws_id = entry.get("workspace_id")
+        if isinstance(ws_id, str) and ws_id:
+            rec["workspace_id"] = ws_id
+        tabs[sid] = rec
+    return tabs
+
+
+def agent_tab_record(path: Path, session_id: object) -> dict:
+    """The tab record for a session, or `{}`. Never raises."""
+    if not isinstance(session_id, str) or not session_id:
+        return {}
+    return load_agent_tabs(path).get(session_id) or {}
+
+
+def remember_agent_tab(path: Path, session_id: object, tab_id: object,
+                       workspace_id: object = None) -> bool:
+    """Record which tab shows this session's pane. Never raises.
+
+    One locked read-modify-write, through the SAME `state_lock` the state file
+    uses, on a different path — `state_lock` takes any path and locks a sidecar
+    beside it, so two bridges on one machine serialise here exactly as they do
+    there. `state_update` itself is not reused because it parses the state file's
+    `{version, spaces, pending}` shape, and this is a flat map.
+
+    The return says whether the write LANDED. Nothing destructive depends on it
+    (an unrecorded tab costs the operator a click), but a failed write must not
+    be reported as a recorded one.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    if not isinstance(tab_id, str) or not tab_id:
+        return False
+
+    def put(tabs: dict) -> dict:
+        rec = {"tab_id": tab_id}
+        if isinstance(workspace_id, str) and workspace_id:
+            rec["workspace_id"] = workspace_id
+        tabs[session_id] = rec
+        return tabs
+
+    return _update_agent_tabs(path, put)
+
+
+def forget_agent_tab(path: Path, session_id: object) -> bool:
+    """Drop a session's tab record. Never raises; a missing key is success.
+
+    Called when the pane goes, so a later `agent.focus` on a reaped agent cannot
+    target a tab herdr has already reused. `decide` returns the state to write,
+    or None to write NOTHING: removing the last entry leaves `{}`, which is a
+    real state to save (the file must stop naming the dead tab) and must not be
+    confused with "nothing to do" — that is the one distinction the two return
+    values carry.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return False
+
+    def drop(tabs: dict):
+        return tabs if tabs.pop(session_id, None) is not None else None
+
+    return _update_agent_tabs(path, drop)
+
+
+def _update_agent_tabs(path: Path, decide) -> bool:
+    """One locked read-modify-write of the sidecar. Never raises."""
+    try:
+        with state_lock(path):
+            decided = decide(load_agent_tabs(path))
+            if decided is None:
+                return False
+            return _write_agent_tabs(path, decided)
+    except Exception:
+        return False
+
+
+def _write_agent_tabs(path: Path, tabs: dict) -> bool:
+    """Write the sidecar atomically. Never raises; False on any failure.
+
+    Atomic via `os.replace` for the reason `_write_state` is: a crash mid-write
+    must not leave a file the next read discards as corrupt, which here would
+    silently un-remember every agent's tab at once.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".og-agent-tabs")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(tabs, handle, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _upgrade_v1(raw, path: Path, say) -> dict:

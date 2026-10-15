@@ -72,6 +72,12 @@ from og_herdr import (
     OWNER_LAUNCHER,
     SPACE_LIVE,
     _id_of,
+    # The note of which herdr tab carries which agent, written by the bridge
+    # when it creates a tab and read here to move the operator to it. Named in
+    # og_herdr so the writer and this reader cannot drift about the file or its
+    # shape — see `remember_agent_tab` for why herdr cannot answer it.
+    agent_tab_record,
+    agent_tabs_path,
     attach_command,
     # Whether a harness is hosted as a real terminal TUI is a REGISTRY fact
     # (`kind`), so it is read from the registry rather than inferred from the
@@ -2112,7 +2118,7 @@ def _terminal_from_resources(payload: Any) -> Optional[tuple]:
     return None
 
 
-def resolve_agent_terminal(session_id: Optional[str],
+def terminal_behind(session_id: Optional[str],
                            env: Optional[dict] = None,
                            watcher=None) -> Optional[tuple]:
     """The harness terminal behind a session: the runner's answer, else the scan.
@@ -2390,6 +2396,158 @@ def _cli_failure(exc: BaseException) -> str:
         return NOTICE_CLI_FAILED.format(exc)
     except Exception:
         return NOTICE_CLI_FAILED
+
+
+# ---------------------------------------------------------------------------
+# move the operator to an agent's tab: Enter in `og agents`
+# ---------------------------------------------------------------------------
+# What `focus_agent_terminal` says when it cannot move the operator. One line
+# each and DISTINCT on purpose, so "this can never work here" reads differently
+# from "try again"; short so they survive a narrow pane's `_clip`.
+NOTICE_FOCUS_OUTSIDE_HERDR = "focus: not inside herdr (no HERDR_ENV)"
+NOTICE_FOCUS_NO_AGENT = "focus: no agent on this row"
+# The THIRD answer `harness_has_terminal` can give, kept distinct rather than
+# collapsed into either branch: with an unknown harness og cannot say whether
+# the pane in this tab runs the real vendor CLI or a REPL, so it declines rather
+# than moving the operator somewhere it cannot describe.
+NOTICE_FOCUS_UNKNOWN_HARNESS = ("focus: {0} is not a harness og knows, so its "
+                                "tab is unverified")
+NOTICE_FOCUS_NO_TAB = "focus: no herdr tab recorded for this agent"
+NOTICE_FOCUS_FAILED = "focus: {0}"
+
+
+def focus_agent_terminal(session_id: str, harness: Optional[str],
+                         root_session_id: str = "",
+                         env: Optional[dict] = None,
+                         client=None) -> Optional[str]:
+    """Focus the tab showing this agent's real CLI. None on success, else why.
+
+    THE INTERFACE `og agents` USES for Enter. `session_id` is the SELECTED row's
+    own session (root or worker), `root_session_id` that row's root when it has
+    one, and `harness` the row's harness id — the `og agents` pane resolves all
+    three off the row it has (a root's `harness` comes from its detail fetch, a
+    worker's from the install's agent spec). `client` and `env` are the test
+    seams; None builds the real herdr client from `env`.
+
+    Returns None when the operator's herdr UI moved, or a short one-line notice
+    saying why it did not — the same shape and the same contract as
+    `focus_in_herdr` in `og_agents`, and for the same reason: this pane is left
+    open all day, so a herdr that is absent, a socket that is down, a socket
+    that WILL NOT CONNECT and a state file that cannot be read must each become
+    a notice rather than a traceback that kills the view. It NEVER raises, and
+    the formatting is guarded too, so a failure whose own message cannot be
+    rendered still comes back as text.
+
+    WHY A TAB AND NOT `agent.focus`. herdr's `agent.get`/`agent.list` carry a
+    `tab_id`, but nothing links an OMNIGENT session id to one of those records:
+    `agent.get {target}` resolves a live agent NAME or the PANE id hosting the
+    agent, and a session id answers `agent_not_found` — measured against the
+    live server, on both the CLI and the socket API (see
+    `og_herdr.remember_agent_tab`, which is where og records the tab it minted
+    for exactly this reason). A TAB ID, unlike a session id, is something herdr
+    will act on directly, so `tab.focus` is the one call that can work.
+
+    THE TAB IS FOUND FROM OG'S OWN RECORDS, in this order:
+      1. this session's own note — the sidecar the bridge writes when it CREATES
+         a tab, which covers every worker and every root it opened a space for;
+      2. this session's `tab_id` in the state file, which is where the LAUNCHER
+         records the space it opened for `og chat` (a root whose space the
+         bridge only CLAIMED, so it never created a tab to note);
+      3. `root_session_id`'s tab, for a worker whose own note is gone — the
+         conversation it is working in, which is at least the right space.
+    A note is dropped when its pane goes (see `Bridge._forget_tab`), so a tab id
+    is not aimed at after herdr has re-used it.
+
+    THE HARNESS KIND DECIDES NOTHING ABOUT WHETHER TO FOCUS — only whether og
+    can describe what the operator is being sent to. `harness_has_terminal` is
+    True for a native harness (its tab carries the real vendor CLI, attached
+    interactively by `og_herdr.Bridge._pane_command`, which is what makes a
+    vendor's blocking permission prompt answerable from here), and False for an
+    ACP one, whose tab keeps the `omnigent attach` REPL — the same view `og
+    chat`'s down-arrow menu gives, and the correct thing to reach. `None` is the
+    third answer: an unknown harness means the tab's content cannot be described,
+    so the operator gets the honest line and their own screen is left alone.
+
+    The focus is ONE call. Measured against a live server: `tab.focus` also
+    raises the WORKSPACE holding the tab (see `og_herdr_client.tab_focus`), so
+    no `workspace.focus` is sent first — agents routinely live in a space other
+    than the one on screen, and one call moves both.
+    """
+    environ = dict(os.environ) if env is None else dict(env)
+    if not session_id:
+        return NOTICE_FOCUS_NO_AGENT
+    # Inside the guard, and before anything else: this pane must render in ANY
+    # terminal, so a probe that raises has to become a notice like every other
+    # failure rather than killing the view on a keypress.
+    try:
+        inside = is_inside(environ)
+    except Exception:
+        return NOTICE_FOCUS_OUTSIDE_HERDR
+    if not inside:
+        return NOTICE_FOCUS_OUTSIDE_HERDR
+    kind = harness_has_terminal(harness)
+    if kind is None:
+        label = harness if isinstance(harness, str) and harness.strip() \
+            else "this agent"
+        return _focus_line(NOTICE_FOCUS_UNKNOWN_HARNESS, label)
+
+    state_path = default_state_path()
+    tab_id = _focus_tab_id(state_path, session_id, root_session_id)
+    if not tab_id:
+        return NOTICE_FOCUS_NO_TAB
+    try:
+        opened = client if client is not None else _chat_client(environ)
+    except Exception as exc:
+        return _focus_line(NOTICE_FOCUS_FAILED, exc)
+    try:
+        opened.tab_focus(tab_id)
+    except Exception as exc:
+        return _focus_line(NOTICE_FOCUS_FAILED, exc)
+    finally:
+        if client is None:
+            try:
+                opened.close()
+            except Exception:
+                pass
+    return None
+
+
+def _focus_tab_id(state_path: Path, session_id: str,
+                  root_session_id: str = "") -> Optional[str]:
+    """The herdr tab an og session's pane lives in, or None. Never raises.
+
+    See `focus_agent_terminal` for the order and why there are two sources at
+    all: the sidecar is written by the process that owns the tab's lifetime, the
+    state file's copy is what the LAUNCHER left for a root whose space the bridge
+    only claimed. Both are og's own records — herdr cannot be asked (measured).
+    """
+    try:
+        noted = agent_tab_record(agent_tabs_path(state_path), session_id)
+    except Exception:
+        noted = {}
+    tab_id = noted.get("tab_id") if isinstance(noted, dict) else None
+    if isinstance(tab_id, str) and tab_id:
+        return tab_id
+    for candidate in (session_id, root_session_id):
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        try:
+            spaces = load_state(state_path).get("spaces") or {}
+        except Exception:
+            return None
+        record = spaces.get(candidate) if isinstance(spaces, dict) else None
+        tab_id = record.get("tab_id") if isinstance(record, dict) else None
+        if isinstance(tab_id, str) and tab_id:
+            return tab_id
+    return None
+
+
+def _focus_line(template: str, value) -> str:
+    """One notice line. NEVER raises — even while formatting."""
+    try:
+        return template.format(value)
+    except Exception:
+        return template.split("{")[0].strip() or template
 
 
 # ---------------------------------------------------------------------------

@@ -201,6 +201,11 @@ class FakeClient:
         # the same method name and params herdr receives.
         self.call("tab.rename", {"tab_id": tab_id, "label": label})
 
+    def tab_focus(self, tab_id):
+        # The real wrapper, mirrored for the same reason: `focus_agent_terminal`
+        # reaches the operator's UI through exactly this frame.
+        self.call("tab.focus", {"tab_id": tab_id})
+
     def close(self):
         self.closed = True
 
@@ -3106,7 +3111,7 @@ def test_resolve_runner_terminal_builds_a_watcher_when_none_is_injected():
         "sess-1", {"OG_SERVER": "http://127.0.0.1:1"}) is None
 
 
-def test_resolve_agent_terminal_prefers_the_runner_answer(tmp_path, short_dir):
+def test_terminal_behind_prefers_the_runner_answer(tmp_path, short_dir):
     # The runner is authoritative and is asked FIRST: a session with BOTH an
     # on-disk record and a runner resource resolves to the runner's answer, so
     # the scan cannot shadow a fresher one.
@@ -3118,13 +3123,13 @@ def test_resolve_agent_terminal_prefers_the_runner_answer(tmp_path, short_dir):
     server.bind(runner_sock)
     watcher = FakeRunnerWatcher(terminal_page(terminal_resource(runner_sock)))
 
-    got = og_herdr_launch.resolve_agent_terminal(
+    got = og_herdr_launch.terminal_behind(
         "sess-1", {"TMPDIR": str(tmp_path)}, watcher=watcher)
 
     assert got == (runner_sock, "main")
 
 
-def test_resolve_agent_terminal_falls_back_to_the_filesystem_scan(tmp_path, short_dir):
+def test_terminal_behind_falls_back_to_the_filesystem_scan(tmp_path, short_dir):
     # THE ANTI-REGRESSION CASE: a claude-native session must keep resolving when
     # the runner answers nothing at all (an unreachable runner, an older server,
     # no terminal resource for the session).
@@ -3132,15 +3137,15 @@ def test_resolve_agent_terminal_falls_back_to_the_filesystem_scan(tmp_path, shor
     _, session_dir = _native_session(tmp_path, "sess-1")
     (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
 
-    got = og_herdr_launch.resolve_agent_terminal(
+    got = og_herdr_launch.terminal_behind(
         "sess-1", {"TMPDIR": str(tmp_path)},
         watcher=FakeRunnerWatcher(error=OSError("runner down")))
 
     assert got == (sock, "main")
 
 
-def test_resolve_agent_terminal_none_when_neither_answers(tmp_path):
-    assert og_herdr_launch.resolve_agent_terminal(
+def test_terminal_behind_none_when_neither_answers(tmp_path):
+    assert og_herdr_launch.terminal_behind(
         "sess-1", {"TMPDIR": str(tmp_path)}, watcher=FakeRunnerWatcher()) is None
 
 
@@ -3479,3 +3484,211 @@ def test_read_only_attach_quotes_the_target_too():
     remainder = command.replace(shlex.quote(target), "").replace(
         shlex.quote("/tmp/x/tmux.sock"), "")
     assert "$(" not in remainder and "`" not in remainder, remainder
+
+
+# ---------------------------------------------------------------------------
+# focus_agent_terminal — Enter in `og agents` reaches the agent's tab
+# ---------------------------------------------------------------------------
+
+def _note_tab(session_id, tab_id, workspace_id="w1"):
+    """Write one agent-tab note, the way the bridge does when it makes a tab.
+
+    At the path the CODE resolves — `default_state_path()`, from $OMNIGENT_HOME
+    (redirected to a scratch home by the autouse fixture) — not at one this test
+    picks, so the resolution under test is the production one.
+    """
+    tabs = og_herdr.agent_tabs_path(og_herdr_launch.default_state_path())
+    assert og_herdr.remember_agent_tab(tabs, session_id, tab_id, workspace_id)
+    return tabs
+
+
+class RaisingFocusClient:
+    """A herdr client whose `tab.focus` fails, the way a down socket would."""
+
+    def __init__(self, exc=None):
+        self.exc = exc or OSError("herdr is gone")
+        self.focused = []
+
+    def tab_focus(self, tab_id):
+        self.focused.append(tab_id)
+        raise self.exc
+
+    def close(self):
+        pass
+
+
+def _focus_env(**over):
+    """The environ a pane's `og agents` runs with: herdr's own flag, plus overrides."""
+    env = {"HERDR_ENV": "1"}
+    env.update(over)
+    return env
+
+
+def test_focus_agent_terminal_focuses_the_tab_noted_for_the_agent(tmp_path):
+    # THE WHOLE POINT: a worker's tab — the pane running its REAL vendor CLI,
+    # where a permission prompt is waiting — is one `tab.focus` away. herdr
+    # cannot be asked which tab that is (measured: `agent.get` resolves names and
+    # pane ids, never a session id), so og reads the note it wrote itself.
+    _note_tab("worker-1", "w1:t7")
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", root_session_id="root-1",
+        env=_focus_env(), client=client)
+
+    assert notice is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t7"}]
+    # ONE call, no `workspace.focus`: measured against a live server, tab.focus
+    # raises the workspace holding the tab as well.
+    assert client.methods == ["tab.focus"], client.methods
+
+
+def test_focus_agent_terminal_reaches_a_root_through_its_spaces_record(tmp_path):
+    # THE ROOT CASE (Task 4). A root has no per-agent tab — it has the workspace
+    # whose first tab the launcher labelled, and whose id lives in the state
+    # file's `spaces` record (the launcher wrote it; the bridge only claimed the
+    # space, so it never made a tab to note). Selecting the orchestrator must
+    # still land the operator on the real Claude Code CLI.
+    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "root-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t1"}]
+
+
+def test_focus_agent_terminal_prefers_the_agents_own_note_over_the_roots(tmp_path):
+    # A root's recorded tab is the FALLBACK for a worker, never the answer when
+    # the worker's own tab is known: the worker's CLI is where its prompt is.
+    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
+    _note_tab("worker-1", "w1:t7")
+    client = FakeClient()
+
+    assert og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", root_session_id="root-1",
+        env=_focus_env(), client=client) is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t7"}]
+
+
+def test_focus_agent_terminal_falls_back_to_the_roots_tab_for_a_worker(tmp_path):
+    # The worker's own note is gone (its pane was reaped and the note dropped),
+    # but the row names its root: the operator is sent to the conversation the
+    # worker is in rather than told nothing can be done.
+    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
+    client = FakeClient()
+
+    assert og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", root_session_id="root-1",
+        env=_focus_env(), client=client) is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t1"}]
+
+
+def test_focus_agent_terminal_focuses_an_acp_agents_tab_too(tmp_path):
+    # An ACP harness has no pty, so its tab keeps the `omnigent attach` REPL —
+    # which is the CORRECT view to reach (`og chat`'s down-arrow menu gives the
+    # same one). The kind decides what the operator will find, not whether the
+    # row can be selected.
+    _note_tab("worker-1", "w1:t9")
+    client = FakeClient()
+
+    assert og_herdr_launch.focus_agent_terminal(
+        "worker-1", "acp:cline", env=_focus_env(),
+        client=client) is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t9"}]
+
+
+def test_focus_agent_terminal_outside_herdr_says_so_and_touches_nothing(tmp_path):
+    _note_tab("worker-1", "w1:t7")
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env={},
+        client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_OUTSIDE_HERDR
+    assert client.calls == []
+
+
+def test_focus_agent_terminal_without_a_session_declines(tmp_path):
+    client = FakeClient()
+    notice = og_herdr_launch.focus_agent_terminal(
+        "", "claude-native", env=_focus_env(), client=client)
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_AGENT
+    assert client.calls == []
+
+
+def test_focus_agent_terminal_refuses_an_unknown_harness_distinctly(tmp_path):
+    # `harness_has_terminal` has THREE answers and None is not one of the two
+    # branches: with an unknown harness og cannot say whether this tab runs the
+    # real CLI or a REPL, so it declines with its own line rather than moving the
+    # operator somewhere it cannot describe.
+    _note_tab("worker-1", "w1:t7")
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "brand-new-tui", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_UNKNOWN_HARNESS.format(
+        "brand-new-tui")
+    assert notice != og_herdr_launch.NOTICE_FOCUS_NO_TAB
+    assert client.calls == [], "an unknown harness must not move the screen"
+
+
+def test_focus_agent_terminal_without_a_recorded_tab_says_so(tmp_path):
+    # A finished agent whose tab was reaped: the note goes with the pane (see
+    # `Bridge._forget_tab`), so there is nothing to aim at and the operator is
+    # told rather than sent to a tab id herdr may have re-used.
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "gone-1", "claude-native", root_session_id="also-gone",
+        env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TAB
+    assert client.calls == []
+
+
+def test_focus_agent_terminal_never_raises_when_herdr_fails(tmp_path):
+    _note_tab("worker-1", "w1:t7")
+    client = RaisingFocusClient(OSError("connect: cannot reach herdr"))
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice is not None and notice.startswith("focus: ")
+    assert "cannot reach herdr" in notice
+    assert client.focused == ["w1:t7"]
+
+
+def test_focus_agent_terminal_survives_a_broken_state_file(tmp_path):
+    # A hand-edited or truncated file is "we recorded nothing", never a
+    # traceback: this pane is left open all day.
+    home = og_herdr_launch.default_state_path().parent
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "og-herdr.json").write_text("{ not json")
+    (home / "og-agent-tabs.json").write_text("{ also not json")
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TAB
+
+
+def test_focus_agent_terminal_ignores_a_note_with_no_tab_id(tmp_path):
+    # The note is read defensively, like every other document og does not own: a
+    # record with no usable tab id names no tab.
+    home = og_herdr_launch.default_state_path().parent
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "og-agent-tabs.json").write_text(json.dumps(
+        {"worker-1": {"workspace_id": "w1"}, "worker-2": {"tab_id": None},
+         "worker-3": "w1:t7"}))
+    client = FakeClient()
+
+    for sid in ("worker-1", "worker-2", "worker-3"):
+        assert og_herdr_launch.focus_agent_terminal(
+            sid, "claude-native", env=_focus_env(),
+            client=client) == og_herdr_launch.NOTICE_FOCUS_NO_TAB
+    assert client.calls == []
