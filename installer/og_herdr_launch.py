@@ -262,7 +262,17 @@ def resolve_chat_dir(path: str, config: dict) -> Path:
     what comes back is what `os.getcwd()` will report in the pane, which is
     the string the pending record below is keyed by and the string the bridge
     matches against.
+
+    An EMPTY path is refused for the same reason. `Path("")` is `.` and
+    `projects_dir / ""` is the projects root, so an empty `--dir` would resolve
+    to somewhere plausible — a value the operator typed that silently means
+    "not where I am", which is the one outcome this flag exists to prevent.
+    Callers must pass an absent flag as None, never as "".
     """
+    if not isinstance(path, str) or not path.strip():
+        raise LaunchError(
+            "--dir was given an empty value — omit it entirely to stay in the "
+            "current directory")
     target = Path(path).expanduser()
     relative = not target.is_absolute()
     if relative:
@@ -721,14 +731,13 @@ def split_agents_pane(client, ws_id: str, tab_id: str, root_pane: str,
     split would only drift, leaving the next person to discover which one ran.
 
     `known_panes` is the set of pane ids the tab held BEFORE the split, for a
-    caller whose tab may already have other panes in it. The two callers that
-    create their own space pass nothing: there is exactly one split, so
-    difference against the tab is exact. An operator's hand-made tab is not —
-    they may have split it themselves — and taking the lowest-numbered "other
-    pane" there would type `og agents` into THEIR pane. Given the set, a pane
-    that is not in it is the one just made; if none is, the split's new pane
-    could not be identified and `og agents` is not started, which is the safe
-    answer.
+    caller whose tab may already have other panes in it — `None` means no
+    baseline and keeps the difference-against-the-tab rule, which is exact only
+    because those callers created the space and so have the one pane they just
+    split. The two are different questions and neither is a third: an empty set
+    is herdr answering "this tab had no panes", while a baseline that could not
+    be read is `tab_pane_ids`' None, and the caller must not have split at all.
+    See `_split_pane_id`.
 
     It RETURNS its failures rather than reporting them, so each caller can route
     a degradation through its own channel: the launcher's `_split_agents` sends
@@ -781,18 +790,28 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
 
 def _split_pane_id(client, ws_id: str, tab_id: str, root_pane: str,
                    reply: Any, known_panes=None) -> Optional[str]:
-    """The pane `pane.split` just made.
+    """The pane `pane.split` just made, or None when it cannot be told.
 
     The reply does not name it: the schema's `pane.split` result is `{"type":
     "ok"}` — no pane, no id. So the new pane is found by DIFFERENCE against the
-    tab, which is exact while there is exactly one split (there is, for a caller
-    that made the space itself) and is pinned here so a future second split
-    cannot quietly return the wrong pane. `known_panes` (the tab's panes as they
-    were BEFORE the split) narrows that difference to the pane herdr just made,
-    for a caller whose tab the operator may already have split; see
-    `split_agents_pane`. A reply that does carry the pane is preferred over the
-    listing, since a server that starts naming it should not have its answer
-    second-guessed.
+    tab. A reply that DOES carry the pane wins outright, since a server that
+    starts naming it should not have its answer second-guessed.
+
+    `known_panes` is the tab's panes as they were BEFORE the split, and it has
+    two spellings that mean OPPOSITE things, which is the whole hazard here:
+
+    * a set — including an EMPTY one — is herdr's answer. Every pane in the tab
+      that is not in it is one herdr just made, and an empty set is a real
+      answer ("this tab had no panes"), not a shrug.
+    * None is NO BASELINE: either the caller made the space itself, so the tab
+      holds exactly the pane being split and the difference is exact by
+      construction, or the baseline could not be read and the caller decided
+      not to split at all. Callers in the second position must not reach here.
+
+    So a caller that does not know what the tab held must filter, not fall back
+    to `others[0]`: the lowest-numbered other pane is only the right answer in
+    the first case, and in the second it can be a pane the OPERATOR split for
+    their own work.
     """
     if isinstance(reply, dict):
         found = _id_of(reply, "pane_id") or _id_of(reply.get("pane"), "pane_id")
@@ -812,18 +831,27 @@ def _split_pane_id(client, ws_id: str, tab_id: str, root_pane: str,
     return others[0] if others else None
 
 
-def tab_pane_ids(client, ws_id: str, tab_id: str) -> set:
-    """The pane ids herdr currently lists in a tab, or an EMPTY set.
+def tab_pane_ids(client, ws_id: str, tab_id: str) -> Optional[set]:
+    """The pane ids herdr currently lists in a tab — or None, "could not ask".
 
     Read BEFORE a split so the pane that split makes can be told from the ones
-    the operator had already. An empty set is the honest "could not find out",
-    and `_split_pane_id` then refuses to guess — an unreadable listing is not a
-    licence to type `og agents` into whichever pane sorts first.
+    the operator had already. Three outcomes, kept apart the way
+    `og_herdr.space_status` keeps a listing apart from a failed one:
+
+    * a set — possibly EMPTY — is herdr's answer, and an empty set is a real one
+      ("this tab has no panes"), not a shrug;
+    * None is "the listing could not be read", and it is NOT an empty baseline.
+      Collapsing the two is how a failed read turns into "every pane in the tab
+      is new", which hands `og agents` to the lowest-numbered other pane — the
+      operator's, in a space they made themselves.
+
+    A caller given None must refuse to guess rather than pass it on: a missing
+    agents pane is cosmetic, a command typed into somebody's pane is not.
     """
     try:
         panes = client.call("pane.list", {"workspace_id": ws_id})
     except Exception:
-        return set()
+        return None
     return {str(pane.get("pane_id")) for pane in (panes or {}).get("panes", [])
             if isinstance(pane, dict) and pane.get("tab_id") == tab_id
             and pane.get("pane_id")}
@@ -1069,7 +1097,10 @@ def chat_pane(argv=None, client=None, env=None) -> int:
     config = install_config()
 
     cwd = None
-    if args.dir:
+    # `is not None`, not truthiness: `--dir ""` is a value the operator typed
+    # and must be REFUSED, not mistaken for the flag being absent — which is
+    # what silently ran the chat in the current directory.
+    if args.dir is not None:
         try:
             cwd = str(resolve_chat_dir(args.dir, config))
         except LaunchError as exc:
@@ -1113,11 +1144,21 @@ def chat_pane(argv=None, client=None, env=None) -> int:
         # Read the tab's panes BEFORE splitting: unlike a launch, this tab is one
         # the operator made and may have split themselves, and "the first pane
         # in this tab that is not the chat pane" is then their pane, not ours.
-        for line in split_agents_pane(opened, ws_id, tab_id, pane_id, here,
-                                      pane_env_for(environ),
-                                      known_panes=tab_pane_ids(
-                                          opened, ws_id, tab_id)):
-            _chat_degrade(line)
+        # A listing that could not be read is not an empty tab (see
+        # `tab_pane_ids`), and guessing from one would type `og agents` into
+        # whatever the operator has — so NO split is made either: a pane nothing
+        # ever runs in is the exact thing `_open_space` refuses to leave behind.
+        baseline = tab_pane_ids(opened, ws_id, tab_id)
+        if baseline is None:
+            _chat_degrade(
+                "could not read this tab's panes from herdr, so no `og agents` "
+                "pane was opened beside the chat; run `og agents` in a pane "
+                "yourself if you want one")
+        else:
+            for line in split_agents_pane(opened, ws_id, tab_id, pane_id, here,
+                                          pane_env_for(environ),
+                                          known_panes=baseline):
+                _chat_degrade(line)
     except Exception as exc:
         _chat_degrade("could not open the og agents pane ({0}); the chat is up "
                       "without it".format(exc))
@@ -1226,7 +1267,7 @@ def build_chat_parser() -> argparse.ArgumentParser:
                     help="directory to root the session in. Absolute paths are "
                          "used as given; a relative one resolves against the "
                          "install's projects_dir (default: {0}). Refused if it "
-                         "does not exist.".format(DEFAULT_PROJECTS_DIR))
+                         "is empty or does not exist.".format(DEFAULT_PROJECTS_DIR))
     return ap
 
 
