@@ -896,14 +896,25 @@ class Bridge:
         """The watcher's live session set for the pass just observed, or None.
 
         `poll_once`/`watch` populate the watcher's `_seen` as their final step,
-        so this is only ever read on the path that has just polled. None means
-        "could not ask" — a watcher with no live set (the FakeWatcher in tests,
-        or a watcher that has not polled) — and makes the orphan sweep a no-op.
-        None is a shrug, never "every session is gone": a listing that cannot
-        be read must never close every space the operator has.
+        so this is only ever read on the path that has just polled. None makes
+        the orphan sweep a no-op — and None is a shrug, never "everything is
+        gone": a listing that cannot be read must never close every space the
+        operator has.
+
+        A TRUNCATED listing is the subtle half of that, not the absent one. On
+        a cold start `_seen` began empty, so the truncated merge yields only
+        what was partially fetched — a LIVE session that simply was not fetched
+        reads as absent. The sweep needs a COMPLETE listing before it may
+        conclude a session is gone; a partial one defers to the next pass,
+        where the orphan is still waiting but a closed operator space is not.
+        A watcher that cannot say whether it was truncated (no
+        `_listing_truncated` attribute — the FakeWatcher in tests, or a watcher
+        that has not polled) is treated as truncated, never as complete.
         """
         seen = getattr(self.watcher, "_seen", None)
         if not isinstance(seen, dict):
+            return None
+        if getattr(self.watcher, "_listing_truncated", True):
             return None
         return frozenset(seen)
 

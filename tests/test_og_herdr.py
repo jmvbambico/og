@@ -1200,6 +1200,42 @@ def test_the_orphan_sweep_closes_only_recorded_orphans_leaving_live_and_stray(se
     assert any("remove rootB" in ln for ln in lines)
 
 
+def test_the_sweep_defers_a_truncated_listing_that_hides_a_live_session(seams):
+    # COLD-START DISASTER GUARD. A truncated listing is partial, not absent: on
+    # the first poll after a restart `_seen` began empty, so the truncated
+    # merge holds only what was fetched, and a LIVE session that simply was not
+    # fetched reads as absent. The sweep must not close it — it waits for the
+    # next complete listing, where the orphan is still waiting but a closed
+    # operator space is not.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("T"))])
+    client.calls.clear()
+    # `root` is live and recorded, but the partial set does NOT contain it.
+    bridge.watcher._seen = {"still-around"}
+    bridge.watcher._listing_truncated = True
+    assert bridge._live_session_ids() is None
+    assert bridge.reconcile([], live_ids=bridge._live_session_ids()) == []
+    assert client.calls == []
+    assert bridge._owned == {"ws1": "root"}
+
+
+def test_the_sweep_defers_when_the_watcher_cannot_report_truncation(seams):
+    # A watcher that can hand over a live set but cannot say whether it is
+    # complete (no `_listing_truncated` attribute — the FakeWatcher) is treated
+    # as truncated, never as complete. The real path goes through
+    # `_live_session_ids`, so the sweep sees nothing to close.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client)
+    bridge.reconcile([Ev("added", "root", root_session("T"))])
+    client.calls.clear()
+    bridge.watcher._seen = {"root"}      # looks live — but is it the whole set?
+    assert bridge._live_session_ids() is None
+    assert bridge.reconcile([], live_ids=bridge._live_session_ids()) == []
+    assert client.calls == []
+    assert bridge._owned == {"ws1": "root"}
+
+
 def test_a_nested_worker_lands_beside_its_own_parent(seams):
     # The same lookup by parent_session_id serves a grandchild, so the layout
     # does not need a second index and does not go flat at depth two.
