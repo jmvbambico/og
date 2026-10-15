@@ -897,7 +897,47 @@ def split_agents_pane(client, ws_id: str, tab_id: str, root_pane: str,
     each line through `report` (log + re-surface before the terminal is handed
     to herdr), and the bridge appends them to its `reconcile` lines. The strings
     are deliberately stable so the launcher's log-matching tests keep passing.
+
+    IDEMPOTENCY: before splitting, we ask the tab how many panes it already has.
+    If there is already a pane besides `root_pane`, the operator already has the
+    agents pane they wanted — we silently succeed rather than creating a third
+    pane and returning the first split's id (the bug this fixes). The check is
+    best-effort: if `pane.list` errors or returns nothing usable, we fall through
+    to the split attempt exactly as before. An unreadable tab must not be able to
+    suppress a real action — the same reasoning the host rule uses, that an
+    unreadable answer must not hide a local session.
+
+    LIMITATION: the herdr `pane.list` protocol returns only pane identity
+    (`pane_id`, `tab_id`, `workspace_id`) — no command, title, or process info.
+    There is no reliable way to distinguish a pane running `og agents` from one
+    the operator split manually for another purpose. The guard therefore treats
+    ANY non-root pane as "agents pane already present". Consequence: an operator
+    who manually splits their chat tab will not get an `og agents` pane opened
+    automatically. This is a known gap; the alternative (attempting to read pane
+    content to guess the command) is fragile and was rejected.
     """
+    # Idempotency check: does this tab already have a non-root pane?
+    # If so, the split has already happened — succeed silently.
+    # Fail safe: any error or unreadable answer means "proceed to split".
+    # LIMITATION: pane.list carries no command/title; we cannot identify an
+    # `og agents` pane specifically. Any non-root pane suppresses the split.
+    try:
+        panes_reply = client.call("pane.list", {"workspace_id": ws_id})
+        existing = [
+            str(pane.get("pane_id")) for pane in (panes_reply or {}).get("panes", [])
+            if isinstance(pane, dict)
+            and pane.get("tab_id") == tab_id
+            and pane.get("pane_id")
+            and pane.get("pane_id") != root_pane
+        ]
+        if existing:
+            # Already split — the operator has their agents pane. Silent success.
+            return []
+    except Exception:
+        # Unreadable: proceed to split. The asymmetry is deliberate — a tab we
+        # cannot read must not lose its agents pane.
+        pass
+
     params = {"target_pane_id": root_pane, "direction": "right",
               "focus": False, "cwd": cwd, "ratio": AGENTS_PANE_RATIO}
     if pane_env:
@@ -907,8 +947,11 @@ def split_agents_pane(client, ws_id: str, tab_id: str, root_pane: str,
     except Exception as exc:
         return ["could not open the og agents pane ({0}); the chat is up "
                 "without it".format(exc)]
-    pane_id = _split_pane_id(client, ws_id, tab_id, root_pane, reply)
+    pane_id, err = _split_pane_id(client, ws_id, tab_id, root_pane, reply)
     if not pane_id:
+        if err and err.startswith("ambiguous"):
+            return ["herdr split the chat pane but the tab now has multiple "
+                    "non-root panes ({0}); `og agents` was not started".format(err)]
         return ["herdr split the chat pane but reported no new pane id; "
                 "`og agents` was not started there"]
     try:
@@ -941,7 +984,7 @@ def _split_agents(ctx: Launch, ws_id: str, tab_id: str, root_pane: str) -> None:
 
 
 def _split_pane_id(client, ws_id: str, tab_id: str, root_pane: str,
-                   reply: Any) -> Optional[str]:
+                   reply: Any) -> tuple[Optional[str], Optional[str]]:
     """The pane `pane.split` just made.
 
     The reply does not name it: the schema's `pane.split` result is `{"type":
@@ -951,20 +994,31 @@ def _split_pane_id(client, ws_id: str, tab_id: str, root_pane: str,
     the wrong pane. A reply that does carry the pane is preferred over the
     listing, since a server that starts naming it should not have its answer
     second-guessed.
+
+    Returns (pane_id, error). error is None on success, a string describing the
+    failure otherwise. The caller (split_agents_pane) converts errors into its
+    stable failure strings.
     """
     if isinstance(reply, dict):
         found = _id_of(reply, "pane_id") or _id_of(reply.get("pane"), "pane_id")
         if found:
-            return found
+            return found, None
     try:
         panes = client.call("pane.list", {"workspace_id": ws_id})
     except Exception:
-        return None
+        return None, "pane.list failed"
     others = sorted(
         str(pane.get("pane_id")) for pane in (panes or {}).get("panes", [])
         if isinstance(pane, dict) and pane.get("tab_id") == tab_id
         and pane.get("pane_id") and pane.get("pane_id") != root_pane)
-    return others[0] if others else None
+    if not others:
+        return None, "no new pane found"
+    if len(others) > 1:
+        # Ambiguous: more than one non-root pane exists. This should not happen
+        # because split_agents_pane checks before splitting, but if it does
+        # (e.g. a concurrent split, or the check failed), we must not guess.
+        return None, "ambiguous: {0} non-root panes in tab".format(len(others))
+    return others[0], None
 
 
 # ---------------------------------------------------------------------------
