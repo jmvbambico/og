@@ -1579,6 +1579,15 @@ def _boxed(lines: Iterable[str], width: int,
         # rather than widening the box (the picker's rule, same reason).
         width = max(BOX_MIN, width)
         inner = width - 2
+        # `max(0, ...)`, NOT the sibling branch's `max(1, ...)` — the `0` here is
+        # REQUIRED, not an oversight of that `1`. In fill mode `inner` is FIXED to
+        # `width - 2`, so at `width == BOX_MIN == 4` it is 2 and this clip is
+        # `max(0, 0) = 0`: every row empties, and the body line
+        # `"│ " + "".ljust(0) + " │"` is `"│  │"`, exactly 4 columns. A `1` would
+        # leave a character in the row that `ljust(inner - 2)` = `ljust(0)` cannot
+        # absorb, giving `"│ X │"` — 5 columns in a 4-column pane, shearing the
+        # box. The content-sized branch can afford its `1` only because IT sizes
+        # `inner` to the clipped rows (`+ 2`), so a 1-wide row still closes there.
         rows = [_clip(text, max(0, width - BOX_PADDING)) for text in lines]
         if title and len(title) + 3 > inner:
             title = ""
