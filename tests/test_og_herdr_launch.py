@@ -1177,7 +1177,10 @@ def test_case_b_focuses_the_existing_space_and_attaches(tmp_path):
     ctx = make_ctx(tmp_path, client, FakeWatcher([root_session()]))
 
     assert launch(ctx) == "attach"
-    assert client.methods == ["workspace.list", "workspace.focus"]
+    # The ping comes FIRST even here, because (B) reads herdr's workspace
+    # listing and that needs the socket: `ensure_server` runs before the attach
+    # is chosen, not after it. See the case-(B)-with-the-server-down regression.
+    assert client.methods == ["ping", "workspace.list", "workspace.focus"]
     assert client.params_of("workspace.focus")[0] == {"workspace_id": "w7"}
 
 
@@ -1217,6 +1220,7 @@ def test_case_b_adopts_when_the_session_has_no_space(tmp_path):
 
     assert launch(ctx) == "attach"
     assert client.methods == [
+        "ping",                      # the server is ensured before the attach
         "workspace.list",            # nothing recorded: is that the whole story?
         "workspace.create",
         "tab.rename",
@@ -1258,6 +1262,65 @@ def test_case_b_refuses_to_guess_when_the_workspace_list_is_unreadable(tmp_path)
 
     with pytest.raises(LaunchError):
         launch(make_ctx(tmp_path, Blind(), FakeWatcher([root_session()])))
+
+
+def test_case_b_starts_the_herdr_server_before_it_reads_the_workspace_list(
+        tmp_path):
+    """THE REGRESSION. Outside herdr, a live session in $PWD, and the server
+    DOWN: `og start herdr` must start the server and then carry on to the attach.
+
+    Case (B) asks herdr for its workspace listing to find the session's recorded
+    space, and that listing needs the socket. The launcher used to branch on the
+    session FIRST and return into the attach, so with the server down the listing
+    raised and the launch died on "could not list herdr workspaces: ..." — it
+    never reached the `ensure_server` call sitting below that return, which is
+    the one thing the operator asked for.
+
+    The client is the one the other case-(B) tests never built: NOTHING answers
+    its socket until `spawn` runs, so a launch that skips the spawn cannot read
+    the listing and cannot attach. The failure is not a missing round trip but
+    the wrong error at the keyboard.
+    """
+    (tmp_path / "og-herdr.json").write_text(
+        '{"version": 2, "spaces": {"s1": {"workspace_id": "w7", '
+        '"tab_id": "w7:t1", "pane_id": "w7:p1", "owner": "launcher"}}, '
+        '"pending": {}}')
+
+    class Cold(FakeClient):
+        """A server that is not running yet: the socket answers nothing."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.up = False
+
+        def ping(self):
+            if not self.up:
+                self.calls.append(("ping", {}))
+                raise RuntimeError("connect: no such socket")
+            return super().ping()
+
+        def workspace_list(self):
+            if not self.up:
+                raise RuntimeError("connect: no such socket")
+            return super().workspace_list()
+
+    started = []
+    client = Cold(workspaces=[{"workspace_id": "w7", "pane_count": 1}])
+
+    def spawn():
+        started.append("herdr server")
+        client.up = True
+
+    ctx = make_ctx(tmp_path, client, FakeWatcher([root_session()]), spawn=spawn)
+
+    assert launch(ctx) == "attach"
+
+    # The server was started, and the attach then went through to the focus: one
+    # probe that failed, one after the spawn that answered, then the listing.
+    assert started == ["herdr server"]
+    assert client.methods == ["ping", "ping", "workspace.list",
+                              "workspace.focus"]
+    assert client.params_of("workspace.focus")[0] == {"workspace_id": "w7"}
 
 
 # ---------------------------------------------------------------------------
