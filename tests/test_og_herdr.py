@@ -1213,8 +1213,18 @@ def test_the_sweep_defers_a_truncated_listing_that_hides_a_live_session(seams):
     bridge.reconcile([Ev("added", "root", root_session("T"))])
     client.calls.clear()
     # `root` is live and recorded, but the partial set does NOT contain it.
-    bridge.watcher._seen = {"still-around"}
-    bridge.watcher._listing_truncated = True
+    # TWO things make this reach the truncation guard rather than stopping at
+    # the one before it, and both are load-bearing:
+    #   * `_seen` must be a real DICT, keyed by session id. `{"still-around"}`
+    #     is a SET — it looks like a live set and reads as one — and `_seen` that
+    #     is not a dict is refused earlier, for a reason that has nothing to do
+    #     with truncation. The test would then pass with the guard deleted.
+    #   * the flag is `_last_truncated`, the record of whether the listing WAS
+    #     truncated, which is what the sweep reads. Set on the instance rather
+    #     than on `FakeWatcher`, which must stay silent about it so the test
+    #     below keeps its own premise.
+    bridge.watcher._seen = {"still-around": {}}
+    bridge.watcher._last_truncated = True
     assert bridge._live_session_ids() is None
     assert bridge.reconcile([], live_ids=bridge._live_session_ids()) == []
     assert client.calls == []
@@ -1223,14 +1233,16 @@ def test_the_sweep_defers_a_truncated_listing_that_hides_a_live_session(seams):
 
 def test_the_sweep_defers_when_the_watcher_cannot_report_truncation(seams):
     # A watcher that can hand over a live set but cannot say whether it is
-    # complete (no `_listing_truncated` attribute — the FakeWatcher) is treated
-    # as truncated, never as complete. The real path goes through
-    # `_live_session_ids`, so the sweep sees nothing to close.
+    # complete (no `_last_truncated` attribute — the FakeWatcher) is treated as
+    # truncated, never as complete. The real path goes through
+    # `_live_session_ids`, so the sweep sees nothing to close. A dict, for the
+    # reason the test above sets out: a `_seen` that is not a dict is refused
+    # earlier and would make this one pass for the wrong reason too.
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client)
     bridge.reconcile([Ev("added", "root", root_session("T"))])
     client.calls.clear()
-    bridge.watcher._seen = {"root"}      # looks live — but is it the whole set?
+    bridge.watcher._seen = {"root": {}}   # looks live — but is it the whole set?
     assert bridge._live_session_ids() is None
     assert bridge.reconcile([], live_ids=bridge._live_session_ids()) == []
     assert client.calls == []
