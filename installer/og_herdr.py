@@ -827,6 +827,10 @@ class Bridge:
         self._ws_ok = False
         self._ws_error = None
         self._pass_notes = []
+        # Ahead of `_prune_pending`, which saves and would otherwise write this
+        # process's construction-time copy of the file straight over a record
+        # the launcher wrote since. See `_reload_state` for the whole argument.
+        self._reload_state()
         lines: list[str] = list(self._prune_pending())
         for event in self._roots_first(events):
             try:
@@ -1045,6 +1049,89 @@ class Bridge:
     def _save_state(self) -> None:
         save_state(self.state_path, {"spaces": self._spaces,
                                     "pending": self._pending})
+
+    def _reload_state(self) -> None:
+        """Fold the state file as it is NOW into this process's two maps.
+
+        THE STALE SNAPSHOT. `og start herdr` starts this bridge BEFORE it execs
+        the launcher (see `bin/og`), and the launcher then writes its own
+        `pending[cwd]` record and exits. Both processes write the same file,
+        whole, last-writer-wins (see `save_state`), so maps loaded once at
+        construction cannot see anything written after that instant — and the
+        miss is silent AND visible at the same time: the dedupe in
+        `_existing_space` / `_claim_pending` finds no record, concludes the
+        session has no space, and opens a SECOND one for a directory that
+        already has one. One operator's state file held three spaces for one
+        directory, two of them the bridge's own, and the extra pane was
+        something they had to notice and close by hand. The dedupe only ever
+        worked across a bridge RESTART, which is why the duplicate looked like
+        it came and went with `og start`.
+
+        WHERE, and why this point. Once per PASS, at the pass boundary, ahead
+        of `_prune_pending`, for three reasons:
+
+          * the ordinary create decision funnels through `_existing_space` —
+            `_added` is its only caller, and `_added` is what decides a root
+            has no space — so the pass that precedes it is the last moment a
+            reload can still inform that decision. The repair path
+            (`_reproject`) can open a space without it, but it only ever runs
+            INSIDE a pass, for a session this bridge is already projecting, and
+            it has had its reload;
+          * it has to precede `_prune_pending`, which SAVES. Pruning writes
+            this process's whole copy of the file, so a prune that ran against
+            the construction-time snapshot would not merely miss the
+            launcher's record, it would DELETE it — and a record no process
+            holds any more can never be found by a later pass either. Reload
+            first and the record is in memory before anything can overwrite
+            it;
+          * per pass, not per event. A batch of ten new sessions must see ONE
+            consistent answer about `pending` rather than ten racing reads of a
+            file the launcher may be writing right now. That is the argument,
+            and the shape, the per-pass `_ws_index` snapshot in `reconcile`
+            already makes for the workspace listing.
+
+        MERGE, never replace. `setdefault` per key, so the file decides for
+        keys this bridge has never heard of and the bridge's own record wins
+        for keys it has. Every mutation it makes to either map is followed by
+        `_save_state` in the same call — `_remember`, `_drop_space_record`,
+        `_prune_pending`, `_forget_workspace`, and the claim at the end of
+        `_existing_space` — so what is in memory is at worst one FAILED write
+        ahead of the file, never behind it, and it is ahead of it on purpose:
+        a wholesale replace would let that failed write roll the bridge back
+        onto the workspace it has already typed an attach command into. (The
+        flip side — a record the bridge deliberately dropped reappearing
+        because its save failed — resolves itself: it names a workspace herdr
+        no longer lists, so the very next pass drops it again.)
+
+        ADDITIVE ONLY, which is what makes an unreadable file a no-op. Missing,
+        empty and unparseable all read back as two empty maps (`load_state`),
+        and merging two empty maps in changes nothing — so a file the bridge
+        cannot read leaves it behaving exactly as it behaves today. That is
+        the shape doing the work, not a fallback bolted onto it: a reload that
+        CLEARED on failure could convince a live bridge that the space a
+        session already has is recorded nowhere, and the next thing it does
+        with that belief is open a second space. An unreadable file must never
+        be able to cause the very duplicate this exists to prevent.
+
+        No note is passed to `load_state`, deliberately: `_state_note` is
+        printed once at startup about the file as it was at startup, and a
+        per-pass reload would either repeat that line forever or drown the
+        pass's own output under it.
+        """
+        try:
+            fresh = load_state(self.state_path)
+        except Exception:
+            # `load_state` is already total — it swallows read and parse errors
+            # and reports through the note instead — so reaching here means it
+            # grew a failure mode, and this bridge is a daemon whose whole job
+            # is projecting sessions. Its pre-reload view is exactly today's
+            # behaviour, which is stale but never fatal; a raise here would
+            # stop the pass instead.
+            return
+        for key, record in (fresh.get("spaces") or {}).items():
+            self._spaces.setdefault(key, record)
+        for key, record in (fresh.get("pending") or {}).items():
+            self._pending.setdefault(key, record)
 
     # -- event handlers -----------------------------------------------------
 
