@@ -363,8 +363,26 @@ Rules:
 - **`owner` records who created the space**, so a future `--cleanup` can offer
   "only what the bridge opened" if that ever matters. Today both are cleaned
   alike.
-- **The file is not a lock.** Two processes can write it. Keep writes small and
-  last-writer-wins; nothing here is worth a lockfile.
+- **The file is not a lock, but every read-modify-write takes one.** Both
+  processes write it whole, so any operation that means something is a
+  read-modify-write, and re-reading immediately before writing (which both
+  sides do) narrows the race without closing it — a second read only moves it.
+  So load, change and save happen inside one `og_herdr.state_update`, holding
+  `og_herdr.state_lock` — an advisory `flock` on a `og-herdr.json.lock` SIDECAR,
+  never the state file itself, because `os.replace` swaps the inode a lock would
+  ride on. Whoever commits first, the second writer reads the first's file and
+  lands on top of it. It is advisory: a writer that ignores it is still
+  last-writer-wins, which is what this file has always been.
+- **Readers re-read, and merge per key — never wholesale.** The bridge folds the
+  file in at each pass boundary (before `_prune_pending`, which saves), inside
+  every save, and again at the moment it claims a pending record — the last of
+  those *is* the save, in one transaction. A key the bridge has not changed
+  since the file last held it belongs to whoever wrote the file last, *including
+  a launcher that replaced it* under the same directory key. Memory wins for a
+  key it holds an unsaved change to, and for a key it has finished with whose
+  record the file still shows unchanged — that second half is what stops a
+  claimed record from being offered to the next session. A key the file no
+  longer has is never removed from memory, so an unreadable file changes nothing.
 
 ### The deferred write
 

@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -26,6 +27,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "installer"))
 
+import og_herdr  # noqa: E402  (the shared state-file discipline, tested from here)
+import og_herdr_launch  # noqa: E402
 from og_herdr import DEFAULT_SPACE_CAP, load_state, save_state  # noqa: E402  (the bridge's own readers)
 from og_herdr_launch import (  # noqa: E402
     AGENTS_PANE_RATIO,
@@ -1092,6 +1095,54 @@ def test_case_d_writes_the_pending_record_before_it_types_chat(tmp_path):
 
     assert client.text_typed() == ["og chat", "og agents"]
     assert CWD in client.pending_at_send[0]
+
+
+def test_a_record_waits_for_the_lock_the_bridge_holds_and_lands_on_top(tmp_path):
+    """BOTH WRITERS TAKE THE SAME LOCK, which is the whole of the discipline.
+
+    `_record` re-reads before it writes, and that used to be enough to argue it
+    could not erase what the bridge wrote. It is not enough, because the bridge
+    now reads, decides and writes inside one transaction: a launcher whose write
+    lands between the bridge's read and its claim is erased by the claim's own
+    save, taking the operator's freshly opened space out of the file. So both
+    sides hold `og_herdr.state_lock`, and this asserts the launcher side really
+    does — it cannot get in while the bridge holds the file, and when it gets in
+    it reads the bridge's committed state and writes on top of it.
+
+    The competitor is a thread, which is the same thing to `flock` as a second
+    process: the lock rides the open file description, and two opens exclude
+    each other within one process exactly as they do across two.
+    """
+    path = ctx_path(tmp_path)
+    path.write_text(json.dumps(
+        {"version": 2,
+         "spaces": {"s1": {"workspace_id": "w7", "tab_id": "w7:t1",
+                           "pane_id": "w7:p1", "owner": "bridge"}},
+         "pending": {}}))
+    ctx = make_ctx(tmp_path, FakeClient(), FakeWatcher())
+    record = {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+              "owner": "launcher", "cwd": CWD}
+    done = threading.Event()
+
+    def write_it():
+        og_herdr_launch._record(ctx.state_path, "pending", CWD, record)
+        done.set()
+
+    with og_herdr.state_lock(path):
+        writer = threading.Thread(target=write_it, daemon=True)
+        writer.start()
+        # Short on purpose, and it can only fail this way if the lock is not
+        # being taken: `_record` has no other reason to take a tenth of a second
+        # to write a 200-byte file.
+        assert not done.wait(0.1), "_record wrote while the bridge held the file"
+
+    writer.join(timeout=10)
+    assert done.is_set(), "_record never completed once the lock was released"
+    state = load_state(path)
+    # The bridge's record is still there: the re-read happened INSIDE the lock,
+    # not before it was taken.
+    assert state["spaces"]["s1"]["workspace_id"] == "w7"
+    assert state["pending"][CWD] == record
 
 
 def test_a_chat_that_fails_to_start_leaves_no_pending_record(tmp_path):
