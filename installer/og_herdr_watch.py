@@ -27,20 +27,23 @@ API facts this encodes, verified against a running server:
   `pending_elicitations_count` — PLURAL, `archived`, plus
   `external_session_id`, `agent_id`, `labels`, `owner`, `permission_level`,
   `runner_id`, `created_at`, `updated_at`, `comments_count`, `viewer_unread`.
-  There is no `session_id`, no `kind` and no `workspace` in a listing row.
+  There is no `session_id`, no `kind`, no `workspace` and no `host_id` in a
+  listing row — the keys it does carry are enumerated in `runner_is_offline`.
 * A listing row is NOT the whole session. `GET /v1/sessions/{id}` — the DETAIL
   endpoint, one request per session — carries `workspace` (the directory the
-  session actually lives in), plus `kind`, `harness`, `git_branch`,
+  session actually lives in), plus `kind`, `harness`, `git_branch`, `host_id`,
   `sub_agent_name`, `runner_online` and the full `pending_elicitations` LIST
   where the listing has only its count. The listing being silent about a
   directory is not evidence that the API has none: it is why every pane once
   opened wherever the bridge happened to be started. So the watcher fetches the
   detail row ONCE per session, on the `added` path, and merges the directory
-  and the session's identity (`kind`, `harness`, `sub_agent_name`) into the
-  session object it emits — see `_workspace_for` for what a sub-agent resolves
-  to, and why that answer is close but deliberately not exact; see DETAIL_FIELDS
-  for why these three come from the detail row rather than from the listing
-  row's `agent_name`, which reads a different name entirely. The same fetch is
+  and the session's identity (`kind`, `harness`, `sub_agent_name`, `host_id`)
+  into the session object it emits — see `_workspace_for` for what a sub-agent
+  resolves to, and why that answer is close but deliberately not exact; see
+  DETAIL_FIELDS for why these four come from the detail row rather than from the
+  listing row's `agent_name`, which reads a different name entirely, and for why
+  `host_id` has to travel at all: the launcher's attach path must be able to
+  tell this machine's sessions from another machine's. The same fetch is
   what decides whether the session is worth projecting at all: `runner_online`
   lives on the detail row only, and `attach` refuses a session with no live
   runner — see `runner_is_offline`, which is why that rule is applied next to
@@ -118,10 +121,10 @@ MAX_POLL_BACKOFF = 30.0
 MAX_PARENT_WORKSPACES = 64
 
 # Fields merged out of the DETAIL row onto the session object the consumer
-# receives, alongside `workspace`. All three answer "which worker is this":
-# `kind` is the server's own classification (default / sub_agent), `harness`
-# names the CLI driving the agent, and `sub_agent_name` is the delegated
-# worker's own name.
+# receives, alongside `workspace`. The first three answer "which worker is
+# this": `kind` is the server's own classification (default / sub_agent),
+# `harness` names the CLI driving the agent, and `sub_agent_name` is the
+# delegated worker's own name.
 #
 # WHY the DETAIL row and not the listing row's `agent_name`, when the listing
 # row appears to carry a name for the same thing: two sources, two answers, and
@@ -133,10 +136,26 @@ MAX_PARENT_WORKSPACES = 64
 # for all of them. The detail row is the authoritative one, and it is already
 # being fetched for the directory, so taking these three costs no request.
 #
+# `host_id` is the odd one out: it answers "WHICH MACHINE", not which worker, and
+# it is here for the LAUNCHER rather than the bridge — `og_herdr_launch.
+# live_session` must not type an `omnigent attach` for a session belonging to
+# another machine, and it can only tell by comparing that session's host with the
+# one `/v1/hosts` reports online. The failure it fixes is real, not theoretical:
+# a work-mac session in the SAME project path matched on `workspace`, was
+# adopted, and the pane it opened showed nothing but "no online runner … its
+# host is offline". Detail-only for the same MEASURED reason as `workspace` —
+# the listing row carries no `host_id` at all (see the key list in
+# `runner_is_offline`), so there is no second source here to disagree with.
+#
 # Each is merged only when it is a non-empty STRING, so a row that reported
 # `sub_agent_name: null` for a root leaves the key absent rather than teaching
-# the consumer that the root's name is null.
-DETAIL_FIELDS = ("kind", "harness", "sub_agent_name")
+# the consumer that the root's name is null. That guard is also what makes
+# `host_id` safe to carry here: a sub-agent's detail row reports `host_id: null`
+# (measured) and is therefore forwarded with NO key at all — which is the "I do
+# not know which machine this is" state every consumer already reads that way,
+# and exactly the one `live_session` needs, since it skips a session only when
+# both ids are known and they differ.
+DETAIL_FIELDS = ("kind", "harness", "sub_agent_name", "host_id")
 
 # Ceilings for the SSE parser. A session event is kilobytes; a megabyte is
 # already several orders of magnitude past anything real. Past these the peer is
@@ -1154,6 +1173,18 @@ A TRUNCATED listing cannot mean anything by an absence — but only for the
         is one request buying five answers, not a second round trip for a label.
         See DETAIL_FIELDS for why these three and not the listing row's
         `agent_name`.
+
+        And the MACHINE it runs on: `host_id` is merged through the same loop,
+        for the same one-request reason, because `og_herdr_launch.live_session`
+        cannot keep `launch` from typing an `omnigent attach` for a session on
+        another machine without it — a work-mac session in the same project path
+        matched on `workspace`, was adopted, and opened a pane whose only content
+        was "its host is offline". It was on that path first and the launcher
+        never saw it, because the listing row does not carry `host_id` at all and
+        nothing forwarded the detail's. The loop's string guard does the right
+        thing for free: a sub-agent's `host_id: null` leaves the key ABSENT, which
+        is the unknown state `live_session` reads as "do not filter", so no
+        second, differently-behaved copy of the merge is needed for this field.
 
         `runner_online` is forwarded as well, when the detail row carries a real
         boolean. It is not decoration: the consumer lays a LIVE session out one
