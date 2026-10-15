@@ -2742,6 +2742,69 @@ def test_the_access_panel_paints_at_full_brightness_not_the_footer_dim():
     assert [role for _t, role in moved_tail[1:1 + len(panel)]] == [a.NORMAL] * len(panel)
 
 
+def test_the_access_panel_colours_its_parts_by_role():
+    """PART 2. The panel's parts are named by ROLE, and a role is a THEME slot —
+    never a hex, so a theme decides every colour. The frame (the title rule and
+    both borders) takes `border`, which names the `rail` slot: the slot `ROLES`
+    documents as "group rails and box borders", which no role reached until now.
+    The URL and the QR take `text` (PLAIN), the caveat takes `meta`."""
+    acc = _access(qr=["QRROW"], url="http://192.168.100.176:6767",
+                  note="same wifi only")
+    rows = a.access_spans(acc, 80)
+
+    def role_of(needle):
+        """The set of roles carried by rows whose text contains `needle`."""
+        return {role for text, role in rows if needle in text}
+
+    # The frame is `border`, top and bottom, and `border` IS the rail slot.
+    assert rows[0][1] == rows[-1][1] == a.BORDER
+    assert a._theme_role(a.BORDER) == "rail"
+    # The title rides the top rule, so it takes the frame's role with it — the
+    # per-row trade: one span list per row, no per-span split for a title.
+    assert rows[0][0].startswith("┌─ " + a.ACCESS_TITLE + " ")
+    assert role_of(a.ACCESS_TITLE) == {a.BORDER}
+
+    # The URL is the panel's content, in the theme's `text` slot.
+    assert role_of("http://192.168.100.176:6767") == {a.PLAIN}
+    assert a._theme_role(a.PLAIN) == "text"
+    # ...the caveat is secondary text...
+    assert role_of("same wifi only") == {a.META}
+    assert a._theme_role(a.META) == "meta"
+    # ...and the QR is PLAIN (the `text` slot), ONE span for the whole row: its
+    # modules are never coloured individually, because a QR has to stay
+    # high-contrast to scan and a per-module colour is how you break that.
+    assert role_of("QRROW") == {a.PLAIN}
+
+
+def test_an_addressless_panel_puts_its_one_line_on_the_meta_role():
+    """The no-address panel is a box around one honest caveat, and the caveat is
+    META like every other caveat — the frame is the only other thing on it."""
+    acc = _access(url=None, note=a.NO_ADDRESS_NOTE)
+    rows = a.access_spans(acc, 80)
+
+    assert len(rows) == 3, "a box around one line"
+    assert rows[0][1] == rows[-1][1] == a.BORDER
+    assert a.NO_ADDRESS_NOTE in rows[1][0] and rows[1][1] == a.META
+
+
+def test_the_access_panel_keeps_its_text_full_width_and_normal_brightness():
+    """The MUST-NOT-REGRESS pair, re-checked through the role-carrying path: each
+    row still joins to the same TEXT `access_lines` returns, still spans the pane,
+    and still hangs NORMAL — never the footer's DIM. The access box was just made
+    full-width and bright on this branch; colouring its parts must not undo that."""
+    acc = _access(qr=["QRROW"])
+    spans = a.access_spans(acc, 80)
+    assert [text for text, _role in spans] == a.access_lines(acc, 80)
+    assert all(len(text) == 80 for text, _role in spans), "still pane-width"
+
+    pane = a._pane(a.Frame(rows=[header()], access=acc), 80)
+    panel = a.access_lines(acc, 80)
+    rows = pane.items[pane.list_rows:][1:1 + len(panel)]
+    assert [role for _spans, role in rows] == [a.NORMAL] * len(panel), \
+        "the panel is not chrome: every row paints NORMAL, not DIM"
+    assert pane.items[-1][1] == a.DIM, "the footer is still the one dim line"
+
+
 def test_the_access_panel_shows_the_qr_and_url_when_wide_enough():
     qr = ["\x1b[40;37;1m" + "█" * 27 + "\x1b[0m"]
     acc = _access(qr=qr, url="http://192.168.100.176:6767")

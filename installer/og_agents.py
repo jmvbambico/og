@@ -380,6 +380,12 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              hands it back `r` as its colour role (see `_bare_role`). This is
 #              how brightness became a PER-SPAN axis — the gutter and the status
 #              glyph are exempt on every row, selected or not.
+#   BORDER     the access panel's own frame: its title rule and its body borders
+#              both, because the title rides ON the top rule and a row is one
+#              span list. It names the theme's `rail` slot — the one slot
+#              `ROLES` documents as "group rails and box borders" and which until
+#              now NO role reached, so the slot was dead. Left PLAIN, `rail` could
+#              not be expressed at all.
 #   FOOTER_KEY    a footer shortcut's KEY half, and FOOTER_LABEL its label half
 #              (and the `·` between entries, and the strip's padding). They are
 #              two roles rather than one because the KEY is the prominent half —
@@ -388,6 +394,7 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              strip, which is why they cannot just be PLAIN/META (see
 #              `_role_background`).
 PLAIN, META, ORCH = "plain", "meta", "orch"
+BORDER = "border"
 FOOTER_KEY = "footer-key"
 FOOTER_LABEL = "footer-label"
 UNDIM = "undim:"
@@ -1591,23 +1598,55 @@ def access_lines(access: Access, width: int) -> list[str]:
     Every line out of here is stripped of ANSI SGR escapes: curses prints what
     it is given, so an escape that reaches `addnstr` shows up as `^[` in the
     pane rather than as a colour.
+
+    This is the panel's TEXT and nothing else, which is why it still returns plain
+    strings: the caller that needs the paint asks `access_spans`, and every test
+    that treats these rows as text keeps working.
+    """
+    return [text for text, _role in access_spans(access, width)]
+
+
+def access_spans(access: Access, width: int) -> list[tuple[str, str]]:
+    """The access panel's rows, each with the role it paints under: `(line, role)`.
+
+    `access_lines` is the text half of this, so the panel's SHAPE and its PAINT
+    cannot drift: the box is built in one place and a row is coloured by what it
+    IS, rather than by re-deriving the layout wherever it is painted.
+
+    The roles come from the ordinary vocabulary and nothing new is invented:
+
+      * the FRAME — the title rule and both borders — is `BORDER`, which names the
+        theme's `rail` slot. The title rides ON the top rule and one row is one
+        span list, so the title is coloured with its border; splitting a row into
+        two spans to separate them would buy nothing a reader could see.
+      * the URL is PLAIN, the theme's `text` slot: it is the panel's content and
+        the one thing the operator opened the panel for.
+      * the NOTE (the caveat under the address) is META, the secondary role.
+      * the QR is PLAIN — the `text` slot — and deliberately NOT coloured per
+        module. A QR has to stay high-contrast to scan, and a theme whose `text`
+        sits close to its `bg` would make a code that LOOKS scannable and is not;
+        the glyphs are left exactly as `qrencode` produced them.
     """
     if access.url is None:
-        return _boxed([access.note or NO_ADDRESS_NOTE], width, fill=True)
-    content: list[str] = []
-    qr = [_ANSI_SGR.sub("", line) for line in access.qr]
-    # Measured with `_visible_width` rather than `len`: "does the code fit" is a
-    # question about the columns the terminal will paint, and the rule that says
-    # so lives in one place.
-    if qr and max(_visible_width(row) for row in qr) + BOX_PADDING <= width:
-        content.extend(qr)
-        # A blank row between the code and the prose, so the eye lands on the
-        # code first and the URL is not read as part of it.
-        content.append("")
-    content.append(access.url)
-    if access.note:
-        content.append(access.note)
-    return _boxed(content, width, fill=True)
+        content: list[tuple[str, str]] = [(access.note or NO_ADDRESS_NOTE, META)]
+    else:
+        content = []
+        qr = [_ANSI_SGR.sub("", line) for line in access.qr]
+        # Measured with `_visible_width` rather than `len`: "does the code fit" is a
+        # question about the columns the terminal will paint, and the rule that says
+        # so lives in one place.
+        if qr and max(_visible_width(row) for row in qr) + BOX_PADDING <= width:
+            content.extend((row, PLAIN) for row in qr)
+            # A blank row between the code and the prose, so the eye lands on the
+            # code first and the URL is not read as part of it.
+            content.append(("", PLAIN))
+        content.append((access.url, PLAIN))
+        if access.note:
+            content.append((access.note, META))
+    # `_boxed` returns head + one row per content line + bottom, so the two frames
+    # are exactly the first and last of these roles.
+    box = _boxed([text for text, _role in content], width, fill=True)
+    return list(zip(box, [BORDER] + [role for _text, role in content] + [BORDER]))
 
 
 # --- span composition --------------------------------------------------------
@@ -2358,8 +2397,13 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     # selection's axis and it applies to worker boxes; the footer below is the
     # chrome and is still DIM.
     if frame.access is not None:
-        tail.extend(([(line, PLAIN)], NORMAL)
-                    for line in access_lines(frame.access, width))
+        # Each row is hung with the ROLE the panel gave it — the frame is `rail`,
+        # the URL and the QR are `text`, the caveat is `meta` — rather than one
+        # PLAIN span for the lot: the panel is drawn by the same painter as the
+        # tree, so its parts are named the same way. Per ROW, not per span within
+        # a row; the title shares its rule's role because they share the row.
+        tail.extend(([(text, role)], NORMAL)
+                    for text, role in access_spans(frame.access, width))
         tail.append(([("", PLAIN)], NORMAL))
     # The focus notice, while it is up, TAKES the footer's row rather than adding
     # one above it: the tail is the same length either way, so the pane's row
@@ -2599,8 +2643,11 @@ def _theme_role(role: str) -> Optional[str]:
     wants on the terminal in hand. Keeping them apart here is what stops the two
     from drifting into two different opinions about which role a span names.
 
-    The footer's two roles name `text` and `meta`, the prominent half and the
-    recessed half of the same row.
+    BORDER NAMES `rail`, and that is the slot's documented purpose ("group rails
+    and box borders") finally being reached: no role mapped to it before, so the
+    access panel's frame — its title rule and its borders — is the first thing to
+    paint it. The footer's two roles name `text` and `meta`, the prominent half
+    and the recessed half of the same row.
     """
     bare = _bare_role(role)
     if bare.startswith("mark:"):
@@ -2609,6 +2656,8 @@ def _theme_role(role: str) -> Optional[str]:
         return None                      # a weight, and no colour, as always
     if bare == META:
         return META
+    if bare == BORDER:
+        return "rail"
     if bare == FOOTER_LABEL:
         return META
     if bare == FOOTER_KEY:
