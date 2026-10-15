@@ -79,11 +79,15 @@ from og_herdr_watch import (
 from og_themes import (
     CURSES_DEFAULT,
     Theme,
+    ansi256_rgb,
     curses_value,
     hex_to_ansi256,
+    hex_to_rgb,
     load_catalog,
     ordered_themes,
     readable_index,
+    relative_luminance,
+    rgb_to_hex,
     save_theme,
     theme_for,
     valid_slugs,
@@ -255,15 +259,16 @@ DEFAULT_WIDTH = 80
 # a key: a key with no label is still findable by pressing it, a key clipped off
 # the end is gone.
 #
-# NO LOCALE-DEPENDENT GLYPH HERE. The move keys were once ↑/↓ (U+2191/U+2193),
-# which are East Asian AMBIGUOUS: one column in a Latin locale, TWO in a CJK one.
-# `_display_width` charged them one, so the full form measured exactly 64 and was
-# chosen for a 64-column pane — but a CJK terminal painted 66 and `_clip` cut the
-# trailing keys off. That is the very bug the three forms exist to end, merely
-# relocated to another locale. They are ASCII now (`^/v`), so every footer glyph
-# measures one column under BOTH rules and the question cannot arise. ⏎ (U+23CE)
-# and ␣ (U+2423) are Narrow — checked, not assumed — and `_display_width` charges
-# Ambiguous two as a backstop for anything a future edit adds. See
+# THE FOOTER NAMES ITS KEYS IN ASCII, AND ITS ONE NON-ASCII SEPARATOR IS A KNOWN
+# AMBIGUOUS. The move keys were once ↑/↓ (U+2191/U+2193), East Asian AMBIGUOUS —
+# one column in a Latin locale, TWO in a CJK one. `_display_width` charged them
+# one, so the full form measured exactly 64 and was chosen for a 64-column pane —
+# but a CJK terminal painted 66 and `_clip` cut the trailing keys off. They are
+# ASCII now (`^/v`), and ⏎ (U+23CE) and ␣ (U+2423) are Narrow — checked, not
+# assumed. The ` · ` separator is Ambiguous and is handled rather than avoided:
+# `_footer` picks a form with `_display_width`, which charges it two, so a form is
+# only chosen for a pane it fits under the CJK rule as well. ⏎/␣/· are the only
+# non-ASCII glyphs here and each is charged by that pessimistic ruler. See
 # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
 #
 # `t theme` JOINED ALL THREE FORMS WITHOUT MOVING ANY THRESHOLD, and that took a
@@ -275,12 +280,47 @@ DEFAULT_WIDTH = 80
 # `t theme`: the key `r` still EXISTS in all three forms (the rule is that a key
 # may never degrade, only its label), and `r` is the one binding whose loss costs
 # the operator nothing — it is a convenience refresh, where every other binding is
-# something you cannot guess. COMPACT is therefore 45 columns wide, the width it
-# has always been, and `test_the_footer_chooses_a_form_by_measured_width` pins
-# that.
-FOOTER = "q quit  r refresh  ^/v move  enter focus  space expand  a access  t theme"
-FOOTER_COMPACT = "q quit r ^v ⏎ focus ␣ expand a access t theme"
-FOOTER_KEYS = "q r ^v ⏎ ␣ a t"
+# something you cannot guess.
+#
+# THE THREE FORMS ARE BUILT FROM (key, label) PAIRS, not typed out, so a key can
+# never appear in one form without its label and the ` · ` separator can never be
+# forgotten in one of them: `_footer_form` is the ONE place a form is spelled out,
+# and `_footer_spans` paints the SAME pair list it built from (`_footer_entries`),
+# one span per half. THE SEPARATOR CHANGED EVERY WIDTH: the old double space was
+# 2 columns and ` · ` is 3, so the full form went 73 -> 79 columns, and the
+# Ambiguous `·` costs 2 under `_display_width`, which is the ruler `_footer` picks
+# with, so the MEASURED widths are 85 / 63 / 32. The full form therefore needs 85
+# columns and a plain 80-column terminal shows COMPACT — the deliberate price of a
+# spaced separator, and the reason `test_the_footer_chooses_a_form_by_measured_width`
+# pins the measured numbers rather than the printed ones.
+FOOTER_SEP = " \u00b7 "
+
+
+def _footer_form(entries: Iterable[tuple[str, str]]) -> str:
+    """One footer form from its `(key, label)` pairs: `q quit · r refresh`.
+
+    A label of "" is a KEY with no label (the compact and keys forms). The
+    separator is `FOOTER_SEP` between entries and a single space inside one, which
+    is exactly what the three constants below have always looked like.
+    """
+    return FOOTER_SEP.join(
+        key + (f" {label}" if label else "") for key, label in entries)
+
+
+FOOTER_ENTRIES = (
+    ("q", "quit"), ("r", "refresh"), ("^/v", "move"), ("enter", "focus"),
+    ("space", "expand"), ("a", "access"), ("t", "theme"),
+)
+FOOTER_COMPACT_ENTRIES = (
+    ("q", "quit"), ("r", ""), ("^v", ""), ("⏎", "focus"),
+    ("␣", "expand"), ("a", "access"), ("t", "theme"),
+)
+FOOTER_KEYS_ENTRIES = (
+    ("q", ""), ("r", ""), ("^v", ""), ("⏎", ""), ("␣", ""), ("a", ""), ("t", ""),
+)
+FOOTER = _footer_form(FOOTER_ENTRIES)
+FOOTER_COMPACT = _footer_form(FOOTER_COMPACT_ENTRIES)
+FOOTER_KEYS = _footer_form(FOOTER_KEYS_ENTRIES)
 
 # The caveats shown under the address, mirroring bin/og's `show_access`: the
 # operator must know whether the address is scannable only on the same wifi or
@@ -340,7 +380,16 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              hands it back `r` as its colour role (see `_bare_role`). This is
 #              how brightness became a PER-SPAN axis — the gutter and the status
 #              glyph are exempt on every row, selected or not.
+#   FOOTER_KEY    a footer shortcut's KEY half, and FOOTER_LABEL its label half
+#              (and the `·` between entries, and the strip's padding). They are
+#              two roles rather than one because the KEY is the prominent half —
+#              it takes the `text` slot and is `undim`-exempt — while the label
+#              recedes into `meta`. Both carry the footer's derived background
+#              strip, which is why they cannot just be PLAIN/META (see
+#              `_role_background`).
 PLAIN, META, ORCH = "plain", "meta", "orch"
+FOOTER_KEY = "footer-key"
+FOOTER_LABEL = "footer-label"
 UNDIM = "undim:"
 
 # PLAIN is a COLOUR ROLE; `text` is the THEME role it asks the catalog for. They
@@ -1934,6 +1983,20 @@ def move_selection(rows: list[Row], selected: Optional[int],
     return workers[min(max(at + (1 if delta > 0 else -1), 0), len(workers) - 1)]
 
 
+def _footer_entries(width: int) -> tuple:
+    """The `(key, label)` pairs of the form that fits `width` columns.
+
+    The one decision `_footer` makes, factored out so the TEXT (`_footer`) and the
+    SPANS (`_footer_spans`) are built from the same list: the painter could not
+    otherwise agree with the measurement about which form belongs on screen.
+    """
+    if width >= _display_width(FOOTER):
+        return FOOTER_ENTRIES
+    if width >= _display_width(FOOTER_COMPACT):
+        return FOOTER_COMPACT_ENTRIES
+    return FOOTER_KEYS_ENTRIES
+
+
 def _footer(width: int) -> str:
     """The footer form that fits `width` columns, widest readable first.
 
@@ -1946,14 +2009,62 @@ def _footer(width: int) -> str:
 
     Below the KEYS width there is nothing left to drop but keys themselves; the
     agents pane is never that narrow (it is a ~46-column split, and `access_lines`
-    has already given up its QR by 31), so `_pane`'s `_clip` guard is the only
-    thing that could cut here, and it would cut a key list, not mid-sentence.
+    has already given up its QR by 31), so `_pane`'s guard is the only thing that
+    could cut here, and it would cut a key list, not mid-sentence.
+
+    This is the TEXT of the row (the tests compare painted text to it);
+    `_footer_spans` is the painted form.
     """
-    if width >= _display_width(FOOTER):
-        return FOOTER
-    if width >= _display_width(FOOTER_COMPACT):
-        return FOOTER_COMPACT
-    return FOOTER_KEYS
+    return _footer_form(_footer_entries(width))
+
+
+def _pad_footer(spans: list[Span], width: int) -> list[Span]:
+    """`spans` clipped to `width` columns and padded out to exactly `width`.
+
+    THE PADDING IS THE STRIP. `paint_line` only colours the cells a span covers,
+    so a footer that stopped at its last key would leave the window's own
+    background showing between the keys and the pane edge — the strip has to be
+    carried by a span that reaches the edge. The pad takes `FOOTER_LABEL` (never
+    PLAIN) so it shares the footer's derived background; under `og` that
+    background is None and the padding is invisible, which is the point — it costs
+    the theme-less pane nothing.
+
+    The measure is `len` (`_spans_width`), the ruler the whole pane is composed
+    under and the one `paint_line` positions by — so the pad lands in the pane's
+    last column in the terminal this is built for. See the footer comment for the
+    CJK caveat that an Ambiguous separator brings.
+    """
+    clipped = _clip_spans(spans, width)
+    gap = width - _spans_width(clipped)
+    if gap > 0:
+        clipped = clipped + [(" " * gap, FOOTER_LABEL)]
+    return clipped
+
+
+def _footer_spans(width: int) -> list[Span]:
+    """The footer row as SPANS: each key, its label, a `·` between entries, padded
+    to the pane width.
+
+    THE KEY AND ITS LABEL ARE DIFFERENT ROLES so the operator can see at a glance
+    which half is the thing to press. The KEY takes `text` (the body colour) and is
+    hung through `undim`, so it stays at full brightness on a line the pane paints
+    DIM — the footer is chrome and its LINE is dim, but the key is the content of
+    that chrome and must not be. The LABEL and the `·` separator both take `meta`,
+    which is the dimmer of the two, so the separator recedes between the entries
+    exactly as a divider should. Both roles carry the derived strip background
+    (see `_role_background`).
+
+    ` ` joins a key to its label and `FOOTER_SEP` joins the entries, so the spans
+    JOIN to exactly the string `_footer(width)` chooses — one form, two renderings.
+    """
+    spans: list[Span] = []
+    for index, (key, label) in enumerate(_footer_entries(width)):
+        if index:
+            spans.append((FOOTER_SEP, FOOTER_LABEL))
+        spans.append((key, undim(FOOTER_KEY)))
+        if label:
+            spans.append((f" {label}", FOOTER_LABEL))
+    return _pad_footer(spans, width)
 
 
 # ---------------------------------------------------------------------------
@@ -2260,7 +2371,12 @@ def _pane(frame: Frame, width: int = DEFAULT_WIDTH,
     if frame.notice:
         tail.append(([(_clip(frame.notice, width), PLAIN)], NORMAL))
     else:
-        tail.append(([(_clip(_footer(width), width), PLAIN)], DIM))
+        # The footer is a span list, not one clipped string: each key is its own
+        # span (`undim`, `text` slot) so it stays bright on the DIM chrome line,
+        # each label and the `·` between entries are `meta`, and the row is padded
+        # to `width` so the background strip reaches the pane edge. See
+        # `_footer_spans`.
+        tail.append((_footer_spans(width), DIM))
 
     room = None if height is None else max(ACCESS_LIST_FLOOR, height - len(tail))
     kept: list[list[Line]] = []
@@ -2482,6 +2598,9 @@ def _theme_role(role: str) -> Optional[str]:
     index (the pure, testable seam) and `_role_value` into whatever `init_pair`
     wants on the terminal in hand. Keeping them apart here is what stops the two
     from drifting into two different opinions about which role a span names.
+
+    The footer's two roles name `text` and `meta`, the prominent half and the
+    recessed half of the same row.
     """
     bare = _bare_role(role)
     if bare.startswith("mark:"):
@@ -2490,6 +2609,10 @@ def _theme_role(role: str) -> Optional[str]:
         return None                      # a weight, and no colour, as always
     if bare == META:
         return META
+    if bare == FOOTER_LABEL:
+        return META
+    if bare == FOOTER_KEY:
+        return PLAIN_TEXT
     if bare.startswith("state:"):
         state = bare[len("state:"):]
         return state if state in _STATE_COLOURS else None
@@ -2565,6 +2688,74 @@ def _mark_colour(vendor: str, theme: Optional[Theme] = None) -> Optional[int]:
     return readable_index(index, theme.background())
 
 
+# ---------------------------------------------------------------------------
+# the footer's background strip
+# ---------------------------------------------------------------------------
+#
+# The strip is a SHADE OF THE THEME'S OWN `bg`, not a ninth theme role. A role
+# would have meant editing `ROLES`, every row of installer/themes.json and the
+# loader's refusal rule — churn that was explicitly rejected — so the strip is
+# DERIVED, and deriving it has ONE failure mode that must be defended against,
+# because this bug is silent:
+#
+# TWO DIFFERENT HEXES ROUTINELY LAND ON THE SAME 256-COLOUR CELL, and this
+# terminal reports COLORS=256 and cannot redefine any of them (no `ccc`), so a
+# hex is never painted — only the cell it snaps to is. A shade a comfortable 12%
+# brighter than the background can therefore resolve to the background's OWN
+# cell, at which point the strip is exactly the pane background and the whole
+# feature does nothing. Nothing about a hex reveals this; only the cell does. So
+# the derivation does not stop at the first shade: it resolves each candidate to
+# its CELL and keeps stepping until that cell differs from `bg`'s — and if no step
+# separates them, it falls back to a palette neighbour, which is a different cell
+# by construction. The test that pins this across every shipped theme is the
+# point of the guard; without it a theme could ship the strip invisible.
+STRIP_STEP = 0.12
+STRIP_STEPS = 8
+
+
+def _shade(srgb: tuple, amount: float) -> tuple:
+    """`srgb` moved `amount` of the way toward white (amount > 0) or black
+    (amount < 0), per channel. Floats; `rgb_to_hex` does the rounding."""
+    if amount >= 0:
+        return tuple(channel + (255 - channel) * amount for channel in srgb)
+    return tuple(channel * (1 + amount) for channel in srgb)
+
+
+def footer_strip(theme: Optional[Theme]) -> Optional[str]:
+    """The footer's background strip for `theme`, as a hex — or None where there is
+    no known background to shade.
+
+    None for `og` (and for any theme whose `bg` is `"default"`): the pane is
+    transparent, there is no colour here to shade, and painting a strip anyway
+    would put a colour on the one theme that promises the terminal's own — the
+    same promise `apply_background` keeps.
+
+    Otherwise a shade of the theme's `bg`, moved AWAY from it — lighter on a dark
+    pane, darker on a light one — because a shade that moved toward the background
+    would BE the background. Each candidate is resolved to its 256-cell and
+    rejected while it equals `bg`'s cell (see the block comment above: that is the
+    whole reason this is a loop and not one multiplication). If no step separates
+    them, a DEFINED NEIGHBOUR of the background's own cell — the next palette index
+    — is returned, so the strip can never come back as the background it is meant
+    to sit on. `max(16, ...)` keeps that neighbour out of the terminal's own first
+    sixteen ANSI slots, whose colours are the terminal's and not the catalog's.
+    """
+    if theme is None:
+        return None
+    base = theme.background()
+    if base is None:
+        return None
+    base_cell = hex_to_ansi256(base)
+    source = hex_to_rgb(base)
+    direction = 1.0 if relative_luminance(base) < 0.5 else -1.0
+    for step in range(1, STRIP_STEPS + 1):
+        candidate = rgb_to_hex(_shade(source, direction * STRIP_STEP * step))
+        if hex_to_ansi256(candidate) != base_cell:
+            return candidate
+    neighbour = base_cell + 1 if base_cell + 1 < 256 else base_cell - 1
+    return rgb_to_hex(ansi256_rgb(max(16, neighbour)))
+
+
 def _role_background(role: str, theme: Optional[Theme] = None, *,
                      on_selected: bool = False) -> Optional[str]:
     """The theme hex a span of `role` paints its background in, or None.
@@ -2583,9 +2774,18 @@ def _role_background(role: str, theme: Optional[Theme] = None, *,
     `sel_bg` is for, and what the catalog's `text`/`sel_bg` >= 4.5 floor is
     actually testing. Under `og` both answers are None, which is why the golden
     render is unaffected.
+
+    AND EXCEPT THE FOOTER'S TWO ROLES, which take the STRIP — a shade of the same
+    `bg`, derived per theme by `footer_strip` so it is never the cell `bg` is.
+    That is the second thing `_role_background` is a per-span property for: the
+    footer is chrome, and a chrome band has to read as a band rather than vanish
+    into the pane. The strip is a bare 12% away from `bg`, so text and labels
+    chosen for `bg` keep their contrast on it.
     """
     if theme is None:
         return None
+    if _bare_role(role) in (FOOTER_KEY, FOOTER_LABEL):
+        return footer_strip(theme)
     key = "sel_bg" if on_selected else "bg"
     return None if theme.is_default(key) else theme.colour(key)
 

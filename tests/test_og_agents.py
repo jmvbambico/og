@@ -186,6 +186,19 @@ def _fmts(lines):
     return [_join(spans) for spans in lines]
 
 
+def _footer_text(width):
+    """The footer row exactly as `render` composes it: the form `_footer` chooses
+    for `width`, laid out in spans and padded out to `width` columns.
+
+    The footer is no longer one clipped string — it is a key span, a label span and
+    a `·` between each entry, all padded with the background strip out to the pane
+    edge — so a test that wants the painted ROW compares against this. `a.FOOTER`
+    and friends remain the form's TEXT, unpadded, and are still the right thing to
+    compare when the FORM itself is under test.
+    """
+    return _join(a._footer_spans(width))
+
+
 # The worded group labels the C2 design used to draw, one per group. The pane
 # dropped them — the animated glyph inside each box carries the state now — so
 # every render test asserts none of these lines survives.
@@ -361,7 +374,11 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "⦿ ✓ │ ⌘  docs                            done│",
         "│   ╰────────────────────────────────────────╯",
         "",
-        a.FOOTER_COMPACT,
+        # The 46-column footer: the ` · ` separator costs the compact form 4
+        # measured columns per entry, so a ~46-column pane now falls through to
+        # the bare KEYS form (see `test_the_footer_chooses_a_form_by_measured_width`).
+        # Whatever form it is, the row is padded out to the pane with the strip.
+        _footer_text(C2_WIDTH),
     ]
     # Every BOX row — the root's and each worker's — is exactly the pane width.
     box_rows = [line for line in lines
@@ -2578,7 +2595,7 @@ def test_main_once_prints_exactly_what_render_returns(monkeypatch, tmp_path, cap
     # `--once` prints TEXT only: selection is a paint attribute now, so a one-shot
     # dump carries no selection signal at all (see `main`).
     assert "▸" not in "\n".join(out)
-    assert out[-1] == a.FOOTER
+    assert out[-1] == _footer_text(a.DEFAULT_WIDTH)
 
 
 def test_main_once_reports_the_missing_tty(monkeypatch, tmp_path, capsys):
@@ -2616,7 +2633,7 @@ def test_access_panel_is_off_by_default_and_the_footer_lists_the_binding():
     assert lines[0].startswith("╭") and "conversation" in lines[1]
     assert "┌─ access" not in "\n".join(lines), "the panel starts closed"
     assert a.Frame().access is None, "the toggle starts off"
-    assert lines[-1] == a.FOOTER
+    assert lines[-1] == _footer_text(a.DEFAULT_WIDTH)
     assert "a access" in a.FOOTER, "the footer must advertise the binding"
 
 
@@ -2733,7 +2750,7 @@ def test_the_access_panel_shows_the_qr_and_url_when_wide_enough():
 
     assert any("█" * 27 in line for line in lines)
     assert "http://192.168.100.176:6767" in "\n".join(lines)
-    assert lines[-2] == "" and lines[-1] == a.FOOTER, "blank, then the footer"
+    assert lines[-2] == "" and lines[-1] == _footer_text(80), "blank, then the footer"
 
 
 def test_access_panel_drops_the_qr_when_the_pane_is_too_narrow():
@@ -2752,8 +2769,13 @@ def test_access_panel_drops_the_qr_when_the_pane_is_too_narrow():
                for line in lines)
     # 26 columns is far below any footer form: it falls to the bare key list
     # rather than being clipped mid-word (see `_footer`).
-    assert lines[0] == "" and lines[-1] == a._footer(26)
-    assert a._display_width(lines[-1]) <= 26
+    assert lines[0] == "" and lines[-1] == _footer_text(26)
+    # The row is the bare key list padded out to the 26-column pane with the
+    # strip. Under the pane's own ruler that is exactly the pane (`len`);
+    # `_display_width` would read it wider, because the ` · ` separator is East
+    # Asian Ambiguous and is charged two columns there — see
+    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
+    assert len(lines[-1]) <= 26
     assert len(a.access_lines(acc, 26)) == 4, "borders, address, caveat, borders"
 
 
@@ -2825,7 +2847,7 @@ def test_access_panel_height_is_content_sized():
     assert lines[3] == "", "a blank row separates the list from the panel"
     assert lines[4:4 + len(panel)] == panel
     assert len(panel) == 2 + 13 + 1 + 2, "2 borders + 13 QR + blank + URL + note"
-    assert lines[-1] == a.FOOTER
+    assert lines[-1] == _footer_text(80)
 
 
 def test_the_list_keeps_a_floor_of_rows_and_the_panel_is_never_squeezed():
@@ -3244,15 +3266,19 @@ def test_a_short_list_paints_its_footer_once(monkeypatch):
     The window ran over the whole of `items`, tail included, and landed on the
     footer just above where the pinned tail drew it again — two footers, one
     under the last box and one at the pane bottom.
+
+    The footer is SEVERAL span writes on ONE row now (each key, each label, the
+    `·` between them and the strip's padding each get their own write), so "once"
+    is counted per ROW: the row whose reassembled text is the footer form must be
+    exactly one, and it must be the pane's bottom row.
     """
     frame = a.Frame(rows=[header(), worker("w1", "working")], selected=1)
     writes = _paint(frame, 60, 24, monkeypatch)
 
-    # A 60-column pane selects the compact footer form, so the expected line is
-    # whatever form `_footer` picks for the width — not the full one.
-    footers = [row for row, _col, text, _n in writes if text == a._footer(60)]
-    assert len(footers) == 1, "the footer is painted exactly once, not twice"
-    assert footers[0] == 23, "and once means pinned to the pane's bottom row"
+    lines = _rows_to_lines(writes)
+    footers = [row for row, text in lines.items()
+               if text.rstrip() == a._footer(60)]
+    assert footers == [23], "the footer is painted exactly once, not twice"
 
 
 def test_a_long_list_keeps_one_footer_pinned_at_the_bottom(monkeypatch):
@@ -3265,9 +3291,10 @@ def test_a_long_list_keeps_one_footer_pinned_at_the_bottom(monkeypatch):
     frame = a.Frame(rows=rows, selected=1)
     writes = _paint(frame, 60, 12, monkeypatch)
 
-    footers = [row for row, _col, text, _n in writes if text == a._footer(60)]
-    assert len(footers) == 1, "the footer is painted exactly once"
-    assert footers[0] == 11, "and stays pinned to the bottom while the list scrolls"
+    lines = _rows_to_lines(writes)
+    footers = [row for row, text in lines.items()
+               if text.rstrip() == a._footer(60)]
+    assert footers == [11], "and stays pinned to the bottom while the list scrolls"
 
 
 # ---------------------------------------------------------------------------
@@ -4200,7 +4227,7 @@ def test_a_notice_takes_the_bottom_row_in_place_of_the_footer():
 
 def test_without_a_notice_the_bottom_row_is_still_the_footer():
     lines = a.render(_notice_frame(), width=80)
-    assert lines[-1] == a._footer(80)
+    assert lines[-1] == _footer_text(80)
 
 
 def test_a_notice_longer_than_the_pane_is_clipped_not_overflowed():
@@ -4332,9 +4359,10 @@ def test_the_footer_names_the_focus_and_expand_bindings():
 def _cjk_width(text: str) -> int:
     """Display columns if AMBIGUOUS is two — the CJK-locale rule.
 
-    A footer form must fit under BOTH this and the Latin rule; the only way to
-    guarantee that is for the form to contain no Ambiguous glyph, which is what
-    `test_the_footer_is_measured_the_same_in_a_cjk_locale` pins.
+    A footer FORM must fit under BOTH this and the Latin rule, and `_display_width`
+    charges Ambiguous two, so `_footer` choosing with it is what guarantees that —
+    including for the ` · ` separator, which IS Ambiguous. See
+    `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
     """
     import unicodedata
     return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 1
@@ -4346,41 +4374,46 @@ def test_the_footer_names_every_key_at_every_width():
     # is a ~46-column split, so a FIXED footer was clipped mid-word — "space
     # expand" and "a access" fell off the end, leaving the operator without the
     # two keys they most needed (Space, which had just inherited expand from
-    # Enter). At every width the footer must FIT the pane UNDER BOTH LOCALE RULES
-    # and still name q, r, the move keys, enter, space and a.
+    # Enter).
+    #
+    # The FORM is measured with the pessimistic ruler, so the form a width gets
+    # fits that width under BOTH locale rules and no key can be clipped in either.
+    # The painted ROW is that form padded with the strip out to the pane, and it is
+    # composed under the pane's own (western) ruler — measured with `len`. See
+    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
     for width in (46, 52, 64, 80):
-        footer = a.render(a.Frame(), width=width)[-1]
-        assert a._display_width(footer) <= width, (width, footer)
-        assert _cjk_width(footer) <= width, (width, footer)
+        row = a.render(a.Frame(), width=width)[-1]
+        form = a._footer(width)
+        assert a._display_width(form) <= width, (width, form)
+        assert _cjk_width(form) <= width, (width, form)
+        assert row.rstrip() == form and len(row) == width, (width, row)
         for letter in ("q", "r", "a"):
-            assert letter in footer, (width, letter, footer)
-        assert ("^/v" in footer or "^v" in footer), (width, footer)
+            assert letter in row, (width, letter, row)
+        assert ("^/v" in row or "^v" in row), (width, row)
         # Enter and Space are words at full width and glyphs when compact, but a
         # key must be named EITHER way.
-        assert ("enter" in footer or "⏎" in footer), (width, footer)
-        assert ("space" in footer or "␣" in footer), (width, footer)
+        assert ("enter" in row or "⏎" in row), (width, row)
+        assert ("space" in row or "␣" in row), (width, row)
 
 
 def test_the_footer_chooses_a_form_by_measured_width():
     # The threshold is each form's own width, measured — not a magic number
     # that can drift out of step with the strings.
     #
-    # THE NUMBERS MOVED WHEN `t theme` JOINED, and the shape did not. The full
-    # form grew to 73 (it carries every word), and COMPACT deliberately SHED the
-    # word `refresh` to stay at 45 — the width the ~46-column agents split has
-    # always used. Had COMPACT simply grown to 53, every real pane would have
-    # fallen through to the bare KEYS form, which is a far worse trade than
-    # losing one label. The key `r` is still in all three forms: only labels
-    # degrade.
-    assert a._footer(80) == a.FOOTER
-    assert a._footer(73) == a.FOOTER, "the full form fits a 73-column pane"
-    assert a._footer(72) == a.FOOTER_COMPACT
-    assert a._footer(45) == a.FOOTER_COMPACT, "the compact form fits 46"
-    assert a._footer(44) == a.FOOTER_KEYS
-    assert a._footer(43) == a.FOOTER_KEYS
-    assert a._display_width(a.FOOTER) == 73
-    assert a._display_width(a.FOOTER_COMPACT) == 45
-    assert a._display_width(a.FOOTER_KEYS) == 14
+    # THE NUMBERS MOVED TWICE. `t theme` first cost COMPACT the word `refresh` (it
+    # shed a label rather than growing past the ~46-column split). Then the ` · `
+    # separator cost EVERY form 4 MEASURED columns per entry, because U+00B7 is
+    # East Asian AMBIGUOUS and `_display_width` — the ruler `_footer` chooses with
+    # — charges it two. So the full form needs 85 columns and a plain 80-column
+    # terminal now shows COMPACT; the ~46-column split falls to the bare KEYS form.
+    # The key `r` is still in all three forms: only labels degrade.
+    assert a._footer(85) == a.FOOTER
+    assert a._footer(80) == a.FOOTER_COMPACT, "85 measured columns is more than 80"
+    assert a._footer(63) == a.FOOTER_COMPACT
+    assert a._footer(62) == a.FOOTER_KEYS
+    assert a._display_width(a.FOOTER) == 85
+    assert a._display_width(a.FOOTER_COMPACT) == 63
+    assert a._display_width(a.FOOTER_KEYS) == 32
     # And the boundary is the MEASUREMENT, checked from both sides of each form,
     # so a future edit to the strings cannot quietly move a threshold. FOOTER_KEYS
     # is excluded from the lower side on purpose: it is the FLOOR, and `_footer`
@@ -4392,11 +4425,12 @@ def test_the_footer_chooses_a_form_by_measured_width():
     floor = a._display_width(a.FOOTER_KEYS)
     assert a._footer(floor) == a.FOOTER_KEYS
     assert all(a._footer(w) == a.FOOTER_KEYS for w in range(0, floor + 1))
-    # Only labels degrade: every form names every key, and every form now names
-    # `t` too.
+    # Only labels degrade: every form names every key, every form names `t`, and
+    # every form carries the ` · ` separator between its entries.
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
         assert "q" in form and "r" in form and "a" in form and "t" in form, form
         assert ("^/v" in form or "^v" in form), form
+        assert a.FOOTER_SEP in form, form
 
 
 def test_the_footer_is_measured_the_same_in_a_cjk_locale():
@@ -4404,28 +4438,102 @@ def test_the_footer_is_measured_the_same_in_a_cjk_locale():
     # ↓ (U+2193) are East Asian AMBIGUOUS — one column in a Latin locale, TWO in a
     # CJK one. While they were in the footer, `_footer` measured the full form as
     # 64 and chose it for a 64-column pane, but a CJK terminal painted 66 and
-    # `_clip` cut "a access" off. The footer now carries no Ambiguous or Wide
-    # glyph, so its measured width is identical under both rules and no form can
-    # overflow in either.
+    # `_clip` cut "a access" off. That is the bug the three forms exist to end.
+    #
+    # THE ` · ` SEPARATOR IS THE ONE AMBIGUOUS GLYPH BACK IN THE FOOTER, and the
+    # guarantee is now about the FORM rather than the whole padded row. `_footer`
+    # measures with `_display_width`, which charges Ambiguous two, so the form it
+    # picks for a pane fits that pane under BOTH rules — and since only LABELS
+    # degrade, the KEYS survive in either locale. The row's trailing strip is
+    # padded out under `len`, the ruler the whole pane is composed for (the box
+    # borders are Ambiguous and composed the same way), so the strip reaches the
+    # pane edge in the western terminal this ships to.
     import unicodedata
 
+    # Both rulers charge the separator two, so the two measures agree on every
+    # form — the disagreement is only against `len`.
+    assert unicodedata.east_asian_width("\u00b7") == "A"
+    assert a._display_width(a.FOOTER_SEP) == _cjk_width(a.FOOTER_SEP) == 4
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
+        assert a._display_width(form) == _cjk_width(form), form
+        assert a.FOOTER_SEP in form, form
+        # The separator is the ONLY glyph here whose width depends on the locale:
+        # every other glyph is Narrow, so it measures the same under either rule.
         for ch in form:
+            if ch == "\u00b7":
+                continue
             assert unicodedata.east_asian_width(ch) not in ("W", "F", "A"), (ch, form)
-        # One honest width rule: no glyph's width depends on the locale.
-        assert a._display_width(form) == _cjk_width(form) == len(form), form
 
-    # ⏎ and ␣ stay Narrow, and the wider keys still fit under the CJK rule.
+    # ⏎ and ␣ stay Narrow — checked, not assumed.
     for glyph in ("⏎", "␣"):
         assert unicodedata.east_asian_width(glyph) == "N", glyph
-    assert _cjk_width(a.FOOTER) == 73
-    assert _cjk_width(a.FOOTER_COMPACT) <= 46
 
     # Every form `_footer` picks for a pane at least as wide as the KEYS floor
-    # fits that pane under the CJK rule too.
+    # fits that pane under the CJK rule too, so no key is ever clipped.
     floor = _cjk_width(a.FOOTER_KEYS)
     for width in range(floor, 90):
         assert _cjk_width(a._footer(width)) <= width, width
+
+
+def test_the_footer_key_is_prominent_and_its_label_recedes():
+    """1a. Each entry is TWO spans, so the KEY reads as the prominent half: the key
+    takes the theme's `text` slot AND is exempt from the footer line's DIM, while
+    the label and the ` · ` separator take `meta` and dim with the chrome."""
+    spans = a._footer_spans(120)          # wide enough for the full form
+
+    key_text = "".join(t for t, role in spans
+                       if a._bare_role(role) == a.FOOTER_KEY)
+    label_text = "".join(t for t, role in spans
+                         if a._bare_role(role) == a.FOOTER_LABEL)
+    for key in ("q", "r", "^/v", "enter", "space", "a", "t"):
+        assert key in key_text, (key, key_text)
+    for label in ("quit", "refresh", "move", "focus", "expand", "access", "theme"):
+        assert label in label_text, (label, label_text)
+    # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES, and there is exactly one per
+    # join between entries.
+    assert label_text.count(a.FOOTER_SEP) == len(a.FOOTER_ENTRIES) - 1
+    # ONLY the key is exempt from the line's brightness: the exemption and the role
+    # are the same fact, and nothing else carries it.
+    for _text, role in spans:
+        assert role.startswith(a.UNDIM) == (a._bare_role(role) == a.FOOTER_KEY), role
+    # And the two roles name the theme slots the task asked for.
+    assert a._theme_role(a.FOOTER_KEY) == "text"
+    assert a._theme_role(a.FOOTER_LABEL) == a.META == "meta"
+    # The key is the `text` slot at FULL brightness; the label is `meta` on the
+    # line's DIM — so the pairing is prominence, not merely two colours.
+    assert a._role_brightness(a.undim(a.FOOTER_KEY)) == a.NORMAL
+    assert a._role_brightness(a.FOOTER_LABEL) is None
+
+
+def test_the_footer_row_is_padded_to_the_pane_with_the_strip(monkeypatch):
+    """1c. `paint_line` colours only the cells a span covers, so without padding the
+    strip stops at the last key and the window's own background shows between it
+    and the pane edge. The row is padded to `width` with the STRIP's role — never
+    PLAIN, which would paint no strip at all — and the strip really does reach
+    `init_pair` under a theme."""
+    for width in (26, 46, 80, 120):
+        assert a._spans_width(a._footer_spans(width)) == width, width
+    # Where there is padding to place, its span carries the strip's role.
+    for width in (46, 80, 120):
+        assert a._footer_spans(width)[-1][1] == a.FOOTER_LABEL, width
+
+    frame = a.Frame(rows=[header()])
+    theme = _theme("catppuccin-mocha")
+    fake, _writes = _colour_paint(monkeypatch, frame, width=120, theme=theme)
+    assert any(bg == a.hex_to_ansi256(a.footer_strip(theme))
+               for _p, _fg, bg in fake.init_pair_calls), fake.init_pair_calls
+
+
+def test_the_footer_roles_take_the_strip_background_under_a_theme():
+    """The footer's two roles name their theme slots for the FOREGROUND and the
+    derived strip for the BACKGROUND — one span, two answers from the same role."""
+    theme = _theme("nord")
+    strip = a.footer_strip(theme)
+    assert strip is not None and strip != theme.colour("bg")
+    assert a._role_background(a.FOOTER_KEY, theme) == strip
+    assert a._role_background(a.FOOTER_LABEL, theme) == strip
+    # The `undim:` modifier is a brightness, not a colour: it changes nothing here.
+    assert a._role_background(a.undim(a.FOOTER_KEY), theme) == strip
 
 
 # ---------------------------------------------------------------------------
@@ -4457,8 +4565,14 @@ def test_the_themes_background_reaches_init_pair_as_the_second_argument(monkeypa
                                  meta="12s")], selected=1)
     fake, writes = _colour_paint(monkeypatch, frame, theme=_theme("dracula"))
     assert fake.init_pair_calls, "a coloured frame must spend a pair"
-    selected_bg = a.hex_to_ansi256(_theme("dracula").colour("sel_bg"))
-    allowed = {DRACULA_BG, selected_bg}
+    theme = _theme("dracula")
+    selected_bg = a.hex_to_ansi256(theme.colour("sel_bg"))
+    # The footer's strip is a THIRD background the pane spends — a shade of `bg`
+    # again, on its own row (see `_role_background`). On dracula it happens to snap
+    # to the SAME cell as `sel_bg`, so it is named here explicitly rather than
+    # relied on to coincide.
+    strip_bg = a.hex_to_ansi256(a.footer_strip(theme))
+    allowed = {DRACULA_BG, selected_bg, strip_bg}
     for _pair, fg, bg in fake.init_pair_calls:
         assert bg in allowed, (fg, bg)
         assert bg != -1, "the -1 background is exactly what this change replaced"
@@ -4509,7 +4623,10 @@ def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
     a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
                theme=_theme("og"))
     assert scr.bkgd_calls == [], "og leaves the window background untouched"
-    assert [bg for _p, _fg, bg in fake.init_pair_calls] == [-1]
+    # Every background is the terminal's own (-1). The footer's label/meta spans
+    # spend a pair of their own now, so this is a SET of backgrounds, not one —
+    # what `og` promises is that none of them is a colour.
+    assert set(bg for _p, _fg, bg in fake.init_pair_calls) == {-1}
 
 
 def test_the_window_background_is_set_by_a_CALL_a_terminal_will_accept():
@@ -4697,23 +4814,101 @@ def test_only_the_selected_row_gets_a_background(monkeypatch):
     assert a.hex_to_ansi256(dracula.colour("sel_bg")) in backgrounds
 
 
+def test_the_footer_strip_is_a_different_cell_from_the_background_of_every_theme():
+    """THE WHOLE POINT OF THE STRIP GUARD. A strip is derived as a HEX, but the
+    terminal paints a CELL — and two different hexes snap to the same 256-colour
+    cell all the time. This terminal reports COLORS=256 and can redefine none (no
+    `ccc`), so a strip whose shade resolved to the background's OWN cell would be
+    invisible and the feature would do nothing at all, silently. Every theme the
+    catalog ships is checked here, and `og` — whose `bg` is the terminal's own — is
+    checked to have NO strip, because there is no colour to shade."""
+    themes = th.ordered_themes(th.load_catalog())
+    opaque = 0
+    for theme in themes:
+        strip = a.footer_strip(theme)
+        if theme.background() is None:
+            assert strip is None, theme.slug
+            continue
+        opaque += 1
+        assert a.hex_to_ansi256(strip) != a.hex_to_ansi256(theme.colour("bg")), \
+            f"{theme.slug}: the strip IS the background it is meant to sit on"
+    assert opaque >= 25, opaque
+
+
+def test_the_strip_guard_steps_past_a_shade_that_snaps_to_the_background_cell(tmp_path):
+    """THE GUARD'S OWN TEETH, on a background that really does collide.
+
+    `#000033` is chosen because its FIRST 12% shade lands on its OWN 256-cell (17)
+    — which no hex reveals, only the cell does. The derivation must notice, step
+    further, and answer with a cell that differs.
+    """
+    theme = _hand_edited_theme(tmp_path, bg="#000033")
+    base = a.hex_to_ansi256("#000033")
+    first = a.rgb_to_hex(a._shade(a.hex_to_rgb("#000033"), a.STRIP_STEP))
+    assert a.hex_to_ansi256(first) == base, "the fixture no longer collides at step 1"
+
+    strip = a.footer_strip(theme)
+    assert strip is not None
+    assert a.hex_to_ansi256(strip) != base
+
+
+def test_the_strip_falls_back_to_a_neighbour_cell_when_no_shade_separates(
+        tmp_path, monkeypatch):
+    """The belt-and-braces branch: when NO step separates the cells, a defined
+    NEIGHBOUR of the background's own cell is used — a different cell by
+    construction. Driven by zeroing the step, so every candidate IS the
+    background."""
+    monkeypatch.setattr(a, "STRIP_STEP", 0.0)
+    theme = _hand_edited_theme(tmp_path, bg="#282a36")
+    base = a.hex_to_ansi256("#282a36")
+
+    assert a.hex_to_ansi256(a.footer_strip(theme)) == base + 1
+
+
+def test_an_og_footer_has_no_strip_and_spends_no_pair_for_one():
+    """`og` PROMISES THE TERMINAL'S OWN BACKGROUND, and a strip is a colour this
+    process would be inventing for a pane that has no background to shade. So there
+    is none, the footer's roles resolve to `default`, and the key's own span spends
+    no pair at all."""
+    og = _theme("og")
+    assert og.background() is None
+    assert a.footer_strip(og) is None
+    assert a.footer_strip(None) is None
+    assert a._role_background(a.FOOTER_KEY, og) is None
+    assert a._role_background(a.FOOTER_LABEL, og) is None
+
+    fake = FakeCurses(colors=256, color_pairs=256)
+    colours = a._Colours(fake, og)
+    assert colours.role_attr(a.undim(a.FOOTER_KEY), og) == 0, \
+        "a `default` foreground on no background is pair 0, not a new pair"
+
+
 def test_an_opaque_theme_spends_no_sel_bg_pair_while_the_pane_is_untouched(monkeypatch):
-    """THE THEME CONSEQUENCE OF THE UNTOUCHED PANE, on `github-dark` (`sel_bg`
-    `#163356`, a visible bar against its `#0d1117` background).
+    """THE THEME CONSEQUENCE OF THE UNTOUCHED PANE, on `catppuccin-mocha`.
 
     `sel_bg` is only ever reached through `attr_for`'s `on_selected`, which is
     False on every span of every line while nothing is selected — so the painter
     allocates the pair for NOTHING. This is the assertion the theming change made
     load-bearing: a phantom selection is no longer a subtle brightness
     difference, it is a coloured bar on a row the operator never chose.
+
+    THE THEME IS CHOSEN FOR A REASON. The footer's strip is a shade of `bg` and
+    here it lands on a cell of its own — clear of both `bg` and `sel_bg` — so a
+    background genuinely says whether `sel_bg` was spent. On the theme this used
+    to name (github-dark) the strip snaps to the SAME cell as `sel_bg`, and the
+    cell could no longer tell a spent strip from a spent selection: that is the
+    collision the strip's own guard is about, arriving one role over.
     """
     rows = [header(),
             rail("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    theme = _theme("github-dark")
+    theme = _theme("catppuccin-mocha")
     sel_bg = theme.colour("sel_bg")
     assert sel_bg != theme.colour("bg"), "the theme really does tint its selection"
+    strip = a.hex_to_ansi256(a.footer_strip(theme))
+    assert strip not in (a.hex_to_ansi256(theme.colour("bg")),
+                         a.hex_to_ansi256(sel_bg)), "the test could not tell them apart"
 
     def backgrounds(keys):
         fake, _writes = _colour_paint(monkeypatch, a.Frame(rows=rows),
@@ -4722,6 +4917,8 @@ def test_an_opaque_theme_spends_no_sel_bg_pair_while_the_pane_is_untouched(monke
 
     untouched = backgrounds([QUIT])
     assert a.hex_to_ansi256(theme.colour("bg")) in untouched, "the theme is on"
+    # Only the pane background and the footer's strip are spent — nothing else.
+    assert untouched <= {a.hex_to_ansi256(theme.colour("bg")), strip}, untouched
     assert a.hex_to_ansi256(sel_bg) not in untouched, \
         "no sel_bg pair is allocated at all"
 
@@ -5109,7 +5306,10 @@ GOLDEN_FRAME = [
     '⦿ ⠋ │    w3                                                             working│',
     '│   ╰──────────────────────────────────────────────────────────────────────────╯',
     '',
-    a.FOOTER,
+    # The footer row as `_pane` composes it: the form an 80-column pane gets
+    # (COMPACT, because the Ambiguous ` · ` separator pushes the full form to 85
+    # measured columns), padded with the background strip out to the pane edge.
+    _footer_text(a.DEFAULT_WIDTH),
 ]
 
 
