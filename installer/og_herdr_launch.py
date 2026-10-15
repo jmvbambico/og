@@ -2485,14 +2485,28 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
         return NOTICE_FOCUS_OUTSIDE_HERDR
     if not inside:
         return NOTICE_FOCUS_OUTSIDE_HERDR
-    kind = harness_has_terminal(harness)
+    # Both reads are guarded even though neither is documented as raising: this
+    # function's "NEVER raises" is absolute, and these are the two seams that
+    # touch something outside it. `harness_has_terminal` reads the registry (a
+    # catalog that is not this module's), and `default_state_path` resolves
+    # $OMNIGENT_HOME through `Path.home()`, which a sandboxed pane can leave
+    # unresolvable. A failure in either is exactly "og cannot tell" and "there is
+    # no tab to find" — the notices this already has — never a traceback that
+    # kills the view.
+    try:
+        kind = harness_has_terminal(harness)
+    except Exception:
+        kind = None
     if kind is None:
         label = harness if isinstance(harness, str) and harness.strip() \
             else "this agent"
         return _focus_line(NOTICE_FOCUS_UNKNOWN_HARNESS, label)
 
-    state_path = default_state_path()
-    tab_id = _focus_tab_id(state_path, session_id, root_session_id)
+    try:
+        state_path = default_state_path()
+        tab_id = _focus_tab_id(state_path, session_id, root_session_id)
+    except Exception:
+        tab_id = None
     if not tab_id:
         return NOTICE_FOCUS_NO_TAB
     try:

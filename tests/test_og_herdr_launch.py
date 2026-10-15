@@ -3704,6 +3704,44 @@ def test_focus_agent_terminal_never_raises_when_herdr_fails(tmp_path):
     assert client.focused == ["w1:t7"]
 
 
+def test_focus_agent_terminal_never_raises_when_the_home_cannot_be_resolved(
+        tmp_path, monkeypatch):
+    # `default_state_path()` goes through `Path.home()`, which a sandboxed pane
+    # can leave unresolvable. "NEVER raises" covers that too, and its answer is
+    # the same as any other "no tab can be found".
+    def unresolvable():
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(og_herdr_launch, "default_state_path", unresolvable)
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TAB
+    assert client.calls == []
+
+
+def test_focus_agent_terminal_never_raises_when_the_catalog_is_unreadable(
+        tmp_path, monkeypatch):
+    # `harness_has_terminal` reads the registry catalog. If that read blows up,
+    # og cannot say what the row's tab is — the third answer — rather than
+    # letting a traceback kill the pane on a keypress.
+    def unreadable(harness):
+        raise OSError("registry is not readable")
+
+    monkeypatch.setattr(og_herdr_launch, "harness_has_terminal", unreadable)
+    _note_tab("worker-1", "w1:t7")
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_UNKNOWN_HARNESS.format(
+        "claude-native")
+    assert client.calls == []
+
+
 def test_focus_agent_terminal_survives_a_broken_state_file(tmp_path):
     # A hand-edited or truncated file is "we recorded nothing", never a
     # traceback: this pane is left open all day.
