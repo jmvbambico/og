@@ -17,6 +17,7 @@ import io
 import json
 import os
 import socket
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -2933,6 +2934,37 @@ def test_resolve_harness_terminal_none_without_an_id_or_a_tree(tmp_path):
         "sess-1", {"TMPDIR": str(tmp_path / "nope")}) is None
 
 
+def test_resolve_harness_terminal_bridge_json_as_a_list_is_absent(tmp_path, short_dir):
+    # bridge.json whose JSON top level is a LIST, not a dict: `_bridge_names_session`
+    # must not raise, and the session reads as absent.
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "sess-7")
+    (session_dir / "bridge.json").write_text(json.dumps(["sess-7"]))
+    (session_dir / "tmux.json").write_text(json.dumps(
+        {"socket_path": sock, "tmux_target": "main"}))
+
+    assert og_herdr_launch.resolve_harness_terminal(
+        "sess-7", {"TMPDIR": str(tmp_path)}) is None
+
+
+def test_resolve_harness_terminal_survives_an_unreadable_bridge_json(tmp_path, short_dir):
+    # A `bridge.json` that cannot be read (PermissionError) is "no terminal" for
+    # that session: the scan skips it, the exception never escapes, and the
+    # socket recorded in tmux.json never gets attached to.
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "sess-8")
+    bridge = session_dir / "bridge.json"
+    bridge.write_text(json.dumps({"conversation_id": "sess-8"}))
+    (session_dir / "tmux.json").write_text(json.dumps(
+        {"socket_path": sock, "tmux_target": "main"}))
+    bridge.chmod(0o000)
+    try:
+        assert og_herdr_launch.resolve_harness_terminal(
+            "sess-8", {"TMPDIR": str(tmp_path)}) is None
+    finally:
+        bridge.chmod(0o600)
+
+
 def _space_state(state_path, root, **record):
     """Write one live space record for `root`, in the real v2 shape."""
     rec = {"workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
@@ -3053,6 +3085,60 @@ def test_cli_pane_toggle_refuses_when_no_space_is_recorded(tmp_path):
     assert "pane.split" not in client.methods
 
 
+def test_cli_pane_toggle_state_write_returns_false_closes_the_pane(tmp_path, short_dir, monkeypatch):
+    # `state_update` is declared `-> bool` precisely so the caller can tell
+    # whether the write landed. When it returns falsey (disk full, permissions,
+    # anything `_write_state` reports as a failed write) the pane is open but
+    # unrecorded: close it and decline, so a second `c` can never split a
+    # duplicate mirror.
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "root-1")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+    monkeypatch.setattr(og_herdr_launch, "state_update",
+                        lambda path, decide, on_saved=None: False)
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state)
+
+    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED
+    assert client.methods.count("pane.split") == 1, client.methods
+    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
+    # The pane that never got recorded is closed again: nothing unrecorded
+    # lingers for the next toggle to misread.
+    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
+
+
+def test_cli_pane_toggle_state_write_raising_never_propagates(tmp_path, short_dir, monkeypatch):
+    # Same failure, but `state_update` raises instead of returning falsey:
+    # `_set_cli_pane` swallows the exception and the toggle still becomes a
+    # notice rather than a traceback that kills the `og agents` pane.
+    state = tmp_path / "og-herdr.json"
+    _space_state(state, "root-1")
+    sock = _bound_socket(short_dir)
+    _, session_dir = _native_session(tmp_path, "root-1")
+    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
+    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
+    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
+
+    def raising(path, decide, on_saved=None):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(og_herdr_launch, "state_update", raising)
+
+    notice = og_herdr_launch.cli_pane_toggle(
+        "root-1", "root-1", "claude-native", environ=env, client=client,
+        state_path=state)
+
+    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED
+    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
+    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
+
+
 def test_the_optional_cli_pane_id_survives_a_state_reload(tmp_path):
     # THE REGRESSION this pins: `_read_spaces` is a WHITELIST, so a field it does
     # not name is dropped on load. `cli_pane_id` is written through `state_update`
@@ -3085,3 +3171,20 @@ def test_the_cli_attach_cannot_resize_or_type_into_the_live_session():
     # A socket path with a space must not split the command.
     spaced = og_herdr_launch.read_only_attach_command("/tmp/a b/tmux.sock", "main")
     assert "'/tmp/a b/tmux.sock'" in spaced, spaced
+
+
+def test_read_only_attach_quotes_the_target_too():
+    # `read_only_attach_command` quotes BOTH values: the socket path is covered
+    # above, but a regression dropping the quote on `tmux_target` would pass
+    # that test. A target carrying spaces AND shell metacharacters must arrive
+    # at tmux as ONE argument — never split, never run through `$()`.
+    target = "my sess:0.$(id)"
+    command = og_herdr_launch.read_only_attach_command("/tmp/x/tmux.sock", target)
+
+    assert "/tmp/x/tmux.sock" in command, command
+    assert "-t " + shlex.quote(target) in command, command
+    # Nothing unquoted remains of the target: no `$(` the pane shell could run,
+    # no space that would carve a second argument off it.
+    remainder = command.replace(shlex.quote(target), "").replace(
+        shlex.quote("/tmp/x/tmux.sock"), "")
+    assert "$(" not in remainder and "`" not in remainder, remainder

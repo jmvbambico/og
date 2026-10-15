@@ -26,6 +26,7 @@ import pytest
 
 import og_agents as a
 import og_herdr as h
+import og_herdr_launch
 import og_herdr_watch as w
 import og_themes as th
 
@@ -4259,6 +4260,44 @@ def test_focus_degrades_when_the_herdr_client_cannot_be_imported(monkeypatch):
 
     assert any(a.NOTICE_FOCUS_UNAVAILABLE in text for text in screen.painted), \
         screen.painted
+
+
+def test_the_c_key_drives_cli_pane_for_the_selected_row(monkeypatch):
+    """The footer names `c cli`, but nothing asserted the `c` key actually
+    reaches `cli_pane_for_row` with the selected row's ids — a keypath break
+    (a row's agent dropped, or the root never resolved) would pass on the
+    footer test alone.
+
+    `cli_pane_toggle` is the dependency `cli_pane_for_row` delegates the whole
+    open/close decision to (it owns the state record and is the only place a
+    pane is split for this feature), so a recording fake there proves the
+    keypath without monkeypatching the function under test itself.
+    """
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = []
+
+    def fake_toggle(root_session_id, session_id, harness, *,
+                    environ=None, client=None, state_path=None):
+        calls.append((root_session_id, session_id, harness))
+        return None
+
+    monkeypatch.setattr(og_herdr_launch, "cli_pane_toggle", fake_toggle)
+
+    frame = a.Frame(rows=[
+        header(sid="root"),
+        a.Row(session_id="w1", text="one", state="idle", depth=1,
+              harness="claude-native", root_session_id="root"),
+    ])
+    screen = _run_tui_capture(
+        monkeypatch, [DOWN, ord("c"), QUIT],
+        model=_StubModel(frame))
+
+    # DOWN adopts the first selectable box (w1; the root row is not selectable),
+    # so `c` acts on w1: its own session is the agent to mirror, its root is
+    # the space the pane splits into.
+    assert calls == [("root", "w1", "claude-native")], calls
+    # And a successful toggle paints no notice.
+    assert not any("cli:" in text for text in screen.painted), screen.painted
 
 
 def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(

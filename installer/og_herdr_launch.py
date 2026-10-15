@@ -1817,6 +1817,15 @@ NOTICE_CLI_NO_PANE = "cli: herdr split but reported no new pane id"
 NOTICE_CLI_NOT_FOUND = "cli: no live terminal found (the session may have ended)"
 NOTICE_CLI_NO_TMUX = "cli: tmux is not on PATH to mirror the terminal"
 NOTICE_CLI_ACP = "{0} runs on an ACP harness, which has no terminal to show"
+# The mirror pane is on screen but og's state file does not name it: the write
+# that was supposed to remember it landed nowhere (disk full, permissions, a
+# concurrent writer). The next `c` press would then read "no CLI pane open" and
+# split a SECOND mirror beside this one — the duplicate-pane defect the
+# `_read_spaces` whitelist fix on the other side of this toggle exists to kill,
+# arriving here through a second route. Returned from `_open_cli_pane` after
+# closing the unrecorded pane, and from `_close_cli_pane` when the clear itself
+# failed and the record still names a dead pane.
+NOTICE_CLI_NOT_RECORDED = "cli: the mirror pane was not recorded"
 
 
 def omnigent_tmp_root(environ: Optional[dict] = None) -> Optional[Path]:
@@ -2062,7 +2071,18 @@ def _open_cli_pane(state_path: Path, root_session_id: str, record: dict,
         except Exception:
             pass
         return _cli_failure(exc)
-    _set_cli_pane(state_path, root_session_id, pane_id)
+    # The pane is open, but if the state write did not LAND then nothing on disk
+    # remembers it: the next `c` press reads "no CLI pane open" and splits a
+    # SECOND mirror beside this one. Closing the pane we just opened is the
+    # same recovery the `pane_run` failure path above already uses — an orphan
+    # pane the next keypress can misread is worse than a degraded notice — so
+    # the write's return value is load-bearing here, not cosmetic.
+    if not _set_cli_pane(state_path, root_session_id, pane_id):
+        try:
+            client.pane_close(pane_id)
+        except Exception:
+            pass
+        return NOTICE_CLI_NOT_RECORDED
     return None
 
 
@@ -2085,11 +2105,18 @@ def _close_cli_pane(state_path: Path, root_session_id: str, pane_id: str,
         client.pane_close(pane_id)
     except Exception:
         pass
-    _set_cli_pane(state_path, root_session_id, None)
+    # Best-effort close, but the FIELD is cleared either way: a record that
+    # still names a dead pane makes the next toggle try to close a pane that is
+    # not there instead of opening one. If the clear itself failed to land, the
+    # record may still name this pane, so say so rather than silently leaving a
+    # stale pointer the next keypress will misread.
+    if not _set_cli_pane(state_path, root_session_id, None):
+        return NOTICE_CLI_NOT_RECORDED
     return None
 
 
-def _set_cli_pane(state_path: Path, session_id: str, pane_id: Optional[str]) -> None:
+def _set_cli_pane(state_path: Path, session_id: str,
+                  pane_id: Optional[str]) -> bool:
     """Set (or clear) the CLI pane field on a space record, ADDITIVELY.
 
     A merge into the existing record through `og_herdr.state_update` — never a
@@ -2097,6 +2124,14 @@ def _set_cli_pane(state_path: Path, session_id: str, pane_id: Optional[str]) -> 
     holds survive, and a record for a session that is not there is left alone.
     Clearing REMOVES the key rather than setting it null, so a closed toggle
     leaves the v2 record shaped exactly as one written before this feature.
+
+    Returns True when the write landed, False when `state_update` returned
+    falsey or raised. NEVER-RAISING by design: `_open_cli_pane` and
+    `_close_cli_pane` convert a failed write into a notice, and a notice is
+    always better than killing the `og agents` pane over a state-file write.
+    The return is load-bearing: `_open_cli_pane` closes a pane whose write did
+    not land, because a mirror on screen with no record naming it is exactly
+    how the next `c` press splits a SECOND mirror.
     """
     def put(state: dict) -> dict:
         record = (state.get("spaces") or {}).get(session_id)
@@ -2108,9 +2143,12 @@ def _set_cli_pane(state_path: Path, session_id: str, pane_id: Optional[str]) -> 
         return state
 
     try:
-        state_update(state_path, put)
+        return bool(state_update(state_path, put))
     except Exception:
-        pass
+        # `state_update` itself never raises (it wraps `_write_state`), but
+        # defend in depth: a failed write must become a False, never a traceback
+        # that reaches `cli_pane_toggle`'s caller.
+        return False
 
 
 def _cli_failure(exc: BaseException) -> str:
