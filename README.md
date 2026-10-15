@@ -429,6 +429,8 @@ og restart [mode]   og stop, then og start — same arguments as start
 og setup            re-run the installer: agents, models, reviewer
 og status           what is running, and the URL
 og chat             open an orchestrator session in this terminal
+                    --dir <path> roots it elsewhere; a relative path resolves
+                    under the configured projects dir (default ~/projects)
 og url              print the URL (pipe-friendly)
 og logs [-f]        tail the server log
 og audit [id]       what happened in the latest run — per worker: tools, stalls, report

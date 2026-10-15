@@ -104,6 +104,9 @@ that ever bites, add `--require-mux` rather than changing the default.
 Four situations, distinguished by two facts: are we already inside the mux, and
 does this directory already have a live session.
 
+A fifth, (E), sits outside that grid: it is reached by typing `og chat` rather
+than `og start`, so neither fact selects it. See below.
+
 ```
                     ┌─ inside the mux? (HERDR_ENV)
                     │
@@ -225,6 +228,46 @@ pressing "new space":
 
 The og server is normally already running in this case. Detect and skip rather
 than restart.
+
+**(E) Inside the mux, in a space herdr made, typing `og chat` directly.**
+
+The operator presses "new space", gets a shell, `cd`s to the directory they
+want, and types `og chat`. No `og start` runs, so none of (A)–(D) applies: the
+space already exists and herdr, not og, created it.
+
+`og chat` therefore does for itself the two things `_open_space` does for a
+launched space, and nothing else:
+
+- write the `pending` record keyed by `$PWD` (§3) **before** exec'ing the chat,
+  so the bridge can claim and rename the space when the session appears
+- if `herdr_agents_pane` is on, split and run `og agents`
+
+Then `exec omnigent run` as it always did.
+
+Three constraints this case brought with it, each of them a real difference
+from (A)–(D) rather than a copy of it:
+
+- **It must be a no-op outside herdr.** `og chat` in an ordinary terminal has
+  to behave exactly as it always has. The gate is `HERDR_ENV=1` plus all three
+  of `HERDR_WORKSPACE_ID` / `HERDR_TAB_ID` / `HERDR_PANE_ID` — all three,
+  because a record naming a pane that does not exist is worse than no record.
+- **The tab is not renamed.** (A) renames because `workspace.create` cannot
+  label the tab it makes; here herdr made the tab, and the bridge renames it to
+  the conversation title on adoption, so an interim basename would be visible
+  for a moment and then replaced.
+- **The split cannot assume it owns the tab.** `_split_pane_id` picks "any pane
+  in this tab but the chat pane", which is exact when the launcher made the
+  space — but this space is the operator's, and a pane they split themselves is
+  theirs. The chat path passes the tab's panes as they were *before* the split,
+  and when no new pane can be identified it starts `og agents` nowhere rather
+  than guessing into one of theirs.
+
+`og chat --dir <path>` sets the directory the session is rooted in without
+`cd`-ing first. An absolute path is used as-is; a relative one resolves against
+`projects_dir` from `og-install.json` (default `~/projects`). A path that does
+not exist is refused, never created. `--dir` is consumed by `og chat`;
+everything else is still forwarded verbatim to `omnigent run`, which is what
+keeps `og chat --resume <id>` working.
 
 ### What counts as "a session in this directory"
 
