@@ -498,6 +498,26 @@ class HerdrClient:
         """Close a tab and its panes."""
         self.call("tab.close", {"tab_id": tab_id})
 
+    def tab_focus(self, tab_id: str) -> None:
+        """Focus a tab — and, measured, bring its WORKSPACE forward with it.
+
+        MEASURED against a live server (herdr 0.9.x), because the answer decides
+        whether a caller needs a second call: after `tab.focus {tab_id: w2K:t1}`,
+        `workspace.list` reported `w2K` as `focused: true` while the previously
+        focused space read False. So there is deliberately NO `workspace.focus`
+        sent first — one call raises the containing space and selects the tab in
+        it. Agents routinely live in a space other than the one on screen, so a
+        tab.focus that did not raise its space would move an invisible tab.
+
+        The wire method is `tab.focus` and its `TabTarget` requires `tab_id`. A
+        named wrapper and not the generic `call`, for the reason `tab_rename`
+        gives: the schema conformance guard in tests/test_og_herdr_client.py
+        enumerates wrappers by introspection, so a frame sent through `call` is
+        invisible to it — which is how `pane.run`, a method herdr never had,
+        survived 223 green tests.
+        """
+        self.call("tab.focus", {"tab_id": tab_id})
+
     def tab_rename(self, tab_id: str, label: str) -> None:
         """Rename a tab.
 

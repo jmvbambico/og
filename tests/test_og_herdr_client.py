@@ -172,6 +172,14 @@ RESULTS = {
     # method rather than refuse it. This is what gives a space's first tab the
     # space's own label instead of herdr's tab number.
     "tab.rename": {"type": "tab_renamed"},
+    # The real tab.focus reply, measured against a live 0.9.x server: it is the
+    # SAME `tab_info` document `tab.get` answers, and the tab in it reads
+    # `focused: true` — which is the evidence that focusing a tab also raises
+    # the workspace holding it (see og_herdr_client.tab_focus).
+    "tab.focus": {"type": "tab_info",
+                  "tab": {"tab_id": "w1:tG", "workspace_id": "w1", "number": 16,
+                          "label": "og-null-ws", "focused": True,
+                          "pane_count": 1, "agent_status": "unknown"}},
     # pane.run is absent because it is not a request variant: `herdr pane run` is
     # a CLI subcommand. pane.send_text is what a pane actually runs a command
     # with, and returns the void `ok` result.
@@ -1521,7 +1529,8 @@ def test_the_conformance_guard_covers_every_requesting_wrapper(fake):
     assert names == {
         "ping", "workspace_list", "workspace_create", "workspace_close",
         "workspace_rename",
-        "tab_create", "tab_close", "tab_rename", "pane_run", "pane_send_text",
+        "tab_create", "tab_close", "tab_focus", "tab_rename", "pane_run",
+        "pane_send_text",
         "pane_close", "pane_rename", "pane_read", "report_agent",
         "release_agent", "report_metadata", "agent_list", "agent_get",
         "events_subscribe",

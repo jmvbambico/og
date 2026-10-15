@@ -60,6 +60,11 @@ runner or harness. Three properties make it the right pane process:
    (`repl/_repl.py:996-1122`) and POSTs the verdict itself
    (`repl/_repl.py:2654-2660`).
 
+It remains the plain-pane command everywhere a vendor CLI has no terminal of its
+own. Where one EXISTS, a **native** harness's tab attaches to that terminal
+instead, so a blocking prompt the vendor CLI is holding can be answered — see
+*Reaching an agent's real CLI from `og agents`* below.
+
 ### One caveat on discovery
 
 `GET /v1/sessions` defaults to `kind="default"`, which returns **root sessions
@@ -447,10 +452,120 @@ Which panes can fire it, on omnigent 0.17.0:
 | Pane | Command | Opens a browser? |
 |---|---|---|
 | Launcher's space (case A/D) | `og chat` | **Yes**, at session creation — and `BROWSER` does not stop it on macOS |
-| Bridge's space for a live root (`_add_space`) | `omnigent attach …` | No — `attach` resolves `auto_open_conversation` to `False` unless the operator configured it |
-| Bridge's tab for a sub-agent (`_add_tab`) | `omnigent attach …` | Same as above |
+| Bridge's space for a live root (`_add_space`) | `omnigent attach …` — a root's own tab is the conversation's MAIN PANE and is never repurposed | No — `attach` resolves `auto_open_conversation` to `False` unless the operator configured it |
+| Bridge's tab for a sub-agent (`_add_tab`) | that agent's own view: a native harness's `tmux … attach`, otherwise `omnigent attach …` | Same as above, and a tmux attach runs no omnigent process at all |
+| An agent's vendor-CLI tab, opened on demand by Enter | `tmux … attach -f ignore-size` | No |
 | Bridge's history space (`_add_history_space`) | `og chat --resume <id>`, **unsubmitted** | Nothing runs until the operator presses Enter; then **yes**, same as the launcher's pane |
 | The `og agents` split | `og agents` | No |
+| An agent's CLI mirror (`c` in `og agents`) | `tmux … attach -f ignore-size` | No |
+
+---
+
+## Reaching an agent's real CLI from `og agents`
+
+The motivating case is a vendor CLI holding a blocking question — a permission
+prompt — that cannot be answered through `og chat`. The web UI answers it by
+attaching to the agent's terminal; `og agents` does the same two ways.
+
+### The layout, and the one rule that keeps it
+
+The conversation's **main pane stays `og chat`** (the Omnigent CLI), with the
+`og agents` pane beside it when `herdr_agents_pane` is on. Nothing in this
+feature retypes, repurposes or retargets it. Each agent's own CLI is a **tab of
+its own**:
+
+* **native** (`claude-native`, `codex-native`, …) — that agent's real vendor CLI,
+  attached **interactively** to Omnigent's own private tmux server
+  (`-f ignore-size`, no `-r`; see `TMUX_ATTACH_FLAGS`). That is the whole point:
+  a blocking permission prompt is answerable from the multiplexer.
+* **ACP** (`acp:*`, and the builtin `grok`/`devin`) — a plain stdio JSON-RPC
+  child with no pty, so there is no terminal to attach to by construction. Its
+  tab holds `omnigent attach <session_id>` — the og chat view specific to that
+  ACP agent, the same one `og chat`'s down-arrow menu gives.
+* **`None`** — an unknown harness is the third answer and is not collapsed into
+  either branch: the tab keeps the REPL, which is always valid, and no promise
+  about a vendor CLI is made.
+
+`Bridge._pane_command` decides what the panes the BRIDGE creates run, off
+`og_herdr.harness_has_terminal(harness)` (the registry's `kind`). A **root's own
+tab is the main pane** and always keeps the Omnigent view, whatever its harness:
+its vendor CLI is an ADDITIONAL tab, opened on demand. Every failure — no
+terminal resolvable, no `tmux` on `PATH`, the resolver unavailable — falls back
+to the REPL, because a pane with nothing running in it is the one outcome
+`_open_space` refuses to leave behind.
+
+### Where a terminal is found: the runner first, the filesystem as fallback
+
+`og_herdr_launch.terminal_behind` asks the runner for the session's terminal
+**resources** (`GET /v1/sessions/{id}/resources/terminals`, the route the web
+UI's terminal tabs are built from) and reads `metadata.tmux_socket` /
+`metadata.tmux_target`. That is authoritative and covers every native harness.
+`resolve_harness_terminal`'s scan of `$TMPDIR/omnigent-<uid>/<harness>/<id>/`
+stays as the FALLBACK, because it resolves a live `claude-native` session with no
+network at all.
+
+**Measured, and the reason the scan was not enough:** `codex-native` writes **no**
+`tmux.json` — its `bridge.json` is an MCP config — so a codex sub-agent has no
+on-disk record for the scan to find (`runtime/harnesses/codex_native/bridge.py`).
+The scan resolves `claude-native` and nothing else.
+
+### Focus is a TAB, because a session id names nothing in herdr
+
+`focus_agent_terminal(session_id, harness, root_session_id="", env=None,
+client=None)` returns `None` on success or one short notice, and never raises.
+
+Both of these were measured against a running server rather than assumed:
+
+* **`agent.get`/`agent.list` DO carry `tab_id`** — for roots and workers alike —
+  but there is **no way to travel from an OMNIGENT session id to that record**.
+  `agent.get {target}` resolves a live agent NAME (registered by `agent.start`)
+  or the PANE id hosting the agent; a session id, a session title, a tab id and
+  a terminal id all answer `agent_not_found`, on the CLI and the socket API. The
+  `agent_session_id` that `pane.report_agent` accepts is stored but surfaced
+  **nowhere** — not in `agent.get`, not in `agent.list`, not in `pane.get`. So og
+  records the tab id itself while it still has both: a sidecar at
+  `$OMNIGENT_HOME/og-agent-tabs.json`, written by the bridge when it creates a
+  tab (`remember_agent_tab`) and dropped when the pane goes (`_forget_tab`). A
+  sidecar and not a field on the space record, because `--cleanup` closes every
+  `workspace_id` in the state file while a WORKER's tab belongs to its PARENT's
+  space.
+* **`tab.focus` also raises the workspace holding the tab** — after
+  `tab.focus {tab_id: w2K:t1}`, `workspace.list` reported `w2K` as
+  `focused: true`. So no `workspace.focus` is sent first: one call moves both,
+  which matters because agents routinely live in a space other than the one on
+  screen.
+
+Those notes are keyed by **ROLE**, because one agent can have two tabs and Enter
+has to pick the right one: `main` is the tab holding the agent's Omnigent view (a
+root's own pane), `cli` is the vendor-CLI tab beside it. Enter reads, in order:
+
+* **native** — the `cli` note. If there is none, the terminal is resolved
+  (runner API first, scan as fallback) and a tab is **opened on demand** in the
+  agent's space, running the same interactive attach, before being focused. So a
+  launcher-created ROOT behaves exactly like a bridge-created one: the operator
+  gets the agent's CLI in a NEW tab and the conversation's pane is untouched. An
+  unresolvable terminal is an honest notice and NO tab — never a focus on the
+  chat pane, which would silently show the wrong thing.
+* **ACP** — the `main` note; then `spaces[session_id].tab_id` in the state file
+  (a root whose space the LAUNCHER opened — the bridge only CLAIMED it, so it
+  never made a tab to note); then the root's tab for a worker whose own note is
+  gone.
+
+**Idempotence is the load-bearing property**: pressing Enter on the same agent
+twice lands on the SAME tab, because the second call finds the `cli` note and
+`tab.create` is not reached. And if that note does NOT land, the tab just opened
+is closed again — an on-screen tab nothing records is exactly how the next Enter
+opens a second one, the defect `cli_pane_id` had to be fixed for twice. Notes are
+dropped when the panes go (`Bridge._forget_tab`), and a worker's vendor-CLI tab
+is closed with them (`Bridge._close_cli_tab`) since it is a tab of its own.
+
+The notices are distinct so "this can never work here" reads differently from
+"try again": `focus: not inside herdr (no HERDR_ENV)`, `focus: no agent on this
+row`, `focus: <harness> is not a harness og knows, so its tab is unverified`,
+`focus: no live terminal for this agent (its harness may have exited)`,
+`focus: this agent has no herdr space to open a tab in`,
+`focus: the new CLI tab could not be recorded`,
+`focus: no herdr tab recorded for this agent`, `focus: <error>`.
 
 ---
 

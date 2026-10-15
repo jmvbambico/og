@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 import og_herdr as m
+import og_herdr_launch
 
 
 class FakeHerdrError(Exception):
@@ -232,6 +233,21 @@ def seams(monkeypatch):
     """Replace the two lazy seams so no real sibling module is imported."""
     monkeypatch.setattr(m, "_state", lambda s: s.get("state", "idle"))
     monkeypatch.setattr(m, "_error_cls", lambda: FakeHerdrError)
+
+
+@pytest.fixture(autouse=True)
+def no_live_server(monkeypatch):
+    """Keep every bridge's terminal lookup off any REAL server.
+
+    A native harness's pane is routed to that harness's vendor CLI, which means
+    the bridge resolves a terminal when it creates the pane — through the
+    runner's terminal-resources route first (`og_herdr_launch.terminal_behind`).
+    Pointing that at a port nothing listens on makes the route fail fast and
+    deterministically, so the suite neither reaches a developer's live Omnigent
+    server nor depends on whether one is running; the filesystem scan that
+    follows finds nothing for these session ids either.
+    """
+    monkeypatch.setenv("OG_SERVER", "http://127.0.0.1:1")
 
 
 @pytest.fixture(autouse=True)
@@ -4811,3 +4827,414 @@ def test_a_failed_repair_leaves_no_stale_record_behind(seams):
     assert bridge.reconcile([Ev("changed", "w1", sub_session(
         "root", "coder_zen:fix"), previous={})]) == []
     assert client.calls == [], "the same failure was repeated on the next poll"
+
+
+# ---------------------------------------------------------------------------
+# which herdr TAB shows which agent — the note og has to keep itself
+# ---------------------------------------------------------------------------
+# herdr carries a `tab_id` on every agent record but offers no way to travel
+# from an OMNIGENT session id to one: `agent.get {target}` resolves a live agent
+# NAME or the PANE id, and a session id answers `agent_not_found` (measured, CLI
+# and socket API); the `agent_session_id` `pane.report_agent` accepts is
+# surfaced nowhere (`agent.get` / `agent.list` / `pane.get` all checked). So the
+# bridge notes the tab id at the one moment it has both, and these tests pin
+# that note: written when a tab is made, read back by id, dropped when the pane
+# goes.
+
+def test_agent_tab_note_round_trips(tmp_path):
+    path = tmp_path / "og-agent-tabs.json"
+
+    assert m.remember_agent_tab(path, "worker-1", "w1:t7", "w1") is True
+    assert m.agent_tab_record(path, "worker-1") == {"tab_id": "w1:t7",
+                                                    "workspace_id": "w1"}
+    # A second agent's note does not disturb the first.
+    assert m.remember_agent_tab(path, "worker-2", "w1:t8") is True
+    assert m.agent_tab_record(path, "worker-1")["tab_id"] == "w1:t7"
+    assert m.agent_tab_record(path, "worker-2") == {"tab_id": "w1:t8"}
+
+
+def test_agent_tab_note_is_additive_a_missing_file_reads_as_nothing(tmp_path):
+    # A file written before this feature, or a home that has none, is "we
+    # recorded nothing" — never an error and never a half-read table.
+    path = tmp_path / "nothing-here.json"
+    assert m.load_agent_tabs(path) == {}
+    assert m.agent_tab_record(path, "anyone") == {}
+
+
+def test_forget_agent_tab_drops_one_and_survives_the_last(tmp_path):
+    # Dropping the LAST entry must still WRITE: the file has to stop naming a
+    # tab herdr may have re-used. That is why `decide` distinguishes "write an
+    # empty map" from "write nothing at all".
+    path = tmp_path / "og-agent-tabs.json"
+    m.remember_agent_tab(path, "worker-1", "w1:t7")
+
+    assert m.forget_agent_tab(path, "worker-1") is True
+    assert m.agent_tab_record(path, "worker-1") == {}
+    assert json.loads(path.read_text()) == {}
+
+    # Nothing to drop writes nothing at all, and reports so.
+    assert m.forget_agent_tab(path, "worker-1") is False
+    # A missing file is the same answer, not a crash.
+    assert m.forget_agent_tab(tmp_path / "absent.json", "x") is False
+
+
+@pytest.mark.parametrize("payload", [
+    "{ not json", json.dumps(["a list"]), json.dumps({"worker-1": "w1:t7"}),
+    json.dumps({"worker-1": {"tab_id": None}}),
+    json.dumps({"worker-1": {"tab_id": ""}}),
+    json.dumps({"": {"tab_id": "w1:t7"}}),
+])
+def test_agent_tab_note_never_raises_on_a_file_it_did_not_write(tmp_path, payload):
+    path = tmp_path / "og-agent-tabs.json"
+    path.write_text(payload)
+    assert m.load_agent_tabs(path) == {}
+    assert m.agent_tab_record(path, "worker-1") == {}
+    # ...and a fresh note can still be written over it.
+    assert m.remember_agent_tab(path, "worker-1", "w1:t7") is True
+
+
+def test_remember_agent_tab_refuses_ids_it_cannot_use(tmp_path):
+    path = tmp_path / "og-agent-tabs.json"
+    assert m.remember_agent_tab(path, "", "w1:t7") is False
+    assert m.remember_agent_tab(path, "worker-1", None) is False
+    assert m.remember_agent_tab(path, None, None) is False
+    assert not path.exists(), "nothing usable means no file is written"
+
+
+def test_the_bridge_notes_the_tab_when_it_creates_one(seams):
+    # A WORKER's tab — the pane running its vendor CLI — is noted as `_setup_pane`
+    # runs, which is the only moment the session id and the tab id are both in
+    # hand (herdr cannot be asked later; see the note above).
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    # The root FIRST, so the worker lands in the root's space as a TAB rather
+    # than opening a space of its own.
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    bridge.reconcile([Ev("added", "worker-1", sub_session("root-1"))])
+
+    note = m.agent_tab_record(bridge.agent_tabs_path, "worker-1")
+    # The id herdr minted for THIS worker's tab — the one `tab.create` returned
+    # — and the space it lives in, which is its ROOT's.
+    assert note["tab_id"] == bridge._recs["worker-1"]["tab_id"]
+    assert note["tab_id"] != bridge._recs["root-1"]["tab_id"], (
+        "the worker's own tab must be noted, not its root's")
+    assert note["workspace_id"] == bridge._recs["root-1"]["workspace_id"]
+
+
+def test_the_bridge_notes_a_roots_own_tab_too(seams):
+    # A root is noted as well, and names the tab it created and renamed.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+
+    note = m.agent_tab_record(bridge.agent_tabs_path, "root-1")
+    assert note["tab_id"] == _call(client, "tab_rename")[1][0]
+
+
+def test_the_bridge_drops_the_note_when_the_pane_goes(seams):
+    # A reaped tab must not stay noted: herdr re-uses ids, and a stale note aims
+    # Enter at somebody else's tab.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    bridge.reconcile([Ev("added", "worker-1", sub_session("root-1"))])
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1")
+
+    bridge.reconcile([Ev("removed", "worker-1", {})])
+
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1") == {}
+
+
+def test_a_roots_removal_drops_its_workers_notes_too(seams):
+    # Closing a space takes its tabs with it, so the workers' notes go in the
+    # same breath — otherwise a later Enter aims at a tab id herdr has freed.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    bridge.reconcile([Ev("added", "worker-1", sub_session("root-1"))])
+
+    bridge.reconcile([Ev("removed", "root-1", {})])
+
+    assert m.agent_tab_record(bridge.agent_tabs_path, "root-1") == {}
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1") == {}
+
+
+# ---------------------------------------------------------------------------
+# what a tab RUNS: the real vendor CLI, or the attach REPL
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _tmux_on_path(monkeypatch):
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/usr/bin/" + name)
+
+
+def test_a_native_workers_tab_attaches_its_own_vendor_cli(seams, _tmux_on_path,
+                                                          monkeypatch):
+    # A WORKER's tab is a per-agent tab and nothing else, so a native harness's
+    # goes straight to that agent's vendor CLI — where a permission prompt is
+    # answered — instead of typing `omnigent attach`.
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind",
+                        lambda sid, env=None, watcher=None: ("/tmp/x/tmux.sock",
+                                                             "main"))
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    _worker_in_a_space(client, bridge, "claude-native")
+
+    worker_tab = bridge._recs["worker-1"]["tab_id"]
+    typed = _typed_by_pane(client)
+    assert typed[bridge._recs["worker-1"]["pane_id"]] == (
+        "tmux -S /tmp/x/tmux.sock attach -f ignore-size -t main")
+    # ...and it is noted as the CLI role, so Enter reaches it and not something
+    # else this agent has.
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1",
+                              m.TAB_ROLE_CLI)["tab_id"] == worker_tab
+
+
+def test_a_ROOTS_own_tab_keeps_the_omnigent_view_never_repurposed(
+        seams, _tmux_on_path, monkeypatch):
+    # THE CORRECTED MODEL, and the property that matters most to the operator:
+    # the main pane stays the Omnigent view. A root's own tab is the chat — the
+    # launcher's `og chat`, or this `omnigent attach` for a space the bridge
+    # opened — and the vendor CLI gets a tab of its OWN, on demand, from
+    # `focus_agent_terminal`. So the root's tab is noted as `main`, and nothing
+    # here resolves a terminal at all.
+    def must_not_be_called(*args, **kwargs):
+        raise AssertionError("a root's own pane is not the vendor CLI")
+
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind", must_not_be_called)
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    assert _call(client, "pane_run")[1] == (
+        "pane1", "omnigent attach --server http://127.0.0.1:6767 s1")
+    assert m.agent_tab_record(bridge.agent_tabs_path, "s1",
+                              m.TAB_ROLE_MAIN)["tab_id"] == "tab1"
+    assert m.agent_tab_record(bridge.agent_tabs_path, "s1",
+                              m.TAB_ROLE_CLI) == {}, (
+        "no vendor-CLI tab is opened eagerly for a root")
+
+
+def _typed_commands(client):
+    """Every command typed into a pane, in order."""
+    return [args[1] for name, args, _ in client.calls if name == "pane_run"]
+
+
+def _typed_by_pane(client):
+    """`{pane_id: command}` for every line typed into a pane.
+
+    A space's panes are created in their own order, so keying by pane id is how
+    a test says WHICH agent's tab got which command rather than relying on
+    position in a list.
+    """
+    return {args[0]: args[1] for name, args, _ in client.calls
+            if name == "pane_run"}
+
+
+def _worker_in_a_space(client, bridge, harness):
+    """Project a root, then a worker on `harness` into its space. Silent helper."""
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    bridge.reconcile([Ev("added", "worker-1",
+                         sub_session("root-1", harness=harness))])
+
+
+def test_an_acp_agents_tab_keeps_the_attach_repl(seams, _tmux_on_path,
+                                                 monkeypatch):
+    # An ACP harness is a stdio JSON-RPC child with NO pty, so there is no
+    # terminal to attach to by construction — and the `omnigent attach` REPL is
+    # the view `og chat`'s down-arrow menu gives, which is correct as it stands.
+    # No terminal is even looked for.
+    def must_not_be_called(*args, **kwargs):
+        raise AssertionError("an ACP tab has no terminal to resolve")
+
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind", must_not_be_called)
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    _worker_in_a_space(client, bridge, "acp:cline")
+
+    assert any("omnigent attach" in line for line in _typed_commands(client)), \
+        _typed_commands(client)
+
+
+def test_an_unknown_harness_is_the_third_answer_not_either_branch(seams,
+                                                                  _tmux_on_path,
+                                                                  monkeypatch):
+    # `harness_has_terminal` -> None is "og cannot tell". Collapsing it into
+    # "native" would attach to a terminal that may not exist; into "ACP" would
+    # print a reason that is not true. The pane keeps the attach REPL, which is
+    # always valid, and no terminal is resolved.
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not resolve for None")))
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    # A session dict naming no harness at all: the third answer.
+    bridge.reconcile([Ev("added", "s1", {"title": "T", "state": "working"})])
+
+    typed = _typed_commands(client)
+    assert typed, client.calls
+    assert "omnigent attach" in typed[0], typed
+
+
+def test_a_native_agents_tab_falls_back_when_tmux_is_missing(seams, monkeypatch):
+    # No tmux means no attach: a pane left with nothing running in it is the one
+    # outcome the whole file refuses to leave behind, so the REPL is used and the
+    # operator still has a working pane.
+    monkeypatch.setattr(m.shutil, "which", lambda name: None)
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("must not resolve without tmux")))
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    typed = _typed_commands(client)
+    assert typed, client.calls
+    assert "omnigent attach" in typed[0], typed
+
+
+def test_a_native_agents_tab_falls_back_when_no_terminal_resolves(seams,
+                                                                 _tmux_on_path,
+                                                                 monkeypatch):
+    # The terminal is gone (the harness exited, the runner is offline): the pane
+    # still has to run something, so it runs the REPL.
+    monkeypatch.setattr(og_herdr_launch, "terminal_behind",
+                        lambda sid, env=None, watcher=None: None)
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+
+    bridge.reconcile([Ev("added", "s1", root_session("Fix bug"))])
+
+    typed = _typed_commands(client)
+    assert typed, client.calls
+    assert "omnigent attach" in typed[0], typed
+
+
+def test_agent_tab_roles_are_independent(tmp_path):
+    # ONE agent can have both notes — its Omnigent view (`main`) and its
+    # vendor-CLI tab (`cli`) — and writing one must not disturb the other. That
+    # is what lets Enter tell a root's chat pane from the CLI tab it opened
+    # beside it.
+    path = tmp_path / "og-agent-tabs.json"
+    m.remember_agent_tab(path, "root-1", "w1:t1", "w1", role=m.TAB_ROLE_MAIN)
+    m.remember_agent_tab(path, "root-1", "w1:t9", "w1", role=m.TAB_ROLE_CLI)
+
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_MAIN)["tab_id"] == "w1:t1"
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_CLI)["tab_id"] == "w1:t9"
+
+    # Dropping ONE role leaves the other exactly where it was...
+    assert m.forget_agent_tab(path, "root-1", m.TAB_ROLE_CLI) is True
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_CLI) == {}
+    assert m.agent_tab_record(path, "root-1", m.TAB_ROLE_MAIN)["tab_id"] == "w1:t1"
+
+    # ...and the default drop takes every role for the session, entry included.
+    assert m.forget_agent_tab(path, "root-1") is True
+    assert json.loads(path.read_text()) == {}
+
+
+def test_agent_tab_record_with_no_role_says_main(tmp_path):
+    # The default role is the agent's own tab, so a caller that has not learned
+    # about roles yet reads what it always did.
+    path = tmp_path / "og-agent-tabs.json"
+    m.remember_agent_tab(path, "worker-1", "w1:t7")
+    assert m.agent_tab_record(path, "worker-1") == m.agent_tab_record(
+        path, "worker-1", m.TAB_ROLE_MAIN)
+
+
+def test_an_unknown_role_is_refused_rather_than_written(tmp_path):
+    # A role is a closed set: a typo must not create a third slot nothing reads.
+    path = tmp_path / "og-agent-tabs.json"
+    assert m.remember_agent_tab(path, "worker-1", "w1:t7", role="bogus") is False
+    assert m.forget_agent_tab(path, "worker-1", "bogus") is False
+    assert not path.exists()
+    assert m.agent_tab_record(path, "worker-1", "bogus") == {}
+
+
+def test_a_flat_note_from_before_the_roles_reads_as_the_main_tab(tmp_path):
+    # Nothing in this tree ever wrote the flat shape, but a file that says which
+    # tab an agent has should be believed for that much: read as "nothing", the
+    # next Enter on a native agent would open a SECOND vendor-CLI tab beside the
+    # recorded one.
+    path = tmp_path / "og-agent-tabs.json"
+    path.write_text(json.dumps({"worker-1": {"tab_id": "w1:t7",
+                                             "workspace_id": "w1"}}))
+
+    assert m.agent_tab_record(path, "worker-1", m.TAB_ROLE_MAIN) == {
+        "tab_id": "w1:t7", "workspace_id": "w1"}
+    assert m.agent_tab_record(path, "worker-1", m.TAB_ROLE_CLI) == {}
+
+
+def test_removing_a_worker_closes_the_vendor_cli_tab_beside_it_too(seams):
+    # A worker's vendor-CLI tab is a tab of its OWN beside the worker's own tab
+    # in its parent's space, so closing the worker's tab does not take it: it has
+    # to be closed here, or it stays on screen with nothing recording it. This is
+    # the "reaped like the others" half of opening one on demand.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    bridge.reconcile([Ev("added", "worker-1", sub_session("root-1",
+                                                          harness="acp:cline"))])
+    # The tab `focus_agent_terminal` would have opened for this worker.
+    assert m.remember_agent_tab(bridge.agent_tabs_path, "worker-1", "ws1:t99",
+                                "ws1", role=m.TAB_ROLE_CLI)
+
+    bridge.reconcile([Ev("removed", "worker-1", {})])
+
+    assert ("tab_close", ("ws1:t99",), {}) in client.calls, client.calls
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1",
+                              m.TAB_ROLE_CLI) == {}
+    assert m.agent_tab_record(bridge.agent_tabs_path, "worker-1",
+                              m.TAB_ROLE_MAIN) == {}
+
+
+def test_removing_a_root_closes_its_vendor_cli_tab_and_its_notes(seams):
+    # A root's space close takes its tabs with it, so the CLI tab is attempted
+    # anyway — `not_found` is the answer, counted as done — and both notes go.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    assert m.remember_agent_tab(bridge.agent_tabs_path, "root-1", "ws1:t99",
+                                "ws1", role=m.TAB_ROLE_CLI)
+
+    bridge.reconcile([Ev("removed", "root-1", {})])
+
+    assert ("tab_close", ("ws1:t99",), {}) in client.calls, client.calls
+    assert m.agent_tab_record(bridge.agent_tabs_path, "root-1",
+                              m.TAB_ROLE_CLI) == {}
+    assert m.agent_tab_record(bridge.agent_tabs_path, "root-1",
+                              m.TAB_ROLE_MAIN) == {}
+
+
+def test_a_not_found_when_closing_the_cli_tab_is_not_an_error(seams):
+    # The space close usually got there first, so `not_found` is the ordinary
+    # answer here and must not be reported as a failure.
+    client = RecordingClient()
+    client.fail = {"tab_close": FakeHerdrError("not_found")}
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    m.remember_agent_tab(bridge.agent_tabs_path, "root-1", "ws1:t99", "ws1",
+                         role=m.TAB_ROLE_CLI)
+
+    lines = bridge.reconcile([Ev("removed", "root-1", {})])
+
+    assert not [line for line in lines if line.startswith("error")], lines
+    assert m.agent_tab_record(bridge.agent_tabs_path, "root-1",
+                              m.TAB_ROLE_CLI) == {}
+
+
+def test_an_ordinary_removal_costs_no_cli_tab_call(seams):
+    # The close is attempted ONLY when a vendor-CLI tab is noted, so a removal
+    # that never opened one makes no extra call.
+    client = RecordingClient()
+    bridge = m.Bridge(FakeWatcher([]), client, cwd="/tmp/ws")
+    bridge.reconcile([Ev("added", "root-1", root_session("Root"))])
+    client.calls.clear()
+
+    bridge.reconcile([Ev("removed", "root-1", {})])
+
+    assert "tab_close" not in [name for name, _, _ in client.calls], client.calls
