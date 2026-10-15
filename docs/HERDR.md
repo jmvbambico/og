@@ -514,6 +514,30 @@ Things the bridge has to do because of how long it runs:
   `self._seen` is assigned last in `poll_once`, a failed poll cannot corrupt
   it, so recovery diffs against the last state actually observed instead of
   emitting a storm of `removed` + `added`.
+- **The sweep runs on idle passes, not only on events.** An event stream reports
+  *change*, so a poll that finds nothing changed is invisible to a consumer
+  iterating the generator — and the orphan sweep is the one consumer decision
+  that rests on an *absence*: a recorded space whose session is not live. A
+  session deleted in the web UI while the bridge was down is missing from the
+  first listing after a restart, so it never produces a `removed` event at all.
+  `watch(on_idle=…)` therefore calls back after a poll that returned and produced
+  no events, and `run_forever` reconciles that pass with an empty batch. The
+  callback is emitted from inside the poll loop, so it cannot arrive before a
+  poll has written `_seen` — which is the one state where an empty `_seen` plus
+  the `False` `_last_truncated` is born with reads as a confident "nothing is
+  live", and sweeping on it would close every space the operator has. A poll that
+  failed produces no tick at all, and a listing that was truncated defers the
+  sweep to the next complete one (`_live_session_ids` is the only gate).
+- **A space recorded by an earlier process is closed from the file.** `_recs`
+  holds live handles and is rebuilt by every process; `_spaces` is the durable
+  record and survives a restart. The sweep finds orphans in `_spaces` and acts
+  through `_removed`, which only knows `_recs` — so before hydration the two
+  disagreed at exactly one moment, the restart, and the sweep found the orphan
+  and declined. `_hydrate_for_close` rebuilds the minimum handle from the state
+  file alone (never inventing a record for a space og did not record), with
+  `owns_space` derived from `owner` by the same `BRIDGE_OWNED` rule `_adopt`
+  uses. The agent string is not in the file, so the release is skipped and the
+  close goes ahead: the marker is drawn on a pane the close is about to remove.
 - **The SSE buffers are capped** (`MAX_SSE_LINE_BYTES`, `MAX_SSE_FRAME_BYTES`).
   A stream that never sends a newline, or a `data:` run never closed by a blank
   line, would otherwise grow memory without limit in a process meant to run for

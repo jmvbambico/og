@@ -5,9 +5,16 @@ in this file can reach the operator's live herdr server, live spaces, or live
 sessions. That is not a stylistic preference: the launcher closes panes and
 removes workspaces, and a test that could do that to a real session would be a
 worse hazard than the bug it is looking for.
+
+The last section drives `og chat` itself, in a throwaway HOME against a fake
+`omnigent`. That is the same discipline one file over: the handshake has a
+BASH half, and bash is where "the flag was absent" and "the flag was given an
+empty value" are told apart.
 """
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -16,15 +23,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "installer"))
 
-from og_herdr import DEFAULT_SPACE_CAP, load_state  # noqa: E402  (the bridge's own readers)
+from og_herdr import DEFAULT_SPACE_CAP, load_state, save_state  # noqa: E402  (the bridge's own readers)
 from og_herdr_launch import (  # noqa: E402
     AGENTS_PANE_RATIO,
     DEFAULT_AGENT_NAME,
+    DEFAULT_PROJECTS_DIR,
     Launch,
     LaunchError,
     _hold_for_problems,
     agents_pane_enabled,
     agent_name,
+    chat_pane,
     install_config,
     is_inside,
     launch,
@@ -32,6 +41,9 @@ from og_herdr_launch import (  # noqa: E402
     live_session,
     main,
     pane_env_for,
+    projects_dir,
+    record_chat_pane,
+    resolve_chat_dir,
     session_space_cap,
 )
 from og_herdr_watch import SessionEvent  # noqa: E402
@@ -1001,6 +1013,410 @@ def test_install_config_survives_a_missing_or_broken_plan(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# `og chat --dir` — where the session is rooted
+# ---------------------------------------------------------------------------
+# `--dir` has to answer two questions the operator cannot: is this path a real
+# directory (a typo must not become an empty session root), and where does a
+# RELATIVE path start. It is a flag rather than a positional because everything
+# else in `og chat`'s arguments is forwarded to `omnigent run` verbatim —
+# `og chat --resume <id>` is how a history space resumes — so a bare directory
+# would collide with the forwarding instead of joining it.
+
+def test_projects_dir_defaults_to_projects_and_expands_tilde():
+    """`~` is expanded where it is READ, not where it is written, so a plan
+    written by hand and one written by `og setup` mean the same thing."""
+    assert DEFAULT_PROJECTS_DIR == "~/projects"
+    assert projects_dir({}) == Path.home() / "projects"
+    assert projects_dir({"projects_dir": "~/code"}) == Path.home() / "code"
+
+
+def test_projects_dir_falls_back_rather_than_raising_on_a_hand_edited_value():
+    """The `session_space_cap` rule: this is read on the way to exec'ing a REPL,
+    so an unusable value must not be the reason `og chat` will not start."""
+    for bad in (None, "", "   ", 7, ["~/projects"], {"dir": "~/projects"}):
+        assert projects_dir({"projects_dir": bad}) == Path.home() / "projects", bad
+
+
+def test_an_absolute_dir_is_used_exactly_as_given(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    assert resolve_chat_dir(str(target), {}) == target.resolve()
+
+
+def test_a_relative_dir_resolves_against_the_configured_projects_root(tmp_path):
+    """The default, and the case the flag exists for: `og chat --dir og` from
+    $HOME means the og checkout, wherever the operator keeps their work."""
+    (tmp_path / "og").mkdir()
+    config = {"projects_dir": str(tmp_path)}
+    assert resolve_chat_dir("og", config) == (tmp_path / "og").resolve()
+    # A configured root, and the default when there is none, are the same rule
+    # read twice — asserted through the reader so both spellings stay honest.
+    assert projects_dir(config) == tmp_path
+    assert projects_dir({}) == Path.home() / "projects"
+
+
+def test_a_dir_that_does_not_exist_is_refused_not_created(tmp_path):
+    """`omnigent run` roots the session at its own cwd, so a directory nobody
+    made has to be made by something — and a silently mkdir'd typo is a session
+    rooted in an empty directory with no error anywhere."""
+    with pytest.raises(LaunchError) as excinfo:
+        resolve_chat_dir("nope", {"projects_dir": str(tmp_path)})
+    assert "--dir nope" in str(excinfo.value)
+    assert not (tmp_path / "nope").exists()
+
+    with pytest.raises(LaunchError):
+        resolve_chat_dir(str(tmp_path / "absent"), {})
+
+
+# ---------------------------------------------------------------------------
+# `og chat` inside a herdr pane — the other end of the launcher's handshake
+# ---------------------------------------------------------------------------
+# THE FLOW THIS PINS: the operator presses "new space", gets a plain shell,
+# `cd`s into a repo and types `og chat`. No launcher ran, so nothing wrote the
+# pending record the bridge adopts — and a bridge that sees a root session in a
+# directory it has no space for opens a SECOND space for the conversation
+# already on screen. So `og chat` writes the record itself, for the pane it is
+# in, and splits the agents pane the way `_open_space` does.
+#
+# The marker is `HERDR_ENV=1` — herdr's own flag for a managed pane, measured
+# from herdr's bundled agent skill (`herdr --skill`: `test "${HERDR_ENV:-}" = 1`)
+# rather than invented here. Outside a herdr pane every one of these must be a
+# NO-OP: a plain `og chat` in an ordinary terminal may not touch the state file.
+
+class SplitClient(FakeClient):
+    """A herdr that makes the pane `pane.split` promises to make.
+
+    `FakeClient`'s listing is scripted and STATIC, which is the launcher's
+    world: a space it created itself, where the one other pane already in the
+    listing IS the split. A tab the operator made needs the listing to grow, so
+    `before` is what herdr lists until a split happens and `after` is what it
+    lists afterwards.
+    """
+
+    def __init__(self, before=("w1:p1",), after=("w1:p1", "w1:p2")):
+        super().__init__(panes=[{"pane_id": p, "tab_id": "w1:t1",
+                                 "workspace_id": "w1"} for p in before])
+        self._after = [{"pane_id": p, "tab_id": "w1:t1", "workspace_id": "w1"}
+                       for p in after]
+
+    def call(self, method, params=None):
+        reply = super().call(method, params)
+        if method == "pane.split":
+            self._panes = self._after
+        return reply
+
+
+class UnreadableOnceClient(FakeClient):
+    """`pane.list` fails once — the pre-split baseline — then answers.
+
+    THE DEFECT THIS REPRODUCES. The baseline read is what stops `og agents`
+    from being typed into a pane the operator split themselves. When that read
+    FAILS, the "baseline" is not an empty tab, it is an unknown one: keep the
+    difference-against-the-tab rule and every pane in the tab looks brand new,
+    so the lowest-numbered other pane wins — and on an operator's tab that is
+    their pane, taking over their shell. The post-split listing here works
+    perfectly, which is exactly how the bug hid: only the FIRST read fails.
+    """
+
+    def __init__(self, panes, fail_next_list=True):
+        super().__init__(panes=panes)
+        self.fail_next_list = fail_next_list
+
+    def call(self, method, params=None):
+        if method == "pane.list" and self.fail_next_list:
+            self.fail_next_list = False
+            self.calls.append((method, params or {}))
+            raise RuntimeError("the socket went away")
+        return super().call(method, params)
+
+
+def _pane_env(**extra):
+    env = {"HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w1", "HERDR_TAB_ID": "w1:t1",
+           "HERDR_PANE_ID": "w1:p1"}
+    env.update(extra)
+    return env
+
+
+def test_record_chat_pane_writes_the_record_the_bridge_claims(tmp_path):
+    """The same record `_open_space` writes, through the same writer, keyed by
+    the same thing. Asserted with the BRIDGE'S OWN reader and against the shape
+    case (A) produces — a record that only this path understands would be a
+    record nothing adopts."""
+    launch(make_ctx(tmp_path, FakeClient(), FakeWatcher()))
+    opened = load_state(ctx_path(tmp_path))["pending"][CWD]
+
+    state = tmp_path / "chat.json"
+    written = record_chat_pane(state, CWD, "w1", "w1:t1", "w1:p1")
+
+    assert written == opened
+    assert load_state(state)["pending"][CWD] == opened
+
+
+def test_record_chat_pane_keeps_what_the_bridge_already_recorded(tmp_path):
+    """`save_state` is whole-file and last-writer-wins and is NOT a lock, so the
+    write re-reads first: a load at the top and a save at the end drops whatever
+    the bridge wrote in between — here, every space it has adopted."""
+    state = tmp_path / "og-herdr.json"
+    save_state(state, {"spaces": {"s1": {"workspace_id": "w0", "cwd": "/elsewhere"}},
+                       "pending": {}})
+
+    record_chat_pane(state, CWD, "w1", "w1:t1", "w1:p1")
+
+    kept = load_state(state)
+    assert kept["spaces"]["s1"]["workspace_id"] == "w0"
+    assert kept["pending"][CWD]["pane_id"] == "w1:p1"
+
+
+def test_chat_pane_inside_herdr_records_the_pane_and_splits_it(tmp_path,
+                                                               monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient()
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert load_state(tmp_path / "og-herdr.json")["pending"][os.getcwd()] == {
+        "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+        "owner": "launcher", "cwd": os.getcwd()}
+    # The split is `split_agents_pane`, the same implementation `_open_space`
+    # uses — asserted on its effect, not by re-reading the source.
+    assert client.text_typed() == ["og agents"]
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+    assert client.split_params["target_pane_id"] == "w1:p1"
+    assert client.split_params["ratio"] == AGENTS_PANE_RATIO
+
+
+def test_chat_pane_outside_herdr_touches_nothing(tmp_path, monkeypatch, capsys):
+    """A plain `og chat` in an ordinary terminal must behave exactly as it did
+    before this existed: no state file, no socket, nothing on stdout."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = FakeClient()
+
+    assert chat_pane(client=client, env={"HOME": str(tmp_path)}) == 0
+
+    assert client.calls == []
+    assert not (tmp_path / "og-herdr.json").exists()
+    assert capsys.readouterr() == ("", "")
+
+
+def test_chat_pane_does_not_split_when_the_install_turned_it_off(tmp_path,
+                                                                 monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "og-install.json").write_text('{"herdr_agents_pane": false}')
+    client = FakeClient()
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    # The RECORD is still written: the agents pane is cosmetic, the pending
+    # record is what stops a second space appearing.
+    assert os.getcwd() in load_state(tmp_path / "og-herdr.json")["pending"]
+    assert client.calls == []
+
+
+def test_chat_pane_never_types_og_agents_into_a_pane_the_operator_already_had(
+        tmp_path, monkeypatch, capsys):
+    """THE DIFFERENCE FROM `og start`, and it is a real one. A launch makes its
+    own space, so the tab holds exactly one pane and "any pane but the chat
+    pane" is the split it just made. This tab is the operator's: they may have
+    split it before typing `og chat`, and then the lowest-numbered other pane is
+    THEIRS — typing `og agents` into it would take over their shell.
+
+    The pane is found by difference against the tab AS IT WAS before the split,
+    and when that cannot be told the answer is no agents pane at all rather than
+    a guess."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=("w1:p1", "w1:p2"),
+                         after=("w1:p1", "w1:p2", "w1:p3"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p3"
+    # The chat is recorded and the space is split either way — only the cosmetic
+    # second command is at stake.
+    assert os.getcwd() in load_state(tmp_path / "og-herdr.json")["pending"]
+    assert "pane.split" in client.methods
+    assert capsys.readouterr().err == ""
+
+
+def test_chat_pane_rather_than_guess_when_the_new_pane_cannot_be_told(tmp_path,
+                                                                     monkeypatch,
+                                                                     capsys):
+    """The other half of the same rule. If herdr split the pane but the listing
+    never grows — or grows in a way that cannot be read — there is no pane id to
+    be sure of, and the safe answer is no `og agents` anywhere rather than one
+    in a pane the operator may be using."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=("w1:p1",), after=("w1:p1",))  # never grows
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert client.text_typed() == []
+    assert "no new pane id" in capsys.readouterr().err
+
+
+def test_a_baseline_listing_that_fails_starts_og_agents_nowhere(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    """THE REVIEW DEFECT. `tab_pane_ids` could not read the tab, and it answered
+    with an empty set — which `known_panes is not None` then took as herdr's
+    verified "this tab had no panes". Every pane in the tab became "new", the
+    lowest-numbered other pane won, and on a tab the operator made themselves
+    `og agents` was typed into THEIR work.
+
+    So "could not read it" and "it was empty" are different answers now, and
+    the first one ends the split: a missing agents pane is cosmetic, a command
+    in somebody's pane is not."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = UnreadableOnceClient(
+        [{"pane_id": "w1:p1", "tab_id": "w1:t1"},      # the chat
+         {"pane_id": "w1:p2", "tab_id": "w1:t1"}])     # the operator's
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert client.text_typed() == []
+    assert "pane.split" not in client.methods, (
+        "nothing was split, so there is no pane nothing runs in")
+    assert "could not read this tab's panes" in capsys.readouterr().err
+
+
+def test_an_operator_pane_is_never_the_one_og_agents_starts_in(tmp_path,
+                                                                monkeypatch,
+                                                                capsys):
+    """The same defect, asserted the only way that matters: whatever the herdr
+    answers AFTER the failed baseline read, no pane that already existed can be
+    the one a command is typed into."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    theirs = {"pane_id": "w1:p2", "tab_id": "w1:t1"}
+    client = UnreadableOnceClient(
+        [{"pane_id": "w1:p1", "tab_id": "w1:t1"}, theirs,
+         {"pane_id": "w1:p3", "tab_id": "w1:t1"}])
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    typed_into = {params["pane_id"]
+                  for params in client.params_of("pane.send_text")}
+    assert typed_into == set() or theirs["pane_id"] not in typed_into
+    # And the operator's pane is still just a pane: nothing was sent into it.
+    assert "pane.send_text" not in client.methods
+
+
+def test_an_empty_baseline_is_an_answer_and_still_finds_the_new_pane(tmp_path,
+                                                                    monkeypatch):
+    """THE BEHAVIOUR THE FIX MUST NOT LOSE. A baseline that genuinely holds no
+    panes is herdr answering, and it is the strongest case for the difference
+    rule: every pane in the tab after the split is one herdr just made, so the
+    agents pane is found and started."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    client = SplitClient(before=(), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert client.text_typed() == ["og agents"]
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
+def test_chat_pane_without_the_pane_ids_says_so_and_records_nothing(tmp_path,
+                                                                    monkeypatch,
+                                                                    capsys):
+    """herdr inside, but no workspace/tab/pane id in the environment. A record
+    naming a pane that does not exist would be adopted by the bridge and then
+    fail every setup call against — worse than recording nothing, which costs
+    the operator one space they can close."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    assert chat_pane(client=FakeClient(), env={"HERDR_ENV": "1"}) == 0
+
+    assert "was not recorded" in capsys.readouterr().err
+    assert not (tmp_path / "og-herdr.json").exists()
+
+
+def test_a_split_failure_costs_the_agents_pane_only_and_is_logged(tmp_path,
+                                                                  monkeypatch):
+    """Same trade the launcher makes: the chat IS the session. Logged as well as
+    printed, because `og chat` ends in `exec omnigent run` and the REPL takes
+    the terminal in the same way herdr's TUI does — a line that reached only the
+    terminal is gone before anyone reads it."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    assert chat_pane(client=NoSplitClient(), env=_pane_env()) == 0
+
+    line = _launch_log(tmp_path).read_text().strip()
+    assert "could not open the og agents pane" in line
+    assert os.getcwd() in load_state(tmp_path / "og-herdr.json")["pending"]
+
+
+def test_chat_pane_prints_the_resolved_dir_as_data_and_prose_to_stderr(tmp_path,
+                                                                       monkeypatch,
+                                                                       capsys):
+    """bin/og captures stdout and cds to it, so anything but the path there
+    would become a `cd` to a sentence."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (tmp_path / "og-install.json").write_text(
+        '{"projects_dir": "%s"}' % tmp_path)
+
+    assert chat_pane(client=FakeClient(), env={}, argv=["--dir", "repo"]) == 0
+
+    out = capsys.readouterr().out
+    assert out.strip() == str(repo.resolve())
+
+
+def test_chat_pane_refuses_a_dir_that_does_not_exist_with_nothing_on_stdout(
+        tmp_path, monkeypatch, capsys):
+    """A refusal, not a degradation: running the session somewhere the operator
+    did not ask for is not a degraded version of what they asked for. The exit
+    is 2 and the stdout is EMPTY, so bin/og cannot cd to a half-answer."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    (tmp_path / "og-install.json").write_text(
+        '{"projects_dir": "%s"}' % tmp_path)
+
+    assert chat_pane(client=FakeClient(), env={},
+                     argv=["--dir", "nope"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--dir nope" in captured.err
+
+
+def test_chat_pane_records_the_dir_it_was_given_not_the_one_it_shell_outed_in(
+        tmp_path, monkeypatch):
+    """`--dir` and the pane are the same directory by the time the REPL starts
+    (bin/og cds first), and the record must be keyed by that: the bridge claims
+    it by matching the session's own `workspace` EXACTLY."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert chat_pane(client=FakeClient(), env=_pane_env(),
+                     argv=["--dir", str(repo)]) == 0
+
+    pending = load_state(tmp_path / "og-herdr.json")["pending"]
+    assert list(pending) == [str(repo.resolve())]
+    assert os.getcwd() not in pending
+
+
+def test_main_dispatches_the_chat_subcommand(monkeypatch, tmp_path):
+    """`og chat` reaches this as a SUBCOMMAND, so the `og start` parser keeps
+    exactly the flags it had — `og start herdr --once` must not grow a
+    vocabulary it does not want."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    assert main(["chat-pane"]) == 0
+    assert not (tmp_path / "og-herdr.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # a multiplexer og has no backend for
 # ---------------------------------------------------------------------------
 
@@ -1011,3 +1427,108 @@ def test_an_unimplemented_multiplexer_warns_and_starts_without_it(capsys):
     out = capsys.readouterr().out
     assert "no backend" in out
     assert "herdr.dev" not in out  # no false claim that tmux was installed
+
+
+# ---------------------------------------------------------------------------
+# `--dir` at the bash seam: absent is not the same as empty
+# ---------------------------------------------------------------------------
+# `og chat --dir ""` is a value somebody TYPED. Handing the chat the current
+# directory instead is the one thing this flag must never do — a conversation
+# rooted where the operator did not ask, with no error anywhere — and that is
+# exactly what "treat the empty string as no flag" produced, on both the bash
+# side (`[[ -n "$dir" ]]`) and the Python side (`if args.dir:`). Both now test
+# for the flag, and the refusal is the same one line a nonexistent path gets.
+#
+# Driven end to end because the half that decides is bash: bin/og has to hand
+# `--dir ""` to the helper rather than deciding on its own that nothing was
+# asked for. The REPL stand-in prints the directory it was started in, which is
+# what `omnigent run` roots the session at — so "the chat ran in the wrong
+# place" is a visible line, not an inference.
+
+OG_BIN = Path(os.environ.get("OG_BIN") or
+              Path(__file__).resolve().parent.parent / "bin" / "og")
+FAKE_OMNIGENT = """#!/bin/sh
+if [ "$1" = server ] && [ "$2" = status ]; then
+  echo "running at http://127.0.0.1:6767"; exit 0
+fi
+echo "RUN-CWD=$(pwd)"
+"""
+
+
+def _og_chat(tmp_path, args=(), cwd=None):
+    """Run `og chat <args>` from `cwd` against a throwaway HOME and a fake REPL."""
+    home = tmp_path / "home"
+    (home / ".omnigent" / "agents" / "dev-lead").mkdir(parents=True, exist_ok=True)
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "omnigent").write_text(FAKE_OMNIGENT)
+    (bindir / "omnigent").chmod(0o755)
+    work = cwd or (home / "here")
+    work.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(
+        ["bash", str(OG_BIN), "chat", *args], cwd=str(work),
+        capture_output=True, text=True, timeout=30,
+        env={"HOME": str(home),
+             # The fake first so the real `omnigent` on this machine cannot be
+             # reached; python3 has to stay findable, because --dir goes through
+             # the helper.
+             "PATH": os.pathsep.join([str(bindir), os.environ.get("PATH", "")]),
+             "OG_REPO": str(Path(__file__).resolve().parent.parent),
+             "TERM": "xterm-256color"})
+
+
+def test_an_empty_dir_is_refused_rather_than_read_as_no_dir(tmp_path):
+    """`--dir ""`: exit non-zero, one line, and NOTHING ELSE HAPPENS — no
+    directory invented, no REPL started, no state written."""
+    result = _og_chat(tmp_path, ["--dir", ""])
+
+    assert result.returncode == 2
+    lines = result.stderr.strip().splitlines()
+    assert len(lines) == 1, result.stderr
+    assert "--dir" in lines[0] and "empty" in lines[0], lines[0]
+    assert "RUN-CWD" not in result.stdout, "the chat ran anyway"
+    assert list((tmp_path / "home" / "here").iterdir()) == []
+    assert not (tmp_path / "home" / ".omnigent" / "og-herdr.json").exists()
+
+
+def test_the_equals_form_of_an_empty_dir_is_refused_too(tmp_path):
+    """`--dir=` is the same value typed the other way, and used to be the same
+    silent no-op."""
+    result = _og_chat(tmp_path, ["--dir="])
+
+    assert result.returncode == 2
+    assert "--dir" in result.stderr and "empty" in result.stderr
+    assert "RUN-CWD" not in result.stdout
+    assert list((tmp_path / "home" / "here").iterdir()) == []
+
+
+def test_no_dir_flag_at_all_still_runs_the_chat_where_it_stands(tmp_path):
+    """The behaviour the refusal must not have cost. No flag is not an empty
+    flag: the chat starts where the operator is, with no cd, no python, no
+    state — exactly as before any of this existed."""
+    here = tmp_path / "home" / "here"
+    result = _og_chat(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert f"RUN-CWD={here.resolve()}" in result.stdout
+    assert not (tmp_path / "home" / ".omnigent" / "og-herdr.json").exists()
+
+
+def test_an_empty_dir_is_refused_by_the_helper_on_its_own(tmp_path, monkeypatch,
+                                                          capsys):
+    """The same refusal from the Python side, for a direct
+    `og_herdr_launch.py chat-pane --dir ''`. Two callers, one rule — and here it
+    is the only gate, so `Path('')` resolving to the current directory would be
+    a silent misreading with nothing behind it."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+
+    assert chat_pane(argv=["--dir", ""], client=FakeClient(), env=_pane_env()) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--dir" in captured.err and "empty" in captured.err
+    assert not (tmp_path / "og-herdr.json").exists()
+
+    with pytest.raises(LaunchError):
+        resolve_chat_dir("", {})

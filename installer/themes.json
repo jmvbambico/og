@@ -6,13 +6,14 @@
     "  label    what the picker shows (exact display name)",
     "  order    picker's sort key; the row order the operator's reference site",
     "           (ansicolor.com) lists its 25 themes in",
-    "  colors   seven roles, lowercase #rrggbb, no shorthand, no alpha:",
+    "  colors   eight roles, lowercase #rrggbb, no shorthand, no alpha:",
     "    bg       pane background",
     "    text     dominant body text -- agent and worker names",
     "    meta     secondary text -- model ids, timestamps, status detail",
     "    sel_bg   background of the SELECTED row",
     "    idle     idle status glyph (check mark)",
     "    working  working status glyph (spinner)",
+    "    failed   failed status glyph (heavier red mark), beside the other two",
     "    rail     group rails and box-drawing borders",
     "",
     "Every value is the theme's own published colour (upstream theme file or",
@@ -33,7 +34,7 @@
     "That refusal is BOUNDED, because the 6x6x6 cube's darkest cells are",
     "saturated primaries -- no tinted cell exists below OKLab L 0.502, so a dark",
     "tint costs 0.13 to keep and 0.03 to drop. Past MAX_CHROMA_PENALTY the ramp",
-    "wins and the nearest cell is the honest answer; 33 of the 175 role-colours",
+    "wins and the nearest cell is the honest answer; 33 of the 200 role-colours",
     "here take that route and every one of them is below that lightness.",
     "",
     "Where a theme's published foreground cannot reach its target, that single",
@@ -45,17 +46,17 @@
     "painted before themes existed, and it is the only row here whose values were",
     "not chosen: they were READ OFF the code. Its order is 0 so the picker sorts",
     "it FIRST -- dracula stays the default, and `og` is the way back, not the way",
-    "in. Four of its seven roles are the string \"default\", which means curses -1:",
+    "in. Four of its eight roles are the string \"default\", which means curses -1:",
     "allocate no colour and inherit the terminal's own. That is the whole of the",
     "row. The pane used to allocate every pair with a -1 background (\"what lets",
     "colour and the pane's transparency coexist\"), and dracula's opaque background",
     "ends that; `og` is the only way to get it back, which makes it the",
     "REGRESSION GUARD for the whole background change rather than a cosmetic",
-    "extra. Its three hexes are the exact sRGB of the indices the code shipped --",
-    "#87afaf is ansi 109, #00ff00 is 46, #ffff00 is 226 -- and a test asserts the",
-    "round trip, so this row is provably today's colours and not an approximation",
-    "of them. Do not give it invented hexes to make it measurable; see the",
-    "exemption in the test file."
+    "extra. Its four hexes are the exact sRGB of the indices the code shipped --",
+    "#87afaf is ansi 109, #00ff00 is 46, #ffff00 is 226, #ff0000 is 196 -- and a test",
+    "asserts the round trip, so this row is provably today's colours and not an",
+    "approximation of them. Do not give it invented hexes to make it measurable;",
+    "see the exemption in the test file."
   ],
   "version": 1,
   "themes": {
@@ -69,9 +70,10 @@
         "sel_bg": "default",
         "idle": "#00ff00",
         "working": "#ffff00",
+        "failed": "#ff0000",
         "rail": "default"
       },
-      "_note": "NOT a theme: today's colours, preserved as a choice. bg/text/sel_bg/rail are 'default' (curses -1, the terminal's own background) because that is exactly what the pane painted before themes existed. The three hexes are the exact sRGB of the indices the code shipped and are EXEMPT from every contrast assertion in tests/test_og_themes_catalog.py -- 'default' has no computable luminance, so a contrast test over this row crashes or silently skips, and inventing hexes to satisfy one would destroy the only property this row exists for."
+      "_note": "NOT a theme: today's colours, preserved as a choice. bg/text/sel_bg/rail are 'default' (curses -1, the terminal's own background) because that is exactly what the pane painted before themes existed. The four hexes are the exact sRGB of the indices the code shipped and are EXEMPT from every contrast assertion in tests/test_og_themes_catalog.py -- 'default' has no computable luminance, so a contrast test over this row crashes or silently skips, and inventing hexes to satisfy one would destroy the only property this row exists for."
     },
     "andromeda": {
       "label": "Andromeda",
@@ -83,6 +85,7 @@
         "sel_bg": "#1e252c",
         "idle": "#96e072",
         "working": "#f3d56e",
+        "failed": "#ff5874",
         "rail": "#3a3f4c"
       }
     },
@@ -96,6 +99,7 @@
         "sel_bg": "#253340",
         "idle": "#aad94c",
         "working": "#ffb454",
+        "failed": "#f07178",
         "rail": "#2e3741"
       }
     },
@@ -109,6 +113,7 @@
         "sel_bg": "#f0eee4",
         "idle": "#739a00",
         "working": "#bd8400",
+        "failed": "#f07178",
         "rail": "#cdcbca"
       }
     },
@@ -122,6 +127,7 @@
         "sel_bg": "#34373d",
         "idle": "#37ae6f",
         "working": "#c9a022",
+        "failed": "#d16d6d",
         "rail": "#3b414b"
       }
     },
@@ -135,6 +141,7 @@
         "sel_bg": "#c9e4ec",
         "idle": "#189433",
         "working": "#9c7d00",
+        "failed": "#d16d6d",
         "rail": "#bbc1c6"
       }
     },
@@ -148,6 +155,7 @@
         "sel_bg": "#414559",
         "idle": "#a6d189",
         "working": "#e5c890",
+        "failed": "#e78284",
         "rail": "#51576d"
       }
     },
@@ -161,6 +169,7 @@
         "sel_bg": "#ccd0da",
         "idle": "#3e9c2a",
         "working": "#b47317",
+        "failed": "#d20f39",
         "rail": "#bcc0cc"
       }
     },
@@ -174,6 +183,7 @@
         "sel_bg": "#363a4f",
         "idle": "#a6da95",
         "working": "#eed49f",
+        "failed": "#ed8796",
         "rail": "#414559"
       }
     },
@@ -187,6 +197,7 @@
         "sel_bg": "#313244",
         "idle": "#a6e3a1",
         "working": "#f9e2af",
+        "failed": "#f38ba8",
         "rail": "#3a3e54"
       }
     },
@@ -200,6 +211,7 @@
         "sel_bg": "#44475a",
         "idle": "#50fa7b",
         "working": "#f1fa8c",
+        "failed": "#ff5555",
         "rail": "#44475a"
       },
       "_note": "text is #ffd7af, a warm parchment, and it was CHOSEN BY THE OPERATOR from the 256-colour palette cells -- not read off Dracula's upstream theme, and not a nudge of one. It is deliberately NEITHER Dracula's own Parchment #f8f8f2 NOR the #f0e6d2 this row used to ship. The reason it is not #f0e6d2 is a BUG, not a taste: #f0e6d2's nearest 256-colour cell is 254, a PURE GREY, so on any terminal reporting 256 colours -- every terminal that does not claim truecolor, tmux included -- the default pane painted its body text grey where parchment was asked for. The converter no longer does that (installer/og_themes.py: a chromatic colour may not resolve to a neutral cell), and #ffd7af is what the operator picked from the cells that remain. #ffd7af IS ansi 223 exactly -- it is a cube cell, so the round trip is lossless and asserted in tests/test_og_themes.py -- it is the closest in lightness of the candidates shown, and it sits 17.9 degrees of hue from the original parchment, which is why the brighter 230 and the more muted 187 were not chosen. Do not 'correct' it back to Dracula's #f8f8f2 and do not 'correct' it to #f0e6d2: neither is what was chosen, and only one of the two survives conversion at all."
@@ -214,6 +226,7 @@
         "sel_bg": "#163356",
         "idle": "#238636",
         "working": "#fcb32c",
+        "failed": "#f85149",
         "rail": "#30363d"
       }
     },
@@ -227,6 +240,7 @@
         "sel_bg": "#504945",
         "idle": "#b8bb26",
         "working": "#fabd2f",
+        "failed": "#fb4934",
         "rail": "#494542"
       }
     },
@@ -240,6 +254,7 @@
         "sel_bg": "#49483e",
         "idle": "#a8dc76",
         "working": "#ffd966",
+        "failed": "#ff6188",
         "rail": "#464539"
       }
     },
@@ -253,6 +268,7 @@
         "sel_bg": "#eee5de",
         "idle": "#259966",
         "working": "#c2740a",
+        "failed": "#ff6188",
         "rail": "#d3c5bc"
       }
     },
@@ -266,6 +282,7 @@
         "sel_bg": "#3b4252",
         "idle": "#a3be8c",
         "working": "#ebcb8b",
+        "failed": "#bf616a",
         "rail": "#4c566a"
       }
     },
@@ -279,6 +296,7 @@
         "sel_bg": "#3e4451",
         "idle": "#98c379",
         "working": "#d19a66",
+        "failed": "#e06c75",
         "rail": "#495162"
       }
     },
@@ -292,6 +310,7 @@
         "sel_bg": "#d0d0d0",
         "idle": "#3e953a",
         "working": "#ae893b",
+        "failed": "#e45649",
         "rail": "#cccccc"
       }
     },
@@ -305,6 +324,7 @@
         "sel_bg": "#32374c",
         "idle": "#a9c77d",
         "working": "#ffcb6b",
+        "failed": "#ff5370",
         "rail": "#676e95"
       }
     },
@@ -318,6 +338,7 @@
         "sel_bg": "#31353a",
         "idle": "#19f9d8",
         "working": "#ffb86c",
+        "failed": "#ff75b5",
         "rail": "#424756"
       }
     },
@@ -331,6 +352,7 @@
         "sel_bg": "#073642",
         "idle": "#859900",
         "working": "#b58900",
+        "failed": "#dc322f",
         "rail": "#0a4b5b"
       }
     },
@@ -344,6 +366,7 @@
         "sel_bg": "#eee8d5",
         "idle": "#839600",
         "working": "#b28700",
+        "failed": "#dc322f",
         "rail": "#d3c392"
       }
     },
@@ -357,6 +380,7 @@
         "sel_bg": "#34294f",
         "idle": "#72f1b8",
         "working": "#f3e70f",
+        "failed": "#fe4450",
         "rail": "#3e3e6e"
       }
     },
@@ -370,6 +394,7 @@
         "sel_bg": "#1e293b",
         "idle": "#22c55e",
         "working": "#eab308",
+        "failed": "#ef4444",
         "rail": "#334155"
       }
     },
@@ -383,6 +408,7 @@
         "sel_bg": "#33467c",
         "idle": "#9ece6a",
         "working": "#e0af68",
+        "failed": "#f7768e",
         "rail": "#393d58"
       }
     },
@@ -396,6 +422,7 @@
         "sel_bg": "#dcdee3",
         "idle": "#385f0d",
         "working": "#8f5e15",
+        "failed": "#8c4351",
         "rail": "#b5b6bc"
       }
     }

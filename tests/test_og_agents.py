@@ -254,10 +254,10 @@ def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
     # boxes, rail, boxes) — the rail alone, in column 0.
     assert sum(1 for line in lines if line == "│") == 3
     # The state is still told apart, by the glyph in each box's gutter: a working
-    # spinner frame, and the static `✗` and `✓`.
+    # spinner frame, and the static `×` and `✓`.
     joined = "\n".join(lines)
     assert a.SPIN_FRAMES[0] in joined
-    assert "✗" in joined and "✓" in joined
+    assert "×" in joined and "✓" in joined
 
 
 def test_renderer_flattens_a_nested_worker_and_shows_an_expanded_snippet():
@@ -354,7 +354,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
-        "⦿ ✗ │ 𝗙  scouts                        failed│",
+        "⦿ × │ 𝗙  scouts                        failed│",
         "│   ╰────────────────────────────────────────╯",
         "│",
         "│   ╭────────────────────────────────────────╮",
@@ -385,7 +385,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     # is NOT inside the box: the spinner is w1's, and every non-content box row
     # carries a space there.
     assert lines[5][0] == "⦿" and lines[5][2] == a.SPIN_FRAMES[0]
-    assert lines[9][2] == "⏸" and lines[13][2] == "✗" and lines[17][2] == "✓"
+    assert lines[9][2] == "⏸" and lines[13][2] == "×" and lines[17][2] == "✓"
     assert lines[6][:4] == "│   " and a.SPIN_FRAMES[0] not in lines[5][4:], \
         "the state glyph is in the gutter, never inside the box"
     # The AGENT NAME is dropped from every row: the mark carries it, so `zen`,
@@ -553,23 +553,56 @@ def test_the_title_yields_to_the_meta_on_the_shared_content_row():
 def test_the_state_glyphs_are_static_and_working_is_the_spinner():
     # The operator's static glyphs, one per state the viewer draws — and NO
     # static glyph for `working`, which the spinner owns...
-    assert a.STATE_GLYPH == {"blocked": "⏸", "failed": "✗",
+    assert a.STATE_GLYPH == {"blocked": "⏸", "failed": "×",
                              "unknown": "?", "idle": "✓"}
-    for state, glyph in (("idle", "✓"), ("blocked", "⏸"), ("failed", "✗"),
+    for state, glyph in (("idle", "✓"), ("blocked", "⏸"), ("failed", "×"),
                          ("unknown", "?")):
         frame = a.Frame(rows=[header(), worker("w", state)])
         assert glyph in "\n".join(a.render(frame, width=48)), state
         # ...and a static glyph does not move as the spinner advances.
         assert a.state_glyph(state, 0) == a.state_glyph(state, 5) == glyph
-    # The finished glyph is a CHECK, not a circle: `✓` reads as done, and it pairs
-    # with the `✗` failed glyph.
+    # The finished glyph is a CHECK, not a circle: `✓` reads as done. The failed
+    # glyph is now the HEAVIER `×` MULTIPLICATION SIGN (U+00D7), replacing the
+    # thinner `✗` BALLOT X the operator asked to make heavier — Latin-1, so every
+    # monospace font has it; see STATE_GLYPH for the ruler argument.
     assert a.STATE_GLYPH["idle"] == "\u2713"
+    assert a.STATE_GLYPH["failed"] == "\u00d7"
     assert "○" not in a.STATE_GLYPH.values()
     # `working` is the SPINNER: a different frame each tick.
     assert a.STATE_GLYPH.get("working") is None
     assert a.state_glyph("working", 0) == a.SPIN_FRAMES[0]
     assert a.state_glyph("working", 1) == a.SPIN_FRAMES[1]
     assert a.state_glyph("working", 0) != a.state_glyph("working", 1)
+
+
+def test_the_failed_glyph_costs_the_same_columns_as_finished():
+    """The FAILED mark must cost the SAME one layout column as the FINISHED `✓`.
+
+    The gutter composes the state glyph with the len-based ruler (`_visible_width`
+    / `_clip`), which charges an East Asian AMBIGUOUS glyph ONE column — so `×`
+    (U+00D7, Ambiguous) and `✓` (U+2713, Narrow) cost the same and the column is
+    neutral between them. This is asserted against THAT ruler and NOT
+    `_display_width`: the display ruler charges Ambiguous two and would fail `×`
+    for a swap nobody made (`_display_width` guards only the footer, never the
+    gutter).
+
+    `len` has a blind spot, though — it charges a Wide glyph ONE too — so the
+    swap that must fail LOUDLY is a Wide/Fullwidth mark, which a terminal would
+    paint two cells wide and which would shear every title downstream. The
+    western paint rule `_slot_width` (Wide/Fullwidth two, Ambiguous one) closes
+    that gap, and the East Asian Width guard names the class directly.
+    """
+    failed, finished = a.STATE_GLYPH["failed"], a.STATE_GLYPH["idle"]
+    # Under the gutter's own ruler: one column each, and one glyph each.
+    assert a._visible_width(failed) == a._visible_width(finished) == 1
+    assert len(failed) == len(finished) == 1
+    # A Wide/Fullwidth swap would slip past `len`; this is the guard that fails.
+    assert a._slot_width(failed) == a._slot_width(finished) == 1
+    assert unicodedata.east_asian_width(failed) not in ("W", "F")
+    assert unicodedata.east_asian_width(finished) not in ("W", "F")
+    # And the composed gutter cell — glyph plus the one space after it — is the
+    # same width for both, which is what keeps the box edges aligned.
+    assert a._visible_width(failed + " ") == a._visible_width(finished + " ") == 2
 
 
 def test_only_the_working_glyph_moves_with_the_spin_counter():
@@ -590,7 +623,7 @@ def test_only_the_working_glyph_moves_with_the_spin_counter():
     assert a.SPIN_FRAMES[0] in changed[0][0]
     assert a.SPIN_FRAMES[1] in changed[0][1]
 
-    for state, glyph in (("blocked", "⏸"), ("failed", "✗"), ("idle", "✓")):
+    for state, glyph in (("blocked", "⏸"), ("failed", "×"), ("idle", "✓")):
         assert render_at(state, 0) == render_at(state, 1), state
         assert glyph in "\n".join(render_at(state, 0)), state
 
@@ -1150,7 +1183,7 @@ def test_the_narrowest_worker_row_keeps_the_state_glyph():
     glyph FIRST is what makes the promise true at 1, 2 and 3.
     """
     cases = (("working", a.SPIN_FRAMES[2]), ("blocked", "⏸"),
-             ("failed", "✗"), ("idle", "✓"))
+             ("failed", "×"), ("idle", "✓"))
     for state, glyph in cases:
         for width in (1, 2, 3):
             spans, selected_row = a.worker_box(
@@ -3749,19 +3782,21 @@ def test_the_status_glyph_spans_carry_their_neon_colours():
     """THE SECOND REPORTED DEFECT: the status glyph had NO colour at all. It sat in
     a PLAIN span, so `✓` and `⠋` painted in the terminal's default foreground and
     only the dim ever varied — four workers running read as four identical grey
-    glyphs. The check mark is NEON GREEN and the spinner NEON YELLOW.
+    glyphs. The check mark is NEON GREEN, the spinner NEON YELLOW, and — since the
+    operator asked for the failed mark to be red — the failed `×` NEON RED.
 
-    Only those two states: `⏸` blocked, `✗` failed and `?` unknown are PLAIN, as
-    they were before, because nothing was asked of them.
+    The green and yellow are the `og` row's cube corners 46 and 226; the red is its
+    own pure-red corner, cell 196. `⏸` blocked and `?` unknown are PLAIN, as they
+    were before, because nothing was asked of them.
     """
-    for state, colour in (("idle", 46), ("working", 226)):
+    for state, colour in (("idle", 46), ("working", 226), ("failed", 196)):
         glyph = a.state_glyph(state, 0)
         spans = a.worker_box(worker("w", state, text="t"), 60, False)[0][1]
         roles = [role for text, role in spans if glyph in text]
         assert roles == [a.undim(a.state_role(state))], (state, spans)
         assert a._role_colour(roles[0]) == colour, state
         assert a._STATE_COLOURS[state] == colour, state
-    for state in ("blocked", "failed", "unknown"):
+    for state in ("blocked", "unknown"):
         assert a.state_role(state) == a.PLAIN, state
         assert a._role_colour(a.undim(a.state_role(state))) is None, state
 
@@ -3775,7 +3810,8 @@ def test_a_status_glyph_is_neon_and_undimmed_on_an_unselected_row(monkeypatch):
     dim and coloured by the same span role — and the reason a colour alone would
     not have answered the report: neon yellow at half brightness is still dim.
     """
-    for state, glyphs in (("idle", {"✓"}), ("working", set(a.SPIN_FRAMES))):
+    for state, glyphs in (("idle", {"✓"}), ("working", set(a.SPIN_FRAMES)),
+                          ("failed", {"×"})):
         # w1 is SELECTED and w2 carries the state under test, so w2's box is the
         # unselected one. The selection lives in the loop, not on the frame, so
         # DOWN is what puts it there — which is why a SINGLE-worker frame could

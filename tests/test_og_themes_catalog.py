@@ -62,18 +62,18 @@ import og_themes as th
 
 CATALOG = Path(__file__).resolve().parents[1] / "installer" / "themes.json"
 
-ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "rail")
+ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "failed", "rail")
 HEX_RE = re.compile(r"^#[0-9a-f]{6}$")
 
 # The literal a role carries when it means curses' `-1`: allocate no colour and
-# inherit the terminal's own. Legal in ANY of the seven roles.
+# inherit the terminal's own. Legal in ANY of the eight roles.
 DEFAULT = "default"
 
 # `og` is the row that is exempt from the contrast assertions, and the ONLY one.
 # WHY IT HAS TO BE, because the next reader's first instinct will be to close this
 # gap by inventing hexes for it:
 #
-#   * Four of its seven roles are the string "default". The point of the row is
+#   * Four of its eight roles are the string "default". The point of the row is
 #     that the pane keeps the TERMINAL's own background, and a background this
 #     process cannot see has NO luminance. `test_body_text_is_readable_on_the_pane`
 #     over "default" does not fail gently -- `_rgb` raises ValueError on the word,
@@ -168,55 +168,55 @@ HEADROOM = 1.02
 # colours in helper.ts, so these are that derivation reproduced, not guesses.
 PUBLISHED = {
     "andromeda": {"bg": "#1a1d23", "text": "#fefefe", "meta": "#746f77",
-        "sel_bg": "#1e252c", "idle": "#96e072", "working": "#f3d56e", "rail": "#3a3f4c"},
+        "sel_bg": "#1e252c", "idle": "#96e072", "working": "#f3d56e", "failed": "#ff5874", "rail": "#3a3f4c"},
     "ayu-dark": {"bg": "#0f1419", "text": "#e6e1cf", "meta": "#5c6773",
-        "sel_bg": "#253340", "idle": "#aad94c", "working": "#ffb454", "rail": "#2d3640"},
+        "sel_bg": "#253340", "idle": "#aad94c", "working": "#ffb454", "failed": "#f07178", "rail": "#2d3640"},
     "ayu-light": {"bg": "#fafafa", "text": "#5c6773", "meta": "#abb0b6",
-        "sel_bg": "#f0eee4", "idle": "#86b300", "working": "#eba400", "rail": "#d9d8d7"},
+        "sel_bg": "#f0eee4", "idle": "#86b300", "working": "#eba400", "failed": "#f07178", "rail": "#d9d8d7"},
     "bearded-dark": {"bg": "#181a1f", "text": "#c8cbd4", "meta": "#515666",
-        "sel_bg": "#34373d", "idle": "#37ae6f", "working": "#c9a022", "rail": "#0b0c0e"},
+        "sel_bg": "#34373d", "idle": "#37ae6f", "working": "#c9a022", "failed": "#d16d6d", "rail": "#0b0c0e"},
     "bearded-light": {"bg": "#f3f4f5", "text": "#0a1315", "meta": "#68909c",
-        "sel_bg": "#c9e4ec", "idle": "#189433", "working": "#bb9600", "rail": "#c9ced2"},
+        "sel_bg": "#c9e4ec", "idle": "#189433", "working": "#bb9600", "failed": "#d16d6d", "rail": "#c9ced2"},
     "catppuccin-frappe": {"bg": "#303446", "text": "#c6d0f5", "meta": "#737994",
-        "sel_bg": "#414559", "idle": "#a6d189", "working": "#e5c890", "rail": "#51576d"},
+        "sel_bg": "#414559", "idle": "#a6d189", "working": "#e5c890", "failed": "#e78284", "rail": "#51576d"},
     "catppuccin-latte": {"bg": "#eff1f5", "text": "#4c4f69", "meta": "#9ca0b0",
-        "sel_bg": "#ccd0da", "idle": "#40a02b", "working": "#df8e1d", "rail": "#bcc0cc"},
+        "sel_bg": "#ccd0da", "idle": "#40a02b", "working": "#df8e1d", "failed": "#d20f39", "rail": "#bcc0cc"},
     "catppuccin-macchiato": {"bg": "#24273a", "text": "#cad3f5", "meta": "#8087a2",
-        "sel_bg": "#363a4f", "idle": "#a6da95", "working": "#eed49f", "rail": "#414559"},
+        "sel_bg": "#363a4f", "idle": "#a6da95", "working": "#eed49f", "failed": "#ed8796", "rail": "#414559"},
     "catppuccin-mocha": {"bg": "#1e1e2e", "text": "#cdd6f4", "meta": "#7f849c",
-        "sel_bg": "#313244", "idle": "#a6e3a1", "working": "#f9e2af", "rail": "#292c3c"},
+        "sel_bg": "#313244", "idle": "#a6e3a1", "working": "#f9e2af", "failed": "#f38ba8", "rail": "#292c3c"},
     "dracula": {"bg": "#282a36", "text": "#ffd7af", "meta": "#6272a4",
-        "sel_bg": "#44475a", "idle": "#50fa7b", "working": "#f1fa8c", "rail": "#44475a"},
+        "sel_bg": "#44475a", "idle": "#50fa7b", "working": "#f1fa8c", "failed": "#ff5555", "rail": "#44475a"},
     "github-dark": {"bg": "#0d1117", "text": "#c9d1d9", "meta": "#8b949e",
-        "sel_bg": "#163356", "idle": "#238636", "working": "#fcb32c", "rail": "#30363d"},
+        "sel_bg": "#163356", "idle": "#238636", "working": "#fcb32c", "failed": "#f85149", "rail": "#30363d"},
     "gruvbox": {"bg": "#282828", "text": "#ebdbb2", "meta": "#928374",
-        "sel_bg": "#504945", "idle": "#b8bb26", "working": "#fabd2f", "rail": "#3c3836"},
+        "sel_bg": "#504945", "idle": "#b8bb26", "working": "#fabd2f", "failed": "#fb4934", "rail": "#3c3836"},
     "monokai-dark": {"bg": "#272822", "text": "#fcfcfa", "meta": "#727072",
-        "sel_bg": "#49483e", "idle": "#a8dc76", "working": "#ffd966", "rail": "#3e3d32"},
+        "sel_bg": "#49483e", "idle": "#a8dc76", "working": "#ffd966", "failed": "#ff6188", "rail": "#3e3d32"},
     "monokai-light": {"bg": "#faf4f2", "text": "#29242a", "meta": "#a59fa0",
-        "sel_bg": "#eee5de", "idle": "#269d69", "working": "#cc7a0a", "rail": "#e6ded9"},
+        "sel_bg": "#eee5de", "idle": "#269d69", "working": "#cc7a0a", "failed": "#ff6188", "rail": "#e6ded9"},
     "nord": {"bg": "#2e3440", "text": "#d8dee9", "meta": "#616e88",
-        "sel_bg": "#3b4252", "idle": "#a3be8c", "working": "#ebcb8b", "rail": "#4c566a"},
+        "sel_bg": "#3b4252", "idle": "#a3be8c", "working": "#ebcb8b", "failed": "#bf616a", "rail": "#4c566a"},
     "one-dark": {"bg": "#282c34", "text": "#abb2bf", "meta": "#5c6370",
-        "sel_bg": "#3e4451", "idle": "#98c379", "working": "#d19a66", "rail": "#495162"},
+        "sel_bg": "#3e4451", "idle": "#98c379", "working": "#d19a66", "failed": "#e06c75", "rail": "#495162"},
     "one-light": {"bg": "#fafafa", "text": "#2a2b33", "meta": "#a0a1a7",
-        "sel_bg": "#d0d0d0", "idle": "#3e953a", "working": "#d2b67b", "rail": "#d4d4d4"},
+        "sel_bg": "#d0d0d0", "idle": "#3e953a", "working": "#d2b67b", "failed": "#e45649", "rail": "#d4d4d4"},
     "palenight": {"bg": "#292d3e", "text": "#bfc7d5", "meta": "#697098",
-        "sel_bg": "#32374c", "idle": "#a9c77d", "working": "#ffcb6b", "rail": "#676e95"},
+        "sel_bg": "#32374c", "idle": "#a9c77d", "working": "#ffcb6b", "failed": "#ff5370", "rail": "#676e95"},
     "panda": {"bg": "#292a2b", "text": "#e6e6e6", "meta": "#757575",
-        "sel_bg": "#31353a", "idle": "#19f9d8", "working": "#ffb86c", "rail": "#3e4250"},
+        "sel_bg": "#31353a", "idle": "#19f9d8", "working": "#ffb86c", "failed": "#ff75b5", "rail": "#3e4250"},
     "solarized-dark": {"bg": "#002b36", "text": "#93a1a1", "meta": "#586e75",
-        "sel_bg": "#073642", "idle": "#859900", "working": "#b58900", "rail": "#073642"},
+        "sel_bg": "#073642", "idle": "#859900", "working": "#b58900", "failed": "#dc322f", "rail": "#073642"},
     "solarized-light": {"bg": "#fdf6e3", "text": "#657b83", "meta": "#93a1a1",
-        "sel_bg": "#eee8d5", "idle": "#859900", "working": "#b58900", "rail": "#eee8d5"},
+        "sel_bg": "#eee8d5", "idle": "#859900", "working": "#b58900", "failed": "#dc322f", "rail": "#eee8d5"},
     "synthwave-84": {"bg": "#262335", "text": "#f2f2f2", "meta": "#848bbd",
-        "sel_bg": "#34294f", "idle": "#72f1b8", "working": "#f3e70f", "rail": "#1a1a2e"},
+        "sel_bg": "#34294f", "idle": "#72f1b8", "working": "#f3e70f", "failed": "#fe4450", "rail": "#1a1a2e"},
     "tailwind": {"bg": "#0f172a", "text": "#e2e8f0", "meta": "#64748b",
-        "sel_bg": "#1e293b", "idle": "#22c55e", "working": "#eab308", "rail": "#334155"},
+        "sel_bg": "#1e293b", "idle": "#22c55e", "working": "#eab308", "failed": "#ef4444", "rail": "#334155"},
     "tokyo-night": {"bg": "#1a1b26", "text": "#a9b1d6", "meta": "#565f89",
-        "sel_bg": "#33467c", "idle": "#9ece6a", "working": "#e0af68", "rail": "#1e202e"},
+        "sel_bg": "#33467c", "idle": "#9ece6a", "working": "#e0af68", "failed": "#f7768e", "rail": "#1e202e"},
     "tokyo-night-light": {"bg": "#e6e7ed", "text": "#343b59", "meta": "#848cb5",
-        "sel_bg": "#dcdee3", "idle": "#385f0d", "working": "#8f5e15", "rail": "#c1c2c7"},
+        "sel_bg": "#dcdee3", "idle": "#385f0d", "working": "#8f5e15", "failed": "#8c4351", "rail": "#c1c2c7"},
 }
 
 # Themes whose published colour could not clear its contrast target and were
@@ -565,7 +565,7 @@ def test_og_is_the_only_row_exempt_from_contrast_and_says_why(themes):
     assert og["colors"] == {
         "bg": "default", "text": "default", "meta": "#87afaf",
         "sel_bg": "default", "idle": "#00ff00", "working": "#ffff00",
-        "rail": "default",
+        "failed": "#ff0000", "rail": "default",
     }
     # The four transparent roles are what make the row worth having, so pin them
     # by name rather than by the dict above alone: a future edit that fills in
@@ -587,15 +587,16 @@ def test_slug_is_the_kebab_case_of_the_label(themes):
     assert themes["og"]["label"] == "OG" and "og" in themes
 
 
-def test_every_row_defines_all_seven_roles(themes):
-    """Seven roles on every row -- and a role is EITHER `#rrggbb` or `"default"`.
+def test_every_row_defines_all_eight_roles(themes):
+    """Eight roles on every row -- and a role is EITHER `#rrggbb` or `"default"`.
 
     The lowercase-hex half of this used to be the whole rule. `"default"` is now
-    legal in ANY of the seven roles, which is the single structural decision that
+    legal in ANY of the eight roles, which is the single structural decision that
     lets one theme reproduce exactly what the pane painted before themes existed;
     so the shape test accepts both and the CONTRAST tests are the ones that
     decide which rows may use `"default"` at all (they may not, except `og` --
-    see OG_EXEMPT).
+    see OG_EXEMPT). `failed` is the eighth: the operator asked for a red failed
+    mark, so every row has to carry one beside `idle` and `working`.
     """
     for slug, theme in themes.items():
         colors = theme["colors"]
@@ -811,7 +812,7 @@ def test_a_chromatic_role_only_collapses_where_the_palette_has_no_tint(themes):
 def test_the_cap_sits_in_the_gap_the_catalog_leaves(themes):
     """THE NUMBER IS THE DATA'S, and this is what will say so if it stops being so.
 
-    Across the 122 chromatic role-colours here, 69 have no penalty at all -- the
+    Across the 147 chromatic role-colours here, 94 have no penalty at all -- the
     chromatic cell IS the nearest cell and the guard is free. The rest are
     bimodal: a cheap band from 0.005 to 0.033, which is what paying for a tint
     actually costs, and an expensive band from 0.036 to 0.111, which is what
@@ -834,7 +835,7 @@ def test_the_cap_sits_in_the_gap_the_catalog_leaves(themes):
     kept.sort()
     refused = [(p, v, i) for p, v, i in kept if p > th.MAX_CHROMA_PENALTY]
     cheap = [(p, v, i) for p, v, i in kept if p <= th.MAX_CHROMA_PENALTY]
-    assert len(kept) == 122, len(kept)
+    assert len(kept) == 147, len(kept)
     assert len(refused) == 33, len(refused)
     assert max(p for p, _v, _i in cheap) == pytest.approx(0.0331, abs=5e-4), \
         "the heaviest keeper moved; re-check the cap"

@@ -46,6 +46,15 @@ REGISTRY = json.loads((HERE / "registry.json").read_text())
 # Measured, not guessed — see docs/TROUBLESHOOTING.md.
 PROMPT_CEILING = 13300
 
+# Where a RELATIVE `og chat --dir` resolves against, for an install that never
+# answered. `~/projects` is the same convention `og_repo_dir` (bin/og) uses to
+# find this checkout, so the installer and the command agree on where work
+# lives. Stored and read as `~`-prefixed on purpose: the expansion happens once,
+# in og_herdr_launch.projects_dir, at the point of use — so moving your projects
+# folder does not mean re-running the installer, and a plan written by hand
+# resolves the same way as one this installer wrote.
+DEFAULT_PROJECTS_DIR = "~/projects"
+
 C = {"dim": "\033[2m", "b": "\033[1m", "g": "\033[0;32m", "y": "\033[0;33m",
      "r": "\033[0;31m", "c": "\033[0;36m", "x": "\033[0m"}
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
@@ -944,6 +953,14 @@ def build_plan_interactive(state: dict) -> dict:
     herdr_agents_pane = ask_yes(
         "In a herdr session, open `og agents` beside `og chat` as a split pane? "
         "(ignored if herdr is not installed)", state.get("herdr_agents_pane", True))
+    # Asked in the same place as the rest of the runtime knobs, and stored as
+    # typed: `og_herdr_launch.projects_dir` expands `~` at read time, so the
+    # answer means the same thing whether it came from this prompt or from a
+    # hand-edited og-install.json. Blank falls back to the default rather than
+    # becoming an empty root that every relative --dir would resolve against.
+    projects_dir = ask("Where do your projects live? (`og chat --dir <name>` "
+                       "resolves a relative path against this)",
+                       state.get("projects_dir") or DEFAULT_PROJECTS_DIR)
 
     return {
         "version": 1,
@@ -961,6 +978,7 @@ def build_plan_interactive(state: dict) -> dict:
         "default_mode": default_mode,
         "auto_update": auto_update,
         "herdr_agents_pane": herdr_agents_pane,
+        "projects_dir": projects_dir or DEFAULT_PROJECTS_DIR,
     }
 
 
@@ -2303,6 +2321,13 @@ def write_og_env(plan: dict) -> None:
         "# this install and re-runs itself on the new script. 0: it only prints the",
         "# notice (`og update` applies it). OG_SKIP_UPDATE=1 bypasses the check once.",
         f"OG_AUTO_UPDATE={1 if plan.get('auto_update', True) else 0}",
+        # `projects_dir` is deliberately NOT written here, though most keys are.
+        # Nothing in bin/og reads it: `og chat --dir` hands the path to
+        # og_herdr_launch, which resolves it against this install's
+        # og-install.json — the same file `og_herdr_launch` reads every other key
+        # from. A second copy in og.env would be a second answer to "where are
+        # my projects", free to drift from the first the moment either file is
+        # edited by hand.
     ]
     if plan.get("ngrok_domain"):
         lines.append("")
@@ -2796,6 +2821,14 @@ def emit_questions() -> None:
              "ask": "In a herdr session, should `og agents` open beside `og chat` as a "
                     "split pane? No means the session starts with `og chat` alone. "
                     "Ignored if herdr is not installed."},
+            # A path with a `~` in it, like the tunnl key question: it is
+            # stored as typed and expanded when `og chat --dir` reads it, so
+            # changing it does not mean re-running the installer.
+            {"key": "projects_dir", "type": "path",
+             "default": DEFAULT_PROJECTS_DIR,
+             "ask": "Where do your projects live? `og chat --dir <name>` resolves a "
+                    "relative path against this, so `og chat --dir og` works from "
+                    "anywhere. Absolute paths in --dir are used as given."},
         ],
         "apply_with": "og-install --plan plan.json",
         "registry": REGISTRY["agents"],
@@ -2934,6 +2967,11 @@ def main() -> None:
         # and re-apply, getting the default rather than failing validation. This
         # is the seam `og update` re-applies the saved plan through.
         plan.setdefault("herdr_agents_pane", True)
+        # Same reason, same seam: an og-install.json written before `og chat`
+        # grew `--dir` must re-apply without the key, and take the default root
+        # rather than refusing. Idempotence is the whole contract here — this
+        # path is what `og update` and every `og setup` re-run.
+        plan.setdefault("projects_dir", DEFAULT_PROJECTS_DIR)
         # Every role to the ordered-chain shape, so an old singleton plan and a
         # new one take the identical path from here on. `priority` still comes
         # from array order, exactly as the coder loop here always set it.
