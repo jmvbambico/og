@@ -109,9 +109,10 @@ class FakeClient:
         self._workspaces = list(workspaces)
         self._create = create if create is not None else create_reply()
         self._split = split if split is not None else {"type": "ok"}
+        # Default to ONLY the root pane — an unsplit tab. Tests that want an
+        # already-split tab pass `panes=` explicitly.
         self._panes = panes if panes is not None else [
             {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
-            {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1"},
         ]
         self._pings = pings_before_up
         self.split_params = None
@@ -132,6 +133,33 @@ class FakeClient:
             return self._create
         if method == "pane.split":
             self.split_params = params
+            # Simulate the split by adding a new pane to the internal list.
+            # The new pane gets a generated ID based on the target pane.
+            target_pane_id = params.get("target_pane_id")
+            # Find the target pane to get its tab_id and workspace_id
+            target_tab_id = None
+            target_ws_id = None
+            for pane in self._panes:
+                if pane.get("pane_id") == target_pane_id:
+                    target_tab_id = pane.get("tab_id")
+                    target_ws_id = pane.get("workspace_id")
+                    break
+            if target_tab_id and target_ws_id:
+                # Generate a new pane ID: w1:p1 -> w1:p2, w1:p2 -> w1:p3, etc.
+                # Extract the number and increment.
+                import re
+                match = re.match(r"(.+):p(\d+)$", target_pane_id)
+                if match:
+                    prefix = match.group(1)
+                    num = int(match.group(2))
+                    new_pane_id = "{}:p{}".format(prefix, num + 1)
+                else:
+                    new_pane_id = target_pane_id + "-split"
+                self._panes.append({
+                    "pane_id": new_pane_id,
+                    "tab_id": target_tab_id,
+                    "workspace_id": target_ws_id,
+                })
             return self._split
         if method == "pane.list":
             return {"type": "pane_list", "panes": self._panes}
@@ -946,6 +974,7 @@ def test_case_a_creates_a_space_runs_chat_and_asks_to_attach(tmp_path):
         "workspace.create",
         "tab.rename",
         "pane.send_text",            # og chat
+        "pane.list",                 # idempotency check: is tab already split?
         "pane.split",
         "pane.list",                 # the split's new pane is not named
         "pane.send_text",            # og agents
@@ -982,6 +1011,7 @@ def test_a_dead_root_in_the_cwd_opens_a_new_space_and_splits_the_agents_pane(tmp
         "workspace.create",
         "tab.rename",
         "pane.send_text",            # og chat — a FRESH conversation
+        "pane.list",                 # idempotency check: is tab already split?
         "pane.split",                # the agents pane IS split
         "pane.list",
         "pane.send_text",            # og agents
@@ -1254,6 +1284,7 @@ def test_case_d_creates_the_space_without_attaching_again(tmp_path):
     # definition and starting another one would be a second server.
     assert client.methods == [
         "workspace.create", "tab.rename", "pane.send_text",
+        "pane.list",                 # idempotency check: is tab already split?
         "pane.split", "pane.list", "pane.send_text",
     ]
     assert load_state(ctx_path(tmp_path))["pending"][CWD]["workspace_id"] == "w1"
@@ -1413,6 +1444,151 @@ def test_the_shared_split_starts_og_agents_when_it_can():
     # The split pane is found by difference against the tab, since the reply
     # names no pane — the same lookup the launcher has always done.
     assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
+# ---------------------------------------------------------------------------
+# idempotent split_agents_pane
+# ---------------------------------------------------------------------------
+
+def test_split_agents_pane_is_idempotent_second_call_does_not_split_again():
+    """A second call against an already-split tab does NOT issue a second
+    pane.split. The first call splits and starts og agents; the second call
+    sees the existing non-root pane and returns success silently.
+    """
+    from og_herdr_launch import split_agents_pane
+
+    # Start with a tab that already has a split pane (w1:p2 exists alongside w1:p1)
+    client = FakeClient(panes=[
+        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+        {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1"},
+    ])
+
+    # First call — should succeed (idempotent: already split)
+    lines1 = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
+    assert lines1 == [], "first call on already-split tab should succeed silently"
+    assert "pane.split" not in client.methods, "must not split again"
+
+    # Second call — also should not split
+    lines2 = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
+    assert lines2 == [], "second call on already-split tab should succeed silently"
+    assert client.methods.count("pane.split") == 0, "must never split"
+
+
+def test_split_agents_pane_first_call_on_unsplit_tab_splits_once():
+    """A first call against an unsplit tab splits exactly once and starts og agents."""
+    from og_herdr_launch import split_agents_pane
+
+    client = FakeClient()  # default: only root pane w1:p1
+    lines = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
+
+    assert lines == []
+    assert client.methods.count("pane.split") == 1, "must split exactly once"
+    assert client.methods.count("pane.list") == 2, "check + post-split lookup"
+    assert client.text_typed()[-1] == "og agents"
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
+def test_split_agents_pane_unreadable_pane_list_still_attempts_split():
+    """If pane.list errors or returns nothing usable, we fall through to the
+    split attempt — an unreadable tab must not lose its agents pane. This is
+    the same fail-safe asymmetry the host rule uses.
+
+    The split reply names the new pane so we don't need a post-split pane.list.
+    """
+    from og_herdr_launch import split_agents_pane
+
+    class UnreadableListClient(FakeClient):
+        def call(self, method, params=None):
+            if method == "pane.list":
+                raise RuntimeError("socket gone")
+            return super().call(method, params)
+
+    # Split reply includes the pane ID so _split_pane_id doesn't need pane.list
+    client = UnreadableListClient(split={"type": "ok", "pane": {"pane_id": "w1:p2"}})
+    lines = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
+
+    assert lines == []
+    assert client.methods.count("pane.split") == 1, "must still attempt split"
+    assert client.text_typed()[-1] == "og agents"
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
+def test_split_agents_pane_ambiguous_multiple_panes_reported_not_guessed():
+    """If after a split the tab has more than one non-root pane, that ambiguity
+    is detected and reported as a failure string — we do NOT guess by returning
+    the first one. This prevents the bug where a second split would return the
+    first split's pane id.
+
+    This test simulates a concurrent split: the idempotency check sees an
+    unsplit tab, but by the time we look up the new pane, there are two.
+    """
+    from og_herdr_launch import split_agents_pane
+
+    class AmbiguousAfterSplitClient(FakeClient):
+        def call(self, method, params=None):
+            if method == "pane.list":
+                # First call (idempotency check): return only root pane
+                # Second call (post-split lookup): return root + TWO new panes
+                if not hasattr(self, "_list_call_count"):
+                    self._list_call_count = 0
+                self._list_call_count += 1
+                if self._list_call_count == 1:
+                    return {"type": "pane_list", "panes": [
+                        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+                    ]}
+                else:
+                    return {"type": "pane_list", "panes": [
+                        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+                        {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1"},
+                        {"pane_id": "w1:p3", "tab_id": "w1:t1", "workspace_id": "w1"},
+                    ]}
+            return super().call(method, params)
+
+    client = AmbiguousAfterSplitClient()
+    lines = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
+
+    assert len(lines) == 1
+    assert "ambiguous" in lines[0].lower()
+    assert client.methods.count("pane.split") == 1  # split was attempted
+    # og agents should NOT have been started because we couldn't identify the pane
+    assert "og agents" not in client.text_typed()
+
+
+def test_split_agents_pane_post_split_ambiguity_detected():
+    """If the idempotency check passes (tab was unsplit) but after the split
+    the tab has multiple non-root panes (e.g. a concurrent split), the
+    ambiguity is detected in _split_pane_id and reported.
+    """
+    from og_herdr_launch import split_agents_pane
+
+    class AmbiguousAfterSplitClient(FakeClient):
+        def call(self, method, params=None):
+            if method == "pane.list":
+                # First call (idempotency check): return only root pane
+                # Second call (post-split lookup): return root + TWO new panes
+                if not hasattr(self, "_list_call_count"):
+                    self._list_call_count = 0
+                self._list_call_count += 1
+                if self._list_call_count == 1:
+                    return {"type": "pane_list", "panes": [
+                        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+                    ]}
+                else:
+                    return {"type": "pane_list", "panes": [
+                        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+                        {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1"},
+                        {"pane_id": "w1:p3", "tab_id": "w1:t1", "workspace_id": "w1"},
+                    ]}
+            return super().call(method, params)
+
+    client = AmbiguousAfterSplitClient()
+    lines = split_agents_pane(client, "w1", "w1:t1", "w1:p1", CWD, {})
+
+    assert len(lines) == 1
+    assert "ambiguous" in lines[0].lower()
+    assert client.methods.count("pane.split") == 1  # split was attempted
+    # og agents should NOT have been started because we couldn't identify the pane
+    assert "og agents" not in client.text_typed()
 
 
 # ---------------------------------------------------------------------------
