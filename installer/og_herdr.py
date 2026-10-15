@@ -12,11 +12,14 @@ sub-agents as TABS inside it. So one space shows one conversation's whole crew:
       tab  coder_zen:space-per-root                 <- a sub-agent
       tab  coder_cmdcode:fix-stale-comments         <- another
 
-Every pane runs `omnigent attach --server <url> <session_id>` — a thin co-drive
-client that streams that session's I/O, so the user can work from herdr instead
-of the browser. The agent column reads as a TOOL NAME ("Claude Code", from
-installer/registry.json) and the title beside it says which worker and which
-task, which is what makes the list above readable at a glance.
+An ACP session's pane runs `omnigent attach --server <url> <session_id>` — a thin
+co-drive client that streams that session's I/O, so the user can work from herdr
+instead of the browser. A session whose harness is hosted as a real terminal TUI
+(`kind: native`) has a vendor CLI of its own, and its pane ATTACHES to that
+terminal instead, interactively, so a blocking prompt the CLI is holding can be
+answered from here (see `_pane_command`). The agent column reads as a TOOL NAME
+("Claude Code", from installer/registry.json) and the title beside it says which
+worker and which task, which is what makes the list above readable at a glance.
 
 A sub-agent never gets a space of its own while its parent has one; it goes in
 beside its parent. The exception is a sub-agent whose parent has no space at all

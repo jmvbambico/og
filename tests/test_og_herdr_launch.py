@@ -3559,6 +3559,48 @@ def test_focus_agent_terminal_reaches_a_root_through_its_spaces_record(tmp_path)
     assert client.params_of("tab.focus") == [{"tab_id": "w1:t1"}]
 
 
+def test_focus_agent_terminal_prefers_the_sidecar_over_the_state_file_for_a_root(tmp_path):
+    # A root can be recorded in BOTH places: the launcher writes the state file's
+    # `spaces` record when it opens the space, and the bridge notes the tab when
+    # IT creates one. The note wins — it is written by the process that owns the
+    # tab's lifetime and dropped when the pane goes, while the state file's copy
+    # can outlive a tab herdr has already re-used.
+    _note_tab("root-1", "w1:t5")
+    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id="w1:t1")
+    client = FakeClient()
+
+    assert og_herdr_launch.focus_agent_terminal(
+        "root-1", "claude-native", env=_focus_env(), client=client) is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t5"}]
+
+
+def test_focus_agent_terminal_reaches_an_acp_root(tmp_path):
+    # A root on an ACP or builtin harness has a tab too (its `omnigent attach`
+    # REPL), and it is the correct view to reach — the kind is never a reason to
+    # refuse a row the operator selected.
+    _note_tab("root-1", "w1:t5")
+    client = FakeClient()
+
+    assert og_herdr_launch.focus_agent_terminal(
+        "root-1", "grok", env=_focus_env(), client=client) is None
+    assert client.params_of("tab.focus") == [{"tab_id": "w1:t5"}]
+
+
+def test_focus_agent_terminal_declines_a_root_with_no_recorded_tab(tmp_path):
+    # A record can name a space and no tab: a v1-upgraded one carries neither tab
+    # nor pane and invents neither (see og_herdr._upgrade_v1). There is nothing
+    # to aim at, so the operator is told rather than sent to a tab id herdr may
+    # have re-used.
+    _space_state(og_herdr_launch.default_state_path(), "root-1", tab_id=None)
+    client = FakeClient()
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "root-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NO_TAB
+    assert client.calls == []
+
+
 def test_focus_agent_terminal_prefers_the_agents_own_note_over_the_roots(tmp_path):
     # A root's recorded tab is the FALLBACK for a worker, never the answer when
     # the worker's own tab is known: the worker's CLI is where its prompt is.
