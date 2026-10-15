@@ -722,8 +722,9 @@ def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selecte
             worker("w2", "idle", text="two")]
 
     pane = a._pane(a.Frame(rows=rows), 48)
-    # The LIST only. The tail below it — the access panel and the footer — is DIM
-    # by design and has nothing to do with selection.
+    # The LIST only: it is the selection axis. The tail below it — the access
+    # panel (pane-width, and NORMAL like the root box, since it is not a worker
+    # the caret can be on) and the footer — carries no selection either way.
     items = pane.items[:pane.list_rows]
 
     assert not [role for _t, role in items if role == a.SELECTED], \
@@ -2619,10 +2620,12 @@ def test_access_panel_is_off_by_default_and_the_footer_lists_the_binding():
     assert "a access" in a.FOOTER, "the footer must advertise the binding"
 
 
-def test_the_access_box_is_content_sized_flush_left_and_drops_a_narrow_qr():
+def test_the_access_box_fills_the_pane_width_flush_left_and_drops_a_narrow_qr():
+    """THE REPORTED BUG (b): the panel was sized to its own content, so it hung as
+    a narrow inset under a full-width tree instead of lining up with the root box.
+    It is the pane's own bottom panel, so it is the pane's width."""
     qr = ["\x1b[40;37;1m" + "█" * 27 + "\x1b[0m"] + ["\x1b[40;37;1m" + "▀▄" * 13 + "\x1b[0m"]
     acc = _access(qr=qr, note="same wifi only — not reachable outside")
-    note_width = len("same wifi only — not reachable outside")
 
     wide = a.render(a.Frame(rows=[header()], access=acc), width=80)
     box = a.access_lines(acc, 80)
@@ -2630,24 +2633,96 @@ def test_the_access_box_is_content_sized_flush_left_and_drops_a_narrow_qr():
     assert "┌─ access " in wide[4], wide[4]
     assert wide[4] == box[0], "flush left: column 0, not under the rail"
     assert box[0].startswith("┌─ access ") and box[0].endswith("┐")
-    assert len(box[0]) == note_width + a.BOX_PADDING, "sized to its content"
-    assert all(len(line) == note_width + a.BOX_PADDING for line in box), \
+    # PANE-width — the pane's own columns, not the note's — and exactly the root
+    # box's width, which is the thing the report compared it to.
+    assert len(box[0]) == len(wide[0]) == 80, \
+        "as wide as the root box above it, never sized to its content"
+    assert all(len(line) == 80 for line in box), \
         "a box whose rows differ in width is not a box"
-    assert box[0] == "┌─ access " + "─" * (note_width - 7) + "┐"
-    assert box[-1] == "└" + "─" * (note_width + 2) + "┘"
+    # The root box's own interior width is the reference the panel has to agree
+    # with: same interior, so the two rectangles line up column for column.
+    inner = len(wide[0][1:-1])
+    assert box[0] == "┌─ " + a.ACCESS_TITLE + " " \
+        + "─" * (inner - len(a.ACCESS_TITLE) - 3) + "┐"
+    assert box[-1] == "└" + "─" * inner + "┘"
     assert any("█" * 27 in line for line in box), "27 columns + padding fits"
     assert acc.url in "\n".join(box)
 
     # The same code in a pane narrower than the code: dropped, address kept
     # (clipped by the pane, which is the only honest way to fit a 27-column URL
-    # in 26 columns).
+    # in 26 columns). The BOX still spans the pane: it is the code that is
+    # dropped, never the panel's width.
     narrow = a.access_lines(acc, 30)
     assert not any("█" in line for line in narrow), \
         "a wrapped code is unreadable noise, not a code"
     assert any(line.strip("│ ").startswith("http://192.168.100.176")
                for line in narrow), narrow
     assert narrow[-1].endswith("┘") and narrow[0].startswith("┌─ access ")
-    assert all(len(line) == 30 for line in narrow), "still a box"
+    assert all(len(line) == 30 for line in narrow), "still a box, still the pane's width"
+
+
+def test_the_access_box_spans_the_pane_at_every_width_a_box_can_close_at():
+    """(b) pinned positively and at every width, not just the one the report used.
+
+    The panel must never draw a row wider than the pane (a border past the edge
+    breaks the row it is on) and never a narrower one (that is the inset the
+    report is about). Where the pane is too narrow for the title's rule, the
+    TITLE is dropped -- the picker's rule, same reason -- rather than the box
+    growing past the pane to hold it.
+    """
+    acc = _access(qr=["QRROW"])
+    row = header()
+
+    for width in range(a.BOX_MIN, 120):
+        box = a.access_lines(acc, width)
+        assert all(len(line) == width for line in box), (width, box)
+        assert box[0].startswith("┌") and box[0].endswith("┐"), (width, box[0])
+        assert box[-1].startswith("└") and box[-1].endswith("┘"), (width, box[-1])
+        # The root box is the reference the panel is supposed to match.
+        assert a._spans_width(a._root_lines(row, width)[0]) == width, width
+
+    # Wide enough for the title, so it is there; the drop is only for panes that
+    # cannot hold its rule.
+    assert a.access_lines(acc, 80)[0].startswith("┌─ " + a.ACCESS_TITLE + " ")
+    assert not a.access_lines(acc, len(a.ACCESS_TITLE) + 4)[0].startswith("┌─ ")
+
+
+def test_the_access_panel_paints_at_full_brightness_not_the_footer_dim():
+    """THE REPORTED BUG (a). The panel was the one box hard-hung DIM, as if it were
+    chrome like the footer -- so the URL and the code an operator opened it to READ
+    were the least readable thing in the pane, while the root box beside it painted
+    NORMAL. Nothing asserted this, which is how the dim shipped.
+
+    The role is the contract, not a colour: the panel must hang the SAME NORMAL
+    that `_blocks` hangs on the root box's lines -- so the two boxes read alike,
+    which is what the report asked for.
+    """
+    acc = _access(qr=["QRROW"])
+    panel = a.access_lines(acc, 80)
+
+    pane = a._pane(a.Frame(rows=[header()], access=acc), 80)
+    tail = pane.items[pane.list_rows:]
+    rows = tail[1:1 + len(panel)]
+    assert rows and [a.line_text(item) for item in rows] == panel, \
+        "the panel is the tail, straight after its blank row"
+    assert [role for _t, role in rows] == [a.NORMAL] * len(panel), \
+        "the panel is not chrome: every row of it paints NORMAL, not DIM"
+    assert pane.items[0][1] == a.NORMAL, \
+        "and that is the very brightness the root box paints at"
+    # The footer remains the pane's one dim line -- the fix is the panel, not the
+    # brightness axis.
+    assert tail[-1][1] == a.DIM
+
+    # A moved caret dims the UNSELECTED WORKERS. It never reaches the panel, which
+    # is not a worker and is not what the caret is on.
+    moved = a._pane(a.Frame(rows=[header(),
+                                  worker("w1", "idle", text="one"),
+                                  worker("w2", "idle", text="two")],
+                            access=acc, selected=1), 80)
+    assert any(role == a.DIM for _t, role in moved.items[:moved.list_rows]), \
+        "an unselected worker's box still dims"
+    moved_tail = moved.items[moved.list_rows:]
+    assert [role for _t, role in moved_tail[1:1 + len(panel)]] == [a.NORMAL] * len(panel)
 
 
 def test_the_access_panel_shows_the_qr_and_url_when_wide_enough():
