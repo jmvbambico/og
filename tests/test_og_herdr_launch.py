@@ -2143,6 +2143,59 @@ def test_a_launch_record_still_stands_down_once_the_split_has_landed(tmp_path,
     assert client.text_typed() == []
 
 
+def test_a_launcher_record_stands_down_even_before_the_split_lands(
+        tmp_path, monkeypatch):
+    """THE RACE, CLOSED AT THE UNIT, and the one that matters most. The launcher's
+    split is IN FLIGHT when this process runs: `_open_space` writes its record,
+    types `og chat` and issues the split in one call, so the pane that split is
+    about to make MAY NOT BE IN THE LISTING YET. A guard that asked the tab — as
+    3311d41 did — reads this tab as holding ONE pane, decides no agents pane is
+    there, and splits again: the three-pane bug, back by way of a lost race
+    against a process that has not finished exec'ing python.
+
+    `owner: launcher` answers the question that does not race — IS A SECOND HALF
+    STILL COMING? — and the answer is yes, so the split stands down even though
+    no second pane is listed. The launcher keeps its split; two panes stay two."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {}, "pending": {str(tmp_path): {
+                   "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+                   "owner": "launcher", "cwd": str(tmp_path)}}})
+    # ONE pane, and it never grows: the split is in flight, not landed.
+    client = SplitClient(before=("w1:p1",), after=("w1:p1",))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" not in client.methods
+    assert client.text_typed() == []
+
+
+def test_a_history_record_with_no_second_pane_still_splits(tmp_path,
+                                                           monkeypatch):
+    """THE CREATION HALF — the mirror of the test above, and the pair IS the
+    point: the two owners are treated OPPOSITELY on the same one-pane tab.
+    `history` is written at space creation by a half that has since returned, so
+    NOBODY is coming to split: a tab holding one pane has no agents pane, whatever
+    the record claims, and this half must make it. That is the resume fix, and the
+    behaviour origin/main got WRONG — it stood this down on the record alone. The
+    split lands in a pane of its own, never in the one holding the resume."""
+    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    save_state(tmp_path / "og-herdr.json",
+               {"spaces": {"s1": {"workspace_id": "w1", "tab_id": "w1:t1",
+                                  "pane_id": "w1:p1", "owner": "history",
+                                  "cwd": str(tmp_path)}},
+                "pending": {}})
+    client = SplitClient(before=("w1:p1",), after=("w1:p1", "w1:p2"))
+
+    assert chat_pane(client=client, env=_pane_env()) == 0
+
+    assert "pane.split" in client.methods
+    assert client.text_typed() == ["og agents"]
+    assert client.params_of("pane.send_text")[-1]["pane_id"] == "w1:p2"
+
+
 def test_an_unreadable_pane_listing_never_stands_an_og_pane_down(tmp_path,
                                                                  monkeypatch,
                                                                  capsys):
@@ -2205,11 +2258,14 @@ def test_a_client_that_cannot_be_built_costs_the_agents_pane_only(tmp_path,
     assert os.getcwd() in load_state(tmp_path / "og-herdr.json")["pending"]
 
 
-def test_og_owns_pane_is_false_for_a_state_file_nobody_wrote(tmp_path):
+def test_og_owns_pane_is_none_for_a_state_file_nobody_wrote(tmp_path):
     """The guard's own default, so the fail-safe direction is pinned where it is
-    decided rather than only where it is used."""
+    decided rather than only where it is used. The return is the matched record's
+    `owner` now — a truthy string when og owns the pane — so "not og's" is None
+    where it used to be False; `if og_owns_pane(...)` reads unchanged, which is
+    the whole reason the owner is returned rather than a (owner, bool) pair."""
     assert og_owns_pane(tmp_path / "nothing-here.json", "w1", "w1:t1", "w1:p1") \
-        is False
+        is None
 
 
 def test_chat_pane_outside_herdr_touches_nothing(tmp_path, monkeypatch, capsys):

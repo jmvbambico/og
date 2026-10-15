@@ -190,8 +190,9 @@ second one.
 **Known gap, unfixed.** THREE things open the `og agents` pane, and none is this
 case: `_open_space` (a fresh launch), `og_herdr._add_history_space` (a history
 space for a past conversation, resumed from the spaces list), and `og chat` in a
-pane nobody else opened (which stands down when one of the first two owns that
-pane AND the tab holds a pane beside it — the rule in §2). All three go through
+pane nobody else opened (which stands down on the launcher's own record, or when
+a history space owns the pane AND the tab holds a pane beside it — the rule in
+§2). All three go through
 the one implementation, `og_herdr_launch.split_agents_pane`; there is
 deliberately no second copy of the split to drift. ADOPTING AN EXISTING SPACE is
 still the case that never splits — and says nothing when the space it attaches
@@ -264,31 +265,40 @@ from (A)–(D) rather than a copy of it:
   theirs. The chat path passes the tab's panes as they were *before* the split,
   and when no new pane can be identified it starts `og agents` nowhere rather
   than guessing into one of theirs.
-- **The split is skipped only when og made this pane AND the tab really has a
-  second one.** `og start` types `og chat` into the pane it is about to split, so
-  on a fresh launch this path IS the launcher's second half and splitting here as
-  well opened three panes where the operator expects two. The launcher keeps the
-  split — it is the half that still holds the pane if `og chat` never reaches its
-  own — and this half stands down.
-  The record alone is not the guard, and that is the whole correction: a record
-  is written when a space is **created**, before the split that is supposed to
-  follow it, and says nothing about whether that split happened. A history space
-  whose `herdr_agents_pane` was off when it opened (turned on afterwards — the
-  setting is read once, at creation), a split that failed into a reconcile line
-  nobody read, an agents pane the operator closed: all three leave the record
-  intact and the tab holding one pane, so `og chat --resume` into that space came
-  up with no agents pane at all, silently and permanently. The tab is therefore
-  asked whether a pane besides this one is actually there, using the listing the
-  split already takes.
-  `pane.list` returns no command and no process, so this half only ever answers
-  *a second pane exists* — never *it is `og agents`*. That is why both halves are
-  required and neither is enough alone, and why a pane whose `og agents` CRASHED
-  is not recovered by this: the operator closes the dead pane and re-runs. A
-  listing that cannot be read is never read as "the pane is already there" (that
-  would cost the operator the pane silently) but is still not a basis for
-  guessing which pane herdr is about to make, which is the separate rule above.
-  A state file that cannot be read is no answer rather than a negative one, and
-  the split is attempted.
+- **The split stands down on WHICH record owns this pane.** `og start` types
+  `og chat` into the pane it is about to split, so on a fresh launch this path IS
+  the launcher's second half and splitting here as well opened three panes where
+  the operator expects two. The launcher keeps the split — it is the half that
+  still holds the pane if `og chat` never reaches its own — and this half stands
+  down. What the record's `owner` says is **not** "did the split work" but **is a
+  second half still coming**, and the two cases turn on it:
+  - `owner: launcher` is the launcher's own record. `_open_space` writes it,
+    types `og chat` and issues the split **in the same call**, so by the time this
+    process reads the file the split is already in flight — a second half is
+    coming, so this half stands down on the record alone, with no pane listing and
+    no race to lose. (A pane listing here would be racy: the pane the split makes
+    need not be in it yet, and losing that race is the three-pane bug.) The price
+    is accepted — a launcher space whose split failed is not repaired by `og chat`,
+    and does not need to be, because the launcher reports its own failure before
+    herdr is handed the terminal.
+  - `owner: history` / `bridge` is a record a half wrote when it **created** the
+    space and then returned; nobody is coming. A history space whose
+    `herdr_agents_pane` was off when it opened (turned on afterwards — the setting
+    is read once, at creation), a split that failed into a reconcile line nobody
+    read, an agents pane the operator closed: all three leave the record intact
+    and the tab holding one pane, so `og chat --resume` into that space came up
+    with no agents pane at all, silently and permanently. The tab is therefore
+    asked whether a pane besides this one is actually there, using the listing the
+    split already takes, and the split is made when it is not.
+  `pane.list` returns no command and no process, so the pane half only ever
+  answers *a second pane exists* — never *it is `og agents`* — which is why it is
+  required only for the creation case and why a pane whose `og agents` CRASHED is
+  not recovered by this: the operator closes the dead pane and re-runs. A listing
+  that cannot be read is never read as "the pane is already there" (that would
+  cost the operator the pane silently) but is still not a basis for guessing which
+  pane herdr is about to make, which is the separate rule above. A state file that
+  cannot be read is no answer rather than a negative one, and the split is
+  attempted.
 
 `og chat --dir <path>` sets the directory the session is rooted in without
 `cd`-ing first. An absolute path is used as-is; a relative one resolves against
