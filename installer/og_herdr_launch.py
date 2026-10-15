@@ -1314,16 +1314,25 @@ def record_chat_pane(state_path: Path, cwd: str, workspace_id: str,
 
 
 def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
-                 pane_id: str) -> Optional[str]:
-    """The OWNER of the record that names this pane — None when og has none.
+                 pane_id: str) -> Optional[dict]:
+    """The record that names this pane — None when og has none.
 
-    The question is the one the boolean this used to return answered: "is this
+    The question is the one the boolean this first returned answered: "is this
     pane one og opened for a chat, rather than one the operator made?" A matched
-    record is og's, so its `owner` comes back and `if og_owns_pane(...)` reads
-    exactly as it did; no match — or a state file that cannot be read — is None.
-    The owner rides along because it answers a question the boolean could not,
-    and one the caller has no other way to ask; see "is a second half coming"
-    below.
+    record IS that yes, and it comes back WHOLE rather than as its `owner` alone,
+    because the caller has two things to read off it and one of them can be
+    absent. Returning the record is what keeps None meaning exactly one thing —
+    nobody matched, so this is not og's pane — where returning the owner alone
+    overloaded it: a record that matched all three ids but carried no `owner`
+    came back as the same None as no record at all, so the caller could not tell
+    "somebody else's pane, split it" from "og's own pane whose writer said
+    nothing, so ask the tab before splitting". Both are real and they are
+    opposites; see `chat_pane` for what it does with each. A truthy dict still
+    reads as a plain yes, so `if og_owns_pane(...)` is unchanged in meaning.
+
+    The owner rides along because it answers a question neither the boolean nor
+    the pane list could — "IS A SECOND HALF STILL COMING?" — which is why it is
+    read rather than merely detected; see below.
 
     `og chat` asks this to stay out of the launcher's way. `og start` types
     `og chat` into a pane `_open_space` has just made and then splits that same
@@ -1356,7 +1365,7 @@ def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
     og's at all.
 
     IS A SECOND HALF STILL COMING? — that, and not "did the split work", is what
-    `owner` answers, and it is why the owner is returned rather than a bare yes.
+    `owner` answers, and it is why the record is returned rather than a bare yes.
     A record is written when a space is CREATED and says nothing about the split
     that is supposed to follow it; what it carries is WHO wrote it, and that is
     what decides the two cases the caller must treat differently. `OWNER_LAUNCHER`
@@ -1372,8 +1381,14 @@ def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
     Every writer sets `owner` and none invents a missing one: `_open_space` and
     `record_chat_pane` on the launcher's side, `_remember` (defaulting to
     `OWNER_BRIDGE`) for the bridge's, and `_claim_pending` carries the value
-    through a claim unchanged — so a record this function matches always has one,
-    which is what makes returning it safe rather than a guess.
+    through a claim unchanged — so a matching record normally has one. A record
+    that has none is nonetheless a shape the caller must survive: it is stale or
+    hand-edited, since nothing current writes one, and it can still match on all
+    three ids. The MATCH is the fact that matters — it proves og opened this
+    pane — so the record comes back and the caller reads the absent owner as
+    "nobody promised a second half, so ask the tab", never as "not og's, split".
+    Returning the whole record is what makes that distinction expressible at all;
+    see `chat_pane`.
 
     It fails OPEN. A state file that cannot be read — missing, truncated, a
     version this code does not know — is og having nothing to say, not og having
@@ -1419,7 +1434,7 @@ def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
             if (record.get("workspace_id") == workspace_id
                     and record.get("tab_id") == tab_id
                     and record.get("pane_id") == pane_id):
-                return record.get("owner")
+                return record
     return None
 
 
@@ -1434,10 +1449,12 @@ def og_owns_pane(state_path: Path, workspace_id: str, tab_id: str,
 # agents pane beside it the way `_open_space` does — EXCEPT when og's own record
 # says a second half is coming or one already came: the LAUNCHER's record means
 # its split is in flight in the same call (stand down on it alone), and a
-# HISTORY/BRIDGE record means the split, if any, happened at space creation, so
-# the tab is asked and the split is made only when no second pane is there. Two
-# halves doing one job is what opened three panes in a tab the operator expects
-# to hold two. See `og_owns_pane`, `_agents_pane_already_split` and `chat_pane`.
+# HISTORY/BRIDGE record — or a matching record whose writer left no owner at all,
+# which the match still proves is og's — means the split, if any, happened at
+# space creation, so the tab is asked and the split is made only when no second
+# pane is there. Two halves doing one job is what opened three panes in a tab the
+# operator expects to hold two. See `og_owns_pane`, `_agents_pane_already_split`
+# and `chat_pane`.
 #
 # It is a NO-OP outside a herdr pane — a plain `og chat` in an ordinary terminal
 # must behave exactly as it always has, including never touching the state file.
@@ -1504,15 +1521,17 @@ def chat_pane(argv=None, client=None, env=None) -> int:
     splitting here as well left the operator a third pane; the launcher keeps the
     split and this half stands down. WHICH record `og_owns_pane` returns decides
     how: the launcher's own record means the split is in flight in that same call
-    (stand down on the record alone, no pane listing, nothing to race), while a
-    `history`/`bridge` record was written at space CREATION by a half that has
-    since finished, so the tab is asked whether a pane is really beside this one
-    and the split is made only when it is not. An operator-made pane has no such
-    record and is split as it always was, and an og-owned pane whose split never
-    happened — the agents pane switched on after the space opened, a split that
-    failed, a pane the operator closed — is split now rather than left
-    permanently without one. See `_agents_pane_already_split` for what that check
-    can and cannot see, and `og_owns_pane` for why the two owners differ.
+    (stand down on the record alone, BEFORE any client is built, no pane listing
+    and no socket to race), while a `history`/`bridge` record — and a matching
+    record whose writer left no owner, which the match still proves is og's —
+    was written at space CREATION by a half that has since finished, so the tab is
+    asked whether a pane is really beside this one and the split is made only when
+    it is not. An operator-made pane has no such record and is split as it always
+    was, and an og-owned pane whose split never happened — the agents pane switched
+    on after the space opened, a split that failed, a pane the operator closed — is
+    split now rather than left permanently without one. See
+    `_agents_pane_already_split` for what that check can and cannot see, and
+    `og_owns_pane` for why the two owners differ.
 
     Exit codes: 0 for the ordinary case, INCLUDING every degradation — the chat
     is the session and a cosmetic second pane must not be able to stop it, which
@@ -1562,7 +1581,7 @@ def chat_pane(argv=None, client=None, env=None) -> int:
     # `record_chat_pane` writes exactly this record, so a lookup after it says
     # "og owns this pane" on every run, the operator's included.
     state = default_state_path()
-    owner = og_owns_pane(state, ws_id, tab_id, pane_id)
+    owned = og_owns_pane(state, ws_id, tab_id, pane_id)
     try:
         record_chat_pane(state, here, ws_id, tab_id, pane_id)
     except Exception as exc:
@@ -1573,6 +1592,32 @@ def chat_pane(argv=None, client=None, env=None) -> int:
     if not agents_pane_enabled(config):
         return 0
 
+    if owned is not None and owned.get("owner") == OWNER_LAUNCHER:
+        # THE LAUNCHER'S OWN RECORD, and the half that must NOT be raced — stood
+        # down HERE, above the client construction, so the launcher path opens NO
+        # socket at all. This is the hot path (every fresh `og start` pane) and
+        # v0.18.1 returned before building a client; a connection here is pure
+        # waste, and every guarded build is one more thing that can raise on the
+        # way to a chat that was never going to need it. `owner` answers "IS A
+        # SECOND HALF STILL COMING?", not "did the split work": `_open_space`
+        # writes this record, types `og chat` and issues its split IN THE SAME
+        # CALL, so the split is already in flight by the time this process
+        # finishes exec'ing python — a second half IS coming. Standing down on the
+        # record alone is therefore deterministic and costs no socket round trip;
+        # asking herdr where the tab's panes are would be a RACE, because the pane
+        # that split is making need not be listed yet, and losing it means
+        # splitting here too — the three-pane bug this whole path exists to
+        # prevent.
+        #
+        # The price, accepted and paid here: a LAUNCHER space whose split FAILED
+        # is not repaired by this half. It does not need to be. The launcher
+        # reports its own split failure (`report`, in `_split_agents`), and that
+        # line re-surfaces before the terminal is handed to herdr, so the operator
+        # is TOLD. The HISTORY/BRIDGE path below has no such channel — its
+        # degradation is only a reconcile line — which is exactly why that path
+        # gets the pane check and this one does not.
+        return 0
+
     try:
         # Constructing a client cannot connect — it resolves a socket path and
         # waits — but it CAN raise (an unimportable `og_herdr_client`, a home
@@ -1581,36 +1626,15 @@ def chat_pane(argv=None, client=None, env=None) -> int:
         # it. Cosmetic pane versus the session the operator asked for is not a
         # close call, so a client that cannot even be built degrades and the
         # chat starts. Unchanged in practice on the split path, and it is what
-        # keeps the stand-down path — which reaches here for the first time now
-        # that it asks herdr — from being able to stop a chat at all.
+        # keeps the creation-half stand-down — which reaches here for the first
+        # time now that it asks herdr — from being able to stop a chat at all.
+        # The launcher path does not reach here at all; it stands down above.
         opened = client if client is not None else _chat_client(environ)
     except Exception as exc:
         _chat_degrade("could not reach herdr to open the og agents pane "
                       "({0}); the chat is up without it".format(exc))
         return 0
     try:
-        if owner == OWNER_LAUNCHER:
-            # THE LAUNCHER'S OWN RECORD, and the half that must NOT be raced.
-            # `owner` answers "IS A SECOND HALF STILL COMING?", not "did the
-            # split work": `_open_space` writes this record, types `og chat` and
-            # issues its split IN THE SAME CALL, so the split is already in
-            # flight by the time this process finishes exec'ing python — a second
-            # half IS coming. Standing down on the record alone is therefore
-            # deterministic and costs no socket round trip; asking herdr where
-            # the tab's panes are would be a RACE, because the pane that split is
-            # making need not be listed yet, and losing it means splitting here
-            # too — the three-pane bug this whole path exists to prevent.
-            #
-            # The price, accepted and paid here: a LAUNCHER space whose split
-            # FAILED is not repaired by this half. It does not need to be. The
-            # launcher reports its own split failure (`report`, in
-            # `_split_agents`), and that line re-surfaces before the terminal is
-            # handed to herdr, so the operator is TOLD. The HISTORY/BRIDGE path
-            # below has no such channel — its degradation is only a reconcile
-            # line — which is exactly why that path gets the pane check and this
-            # one does not.
-            return 0
-
         # ONE listing, read before the remaining decision and used by both of its
         # halves: whether to stand down (is there a pane beside this one?) and, if
         # not, what the tab held BEFORE the split. Hoisted so the split path is
@@ -1621,19 +1645,29 @@ def chat_pane(argv=None, client=None, env=None) -> int:
         # operator made and split themselves, and "the first pane in this tab
         # that is not the chat pane" is then their pane, not ours.
         baseline = tab_pane_ids(opened, ws_id, tab_id)
-        if owner is not None and _agents_pane_already_split(baseline, pane_id):
-            # THE CREATION HALF. A `history`/`bridge` record is written when a
-            # space is CREATED, by a half that has since finished, and says
-            # nothing about whether the split that was supposed to follow it ever
-            # happened: `og_herdr._add_history_space` remembers the pane and then
-            # splits best-effort (`_split_agents` returns early when
-            # `herdr_agents_pane` is off, which the operator can turn on
-            # afterwards), a split can fail into a reconcile line nobody read,
-            # and the operator can close the pane. NOBODY is coming to split
-            # again, so the tab is asked and only a pane that is demonstrably
-            # there counts — otherwise `og chat --resume` into a past
-            # conversation comes back with no agents pane at all — no error,
-            # nothing degraded, nothing to notice.
+        if owned is not None and _agents_pane_already_split(baseline, pane_id):
+            # THE CREATION HALF, and also every matching record that promises no
+            # second half. A `history`/`bridge` record is written when a space is
+            # CREATED, by a half that has since finished, and says nothing about
+            # whether the split that was supposed to follow it ever happened:
+            # `og_herdr._add_history_space` remembers the pane and then splits
+            # best-effort (`_split_agents` returns early when `herdr_agents_pane`
+            # is off, which the operator can turn on afterwards), a split can fail
+            # into a reconcile line nobody read, and the operator can close the
+            # pane. NOBODY is coming to split again, so the tab is asked and only
+            # a pane that is demonstrably there counts — otherwise `og chat
+            # --resume` into a past conversation comes back with no agents pane at
+            # all — no error, nothing degraded, nothing to notice.
+            #
+            # A record that matched all three ids but carried NO `owner` is the
+            # same case from the other end, and it is why `og_owns_pane` returns
+            # the whole record: the match PROVES og opened this pane, and nothing
+            # in it says a second half is coming, so the tab is asked rather than
+            # split on an assumption. Splitting on an unknown owner while a
+            # second pane is already there is a DUPLICATE agents pane — the exact
+            # bug this guard exists to kill. "No record at all" is still the other
+            # direction and still needs no listing: not og's, so the split is
+            # simply made.
             #
             # The cost is bounded in the only direction that matters: the worst
             # answer this can give is a YES about a pane that is not `og agents`
