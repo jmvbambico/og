@@ -205,7 +205,28 @@ LAST_LIST_ERROR = ""
 
 
 def list_models(agent: dict) -> list:
-    """Ask the vendor CLI what it can run. Empty list on any failure."""
+    """Ask the vendor CLI what it can run. Empty list on any failure.
+
+    Two output shapes are tolerated, because the CLIs do not agree:
+
+    * bare ids, one per line -- the shape every vendor CLI prints today and
+      the shape og's `list_cmd` entries invoke (no `--json` flag anywhere in
+      the registry). Lines that are tables, headings or prose are dropped:
+      kiro-cli prints a credits table, cmd groups ids under Capitalized
+      vendor section headings, cursor-agent prints "id - Display Name
+      (tags)".
+
+    * a JSON array of objects, which some CLIs offer as an alternate. Every
+      object's `id` is taken as a model id, in array order, and the other
+      fields (display_name, section, price_per_hour, recommended, available)
+      are ignored here -- the picker is a flat id list, and og has no place
+      for pricing. Trying to parse this with the bare-id rules below fails
+      silently: the JSON braces, quotes and `true`/`false` literals all
+      contain uppercase letters, so the lowercase-only filter drops every
+      line and the probe reads as "the CLI printed nothing", which then
+      falls through to the stale `choices`. Detecting the shape first is
+      what makes a JSON-capable catalog reachable instead of decorative.
+    """
     global LAST_LIST_ERROR
     LAST_LIST_ERROR = ""
     cmd = (agent.get("model") or {}).get("list_cmd")
@@ -224,8 +245,56 @@ def list_models(agent: dict) -> list:
         tail = [l for l in out.stderr.splitlines() if l.strip()][-3:]
         LAST_LIST_ERROR = f"exit {out.returncode}" + (": " + " | ".join(tail) if tail else "")
         return []
+    models = _parse_model_listing(out.stdout)
+    if models is None:
+        # Not JSON -- fall back to the bare-id rules.
+        models = _parse_bare_ids(out.stdout)
+    return models
+
+
+def _parse_model_listing(stdout: str) -> list | None:
+    """Parse a JSON array of model objects, or return None if the body is
+    not that shape.
+
+    This is the ALTERNATE shape some CLIs offer -- og's `list_cmd` entries
+    invoke bare ids (no `--json` flag anywhere in the registry), so this
+    branch only fires for a CLI that happens to print JSON. Every object's
+    `id` is taken as a model id, in array order; display_name, section,
+    price_per_hour, recommended and available are ignored -- the picker is
+    a flat id list and og has no place for pricing.
+
+    Returns None (not []) on a malformed JSON body: an empty array is a
+    legitimate result (the catalog is genuinely empty right now), but a
+    body that looks like JSON and does not parse is a TUI change, and the
+    bare-id path would happily turn it into a garbage id list. Returning
+    None sends list_models() to the bare-id path, which drops the garbage
+    and yields [], which the caller treats as a probe failure and warns --
+    the loud failure the contract asks for, instead of a fabricated lineup.
+    """
+    body = stdout.strip()
+    if not body or not body.startswith("["):
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    ids = []
+    for item in data:
+        if not isinstance(item, dict):
+            return None
+        mid = item.get("id")
+        if not isinstance(mid, str) or not mid:
+            return None
+        ids.append(mid)
+    return ids
+
+
+def _parse_bare_ids(stdout: str) -> list:
+    """The legacy one-id-per-line parser, with the per-vendor noise filters."""
     models = []
-    for line in out.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -488,11 +557,20 @@ def pick_model(agent: dict, current: str | None) -> str | None:
     if spec.get("note"):
         say(f"  {C['dim']}{spec['note']}{C['x']}")
 
-    options = list_models(agent)
+    live = list_models(agent)
     # No live listing? Use the registry's static `choices` so the same picker
     # menu serves both live (`list_cmd`) and fixed lineups.
-    if not options and spec.get("choices"):
-        options = spec["choices"]
+    fallback = bool(spec.get("list_cmd")) and not live and spec.get("choices")
+    if fallback:
+        # `choices` is a FALLBACK, so never show it silently: the user must
+        # know the live probe failed and why (a first-run plugin install that
+        # timed out, a missing binary, a crash), because each cause has a
+        # different fix and a stale list otherwise looks authoritative --
+        # exactly the silent-staleness this probe exists to kill.
+        warn(f"could not probe models with `{' '.join(spec['list_cmd'])}`: "
+             f"{LAST_LIST_ERROR or 'printed nothing'} — falling back to the "
+             f"static `choices` list below")
+    options = live or spec.get("choices") or []
     for pid, kind, why in unlisted_logins(agent, options):
         warn(f"{pid}: logged in ({kind}) but not listed. {why}")
     if options:
