@@ -2848,13 +2848,15 @@ def test_access_panel_drops_the_qr_when_the_pane_is_too_narrow():
     # has and says where it stopped.
     assert any(line.strip("│ ").startswith("http://192.168.100.17")
                for line in lines)
-    # 26 columns IS the bare KEYS floor exactly: below both labelled forms, so it
-    # falls to the key list rather than being clipped mid-word (see `_footer`).
+    # 26 columns is below the bare KEYS floor (32), so the footer picks the bare
+    # key list rather than either labelled form — and that list is itself wider
+    # than this pane, so it is clipped to 26, losing a couple of trailing keys.
+    # That is the FLOOR form's point: a trailing KEY clipped off is recoverable by
+    # pressing it, where a LABEL clipped mid-word is not. See the footer comment.
     assert lines[0] == "" and lines[-1] == _footer_text(26)
-    # The row is the bare key list, exactly the KEYS width, so nothing is padded —
-    # and the pane's own ruler (`len`) agrees with `_display_width`, because every
-    # footer glyph including the separator is Narrow now (see
-    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`).
+    # The row fills the pane (clipped to its last column); the footer glyphs stay
+    # Narrow so the pane's own ruler is unambiguous. See
+    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
     assert len(lines[-1]) <= 26
     assert len(a.access_lines(acc, 26)) == 4, "borders, address, caveat, borders"
 
