@@ -2479,6 +2479,23 @@ def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
             ws_id, cwd or os.getcwd(), _cli_tab_label(harness, session_id),
             focus=False, env=pane_env_for(environ))
     except Exception as exc:
+        # A `tab.create` that TIMES OUT may still have LANDED server-side: the
+        # client's default is 10s and `_read_frame` raises `HerdrError("timeout")`,
+        # so a failure here can mean a tab now EXISTS that this call never saw the
+        # id of. There is then nothing to close and nothing to note, so the result
+        # is a rare orphan tab the operator must close by hand — and a later Enter,
+        # finding no note, opens another. It is NOT SPECIFIC TO THIS PATH: every
+        # create in og has the same shape (`_add_tab`, `_open_space`), because the
+        # herdr protocol has no idempotency key and the client cannot ask whether
+        # its create landed.
+        #
+        # RECONCILING BY LABEL IS DELIBERATELY NOT DONE. `_cli_tab_label` is the
+        # harness PRODUCT name ("Claude Code (cli)"), not unique per session, so
+        # listing tabs and matching it could adopt or close ANOTHER agent's tab —
+        # a wrong-tab bug, worse than the rare orphan it would fix. The real fix
+        # belongs in the herdr protocol (an idempotency key, or a
+        # create-if-absent), not here. Recorded so the next reader does not "fix"
+        # this with exactly that label reconcile.
         return _focus_line(NOTICE_FOCUS_FAILED, exc), None
     if not isinstance(created, dict):
         created = {}
