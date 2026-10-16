@@ -510,7 +510,7 @@
       "kind": "acp-user",
       "acp_command": "blink",
       "omnigent_mcp": false,
-      "kind_note": "`blink` (github.com/jmvbambico/bufflink, >= v0.1.2) is an ACP bridge that drives the freebuff TUI in a PTY. Verified 2026-09-20/21 in og-sandbox: five backlog tasks (small to larger, incl. new modules and e2e tests), 3 of 3 first-try since v0.1.2; every commit in scope, gates green. Facts that matter: one blink process = one freebuff launch = one hour billed up front at the chosen model's rate (GLM 5.3 Flash 5/hr by default, up to DeepSeek V4.1 Flash 15/hr) from the free tier's 25 daily Freebucks, so a costlier pin means fewer launches per day, and the process lives as long as the sub-agent SESSION. Omnigent's sys_session_close does NOT end it (observed 2026-09-21): after closing a finished session, `pgrep -x blink` and SIGTERM it - blink exits cleanly within ~5 s and releases freebuff's single-instance lock; verify with `pgrep -fl manicode/freebuff` before the next launch. freebuff writes its transcript only at turn end, so nothing streams while it thinks; all trial turns finished well inside HARNESS_ACP_PROMPT_TIMEOUT_S (300 s), but keep tasks single-purpose. Omnigent's injected system prompt (~5 kB) arrives as a collapsed 'Pasted text' chip, which blink handles; leave inject_system_prompt on. freebuff resolves RELATIVE paths against the cwd omnigent passed (the workspace, not the worktree): dispatch text must use absolute worktree paths and name the gate commands with `cd`. freebuff writes `.freebuff/project-id` into its cwd; gitignore `.freebuff/`. No approval gate: freebuff runs commands unattended - the worktree is the blast radius.",
+      "kind_note": "`blink` (github.com/jmvbambico/bufflink, >= v0.1.2) is an ACP bridge that drives the freebuff TUI in a PTY. Verified 2026-09-20/21 in og-sandbox: five backlog tasks (small to larger, incl. new modules and e2e tests), 3 of 3 first-try since v0.1.2; every commit in scope, gates green. Facts that matter: one blink process = one freebuff launch = one hour billed up front at the chosen model's rate (GLM 5.3 Flash 5/hr by default, up to DeepSeek V4.1 Flash 15/hr) from the free tier's 25 daily Freebucks, so a costlier pin means fewer launches per day, and the process lives as long as the sub-agent SESSION. Omnigent's sys_session_close does NOT end it (observed 2026-09-21): after closing a finished session, `pgrep -x blink` and SIGTERM it - blink exits cleanly within ~5 s and releases freebuff's single-instance lock; verify with `pgrep -fl manicode/freebuff` before the next launch. freebuff writes its transcript only at turn end, so nothing streams while it thinks; all trial turns finished well inside HARNESS_ACP_PROMPT_TIMEOUT_S (300 s), but keep tasks single-purpose. Omnigent's injected system prompt (~5 kB) arrives as a collapsed 'Pasted text' chip, which blink handles; leave inject_system_prompt on. freebuff resolves RELATIVE paths against the cwd omnigent passed (the workspace, not the worktree): dispatch text must use absolute worktree paths and name the gate commands with `cd`. freebuff writes `.freebuff/project-id` into its cwd; gitignore `.freebuff/`. No approval gate: freebuff runs commands unattended - the worktree is the blast radius. freebuff's model lineup ROTATES server-side and is served under provider-prefixed or hashed ids, so the picker's `choices` are a FALLBACK only: at setup time `blink --list-models` probes the live catalog and every id it prints is offered instead. Install a blink that speaks `--list-models` (>= v0.2.0); an older blink silently falls back to `choices`.",
       "roles": [
         "coder",
         "scout",
@@ -522,12 +522,17 @@
       "model": {
         "required": false,
         "pin_path": "executor.model",
-        "note": "The model is chosen on freebuff's splash (default GLM 5.3 Flash; the lineup ROTATES - there is a limited-time-trial slot - so `choices` is a convenience list, not a closed set: a free-text id matching a splash display name also works). Pinning one exports BLINK_MODEL=<id> into the worker env; a blink that honours BLINK_MODEL selects it on the splash, older blink accepts the default. A pin naming a model freebuff is not offering fails the dispatch loudly rather than running the default, as does a dispatch into a freebuff hour already running on another model (wait for the hour to end or unset the pin). Vendor follows the model: a deepseek/* pick makes Freebuff same-vendor with Cline for review purposes.",
+        "list_cmd": [
+          "blink",
+          "--list-models"
+        ],
+        "note": "At setup time og runs `blink --list-models` and offers every id it prints; that live probe is the source of truth because the lineup ROTATES server-side. `choices` below is a FALLBACK used only when the probe fails or an older blink lacks `--list-models` -- never an empty list. Model ids are provider-prefixed or opaque hashes (e.g. `z-ai/glm-5.3-flash`, `mimo/mimo-v2.6-pro`, `openai/gpt-6-luna`, `upstage/solar-pro4`, `deepseek/deepseek-v4-flash`, `m-79293c5b7d`), so a pin is always written with its prefix and never matched against a splash display name. Pinning one exports BLINK_MODEL=<id> into the worker env; a blink that honours BLINK_MODEL selects it, an older blink accepts freebuff's default. A pin naming a model freebuff is not offering fails the dispatch loudly rather than running the default. Vendor follows the model: a deepseek/* pick makes Freebuff same-vendor with Cline for review purposes.",
         "choices": [
           "z-ai/glm-5.3-flash",
-          "mimo-2.5",
-          "solar-pro-4",
-          "deepseek-v4.1-flash"
+          "mimo/mimo-v2.6-pro",
+          "openai/gpt-6-luna",
+          "upstage/solar-pro4",
+          "deepseek/deepseek-v4-flash"
         ],
         "prefer": "z-ai/glm-5.3-flash",
         "env_var": "BLINK_MODEL"

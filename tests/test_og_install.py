@@ -2471,6 +2471,91 @@ def test_list_models_reports_a_timeout(monkeypatch):
     assert "timed out" in m.LAST_LIST_ERROR
 
 
+def test_list_models_parses_a_json_array_of_model_objects(monkeypatch):
+    """A CLI that prints a JSON array of objects instead of bare ids.
+
+    The bare-id path would drop every line here -- the braces, quotes and
+    true/false literals all contain uppercase letters -- and report the
+    probe as empty, which silently falls through to the stale `choices`.
+    """
+    body = json.dumps([
+        {"id": "z-ai/glm-5.3-flash", "display_name": "GLM 5.3 Flash",
+         "section": "optimized", "price_per_hour": 5, "recommended": True, "available": True},
+        {"id": "m-79293c5b7d", "display_name": "Trial Slot"},
+    ])
+    monkeypatch.setattr(m.subprocess, "run",
+                        _fake_run(body))
+    assert m.list_models({"model": {"list_cmd": ["blink", "--list-models"]}}) == [
+        "z-ai/glm-5.3-flash", "m-79293c5b7d"]
+
+
+def test_list_models_json_shape_falls_through_on_malformed_body(monkeypatch):
+    """A body that starts like JSON but does not parse is a TUI change, not an
+    empty catalog. Returning None sends list_models() at the bare-id path,
+    which drops the garbage and yields [] -- a probe failure the caller
+    warns about -- rather than a fabricated id list."""
+    monkeypatch.setattr(m.subprocess, "run",
+                        _fake_run('[{"id": "z-ai/glm-5.3-flash"'))
+    assert m.list_models({"model": {"list_cmd": ["blink", "--list-models"]}}) == []
+
+
+def test_list_models_json_shape_falls_through_on_a_non_array(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "run",
+                        _fake_run('{"id": "z-ai/glm-5.3-flash"}'))
+    assert m.list_models({"model": {"list_cmd": ["blink", "--list-models"]}}) == []
+
+
+def test_list_models_json_tolerates_an_empty_array(monkeypatch):
+    """[] is a legitimate catalog, not a failure: an empty array parses and
+    returns [], and the caller's `if not options` then falls through to
+    `choices` with the same message as a probe that printed nothing."""
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("[]"))
+    assert m.list_models({"model": {"list_cmd": ["blink", "--list-models"]}}) == []
+
+
+# --------------------------------------------------------------------------
+# pick_model: live probe wins, stale `choices` is the fallback only
+# --------------------------------------------------------------------------
+def test_pick_model_uses_live_ids_when_the_probe_succeeds(monkeypatch):
+    """The live `blink --list-models` probe is the source of truth: every id
+    it prints is offered, and the stale `choices` are not consulted at all."""
+    reg = m.agents_by_id()
+    live = ["mimo/mimo-v2.6-pro", "z-ai/glm-5.3-flash", "openai/gpt-6-luna"]
+    monkeypatch.setattr(m, "list_models", lambda agent: list(live))
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: default)
+    assert m.pick_model(reg["freebuff"], None) == "z-ai/glm-5.3-flash"
+
+
+def test_pick_model_falls_back_to_choices_when_the_probe_fails(monkeypatch, capsys):
+    """A failing or missing probe degrades to `choices` with a clear message,
+    never a crash and never an empty list. The fallback ids are the real,
+    provider-prefixed current lineup, not the stale display-name-era ones."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "list_models", lambda agent: [])
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: default)
+    assert m.pick_model(reg["freebuff"], None) == "z-ai/glm-5.3-flash"
+    warned = capsys.readouterr().out
+    assert "blink --list-models" in warned
+    assert reg["freebuff"]["model"]["choices"] == [
+        "z-ai/glm-5.3-flash", "mimo/mimo-v2.6-pro", "openai/gpt-6-luna",
+        "upstage/solar-pro4", "deepseek/deepseek-v4-flash"]
+
+
+def test_pick_model_falls_back_to_choices_on_a_probe_timeout(monkeypatch, capsys):
+    """A timeout is one failing probe among many: the same fallback and the
+    same warning, with the timeout's own explanation in the message."""
+    reg = m.agents_by_id()
+
+    def slow(agent):
+        m.LAST_LIST_ERROR = "timed out after 120s"
+        return []
+
+    monkeypatch.setattr(m, "list_models", slow)
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: default)
+    assert m.pick_model(reg["freebuff"], None) == "z-ai/glm-5.3-flash"
+    assert "timed out" in capsys.readouterr().out
+
+
 # --------------------------------------------------------------------------
 # install_pth targets omnigent's interpreter, not the installer's
 # --------------------------------------------------------------------------
@@ -2559,13 +2644,15 @@ def test_install_pth_sandboxed_home_leaves_live_pth_untouched(
 # model.choices: a static lineup for agents with no live model listing
 # --------------------------------------------------------------------------
 def test_pick_model_offers_choices_by_number(monkeypatch):
-    # freebuff is required=false with no list_cmd but declares `model.choices`:
-    # the early-return bail-out no longer fires, so the static lineup is shown
-    # through the same numbered menu and selectable by number.
+    # freebuff is required=false and declares `model.choices` as a FALLBACK:
+    # the live `blink --list-models` probe is offered when it returns ids, and
+    # the static lineup is what the numbered menu shows when it does not. The
+    # early-return bail-out no longer fires, so the fallback is shown through
+    # the same numbered menu and selectable by number.
     reg = m.agents_by_id()
-    answers = iter(["4"])
+    answers = iter(["5"])
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
-    assert m.pick_model(reg["freebuff"], None) == "deepseek-v4.1-flash"
+    assert m.pick_model(reg["freebuff"], None) == "deepseek/deepseek-v4-flash"
 
 
 def test_pick_model_without_list_cmd_or_choices_still_prompts(monkeypatch):
@@ -2698,8 +2785,11 @@ def test_emit_questions_carries_choices(monkeypatch, capsys):
     q = json.loads(out[out.index("{"):])
     coder_q = next(x for x in q["questions"] if x["key"] == "coders")
     assert "choices" in coder_q["per_item"]
+    # `choices` is a FALLBACK lineup (stale-tolerant), offered when the live
+    # `blink --list-models` probe fails or an older blink lacks --list-models.
     assert coder_q["per_item"]["choices"]["freebuff"] == [
-        "z-ai/glm-5.3-flash", "mimo-2.5", "solar-pro-4", "deepseek-v4.1-flash"]
+        "z-ai/glm-5.3-flash", "mimo/mimo-v2.6-pro", "openai/gpt-6-luna",
+        "upstage/solar-pro4", "deepseek/deepseek-v4-flash"]
     # rows without choices are simply absent, not empty
     assert "cline" not in coder_q["per_item"]["choices"]
 
