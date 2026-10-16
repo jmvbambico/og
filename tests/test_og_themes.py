@@ -419,7 +419,10 @@ def test_the_real_catalog_loads_with_every_theme_defining_all_eight_roles():
     assert "failed" in th.ROLES
     for slug, theme in catalog.items():
         assert theme.slug == slug
-        assert set(theme.colors) == set(th.ROLES), slug
+        # The EIGHT required roles, plus at most the OPTIONAL `strip` (only `og`
+        # declares it — its background is the terminal's own, so its footer band has
+        # no colour to derive from and the operator named one).
+        assert set(th.ROLES) <= set(theme.colors) <= set(th.ALL_ROLES), slug
         assert theme.colour("failed") != "default", slug
 
 
@@ -567,6 +570,28 @@ def test_a_typo_role_is_refused_rather_than_ignored(tmp_path):
     with pytest.raises(th.ThemeError) as caught:
         th.load_catalog(_write(tmp_path / "t.json", {"nord": _good_row(colors=colors)}))
     assert "nord" in str(caught.value) and "selection" in str(caught.value)
+
+
+def test_the_optional_strip_role_is_validated_like_any_other(tmp_path):
+    """`strip` is OPTIONAL, but when a row declares it, it goes through the SAME
+    validation a required role does — the loader never routes it around the hex
+    check. An ABSENT strip is fine (the 25 derived themes); a MALFORMED one is
+    refused by slug and role, exactly like any other colour."""
+    # Absent: allowed, and resolves to no declared strip.
+    theme = th.load_catalog(_write(tmp_path / "absent.json", {"example": _good_row()}))
+    assert theme["example"].strip() is None
+
+    # Declared and valid: kept verbatim.
+    row = _good_row(colors={**{r: "#112233" for r in th.ROLES}, "strip": "#232625"})
+    theme = th.load_catalog(_write(tmp_path / "valid.json", {"example": row}))
+    assert theme["example"].strip() == "#232625"
+
+    # Declared and MALFORMED: refused, naming the slug AND the role.
+    row = _good_row(colors={**{r: "#112233" for r in th.ROLES}, "strip": "#FFF"})
+    with pytest.raises(th.ThemeError) as caught:
+        th.load_catalog(_write(tmp_path / "bad.json", {"gruvbox": row}))
+    message = str(caught.value)
+    assert "gruvbox" in message and "strip" in message, message
 
 
 @pytest.mark.parametrize("label,order", [(None, 1), ("  ", 1), ("X", "1"),

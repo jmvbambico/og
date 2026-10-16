@@ -1141,10 +1141,17 @@ def test_height_trimming_keeps_a_whole_block_and_never_splits_a_box():
             worker("w1", "working", text="one"),
             header(text="second", sid="root2"), rail("idle"),
             worker("w2", "idle", text="two")]
+
+    def rails(lines):
+        # A RAIL row is the rail glyph ALONE. A worker's row also carries a `│`
+        # inside its box, so match the whole stripped LINE, never the character.
+        return [line for line in lines if line.strip() == a.RAIL]
+
     full = a.render(a.Frame(rows=rows), width=C2_WIDTH)
     joined = "\n".join(full)
-    # The two roots plus the two worker boxes.
+    # The two roots plus the two worker boxes, and one rail per root.
     assert joined.count("╭") == 4 and joined.count("╰") == 4
+    assert len(rails(full)) == 2, rails(full)
 
     # Blocks: [root1 (3)] [rail + w1 (1+3)] [root2 (3)] [rail + w2 (1+3)] = 14
     # rows. With the two-row tail reserved, height=12 leaves room for the first
@@ -1156,6 +1163,11 @@ def test_height_trimming_keeps_a_whole_block_and_never_splits_a_box():
     assert "two" not in short_joined, "a box must not be cut in half"
     # The two root boxes and the first worker box, each whole.
     assert short_joined.count("╭") == short_joined.count("╰") == 3
+    # ...and root2's RAIL went WITH the w2 block it opened: exactly one rail
+    # survives. This is the other half of the invariant — a rail is never left
+    # behind without its boxes — which the BOX counts cannot see: dropping w2's box
+    # while keeping its rail leaves ╭/╰ unchanged and `two` still absent.
+    assert len(rails(short)) == 1, rails(short)
     for word in OLD_GROUP_LABELS:
         assert word not in short_joined, word
 
@@ -3719,8 +3731,14 @@ def test_the_kilo_mark_paints_kilos_brand_lemon(monkeypatch):
     # On the colour, not the pair NUMBER: pairs are spent on first use, so the
     # index depends on what else the frame happened to paint first (here the idle
     # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    # The last two pairs are the FOOTER's, which now carries a strip under `og` too
+    # (its DECLARED `strip` role, `#232625`): the key (`default` fg) and the
+    # label/meta, both on the strip's cell. They are incidental to the mark claim but
+    # are part of the frame's spend, so they are named rather than filtered out.
+    strip_bg = a.hex_to_ansi256(a.footer_strip(_theme("og")))
     assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
-        (a._STATE_COLOURS["idle"], -1), (227, -1), (a.META_COLOR, -1)]
+        (a._STATE_COLOURS["idle"], -1), (227, -1), (a.META_COLOR, -1),
+        (-1, strip_bg), (a.META_COLOR, strip_bg)]
     mark = _writes_for(writes, a.harness_mark(harness))
     assert mark, writes
     for attr in mark:
@@ -3748,11 +3766,12 @@ def test_the_freebuff_mark_paints_freebuffs_brand_sage(monkeypatch):
     frame = a.Frame(rows=[worker("w1", "idle", harness=harness, meta="12s")],
                     selected=0)
     fake, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=256)
-    # On the colour, not the pair NUMBER: pairs are spent on first use, so the
-    # index depends on what else the frame happened to paint first (here the idle
-    # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    # On the colour, not the pair NUMBER (see the kilo test above); the last two
+    # pairs are the footer's strip under `og`, incidental to this mark claim.
+    strip_bg = a.hex_to_ansi256(a.footer_strip(_theme("og")))
     assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
-        (a._STATE_COLOURS["idle"], -1), (108, -1), (a.META_COLOR, -1)]
+        (a._STATE_COLOURS["idle"], -1), (108, -1), (a.META_COLOR, -1),
+        (-1, strip_bg), (a.META_COLOR, strip_bg)]
     mark = _writes_for(writes, a.harness_mark(harness))
     assert mark, writes
     for attr in mark:
@@ -4652,10 +4671,13 @@ def test_the_footer_separator_is_not_ambiguous():
     assert width not in ("W", "F"), "a Wide/Fullwidth separator would shear the row"
 
 
-def test_the_footer_key_is_prominent_and_its_label_recedes():
-    """1a. Each entry is TWO spans, so the KEY reads as the prominent half: the key
-    takes the theme's `text` slot AND is exempt from the footer line's DIM, while
-    the label and the ` ∙ ` separator take `meta` and dim with the chrome."""
+def test_the_footer_key_and_label_are_both_bright_and_differ_in_colour():
+    """1a. Each entry is TWO spans, and the two halves are told apart by COLOUR, not
+    brightness: the KEY takes the theme's `text` slot and the LABEL its `meta`, and
+    BOTH are exempt from the footer line's DIM. The label used to take plain `meta`
+    and dim with the chrome — dimmed twice over (darker colour AND the line's DIM) —
+    which the operator reported as too dim to read. The ` ∙ ` separator stays plain
+    `meta`, so it still recedes between the entries."""
     spans = a._footer_spans(120)          # wide enough for the full form
 
     key_text = "".join(t for t, role in spans
@@ -4668,19 +4690,30 @@ def test_the_footer_key_is_prominent_and_its_label_recedes():
         assert key in key_text, (key, key_text)
     for label in ("move", "focus", "theme", "access", "quit"):
         assert label in label_text, (label, label_text)
-    # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES, and there is exactly one per
-    # join between entries.
+    # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES: it takes plain `meta`, and there
+    # is exactly one per join between entries.
     assert label_text.count(a.FOOTER_SEP) == len(a.FOOTER_ENTRIES) - 1
-    # ONLY the key is exempt from the line's brightness: the exemption and the role
-    # are the same fact, and nothing else carries it.
-    for _text, role in spans:
-        assert role.startswith(a.UNDIM) == (a._bare_role(role) == a.FOOTER_KEY), role
-    # And the two roles name the theme slots the task asked for.
+    assert any(text == a.FOOTER_SEP and role == a.FOOTER_LABEL
+               for text, role in spans), "the separator must NOT be undimmed"
+    # BOTH halves carry the exemption — the key `undim:footer-key`, the label
+    # `undim:footer-label` — and NOTHING else does: the separator and the strip's
+    # padding stay plain (still `meta`, still dimmed). The first assertion is the
+    # reported fix made explicit: without a label span that IS `undim:footer-label`,
+    # every label dims twice over and reads too dim.
+    assert any(role == a.undim(a.FOOTER_LABEL) for _text, role in spans), \
+        "every label must be undim-exempt, or it dims twice and reads too dim"
+    for text, role in spans:
+        exempt = role.startswith(a.UNDIM)
+        expected = role in (a.undim(a.FOOTER_KEY), a.undim(a.FOOTER_LABEL))
+        assert exempt == expected, (text, role)
+    # And the two roles name the theme slots the task asked for: two halves, two
+    # colours, so a key is still distinguishable from its label with the brightness
+    # axis taken away from them.
     assert a._theme_role(a.FOOTER_KEY) == "text"
     assert a._theme_role(a.FOOTER_LABEL) == a.META == "meta"
-    # The key is the `text` slot at FULL brightness; the label is `meta` on the
-    # line's DIM — so the pairing is prominence, not merely two colours.
+    # BOTH halves paint at FULL brightness now; the separator still recedes.
     assert a._role_brightness(a.undim(a.FOOTER_KEY)) == a.NORMAL
+    assert a._role_brightness(a.undim(a.FOOTER_LABEL)) == a.NORMAL
     assert a._role_brightness(a.FOOTER_LABEL) is None
 
 
@@ -4790,10 +4823,17 @@ def test_the_window_background_is_filled_for_an_opaque_theme(monkeypatch):
 
 
 def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
-    """AND NOT FOR `og`. Setting the background to a pair allocated for some
-    other role would put a colour on the pane nobody chose; the whole of what
-    this row promises is that the terminal's own background keeps coming
-    through. NO CALL AT ALL is the claim, so that is what is asserted."""
+    """AND NOT FOR `og`. Setting the WINDOW background to a pair allocated for some
+    other role would put a colour on the pane nobody chose; the whole of what this
+    row promises is that the terminal's own background keeps coming through. NO
+    CALL AT ALL is the claim, so that is what is asserted.
+
+    THE FOOTER STRIP IS THE ONE DELIBERATE EXCEPTION. `og` has no `bg` to shade, so
+    it DECLARES its strip in the catalog's optional `strip` role (`#232625`) for the
+    footer chrome alone (a user-requested fix — an invisible strip is no strip). So
+    the background set is no longer `{-1}`: every PANE role still paints on the
+    terminal's own background, and the strip's single cell is the only colour, spent
+    on the footer row."""
     frame = a.Frame(rows=[header()], selected=0)
     fake = FakeCurses(colors=256, color_pairs=256)
     monkeypatch.setitem(sys.modules, "curses", fake)
@@ -4802,10 +4842,8 @@ def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
     a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
                theme=_theme("og"))
     assert scr.bkgd_calls == [], "og leaves the window background untouched"
-    # Every background is the terminal's own (-1). The footer's label/meta spans
-    # spend a pair of their own now, so this is a SET of backgrounds, not one —
-    # what `og` promises is that none of them is a colour.
-    assert set(bg for _p, _fg, bg in fake.init_pair_calls) == {-1}
+    strip = a.hex_to_ansi256(a.footer_strip(_theme("og")))
+    assert set(bg for _p, _fg, bg in fake.init_pair_calls) == {-1, strip}
 
 
 def test_the_window_background_is_set_by_a_CALL_a_terminal_will_accept():
@@ -5001,16 +5039,26 @@ def test_the_footer_strip_is_a_different_cell_from_the_background_of_every_theme
     background's OWN cell would be invisible and the feature would do nothing at
     all, silently — and one that resolved to `sel_bg`'s cell would paint the footer
     exactly as a SELECTED row. Every theme the catalog ships is checked for both
-    separations here, and `og` — whose `bg` is the terminal's own — is checked to
-    have NO strip, because there is no colour to shade. Before the guard covered
-    `sel_bg`, six shipped themes (ayu-dark, bearded-dark, dracula, github-dark,
-    monokai-dark, one-dark) put the strip on the selection's own cell."""
+    separations here. Before the guard covered `sel_bg`, six shipped themes
+    (ayu-dark, bearded-dark, dracula, github-dark, monokai-dark, one-dark) put the
+    strip on the selection's own cell.
+
+    A TRANSPARENT theme (`og` alone) has no `bg` cell to differ from, so it is
+    checked against its own requirement instead: its strip is DECLARED (the optional
+    `strip` role) and must be a real, DARK cell in the palette."""
     themes = th.ordered_themes(th.load_catalog())
     opaque = 0
     for theme in themes:
         strip = a.footer_strip(theme)
         if theme.background() is None:
-            assert strip is None, theme.slug
+            # A transparent theme has no `bg` cell to differ from; it has a strip
+            # only by DECLARING one (its optional `strip` role), and that must be a
+            # real, DARK cell in the palette. `og` is the only such row today.
+            assert theme.strip() is not None, theme.slug
+            assert strip is not None, theme.slug
+            assert th.relative_luminance(strip) < 0.5, \
+                f"{theme.slug}: a declared strip must be DARK"
+            assert 16 <= th.hex_to_ansi256(strip) < 256, theme.slug
             continue
         opaque += 1
         cell = a.hex_to_ansi256(strip)
@@ -5053,22 +5101,83 @@ def test_the_strip_falls_back_to_a_neighbour_cell_when_no_shade_separates(
     assert a.hex_to_ansi256(a.footer_strip(theme)) == base + 1
 
 
-def test_an_og_footer_has_no_strip_and_spends_no_pair_for_one():
-    """`og` PROMISES THE TERMINAL'S OWN BACKGROUND, and a strip is a colour this
-    process would be inventing for a pane that has no background to shade. So there
-    is none, the footer's roles resolve to `default`, and the key's own span spends
-    no pair at all."""
+def test_og_declares_its_footer_strip_and_it_resolves_to_its_cell():
+    """`og` DRAWS ON THE TERMINAL'S OWN BACKGROUND, so there is no `bg` to shade and
+    its footer strip had no colour at all — the bug the user reported ("what about
+    the background for the full menu strip?"). The operator NAMED one, so it is
+    DECLARED in the catalog's optional `strip` role (`#232625`) rather than derived.
+    The CELL is the claim, never the hex — two hexes routinely share one cell, and
+    `#232625` resolves to cell 235."""
     og = _theme("og")
     assert og.background() is None
-    assert a.footer_strip(og) is None
+    assert og.strip() == "#232625", "og must DECLARE its strip, not derive one"
+    strip = a.footer_strip(og)
+    assert strip == "#232625"
+    assert a.hex_to_ansi256(strip) == 235, a.hex_to_ansi256(strip)
+    assert th.relative_luminance(strip) < 0.5, "the strip must be dark"
     assert a.footer_strip(None) is None
-    assert a._role_background(a.FOOTER_KEY, og) is None
-    assert a._role_background(a.FOOTER_LABEL, og) is None
+    # The footer's TWO roles resolve to that strip; a PANE role does not.
+    assert a._role_background(a.FOOTER_KEY, og) == strip
+    assert a._role_background(a.FOOTER_LABEL, og) == strip
+    assert a._role_background("meta", og) is None
 
     fake = FakeCurses(colors=256, color_pairs=256)
     colours = a._Colours(fake, og)
-    assert colours.role_attr(a.undim(a.FOOTER_KEY), og) == 0, \
-        "a `default` foreground on no background is pair 0, not a new pair"
+    # The key's `default` foreground on the strip's background DOES spend a pair:
+    # `default` is the terminal's own TEXT, not the terminal's own CELL, so it has
+    # to be painted ON the strip. Only both-ends-default is pair 0 now.
+    assert colours.role_attr(a.undim(a.FOOTER_KEY), og) != 0
+    assert colours.role_attr("plain", og) == 0, \
+        "a pane role with no background still spends no pair"
+
+
+def test_a_declared_strip_wins_over_any_derivation(tmp_path):
+    """An explicit `strip` role BEATS the `bg` derivation: `footer_strip` returns the
+    declared colour VERBATIM, never a shade of `bg` the operator did not pick."""
+    derived = a.footer_strip(_hand_edited_theme(tmp_path, bg="#282a36"))
+    declared = a.footer_strip(
+        _hand_edited_theme(tmp_path, bg="#282a36", strip="#123456"))
+
+    assert a.hex_to_ansi256(declared) == a.hex_to_ansi256("#123456")
+    # The SAME `bg` without a declared strip derives something ELSE, which is what
+    # makes the assertion above a test of PRECEDENCE and not of coincidence.
+    assert declared != derived, (declared, derived)
+
+
+def test_the_footer_strip_is_unchanged_for_a_theme_with_an_explicit_background():
+    """The 25 explicit-bg themes are NOT touched by `og`'s declared strip: none of
+    them declares one, so the strip is still a shade of `bg` moved AWAY from it —
+    lighter on a dark theme, darker on a light one. Pinned on one of each so a later
+    "always dark" refactor fails loudly: a dark strip on a LIGHT theme is dark-on-
+    dark. All 25 stay byte-identical to the pre-`strip`-role derivation."""
+    # A dark theme: no declared strip, and the strip differs from `bg` as a CELL.
+    dark = _theme("dracula")
+    assert dark.strip() is None, "an opaque theme must not declare a strip"
+    dark_strip = a.footer_strip(dark)
+    assert dark_strip is not None and dark_strip != dark.colour("bg")
+    assert a.hex_to_ansi256(dark_strip) != a.hex_to_ansi256(dark.colour("bg"))
+
+    # A LIGHT theme: it declares no strip, and its derived strip stays LIGHT —
+    # darker than the light pane, but nowhere near `og`'s declared dark band. This
+    # is the assertion an "always dark" refactor breaks.
+    light = _theme("catppuccin-latte")
+    assert light.strip() is None
+    assert th.relative_luminance(light.colour("bg")) > 0.5, \
+        "the fixture is no longer a light theme"
+    light_strip = a.footer_strip(light)
+    assert light_strip is not None
+    assert a.hex_to_ansi256(light_strip) != a.hex_to_ansi256(light.colour("bg"))
+    assert th.relative_luminance(light_strip) > 0.5, \
+        "a light theme must keep a LIGHT strip, not inheriting og's dark band"
+
+
+def test_a_theme_with_no_declared_strip_and_no_background_has_no_strip(tmp_path):
+    """A theme that declares NO `strip` and has no real `bg` names no footer colour
+    at all, so the strip is None — inventing one would spend a colour nobody chose.
+    (`og` is not this case: it has no `bg` but DOES declare a strip.)"""
+    theme = _hand_edited_theme(tmp_path)          # every role default, no strip
+    assert theme.background() is None and theme.strip() is None
+    assert a.footer_strip(theme) is None
 
 
 def test_an_opaque_theme_spends_no_sel_bg_pair_while_the_pane_is_untouched(monkeypatch):

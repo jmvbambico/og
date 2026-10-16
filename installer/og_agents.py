@@ -426,10 +426,12 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              not be expressed at all.
 #   FOOTER_KEY    a footer shortcut's KEY half, and FOOTER_LABEL its label half
 #              (and the `∙` between entries, and the strip's padding). They are
-#              two roles rather than one because the KEY is the prominent half —
-#              it takes the `text` slot and is `undim`-exempt — while the label
-#              recedes into `meta`. Both carry the footer's derived background
-#              strip, which is why they cannot just be PLAIN/META (see
+#              two roles rather than one because the halves differ in COLOUR: the
+#              KEY is the prominent half (`text`), the label the quieter one
+#              (`meta`). Both are `undim`-exempt so both stay bright on the footer
+#              line's DIM (a label dimmed twice read as too dim — the reported
+#              bug), leaving colour as the distinction. Both carry the footer's
+#              background strip, which is why they cannot just be PLAIN/META (see
 #              `_role_background`).
 PLAIN, META, ORCH = "plain", "meta", "orch"
 BORDER = "border"
@@ -1070,6 +1072,10 @@ _OG_COLOURS = {
     "working": "#ffff00",
     "failed": "#ff0000",
     "rail": "default",
+    # The optional `strip` role: the footer's background band, PICKED by the
+    # operator rather than derived (this row has no `bg` to shade). Kept
+    # byte-for-byte in step with the catalog row by a test.
+    "strip": "#232625",
 }
 
 # The one colour every worker META paints in under the `og` theme: ansi 109, a
@@ -2095,9 +2101,9 @@ def _pad_footer(spans: list[Span], width: int) -> list[Span]:
     so a footer that stopped at its last key would leave the window's own
     background showing between the keys and the pane edge — the strip has to be
     carried by a span that reaches the edge. The pad takes `FOOTER_LABEL` (never
-    PLAIN) so it shares the footer's derived background; under `og` that
-    background is None and the padding is invisible, which is the point — it costs
-    the theme-less pane nothing.
+    PLAIN) so it shares the footer's background — the DERIVED shade on a theme with
+    a `bg`, the DECLARED `strip` on `og` (see `footer_strip`) — and it is what makes
+    the strip span the WHOLE pane width, on `og` too rather than inert.
 
     The measure is `len` (`_spans_width`), the ruler the whole pane is composed
     under and the one `paint_line` positions by — so the pad lands in the pane's
@@ -2119,10 +2125,15 @@ def _footer_spans(width: int) -> list[Span]:
     which half is the thing to press. The KEY takes `text` (the body colour) and is
     hung through `undim`, so it stays at full brightness on a line the pane paints
     DIM — the footer is chrome and its LINE is dim, but the key is the content of
-    that chrome and must not be. The LABEL and the `∙` separator both take `meta`,
-    which is the dimmer of the two, so the separator recedes between the entries
-    exactly as a divider should. Both roles carry the derived strip background
-    (see `_role_background`).
+    that chrome and must not be. The LABEL takes `meta` (the quieter colour) and is
+    ALSO hung through `undim`, so it paints at NORMAL: the reported bug was that a
+    label was dimmed twice over — `meta`'s darker colour AND the line's DIM — and
+    read as too dim to use. The two halves are still told apart, now by COLOUR
+    (`text` vs `meta`) rather than by brightness, which is the cleaner distinction
+    for two pieces of the same instruction. The `∙` separator deliberately keeps
+    plain `meta` and its line's DIM, so it still recedes between the entries exactly
+    as a divider should rather than competing with the labels beside it. All three
+    roles carry the footer's strip background (see `_role_background`).
 
     ` ` joins a key to its label and `_footer_sep` picks what joins the entries,
     so the spans JOIN to exactly the string `_footer(width)` chooses — one form,
@@ -2137,7 +2148,7 @@ def _footer_spans(width: int) -> list[Span]:
             spans.append((sep, FOOTER_LABEL))
         spans.append((key, undim(FOOTER_KEY)))
         if label:
-            spans.append((f" {label}", FOOTER_LABEL))
+            spans.append((f" {label}", undim(FOOTER_LABEL)))
     return _pad_footer(spans, width)
 
 
@@ -2691,8 +2702,9 @@ def _theme_role(role: str) -> Optional[str]:
     BORDER NAMES `rail`, and that is the slot's documented purpose ("group rails
     and box borders") finally being reached: no role mapped to it before, so the
     access panel's frame — its title rule and its borders — is the first thing to
-    paint it. The footer's two roles name `text` and `meta`, the prominent half
-    and the recessed half of the same row.
+    paint it. The footer's two roles name `text` and `meta`, the prominent and the
+    quieter half of the same row — a COLOUR difference, not a brightness one, since
+    both are `undim`-exempt (see `_footer_spans`).
     """
     bare = _bare_role(role)
     if bare.startswith("mark:"):
@@ -2786,11 +2798,11 @@ def _mark_colour(vendor: str, theme: Optional[Theme] = None) -> Optional[int]:
 # the footer's background strip
 # ---------------------------------------------------------------------------
 #
-# The strip is a SHADE OF THE THEME'S OWN `bg`, not a ninth theme role. A role
-# would have meant editing `ROLES`, every row of installer/themes.json and the
-# loader's refusal rule — churn that was explicitly rejected — so the strip is
-# DERIVED, and deriving it has ONE failure mode that must be defended against,
-# because this bug is silent:
+# The strip is a colour OF THE THEME, not one the pane invents: a theme that names
+# its own footer band DECLARES it in the optional `strip` role (`og` — its `bg` is
+# the terminal's own, so it had nothing to shade); every other theme has one DERIVED
+# here as a shade of its `bg`. The DERIVED path has ONE failure mode that must be
+# defended against, because this bug is silent:
 #
 # TWO DIFFERENT HEXES ROUTINELY LAND ON THE SAME 256-COLOUR CELL, and this
 # terminal reports COLORS=256 and cannot redefine any of them (no `ccc`), so a
@@ -2824,30 +2836,53 @@ def _shade(srgb: tuple, amount: float) -> tuple:
 
 
 def footer_strip(theme: Optional[Theme]) -> Optional[str]:
-    """The footer's background strip for `theme`, as a hex — or None where there is
-    no known background to shade.
+    """The footer's background strip for `theme`, as a hex — or None where the
+    theme offers neither a declared strip nor a background to derive one from.
 
-    None for `og` (and for any theme whose `bg` is `"default"`): the pane is
-    transparent, there is no colour here to shade, and painting a strip anyway
-    would put a colour on the one theme that promises the terminal's own — the
-    same promise `apply_background` keeps.
+    THREE ANSWERS, in this ORDER, and the order is the whole design:
 
-    Otherwise a shade of the theme's `bg`, moved AWAY from it — lighter on a dark
-    pane, darker on a light one — because a shade that moved toward the background
-    would BE the background. Each candidate is resolved to its 256-cell and
-    rejected while it lands on a FORBIDDEN cell (see the block comment above: that
-    is the whole reason this is a loop and not one multiplication). Two cells are
-    forbidden — `bg`'s, because a strip that IS the background is invisible, and
-    `sel_bg`'s, because a strip that IS the selection makes the footer read as a
-    chosen row. If no step clears both, a DEFINED NEIGHBOUR of the background's own
-    cell is returned: the neighbour walk takes the nearest cell clear of BOTH, and
-    only where that is impossible does it give up the `sel_bg` requirement — never
-    the `bg` one, because an invisible strip is worse than one that resembles the
-    selection. `[16, 256)` keeps any neighbour out of the terminal's own first
-    sixteen ANSI slots, whose colours are the terminal's and not the catalog's.
+      1. the theme DECLARES a `strip` (the optional ninth catalog role, see
+         `og_themes.OPTIONAL_ROLES`) -> use it VERBATIM. An operator who has PICKED
+         a footer colour has answered the question this function exists to ask, so
+         nothing is derived over the top of it — the same authority the catalog
+         already gives a hand-picked cell (dracula's parchment is `#ffd7af`, chosen
+         from the cells, not computed). `og` is the reason the role exists: its `bg`
+         is the terminal's own, so there was no colour to shade and its strip was
+         invisible until the operator named one (`#232625`).
+      2. else the theme has a real `bg` -> the EXISTING derivation: a shade of `bg`
+         moved AWAY from it (lighter on a dark pane, darker on a light one),
+         resolved to its 256-cell and rejected while it lands on a FORBIDDEN cell
+         (see the block comment above — that is the whole reason this is a loop and
+         not one multiplication). Two cells are forbidden: `bg`'s, because a strip
+         that IS the background is invisible, and `sel_bg`'s, because a strip that
+         IS the selection makes the footer read as a chosen row. If no step clears
+         both, a DEFINED NEIGHBOUR of the background's own cell is returned: the
+         neighbour walk takes the nearest cell clear of BOTH, and only where that is
+         impossible does it give up the `sel_bg` requirement — never the `bg` one,
+         because an invisible strip is worse than one that resembles the selection.
+         `[16, 256)` keeps any neighbour out of the terminal's own first sixteen
+         ANSI slots, whose colours are the terminal's and not the catalog's. THIS
+         PATH IS UNCHANGED and must stay so: all 25 themes with a real `bg` derive
+         their strip here.
+      3. else (no declared strip AND no `bg`) -> None. A theme that named neither has
+         no colour to paint, and inventing one would spend a colour nobody chose.
+
+    WHY `og` IS ALLOWED A STRIP AT ALL, since this used to return None for every
+    transparent theme on the argument that a colour here breaks the row's promise of
+    the terminal's own background. THE PROMISE IS KEPT FOR THE PANE, NOT for the
+    footer chrome: `apply_background` still leaves `og`'s window background
+    untouched, and the footer band is a deliberate, user-requested EXCEPTION — a
+    menu strip that cannot be seen is not a menu strip, which is the bug that
+    produced the `strip` role in the first place.
+
+    Judge the result by its CELL, never its hex: two hexes routinely share one cell,
+    and the terminal paints only the cell (see the block comment above).
     """
     if theme is None:
         return None
+    declared = theme.strip()
+    if declared is not None:
+        return declared
     base = theme.background()
     if base is None:
         return None
@@ -2894,12 +2929,15 @@ def _role_background(role: str, theme: Optional[Theme] = None, *,
     actually testing. Under `og` both answers are None, which is why the golden
     render is unaffected.
 
-    AND EXCEPT THE FOOTER'S TWO ROLES, which take the STRIP — a shade of the same
-    `bg`, derived per theme by `footer_strip` so it is never the cell `bg` is, nor
-    the cell `sel_bg` is. That is the second thing `_role_background` is a per-span
-    property for: the footer is chrome, and a chrome band has to read as a band
-    rather than vanish into the pane OR into the selection. The strip is a bare 12%
-    away from `bg`, so text and labels chosen for `bg` keep their contrast on it.
+    AND EXCEPT THE FOOTER'S TWO ROLES, which take the STRIP — derived per theme by
+    `footer_strip`: a colour the theme DECLARES in its optional `strip` role when it
+    has one (`og` does), else a shade of `bg` (never the cell `bg` is, nor the cell
+    `sel_bg` is) on a theme with a real background. That is the second thing
+    `_role_background` is a per-span property for: the footer is chrome, and a
+    chrome band has to read as a band rather than vanish into the pane OR into the
+    selection. On an opaque theme the strip is a bare 12% away from `bg`, so text
+    and labels chosen for `bg` keep their contrast on it; on `og` it is the
+    operator's own pick (`#232625`), a dark band under the light default foreground.
     """
     if theme is None:
         return None
