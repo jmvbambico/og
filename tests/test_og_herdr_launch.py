@@ -2821,7 +2821,7 @@ def test_an_empty_dir_is_refused_by_the_helper_on_its_own(tmp_path, monkeypatch,
 
 
 # ---------------------------------------------------------------------------
-# the agent's own terminal: resolving it, then mirroring it read-only
+# the agent's own terminal: resolving it for a vendor-CLI tab
 # ---------------------------------------------------------------------------
 # Every test here builds a FAKE `<tmp>/omnigent-<uid>/…` tree and points the code
 # at it through the `environ` argument, so nothing reads the operator's real
@@ -3206,274 +3206,27 @@ def _space_state(state_path, root, **record):
     return rec
 
 
-def test_cli_pane_toggle_opens_a_read_only_attach_below_the_chat(tmp_path, short_dir):
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    sock = _bound_socket(short_dir)
-    _, session_dir = _native_session(tmp_path, "root-1")
-    (session_dir / "tmux.json").write_text(json.dumps(
-        {"socket_path": sock, "tmux_target": "main"}))
-    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state)
-
-    assert notice is None
-    # BELOW the chat (`direction: down`), not beside it: the agents pane's
-    # right-split is where the WIDTH lives, so the mirror takes the chat column.
-    # The split carries the browser-suppression map the pane env rule requires.
-    assert client.split_params == {
-        "target_pane_id": "w1:p1", "direction": "down", "focus": False,
-        "ratio": og_herdr_launch.CLI_PANE_RATIO, "cwd": "/work",
-        "env": {"BROWSER": "true"}}
-    (typed,) = client.text_typed()
-    assert typed.startswith("tmux -S ")
-    assert "-f ignore-size" in typed, typed
-    assert "-t main" in typed, typed
-    # The pane id is remembered on the space record, so the toggle can close it.
-    assert load_state(state)["spaces"]["root-1"][og_herdr.CLI_PANE_FIELD] == "w1:p9"
-
-
-def test_cli_pane_toggle_a_second_press_closes_and_never_doubles(tmp_path, short_dir):
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    sock = _bound_socket(short_dir)
-    _, session_dir = _native_session(tmp_path, "root-1")
-    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
-    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    assert og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state) is None
-    assert og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state) is None
-
-    # Opening twice must NOT open two panes: the second toggle CLOSES the first.
-    assert client.methods.count("pane.split") == 1, client.methods
-    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls
-    # and clearing REMOVES the field, so the record reads as a fresh closed one
-    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
-
-
-def test_cli_pane_toggle_degrades_for_an_acp_harness_without_splitting(tmp_path):
-    # An ACP harness is a plain stdio child with no pty — there is nothing to
-    # mirror, by construction. The line must say so and no pane is opened.
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    client = FakeClient()
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "acp:cline", environ=env, client=client,
-        state_path=state)
-
-    assert notice == "Cline runs on an ACP harness, which has no terminal to show"
-    assert "pane.split" not in client.methods
-
-
-def test_cli_pane_toggle_reports_no_terminal_for_a_native_session_with_none(tmp_path):
-    # Native harness, but no live record (the session ended, or the layout
-    # changed): the honest "no terminal" line, and still no pane.
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    client = FakeClient()
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state)
-
-    assert notice == og_herdr_launch.NOTICE_CLI_NOT_FOUND
-    assert "pane.split" not in client.methods
-
-
-def test_cli_pane_toggle_outside_herdr_says_so_and_touches_nothing(tmp_path):
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    client = FakeClient()
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ={"TMPDIR": str(tmp_path)},
-        client=client, state_path=state)
-
-    assert notice == og_herdr_launch.NOTICE_CLI_OUTSIDE_HERDR
-    assert client.calls == []
-
-
-def test_cli_pane_toggle_refuses_when_no_space_is_recorded(tmp_path):
-    state = tmp_path / "og-herdr.json"  # nothing recorded for this session
-    client = FakeClient()
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state)
-
-    assert notice == og_herdr_launch.NOTICE_CLI_NO_SPACE
-    assert "pane.split" not in client.methods
-
-
-def test_cli_pane_toggle_state_write_returns_false_closes_the_pane(tmp_path, short_dir, monkeypatch):
-    # `state_update` is declared `-> bool` precisely so the caller can tell
-    # whether the write landed. When it returns falsey (disk full, permissions,
-    # anything `_write_state` reports as a failed write) the pane is open but
-    # unrecorded: close it and decline, so a second `c` can never split a
-    # duplicate mirror.
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    sock = _bound_socket(short_dir)
-    _, session_dir = _native_session(tmp_path, "root-1")
-    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
-    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-    monkeypatch.setattr(og_herdr_launch, "state_update",
-                        lambda path, decide, on_saved=None: False)
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state)
-
-    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED
-    assert client.methods.count("pane.split") == 1, client.methods
-    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
-    # The pane that never got recorded is closed again: nothing unrecorded
-    # lingers for the next toggle to misread.
-    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
-
-
-def test_cli_pane_toggle_state_write_raising_never_propagates(tmp_path, short_dir, monkeypatch):
-    # Same failure, but `state_update` raises instead of returning falsey:
-    # `_set_cli_pane` swallows the exception and the toggle still becomes a
-    # notice rather than a traceback that kills the `og agents` pane.
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    sock = _bound_socket(short_dir)
-    _, session_dir = _native_session(tmp_path, "root-1")
-    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
-    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    def raising(path, decide, on_saved=None):
-        raise OSError("no space left on device")
-
-    monkeypatch.setattr(og_herdr_launch, "state_update", raising)
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state)
-
-    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED
-    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
-    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
-
-
-def test_set_cli_pane_absent_record_setting_writes_nothing_and_returns_false(tmp_path):
-    # No space record for this session: setting a pane id records nothing, so
-    # `put` returns falsey, `state_update` writes NOTHING (the file is byte-for
-    # byte unchanged), and `_set_cli_pane` returns False. `_open_cli_pane`
-    # therefore closes the pane it opened and declines.
-    state_path = tmp_path / "og-herdr.json"
-    save_state(state_path, {"spaces": {"other": {
-        "workspace_id": "w2", "tab_id": "w2:t1", "pane_id": "w2:p1",
-        "owner": "launcher", "cwd": "/work"}}, "pending": {}})
-    before = state_path.read_bytes()
-
-    assert og_herdr_launch._set_cli_pane(state_path, "root-1", "w1:p9") is False
-    assert state_path.read_bytes() == before, "state_update must not write when the record is absent"
-
-
-def test_set_cli_pane_absent_record_clearing_returns_true(tmp_path):
-    # No space record: clearing has nothing stale left to remove, which is the
-    # goal, so `_set_cli_pane` returns True and `_close_cli_pane` stays silent
-    # rather than warning the operator about a non-problem. The asymmetry with
-    # setting is the point.
-    state_path = tmp_path / "og-herdr.json"
-    save_state(state_path, {"spaces": {}, "pending": {}})
-
-    assert og_herdr_launch._set_cli_pane(state_path, "root-1", None) is True
-
-
-def test_cli_pane_toggle_record_vanished_between_read_and_write_closes_and_declines(tmp_path, short_dir, monkeypatch):
-    # A space record exists when `_space_record` reads it (so the toggle passes
-    # NO_SPACE and opens a pane), but another writer removes it before
-    # `_set_cli_pane` writes: `state_update`'s `put` sees no record, returns
-    # falsey, writes nothing, and `_set_cli_pane` returns False. The toggle
-    # closes the pane it opened and declines — never reports success with no
-    # cli_pane_id recorded.
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    sock = _bound_socket(short_dir)
-    _, session_dir = _native_session(tmp_path, "root-1")
-    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
-    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    def fake_state_update(path, decide, on_saved=None):
-        # Simulate the record being gone by the time the write decides.
-        return bool(decide({"spaces": {}, "pending": {}}))
-
-    monkeypatch.setattr(og_herdr_launch, "state_update", fake_state_update)
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state)
-
-    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED
-    assert client.methods.count("pane.split") == 1, client.methods
-    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
-    assert og_herdr.CLI_PANE_FIELD not in load_state(state)["spaces"]["root-1"]
-
-
-def test_cli_pane_toggle_state_write_and_recovery_close_both_fail(tmp_path, short_dir, monkeypatch):
-    # The state write fails AND the recovery `pane_close` raises: the pane is
-    # open, unrecorded, and og cannot close it. Return a distinct notice so the
-    # operator knows to close it by hand — a mitigation, not a cure; og cannot
-    # force a pane herdr will not release.
-    state = tmp_path / "og-herdr.json"
-    _space_state(state, "root-1")
-    sock = _bound_socket(short_dir)
-    _, session_dir = _native_session(tmp_path, "root-1")
-    (session_dir / "tmux.json").write_text(json.dumps({"socket_path": sock}))
-    client = FakeClient(split={"type": "ok", "pane": {"pane_id": "w1:p9"}})
-    env = {"HERDR_ENV": "1", "TMPDIR": str(tmp_path)}
-
-    monkeypatch.setattr(og_herdr_launch, "state_update",
-                        lambda path, decide, on_saved=None: False)
-
-    def raising_close(pane_id):
-        client.calls.append(("pane.close", {"pane_id": pane_id}))
-        raise OSError("herdr is gone")
-
-    client.pane_close = raising_close
-
-    notice = og_herdr_launch.cli_pane_toggle(
-        "root-1", "root-1", "claude-native", environ=env, client=client,
-        state_path=state)
-
-    assert notice == og_herdr_launch.NOTICE_CLI_NOT_RECORDED_OR_CLOSED
-    assert client.methods.count("pane.split") == 1, client.methods
-    assert ("pane.close", {"pane_id": "w1:p9"}) in client.calls, client.calls
-
-
-def test_the_optional_cli_pane_id_survives_a_state_reload(tmp_path):
-    # THE REGRESSION this pins: `_read_spaces` is a WHITELIST, so a field it does
-    # not name is dropped on load. `cli_pane_id` is written through `state_update`
-    # and read back through `load_state`; were it not in the whitelist, the
-    # launcher's own toggle would read back "closed" after opening and open a
-    # SECOND pane on the next keypress.
+def test_a_v2_record_carrying_cli_pane_id_loads_and_forgets_it(tmp_path):
+    # The retired `c` read-only CLI mirror wrote an optional `cli_pane_id` onto a
+    # space record, and a real user's `og-herdr.json` may still carry one.
+    # `_read_spaces` is a WHITELIST, so the field is now dropped on load — which
+    # is correct and desirable. What must NOT happen is a crash or a corrupted
+    # record: an existing file that still names the retired field has to load
+    # cleanly, keep every legitimate field it carries, and simply forget that one.
     state = tmp_path / "og-herdr.json"
     save_state(state, {"spaces": {"root-1": {
         "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+        "owner": "launcher", "cwd": "/work",
         "cli_pane_id": "w1:p9", "made-up": "x"}}, "pending": {}})
 
     rec = load_state(state)["spaces"]["root-1"]
 
-    assert rec["cli_pane_id"] == "w1:p9"
+    assert "cli_pane_id" not in rec, "the retired CLI-mirror field is forgotten"
+    assert rec["workspace_id"] == "w1"
+    assert rec["tab_id"] == "w1:t1"
     assert rec["pane_id"] == "w1:p1"
+    assert rec["owner"] == "launcher"
+    assert rec["cwd"] == "/work"
     assert "made-up" not in rec, "the whitelist must still drop unknown fields"
 
 

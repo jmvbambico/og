@@ -384,12 +384,13 @@ upstream change to Omnigent.
 
 Attaching a herdr pane to one of those private sockets *displays* beautifully —
 tested, and the real Claude Code TUI renders live, spinner and status bar
-included, with `-r` keeping the viewer from resizing the owner's pane. But
-herdr sees the pane's foreground process as `tmux`, not `claude`, so its
-process gate never selects a manifest and `agent_status` stays `unknown`.
+included. But herdr sees the pane's foreground process as `tmux`, not `claude`,
+so its process gate never selects a manifest and `agent_status` stays `unknown`.
 
-Useful as an optional high-fidelity view for a native worker. Useless as a
-detection strategy, and inapplicable to ACP workers.
+Useless as a detection strategy, and inapplicable to ACP workers. It is still
+the right way to *reach* a native agent's CLI — but as a tab og opens itself,
+never as something herdr detects (see *Reaching an agent's real CLI from
+`og agents`* below).
 
 ### ACP workers in a terminal
 
@@ -457,7 +458,6 @@ Which panes can fire it, on omnigent 0.17.0:
 | An agent's vendor-CLI tab, opened on demand by Enter | `tmux … attach -f ignore-size` | No |
 | Bridge's history space (`_add_history_space`) | `og chat --resume <id>`, **unsubmitted** | Nothing runs until the operator presses Enter; then **yes**, same as the launcher's pane |
 | The `og agents` split | `og agents` | No |
-| An agent's CLI mirror (`c` in `og agents`) | `tmux … attach -f ignore-size` | No |
 
 ---
 
@@ -465,7 +465,7 @@ Which panes can fire it, on omnigent 0.17.0:
 
 The motivating case is a vendor CLI holding a blocking question — a permission
 prompt — that cannot be answered through `og chat`. The web UI answers it by
-attaching to the agent's terminal; `og agents` does the same two ways.
+attaching to the agent's terminal; `og agents` does the same.
 
 ### The layout, and the one rule that keeps it
 
@@ -555,9 +555,10 @@ root's own pane), `cli` is the vendor-CLI tab beside it. Enter reads, in order:
 twice lands on the SAME tab, because the second call finds the `cli` note and
 `tab.create` is not reached. And if that note does NOT land, the tab just opened
 is closed again — an on-screen tab nothing records is exactly how the next Enter
-opens a second one, the defect `cli_pane_id` had to be fixed for twice. Notes are
-dropped when the panes go (`Bridge._forget_tab`), and a worker's vendor-CLI tab
-is closed with them (`Bridge._close_cli_tab`) since it is a tab of its own.
+opens a second one, the duplicate-pane defect this project has had to fix more
+than once. Notes are dropped when the panes go (`Bridge._forget_tab`), and a
+worker's vendor-CLI tab is closed with them (`Bridge._close_cli_tab`) since it is
+a tab of its own.
 
 The notices are distinct so "this can never work here" reads differently from
 "try again": `focus: not inside herdr (no HERDR_ENV)`, `focus: no agent on this

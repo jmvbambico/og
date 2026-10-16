@@ -376,7 +376,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╰────────────────────────────────────────╯",
         "",
         # The 46-column footer: now that the separator is U+2219 (Narrow) and
-        # COMPACT carries none at all, the compact form measures 45 and a
+        # COMPACT carries none at all, the compact form measures 43 and a
         # ~46-column pane gets it — the LABELLED form, as it should be (see
         # `test_the_footer_chooses_a_form_by_measured_width`). Whatever form it is,
         # the row is padded out to the pane with the strip.
@@ -4271,7 +4271,7 @@ def test_enter_on_a_sub_agent_row_focuses_its_own_session_not_its_root(monkeypat
 
     `w1` is a SUB-AGENT of `root` (`parent_session_id == "root"`). The reported
     defect was that selecting a worker and pressing Enter focused the ROOT's tab
-    (`focus_target` resolved a worker to its root) instead of the worker's own —
+    (the old resolution climbed a worker to its root) instead of the worker's own —
     and selecting the orchestrator focused nothing at all. Enter must now hand
     `focus_agent_terminal` the SELECTED row's OWN session id — `w1`, not `root` —
     with the worker's own harness and its root alongside.
@@ -4311,27 +4311,6 @@ def test_enter_on_the_root_row_focuses_the_root_itself(monkeypatch):
 
     # One DOWN adopts the root, so the root's own session and harness go through.
     assert calls == [("root", "claude-native", "")], calls
-
-
-
-def test_focus_target_climbs_to_the_root_not_the_immediate_parent():
-    """A worker nested two deep resolves to the TOP root — the pane that exists —
-    not its immediate parent, which is itself a pane-less sub-agent."""
-    sessions = [
-        listed("root", status="running", title="conversation"),
-        listed("w1", parent="root", status="running", title="coder_zen:worker"),
-        listed("g1", parent="w1", status="running", title="coder_zen:grandchild"),
-    ]
-    rows = a.build_rows(sessions, ["root"], now=NOW)
-    by_sid = {row.session_id: row for row in rows}
-    assert a.focus_target(by_sid["w1"]) == "root"
-    assert a.focus_target(by_sid["g1"]) == "root"
-
-
-def test_focus_target_of_a_root_row_is_its_own_session_id():
-    """A root owns its own herdr pane and targets itself — unchanged."""
-    assert a.focus_target(header(sid="root")) == "root"
-    assert a.focus_target(header(sid="abc123")) == "abc123"
 
 
 def test_enter_focuses_a_worker_whose_listing_carried_no_root(monkeypatch):
@@ -4398,43 +4377,6 @@ def test_focus_degrades_when_og_herdr_launch_cannot_be_imported(monkeypatch):
 
     assert any(a.NOTICE_FOCUS_UNAVAILABLE in text for text in screen.painted), \
         screen.painted
-
-
-def test_the_c_key_drives_cli_pane_for_the_selected_row(monkeypatch):
-    """The footer names `c cli`, but nothing asserted the `c` key actually
-    reaches `cli_pane_for_row` with the selected row's ids — a keypath break
-    (a row's agent dropped, or the root never resolved) would pass on the
-    footer test alone.
-
-    `cli_pane_toggle` is the dependency `cli_pane_for_row` delegates the whole
-    open/close decision to (it owns the state record and is the only place a
-    pane is split for this feature), so a recording fake there proves the
-    keypath without monkeypatching the function under test itself.
-    """
-    monkeypatch.setenv("HERDR_ENV", "1")
-    calls = []
-
-    def fake_toggle(root_session_id, session_id, harness, *,
-                    environ=None, client=None, state_path=None):
-        calls.append((root_session_id, session_id, harness))
-        return None
-
-    monkeypatch.setattr(og_herdr_launch, "cli_pane_toggle", fake_toggle)
-
-    frame = a.Frame(rows=[
-        header(sid="root"),
-        a.Row(session_id="w1", text="one", state="idle", depth=1,
-              harness="claude-native", root_session_id="root"),
-    ])
-    screen = _run_tui_capture(
-        monkeypatch, [DOWN, DOWN, ord("c"), QUIT],
-        model=_StubModel(frame))
-
-    # The first DOWN adopts the root, the second w1, so `c` acts on w1: its own
-    # session is the agent to mirror, its root is the space the pane splits into.
-    assert calls == [("root", "w1", "claude-native")], calls
-    # And a successful toggle paints no notice.
-    assert not any("cli:" in text for text in screen.painted), screen.painted
 
 
 def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(
@@ -4595,14 +4537,14 @@ def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_ref
 
 
 def test_the_footer_names_the_focus_and_expand_bindings():
-    # The FULL form spells Enter and Space with their KEY GLYPHS now (`⏎ focus`,
-    # `␣ expand`), not the words — that is the 8 columns `c cli` was bought with,
-    # and it is the same vocabulary COMPACT already used. Every binding stays
-    # LABELLED; only the word became a glyph. See `FOOTER_ENTRIES`.
+    # The FULL form spells Enter and Space with their KEY GLYPHS (`⏎ focus`,
+    # `␣ expand`), the same vocabulary COMPACT uses. Since `c cli` was removed the
+    # full form names `esc clear` too — Esc clears the selection and was
+    # undiscoverable. See `FOOTER_ENTRIES`.
     assert "⏎ focus" in a.FOOTER, "the footer must name the Enter binding"
     assert "␣ expand" in a.FOOTER, "the footer must name the Space binding"
     assert "a access" in a.FOOTER, "the existing bindings must survive"
-    assert "c cli" in a.FOOTER, "the footer must name the CLI mirror binding"
+    assert "esc clear" in a.FOOTER, "the footer must surface the Esc binding"
 
 
 def _cjk_width(text: str) -> int:
@@ -4621,7 +4563,7 @@ def _cjk_width(text: str) -> int:
 
 
 def test_the_footer_names_every_key_at_every_width():
-    # The regression this pins: the full footer is 64 columns and the agents pane
+    # The regression this pins: the full footer is 75 columns and the agents pane
     # is a ~46-column split, so a FIXED footer was clipped mid-word — "space
     # expand" and "a access" fell off the end, leaving the operator without the
     # two keys they most needed (Space, which had just inherited expand from
@@ -4638,8 +4580,8 @@ def test_the_footer_names_every_key_at_every_width():
         assert a._display_width(form) <= width, (width, form)
         assert _cjk_width(form) <= width, (width, form)
         assert row.rstrip() == form and len(row) == width, (width, row)
-        for letter in ("q", "r", "a", "t", "c"):
-            assert letter in row, (width, letter, row)
+        for key in ("q", "r", "a", "t", "esc"):
+            assert key in row, (width, key, row)
         assert ("^/v" in row or "^v" in row), (width, row)
         # Enter and Space are words at full width and glyphs when compact, but a
         # key must be named EITHER way.
@@ -4651,30 +4593,30 @@ def test_the_footer_chooses_a_form_by_measured_width():
     # The threshold is each form's own width, measured — not a magic number
     # that can drift out of step with the strings.
     #
-    # THE NUMBERS MOVED TWICE. `t theme` first cost COMPACT the word `refresh` (it
-    # shed a label rather than growing past the ~46-column split). Then a spaced
+    # THE NUMBERS MOVED REPEATEDLY. `t theme` first cost COMPACT the word `refresh`
+    # (it shed a label rather than growing past the ~46-column split). Then a spaced
     # separator was added and its glyph — U+00B7 MIDDLE DOT, East Asian AMBIGUOUS —
     # cost TWO measured columns each, which `_display_width` (the ruler `_footer`
     # chooses with) charged in full: the full form grew to 85, so a plain 80-column
     # terminal showed COMPACT and the ~46-column split fell all the way to the bare
     # KEYS form. THE SEPARATOR IS NOW U+2219 BULLET OPERATOR, NARROW — one column
     # under both rulers — and COMPACT carries none at all (its entries are joined by
-    # a single space, its pre-separator spelling), so the forms measure 79 / 45 / 26
-    # and an 80-column terminal gets the full form back. The key `r` is still in all
-    # three forms: only labels degrade.
+    # a single space, its pre-separator spelling). The key `r` is still in all three
+    # forms: only labels degrade.
     #
-    # THE NUMBERS MOVED A THIRD TIME, for `c cli` (the read-only harness mirror).
-    # The full form was already exactly 79, so Enter and Space were respelled as
-    # their key glyphs (`⏎ focus`, `␣ expand`, -8) to buy the new entry without
-    # dropping any label, and COMPACT shed `theme`'s label (`t` stays) to stay at
-    # 45. So the three forms measure 79 / 45 / 30.
+    # THE LAST MOVE RETIRED `c cli`. The read-only CLI mirror is gone, so its entry
+    # and its columns went to `esc clear`. Removing `c cli` freed 8 columns of the
+    # full form (79 → 71); `esc clear` costs 12 (→ 83), over the 79-column ceiling,
+    # so the full form sheds `refresh`'s label too (→ 75) — the label COMPACT
+    # already drops. So the three forms measure 75 / 43 / 32, with `esc` in all
+    # three.
     assert a._footer(79) == a.FOOTER
     assert a._footer(80) == a.FOOTER, "the full form fits the classic 80 columns again"
     assert a._footer(45) == a.FOOTER_COMPACT
-    assert a._footer(44) == a.FOOTER_KEYS
-    assert a._display_width(a.FOOTER) == 79
-    assert a._display_width(a.FOOTER_COMPACT) == 45
-    assert a._display_width(a.FOOTER_KEYS) == 30
+    assert a._footer(42) == a.FOOTER_KEYS
+    assert a._display_width(a.FOOTER) == 75
+    assert a._display_width(a.FOOTER_COMPACT) == 43
+    assert a._display_width(a.FOOTER_KEYS) == 32
     # And the boundary is the MEASUREMENT, checked from both sides of each form,
     # so a future edit to the strings cannot quietly move a threshold. FOOTER_KEYS
     # is excluded from the lower side on purpose: it is the FLOOR, and `_footer`
@@ -4686,10 +4628,10 @@ def test_the_footer_chooses_a_form_by_measured_width():
     floor = a._display_width(a.FOOTER_KEYS)
     assert a._footer(floor) == a.FOOTER_KEYS
     assert all(a._footer(w) == a.FOOTER_KEYS for w in range(0, floor + 1))
-    # Only labels degrade: every form names every key, `t` and `c` included.
+    # Only labels degrade: every form names every key, `t` and `esc` included.
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
         assert "q" in form and "r" in form and "a" in form and "t" in form, form
-        assert "c" in form, form
+        assert "esc" in form, form
         assert ("^/v" in form or "^v" in form), form
     # THE SEPARATOR IS SPACED IN THE TWO LABELLED FORMS AND ABSENT FROM COMPACT:
     # COMPACT is the degraded form and has already given up words, so it carries no
@@ -4771,12 +4713,11 @@ def test_the_footer_key_is_prominent_and_its_label_recedes():
                        if a._bare_role(role) == a.FOOTER_KEY)
     label_text = "".join(t for t, role in spans
                          if a._bare_role(role) == a.FOOTER_LABEL)
-    # The full form names Enter, Space and the CLI mirror by their KEY GLYPHS and
-    # letter (`⏎`, `␣`, `c`) — the words became glyphs to buy `c cli` its columns.
-    for key in ("q", "r", "^/v", "⏎", "␣", "a", "t", "c"):
+    # The full form names Enter, Space, Esc and the rest by their KEY GLYPHS and
+    # letters (`⏎`, `␣`, `esc`) — the words became glyphs where that bought columns.
+    for key in ("q", "r", "^/v", "⏎", "␣", "a", "t", "esc"):
         assert key in key_text, (key, key_text)
-    for label in ("quit", "refresh", "move", "focus", "expand", "access",
-                  "theme", "cli"):
+    for label in ("quit", "move", "focus", "expand", "access", "theme", "clear"):
         assert label in label_text, (label, label_text)
     # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES, and there is exactly one per
     # join between entries.

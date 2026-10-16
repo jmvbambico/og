@@ -76,14 +76,9 @@ DRY_RUN_SPACE = "dry-run-space:"
 #
 #     {"version": 2,
 #      "spaces":  {"<session_id>": {"workspace_id": …, "tab_id": …,
-#                                   "pane_id": …, "owner": …, "cwd": …,
-#                                   "cli_pane_id": … (optional)}},
+#                                   "pane_id": …, "owner": …, "cwd": …}},
 #      "pending": {"<cwd>":         {"workspace_id": …, "tab_id": …,
 #                                   "pane_id": …, "owner": "launcher", …}}}
-#
-# `cli_pane_id` is the one OPTIONAL extra: the id of the read-only pane that
-# mirrors the native harness TUI (see og_herdr_launch). Absent on every record
-# written before that feature, which is exactly what "no such pane is open" means.
 #
 # v2 is keyed by SESSION ID where v1 was keyed by workspace id, because the two
 # callers want opposite lookups. `--cleanup` asks "is this space ours?" and is
@@ -110,16 +105,6 @@ STATE_VERSION = 2
 # screen right now, and throwing it away orphans them from `--cleanup` — which
 # leaves the operator closing spaces by hand, one per conversation.
 STATE_VERSION_V1 = 1
-
-# The OPTIONAL space-record key naming an agent's read-only CLI-mirror pane.
-# PRESENT means the pane is open and holds its id; ABSENT means none is. Named
-# HERE rather than in og_herdr_launch because `_read_spaces` below is the reader
-# that must CARRY it through a load: a field that whitelist does not name is
-# silently dropped, and then the launcher's own toggle would read back "closed"
-# after opening, and open a SECOND pane on the next keypress — a real defect a
-# draft of this feature shipped with. Additive by design: a record written before
-# the feature has no key and reads as closed, so no version bump, no migration.
-CLI_PANE_FIELD = "cli_pane_id"
 
 # Who opened the space. Recorded, not enforced: the sides differ in where a
 # session's pane comes from (the bridge types `omnigent attach` into a pane it
@@ -542,8 +527,8 @@ def harness_vendors() -> dict[str, str]:
 
 
 # The THIRD sibling of `_REGISTRY_LABELS` / `_REGISTRY_VENDORS`, read from the
-# same catalog for the same reason: whether a harness has a TERMINAL to mirror is
-# a registry fact (its `kind`), not something to re-derive from the harness id's
+# same catalog for the same reason: whether a harness has a TERMINAL to attach to
+# is a registry fact (its `kind`), not something to re-derive from the harness id's
 # spelling. `og agents` asks this to tell a native harness — hosted as a real TUI
 # in a private tmux server — from an ACP one, which is a plain stdio child with
 # no pty and so nothing to show, without a second kind table that could drift
@@ -583,7 +568,7 @@ def harness_kinds() -> dict[str, str]:
 
 # The registry kinds Omnigent hosts WITHOUT a pty: `acp-builtin` and `acp-user`
 # are plain stdio JSON-RPC children (see docs/HERDR.md), so there is no terminal
-# to mirror, by construction. Named as a set so the membership is stated once.
+# to attach to, by construction. Named as a set so the membership is stated once.
 ACP_KINDS = frozenset({"acp-builtin", "acp-user"})
 
 
@@ -2934,8 +2919,8 @@ The rule itself is `_memory_decides`, which is where the distinction
         #
         # Re-sent every time so the record keeps the id that `agent.focus` matches
         # on — the Omnigent session id of the ROOT this pane belongs to, which is
-        # what the `og agents` pane resolves a row to and sends as the target (a
-        # worker's OWN id has no record; see `focus_target`).
+        # what `focus_in_herdr` sends as the target (a worker's OWN id has no
+        # record).
         self.client.report_agent(rec["pane_id"], self.source,
                                  agent=rec["agent"], state=state,
                                  agent_session_id=sid)
@@ -3281,10 +3266,7 @@ def _read_spaces(raw) -> dict:
         if not isinstance(ws_id, str) or not ws_id:
             continue
         rec = {"workspace_id": ws_id}
-        # `CLI_PANE_FIELD` is listed so the optional CLI-mirror pane SURVIVES a
-        # load — it is written through `state_update`, and a field this whitelist
-        # omits would be dropped on the very next read. See its definition.
-        for field in ("tab_id", "pane_id", "owner", "cwd", CLI_PANE_FIELD):
+        for field in ("tab_id", "pane_id", "owner", "cwd"):
             value = entry.get(field)
             if isinstance(value, str) and value:
                 rec[field] = value

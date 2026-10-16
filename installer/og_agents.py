@@ -251,13 +251,13 @@ DEFAULT_WIDTH = 80
 # The footer. Its own constant so the tests can assert the binding is listed
 # without driving a tty. Enter FOCUSES the selected agent's own tab in herdr (see
 # `focus_agent`); snippet expand/collapse moved to SPACE when Enter was taken.
-# `Esc` is deliberately NOT named here: it clears the selection and never quits,
-# but the full form is already exactly 79 columns (the 80-column ceiling), so a
-# new entry can only be bought by dropping another binding's label — see the
+# `Esc` IS named here now (`esc clear`): it clears the selection and never quits,
+# and that binding was undiscoverable while the full form sat at its 79-column
+# ceiling. Removing the `c cli` mirror freed the columns to surface it. See the
 # MEASURED WIDTHS below.
 #
 # THREE forms, chosen by width in `_footer`. The agents pane is a SPLIT of the
-# chat and is often only ~46 columns, while this full sentence is 64, so a single
+# chat and is often only ~46 columns, while this full sentence is 75, so a single
 # fixed footer gets clipped by `_clip` — which is exactly how "space expand" and
 # "a access" used to fall off the end, leaving the operator without the key that
 # had just inherited expand from Enter. FOOTER_COMPACT swaps the Enter and Space
@@ -284,28 +284,25 @@ DEFAULT_WIDTH = 80
 # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
 #
 # `t theme` JOINED ALL THREE FORMS WITHOUT MOVING ANY THRESHOLD, and that took a
-# deliberate choice about WHICH label degrades. The full form could simply grow to
-# 73, but the COMPACT form is the one the ~46-column agents split actually shows,
-# and appending ` t theme` to it would have pushed it to 53 — handing every real
-# pane the bare KEYS form, a far worse trade than losing one word. So COMPACT
-# sheds `refresh` and keeps `q quit`, `⏎ focus`, `␣ expand`, `a access` and
-# `t theme`: the key `r` still EXISTS in all three forms (the rule is that a key
-# may never degrade, only its label), and `r` is the one binding whose loss costs
-# the operator nothing — it is a convenience refresh, where every other binding is
-# something you cannot guess.
+# deliberate choice about WHICH label degrades. The COMPACT form is the one the
+# ~46-column agents split actually shows, and appending ` t theme` to it would
+# have pushed it past that width — handing every real pane the bare KEYS form, a
+# far worse trade than losing one word. So COMPACT sheds `refresh` and keeps
+# `q quit`, `⏎ focus`, `␣ expand`, `a access` and `t theme`: the key `r` still
+# EXISTS in all three forms (the rule is that a key may never degrade, only its
+# label), and `r` is the one binding whose loss costs the operator nothing — it is
+# a convenience refresh, where every other binding is something you cannot guess.
 #
-# `c cli` — THE MIRROR OF THE AGENT'S OWN HARNESS TUI — WAS THE SECOND BINDING TO
-# MOVE A THRESHOLD, and it did so against the SAME 79-column ceiling. The full
-# form already measured exactly 79 (an 80-column terminal is the classic case it
-# is sized for), so a new entry could not be appended without pushing it over and
-# dropping that terminal back to COMPACT. The columns were bought back by
-# spelling Enter and Space with their KEY GLYPHS in the full form too (`⏎ focus`,
-# `␣ expand` — the exact spelling COMPACT already uses), which is -8 columns and
-# keeps every binding LABELLED; the alternative — dropping a label — would have
-# left a bare key beside labelled ones. COMPACT then had to shed one more label
-# to stay <= 45, and it shed `theme` (the `t` key stays: a cosmetic picker, where
-# `access` is the sharing panel the operator cannot guess). MEASURED WIDTHS:
-# 79 / 45 / 30. The key `c` is in all three forms.
+# `c cli` — THE READ-ONLY MIRROR OF THE AGENT'S OWN HARNESS TUI — WAS REMOVED, AND
+# ITS COLUMNS WENT TO `esc`. The mirror is redundant now that Enter opens that
+# agent's real vendor CLI in its own tab INTERACTIVELY: a blocking permission
+# prompt is answerable from a real CLI, which a read-only mirror structurally
+# cannot do. Removing `c cli` freed 8 columns of the full form (79 → 71); `esc
+# clear` costs 12 (→ 83), past the 79-column ceiling the full form is sized for, so
+# the full form sheds `refresh`'s label too (→ 75) — the same cheap label COMPACT
+# already drops, and the one the paragraph above names as the binding whose loss
+# costs the operator nothing. MEASURED WIDTHS: 75 / 43 / 32. The key `esc` is in
+# all three forms.
 #
 # THE THREE FORMS ARE BUILT FROM (key, label) PAIRS, not typed out, so a key can
 # never appear in one form without its label and the separator can never be
@@ -314,13 +311,12 @@ DEFAULT_WIDTH = 80
 # one span per half. `_footer_sep` is the one place the SEPARATOR that JOINs those
 # pairs is chosen, so the text form and the painted spans can never disagree about
 # it. THE SEPARATOR IS SPACED IN THE LABELLED FORMS AND ABSENT FROM COMPACT: the
-# Ambiguous ` · ` charged two columns per entry, so the MEASURED widths were
-# 85 / 63 / 32 and neither the 80-column terminal nor the ~46-column split got a
-# LABELLED form — the labels vanished at the width the operator actually runs.
-# ` ∙ ` (U+2219, Narrow) charges one, and COMPACT joins its entries with a single
-# space — its pre-separator spelling — so the MEASURED widths become 79 / 45 / 26.
-# That is why `test_the_footer_chooses_a_form_by_measured_width` pins the measured
-# numbers rather than the printed ones.
+# Ambiguous ` · ` charged two columns per entry, so neither the 80-column terminal
+# nor the ~46-column split got a LABELLED form — the labels vanished at the width
+# the operator actually runs. ` ∙ ` (U+2219, Narrow) charges one, and COMPACT
+# joins its entries with a single space — its pre-separator spelling. That is why
+# `test_the_footer_chooses_a_form_by_measured_width` pins the measured numbers
+# rather than the printed ones.
 FOOTER_SEP = " \u2219 "
 
 
@@ -347,16 +343,16 @@ def _footer_form(entries: Iterable[tuple[str, str]], sep: str = FOOTER_SEP) -> s
 
 
 FOOTER_ENTRIES = (
-    ("q", "quit"), ("r", "refresh"), ("^/v", "move"), ("⏎", "focus"),
-    ("␣", "expand"), ("a", "access"), ("t", "theme"), ("c", "cli"),
+    ("q", "quit"), ("r", ""), ("^/v", "move"), ("⏎", "focus"),
+    ("␣", "expand"), ("a", "access"), ("t", "theme"), ("esc", "clear"),
 )
 FOOTER_COMPACT_ENTRIES = (
     ("q", "quit"), ("r", ""), ("^v", ""), ("⏎", "focus"),
-    ("␣", "expand"), ("a", "access"), ("t", ""), ("c", "cli"),
+    ("␣", "expand"), ("a", "access"), ("t", ""), ("esc", ""),
 )
 FOOTER_KEYS_ENTRIES = (
     ("q", ""), ("r", ""), ("^v", ""), ("⏎", ""), ("␣", ""), ("a", ""),
-    ("t", ""), ("c", ""),
+    ("t", ""), ("esc", ""),
 )
 FOOTER = _footer_form(FOOTER_ENTRIES)
 FOOTER_COMPACT = _footer_form(FOOTER_COMPACT_ENTRIES, _footer_sep(FOOTER_COMPACT_ENTRIES))
@@ -860,9 +856,9 @@ class Row:
     # state, so with `--all` several roots' workers interleave and a worker's root
     # is not recoverable from a walk of `Frame.rows`. Set for every worker in
     # `_worker_rows`; a root row leaves it "" (a root IS its own root, so
-    # `focus_agent` passes "" for it). Enter no longer aims at a worker's root —
-    # it focuses the row's OWN session (see `focus_agent`) — but the `c` mirror
-    # still keys its pane off the root (see `focus_target` and `cli_pane_for_row`).
+    # `focus_agent` passes "" for it). Enter focuses the row's OWN session (see
+    # `focus_agent`) and passes this root alongside it, because a worker's tab
+    # hangs off its ROOT's space (`og_herdr_launch._agent_space`).
     root_session_id: str = ""
 
 
@@ -1971,8 +1967,7 @@ def _selectable(row: Row) -> bool:
     A worker's box AND the root's are selectable; only a breathing RAIL row is
     not. The rails were always stepped over (they hold no agent), but roots were
     too, and that made the root the one agent an operator could never point at —
-    the reported "I cannot select the orchestrator", which also left
-    `focus_target`'s `is_root` branch unreachable from the TUI.
+    the reported "I cannot select the orchestrator".
 
     This is NOT `_is_box`, deliberately. `_is_box` means "a box that draws a
     status spinner", which a root does not (`frame_working` relies on that to
@@ -3726,37 +3721,13 @@ def listing_failure_notice(server: str, exc: BaseException) -> str:
         return f"server unreachable: {server}"
 
 
-def focus_target(row: Row) -> Optional[str]:
-    """The session id herdr can resolve for `row`: a root is its own, a worker's is its root.
-
-    WHY A WORKER TARGETS ITS ROOT. herdr matches an `agent.focus` target against
-    its PANE RECORDS, and it opens a pane — writing a record that carries
-    `agent_session_id` — only for a ROOT session (see `og_herdr.py`). A sub-agent
-    never gets a pane of its own, so its own id matches no record and herdr answers
-    `agent_not_found`. The worker's work IS visible, though — in its ROOT's pane —
-    so the root was the one target herdr could match. A root row owns its own pane
-    and so targets itself.
-
-    This is the `c` MIRROR's resolution now, not Enter's: Enter focuses the
-    selected row's OWN agent tab through `focus_agent`, which is what the
-    operator's "focus the selected agent" actually means. This stays because the
-    read-only CLI mirror still splits into a row's ROOT (`cli_pane_for_row`).
-
-    None when the row carries no resolvable root (a worker built without one, a
-    malformed row), and the mirror declines rather than sending an id it knows
-    will fail.
-    """
-    if row.is_root:
-        return row.session_id or None
-    return row.root_session_id or None
-
-
 def focus_in_herdr(session_id: str,
                    environ: Optional[dict] = None) -> Optional[str]:
     """Jump the operator's herdr UI to `session_id`. None on success, else why not.
 
     `session_id` is the id the CALLER has already resolved to something herdr can
-    match — a root's own id, or a sub-agent's ROOT (see `focus_target`). It is not
+    match — a root's own id, or a sub-agent's ROOT (herdr records a pane, and so an
+    `agent_session_id` to match, only for a ROOT — see `og_herdr.py`). It is not
     necessarily the selected row's own session: only a root has a pane record, so
     a sub-agent's own id would draw `agent_not_found`. This function sends whatever
     it is given, unchanged; the row-to-root resolution belongs to the caller that
@@ -3773,8 +3744,7 @@ def focus_in_herdr(session_id: str,
     agent tab (`og_herdr_launch.focus_agent_terminal`), which is the operator's
     "focus the thing I selected"; a worker's own id is exactly what this function
     would draw `agent_not_found` for. This stays as the module's one direct
-    `agent.focus` call — pinned by the AST guard above — and as the shape the
-    mirror's `cli_pane_for_row` is built to match.
+    `agent.focus` call — pinned by the AST guard in tests/test_og_agents.py.
 
     Returns None when the UI moved, or a short one-line notice saying why it did
     not, which `_run_tui` shows in the pane (`Frame.notice`). It NEVER raises: an
@@ -3826,9 +3796,9 @@ def focus_in_herdr(session_id: str,
 def focus_agent(row: Row) -> Optional[str]:
     """Enter's handler: focus the SELECTED agent's OWN tab. None on success.
 
-    THE REPORTED BUG, AND WHY THIS IS NOT `focus_target`. Enter used to resolve a
-    row to its ROOT (`focus_target`) — the only session herdr once had a pane for
-    — so selecting a worker focused its root and never the worker itself, and the
+    THE REPORTED BUG, AND WHY THIS IS NOT THE OLD ROOT RESOLUTION. Enter used to
+    resolve a row to its ROOT — the only session herdr once had a pane for — so
+    selecting a worker focused its root and never the worker itself, and the
     orchestrator could not be focused at all. Enter now hands `focus_agent_terminal`
     the row's OWN `session_id` (a root's is its own, a worker's is the worker's),
     so selecting `claude` reaches claude's tab.
@@ -3863,62 +3833,6 @@ def focus_agent(row: Row) -> Optional[str]:
             return NOTICE_FOCUS_FAILED.format(exc)
         except Exception:
             return NOTICE_FOCUS_FAILED
-
-
-# What the pane says when the CLI mirror could not be opened or closed, one line
-# each. The same shape and the same reasons as the focus notices above: short so
-# they survive `_clip`, and distinct so "this can never work here" reads
-# differently from "try again". The ACP and "no terminal" reasons are formed in
-# `og_herdr_launch.cli_terminal_notice`, which is the half that knows the harness
-# kind; these three are the ones this module can produce on its own.
-NOTICE_CLI_OUTSIDE_HERDR = "cli: not inside herdr (no HERDR_ENV)"
-NOTICE_CLI_UNAVAILABLE = "cli: herdr client unavailable"
-NOTICE_CLI_FAILED = "cli: {0}"
-# A rail or a root row that carries no session id at all: there is no agent to
-# mirror, and saying so is better than opening a pane onto nothing.
-NOTICE_CLI_NO_AGENT = "cli: no agent on this row to mirror"
-
-
-def cli_pane_for_row(row: Row, environ: Optional[dict] = None) -> Optional[str]:
-    """Open/close the read-only CLI pane for `row`'s agent. None on success.
-
-    The mirror of `focus_in_herdr`, and built the same way for the same reason:
-    this view is deliberately not herdr-specific and must start in any terminal,
-    so `og_herdr_launch` — and with it every herdr client — is imported INSIDE
-    the handler, never at module load. It NEVER raises: an `og agents` pane an
-    operator leaves open all day must survive a herdr that is absent, a terminal
-    outside a herdr pane, or a socket that is down, so every failure becomes a
-    notice rather than a traceback that kills the pane.
-
-    `row.session_id` is the agent whose TUI is mirrored; `focus_target(row)` —
-    its ROOT — keys the SPACE, because only a root has one (see `focus_target`).
-    The harness comes from the row's own id where a root has one, else from the
-    installed spec for the row's agent name (a worker's listing row carries no
-    harness), which is what tells an ACP harness from a native one so the honest
-    "no terminal" line can be chosen.
-
-    The whole open/close decision belongs to `og_herdr_launch.cli_pane_toggle`:
-    it owns the state record that remembers whether the pane is open, and it is
-    the only place a herdr pane is split or closed for this feature — which is
-    also what keeps this module's outbound traffic to `agent.focus` alone (see
-    `test_source_only_makes_read_only_calls`).
-    """
-    env = os.environ if environ is None else environ
-    if not row.session_id:
-        return NOTICE_CLI_NO_AGENT
-    try:
-        from og_herdr_launch import cli_pane_toggle
-    except Exception:
-        return NOTICE_CLI_UNAVAILABLE
-    try:
-        harness = row.harness or agent_harness(row.agent) or ""
-        return cli_pane_toggle(focus_target(row) or "", row.session_id, harness,
-                               environ=env)
-    except Exception as exc:
-        try:
-            return NOTICE_CLI_FAILED.format(exc)
-        except Exception:
-            return NOTICE_CLI_FAILED
 
 
 def _run_tui(model: AgentModel, interval: float, server: str,
@@ -4348,19 +4262,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                     else:
                         expanded.add(sid)
                     poll = True
-            elif key == ord("c"):
-                # Open/close the READ-ONLY mirror of the selected agent's own
-                # harness TUI, in a second pane in that agent's space. Like
-                # Enter, it does nothing at all while the pane is untouched —
-                # there is no agent to mirror — and like Enter it does NOT set
-                # `poll`: the mirror lives in another pane, so nothing this view
-                # draws changes; a refetch would be a listing walk for nothing.
-                # The notice (why the mirror did not open, or a stale one) is
-                # shown on the next paint. See `cli_pane_for_row` for every way
-                # it can decline, and `og_herdr_launch.cli_pane_toggle` for the
-                # resize-safe attach it runs.
-                if selected is not None and 0 <= selected < len(frame.rows):
-                    notice = cli_pane_for_row(frame.rows[selected])
 
     curses.wrapper(loop)
     return 0
