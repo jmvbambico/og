@@ -241,11 +241,15 @@ def test_renderer_shows_a_root_box_not_a_bare_line():
     assert "━" not in joined and "█" not in joined
 
 
-def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
-    """Workers are grouped by state, each group opened by a breathing rail — the
-    order on screen is the group order (working, blocked, failed, finished), not
-    listing order. The worded labels are gone: the glyph inside each box says the
-    state and the rail alone marks where one group ends and the next begins."""
+def test_workers_keep_delegation_order_and_are_not_reordered_by_state():
+    """REGRESSION for the reported bug: a finished worker stays in place.
+
+    Workers are drawn in DELEGATION order — the order they were dispatched — NOT
+    grouped by state. The list doubles as a timeline of delegation, so a worker
+    that finishes keeps its position; it used to sink to the bottom the moment it
+    went idle. State is still told apart by each box's own gutter glyph and meta,
+    so nothing is lost, and the worded labels stay gone.
+    """
     sessions = [
         dict(listed("root", title="conv", status="running"), harness="claude-native"),
         listed("w1", parent="root", status="idle", title="coder_zen:done-already"),
@@ -254,17 +258,17 @@ def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
     ]
     rows = a.build_rows(sessions, ["root"], now=NOW)
 
-    # The rows themselves are in display order, which is what the caret indexes.
+    # Listing order, verbatim — the idle worker stays FIRST, where it was
+    # dispatched, rather than sorting below the working one.
     boxes = [row.text for row in rows if a._is_box(row)]
-    assert boxes == ["busy", "broke", "done-already"]
+    assert boxes == ["done-already", "busy", "broke"]
 
     lines = a.render(a.Frame(rows=rows))
     # No worded group label survives anywhere in the render.
     for word in OLD_GROUP_LABELS:
         assert word not in lines, word
-    # A breathing rail row opens each of the three groups (rail, boxes, rail,
-    # boxes, rail, boxes) — the rail alone, in column 0.
-    assert sum(1 for line in lines if line == "│") == 3
+    # ONE rail opens the whole worker list; no per-state rail splits it.
+    assert sum(1 for line in lines if line == "│") == 1
     # The state is still told apart, by the glyph in each box's gutter: a working
     # spinner frame, and the static `×` and `✓`.
     joined = "\n".join(lines)
@@ -272,10 +276,91 @@ def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
     assert "×" in joined and "✓" in joined
 
 
+def test_a_worker_that_finishes_between_builds_keeps_its_index():
+    """THE REPORTED BUG, pinned on the row index the caret indexes.
+
+    A worker that transitions to idle between two builds must not move: the list
+    is a delegation timeline, and watching a worker finish used to re-sort it to
+    the bottom, out from under the operator's eye. The index is what the arrow
+    keys and Enter use, so it is what the fix has to preserve.
+    """
+    root = dict(listed("root", title="conv", status="running"),
+                harness="claude-native")
+
+    def build(first_status):
+        return a.build_rows(
+            [root,
+             listed("w1", parent="root", status=first_status, title="coder_zen:one"),
+             listed("w2", parent="root", status="running", title="coder_zen:two")],
+            ["root"], now=NOW)
+
+    def index_of(rows, sid):
+        return next(i for i, row in enumerate(rows) if row.session_id == sid)
+
+    running = build("running")
+    finished = build("idle")
+
+    assert index_of(running, "w1") == index_of(finished, "w1"), \
+        "w1 must not move when it finishes"
+    assert index_of(finished, "w1") < index_of(finished, "w2"), \
+        "delegation order puts w1 above w2, finished or not"
+
+
+def test_the_single_rail_carries_the_most_urgent_state_of_its_workers():
+    """The root's ONE rail resolves its state from `GROUP_ORDER` as a PRECEDENCE.
+
+    The most urgent state present among the workers wins, so the rail reads
+    "something here is still running" while anything is — the behaviour the
+    per-group rails gave — and `GROUP_ORDER` survives instead of going dead.
+    """
+    root = dict(listed("root", title="conv", status="running"),
+                harness="claude-native")
+
+    def rail_state(*workers):
+        rows = a.build_rows([root, *workers], ["root"], now=NOW)
+        return next(row for row in rows if row.rail).state
+
+    idle = lambda sid: listed(sid, parent="root", status="idle",
+                              title=f"coder_zen:{sid}")
+    # One idle and one working: `working` outranks `idle`.
+    assert rail_state(idle("w1"),
+                      listed("w2", parent="root", status="running",
+                             title="coder_zen:busy")) == "working"
+    # `blocked` (an elicitation) outranks `failed` and `idle`.
+    assert rail_state(listed("w1", parent="root", status="failed",
+                             title="coder_zen:bad"),
+                      listed("w2", parent="root", status="running", elicit=1,
+                             title="coder_zen:waiting")) == "blocked"
+    # Everything finished: the rail is idle.
+    assert rail_state(idle("w1"), idle("w2")) == "idle"
+
+
+def test_a_root_with_workers_in_mixed_states_emits_exactly_one_rail():
+    root = dict(listed("root", title="conv", status="running"),
+                harness="claude-native")
+    sessions = [root] + [
+        listed(f"w{i}", parent="root", status=status, title=f"coder_zen:t{i}")
+        for i, status in enumerate(("running", "idle", "failed", "running"))]
+
+    rows = a.build_rows(sessions, ["root"], now=NOW)
+
+    assert len([row for row in rows if row.rail]) == 1
+    assert len([row for row in rows if row.is_root]) == 1
+
+
+def test_a_root_without_workers_emits_no_rail():
+    # A rail opens a worker list; with no workers there is nothing to open, so it
+    # must not be emitted as a stray line under the root box.
+    rows = a.build_rows(
+        [dict(listed("root", title="quiet", status="idle"),
+              harness="claude-native")], ["root"], now=NOW)
+    assert len([row for row in rows if row.rail]) == 0
+
+
 def test_renderer_flattens_a_nested_worker():
-    """A grandchild is grouped by its OWN state like any other worker. Grouping
-    by state and drawing a spine are mutually exclusive, so the tree is
-    flattened."""
+    """A grandchild is a box of its own, in delegation order. The tree is
+    flattened — the parent link is dropped and the spine is not drawn — so the
+    child is never placed under a state that disagrees with its own."""
     root = dict(listed("root", status="running"), harness="claude-native")
     sessions = [
         root,
@@ -286,7 +371,7 @@ def test_renderer_flattens_a_nested_worker():
     lines = a.render(a.Frame(rows=rows))
 
     assert lines[0].startswith("╭"), "the root is a box at column 0"
-    # The grandchild is a box of its own, in the same (working) group...
+    # The grandchild is a box of its own, in the root's worker list...
     assert any("grandchild" in line and "╭" not in line for line in lines)
     # Every WORKER box sits in the gutter: the rail at column 0, the rounded
     # corner at column 4, and the whole line as wide as the pane. (The root box is
@@ -310,10 +395,11 @@ C2_WIDTH = 46
 
 def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     """The operator's iterated C2 template, line for line: the root as an
-    OUTDENTED rounded box at column 0, then a breathing rail opening each state
-    group, and a ROUNDED box per worker BEHIND a node+state gutter. Built through
-    `build_rows` from a listing, so the names, agents and glyphs are the ones the
-    model produces at width 46. The working box's glyph is the first spinner frame.
+    OUTDENTED rounded box at column 0, then ONE breathing rail opening the worker
+    list, and a ROUNDED box per worker in DELEGATION order BEHIND a node+state
+    gutter. Built through `build_rows` from a listing, so the names, agents and
+    glyphs are the ones the model produces at width 46. The working box's glyph is
+    the first spinner frame.
 
     A box is THREE rows: top border, ONE content row, bottom border. The content
     row is the operator's order — 2-column mark slot, title flush left — with the
@@ -353,15 +439,12 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╭────────────────────────────────────────╮",
         "⦿ ⠋ │ ▯  coders                         2m14s│",
         "│   ╰────────────────────────────────────────╯",
-        "│",
         "│   ╭────────────────────────────────────────╮",
         "⦿ ⏸ │ ⌘  reviewers             waiting on you│",
         "│   ╰────────────────────────────────────────╯",
-        "│",
         "│   ╭────────────────────────────────────────╮",
         "⦿ × │ 𝗙  scouts                        failed│",
         "│   ╰────────────────────────────────────────╯",
-        "│",
         "│   ╭────────────────────────────────────────╮",
         "⦿ ✓ │ ⌘  docs                            done│",
         "│   ╰────────────────────────────────────────╯",
@@ -390,12 +473,14 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     assert lines[4].startswith("│   ╭"), "a worker box starts after the gutter"
     assert lines[4].index("╭") == a.GUTTER
     nodes = [i for i, line in enumerate(lines) if line.startswith("⦿")]
-    assert nodes == [5, 9, 13, 17], nodes
+    assert nodes == [5, 8, 11, 14], nodes
+    # ONE rail opens the worker list — no per-state rail splits it.
+    assert sum(1 for line in lines if line == "│") == 1
     # The state glyph rides the gutter's column 2, on the CONTENT row alone, and
     # is NOT inside the box: the spinner is w1's, and every non-content box row
     # carries a space there.
     assert lines[5][0] == "⦿" and lines[5][2] == a.SPIN_FRAMES[0]
-    assert lines[9][2] == "⏸" and lines[13][2] == "×" and lines[17][2] == "✓"
+    assert lines[8][2] == "⏸" and lines[11][2] == "×" and lines[14][2] == "✓"
     assert lines[6][:4] == "│   " and a.SPIN_FRAMES[0] not in lines[5][4:], \
         "the state glyph is in the gutter, never inside the box"
     # The AGENT NAME is dropped from every row: the mark carries it, so `zen`,
@@ -404,8 +489,8 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         assert name not in "\n".join(lines), name
     # The meta is right-aligned on the CONTENT row: each one ends at the box's
     # right edge, on the same line as the title.
-    for row_index, meta in ((5, "2m14s"), (9, "waiting on you"),
-                            (13, "failed"), (17, "done")):
+    for row_index, meta in ((5, "2m14s"), (8, "waiting on you"),
+                            (11, "failed"), (14, "done")):
         assert lines[row_index].endswith(meta + "│"), lines[row_index]
 
 
@@ -787,13 +872,16 @@ def test_enter_on_an_untouched_pane_focuses_nothing_and_shows_no_notice(monkeypa
 
 
 def test_the_selection_follows_its_session_across_a_state_change_reorder():
-    """THE HAZARD THE GROUPING CREATES, and why the selection tracks an id.
+    """THE HAZARD ANY REORDER CREATES, and why the selection tracks an id.
 
-    A selected worker that changes state moves from one group to another, so the
-    rows reorder underneath it. Holding the INDEX across that refresh lands the
-    selection on whichever worker now occupies it — here `w2`, selected at index 4
-    in the idle group, becomes `working` and moves to index 2, while index 4 in the
-    new rows is its sibling `w3`. The id is what survives the move.
+    Any refresh can reorder the rows — a worker added or removed, a root entering
+    or leaving scope — and holding the INDEX across that refresh lands the
+    selection on whichever worker now occupies it. The rows here are built BY HAND
+    to stand for such a reorder: `w2`, selected at index 4 in `before`, sits at
+    index 2 in `after` while index 4 is its sibling `w3`. The id survives the move.
+    (A state change no longer reorders anything — workers keep delegation order,
+    see `build_rows` — so this exercises the mechanism against an arbitrary
+    reorder rather than one a state transition still produces.)
     """
     before = [header(), rail("working"),
               worker("w1", "working", text="one"),
@@ -1002,24 +1090,22 @@ def test_every_harness_mark_fills_the_slot_and_every_title_starts_in_one_column(
         assert a.harness_mark(harnesses[vendor]) == mark + " ", vendor
 
 
-def test_a_breathing_rail_row_separates_one_state_group_from_the_next():
-    """The worded group label is gone, but a rail-only row still separates one
-    state group from the next and its boxes line up behind the same rail."""
+def test_a_breathing_rail_row_opens_the_worker_list_below_it():
+    """One rail row opens the list; it is the rail alone, and the boxes line up
+    behind the same gutter. The worded group label stays gone."""
     rows = [header(),
-            rail("working"), worker("w1", "working", text="one"),
-            rail("failed"), worker("w2", "failed", text="two")]
+            rail("working"),
+            worker("w1", "working", text="one"),
+            worker("w2", "idle", text="two")]
     lines = a.render(a.Frame(rows=rows), width=C2_WIDTH)
-    # A rail-only row (just "│") opens EACH of the two groups, so the eye still
-    # sees where one group ends — and no label word follows it.
     rails = [i for i, line in enumerate(lines) if line == "│"]
-    assert len(rails) == 2, rails
+    assert len(rails) == 1, rails
     for word in OLD_GROUP_LABELS:
         assert word not in lines, word
-    # Each group's box top follows its rail, at the same column.
-    assert lines[rails[0] + 1][0] == "│"
-    assert lines[rails[0] + 1].index("╭") == a.GUTTER
-    assert lines[rails[1] + 1][0] == "│"
-    assert lines[rails[1] + 1].index("╭") == a.GUTTER
+    # Both worker box tops follow the one rail, at the same gutter column.
+    for top in (rails[0] + 1, rails[0] + 4):
+        assert lines[top][0] == "│"
+        assert lines[top].index("╭") == a.GUTTER
 
 
 def test_multiple_roots_each_get_their_own_box():
@@ -1046,31 +1132,30 @@ def test_multiple_roots_each_get_their_own_box():
     assert "━" not in joined
 
 
-def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
-    """The trimmer works in whole blocks (a root, or a rail and its boxes), so a
-    box can never be cut in half and a group's rail never leaves its boxes. With
-    the worded labels gone there is no label left to orphan, which is why the
-    block is now just the rail and the boxes. The root block is THREE rows and a
-    worker box is THREE rows, so the block arithmetic below is a rail + three."""
-    rows = [header(), rail("working"),
+def test_height_trimming_keeps_a_whole_block_and_never_splits_a_box():
+    """The trimmer works in whole blocks — a root, or a rail and ALL the boxes it
+    opens — so a box can never be cut in half and a rail never leaves its boxes.
+    A root box is THREE rows and a worker box is THREE, so the arithmetic below is
+    a root (3) plus a rail-opened worker block (rail + 3 per box)."""
+    rows = [header(text="first", sid="root1"), rail("working"),
             worker("w1", "working", text="one"),
-            rail("idle"),
+            header(text="second", sid="root2"), rail("idle"),
             worker("w2", "idle", text="two")]
     full = a.render(a.Frame(rows=rows), width=C2_WIDTH)
     joined = "\n".join(full)
-    # The root box plus the two worker boxes.
-    assert joined.count("╭") == 3 and joined.count("╰") == 3
+    # The two roots plus the two worker boxes.
+    assert joined.count("╭") == 4 and joined.count("╰") == 4
 
-    # Room for the root block (3 rows) and the first group (rail + 3-row box = 4
-    # rows) but not the second group: the second group is dropped WHOLE, so its box
-    # is never cut and its rail is never left behind without it.
-    short = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=10)
+    # Blocks: [root1 (3)] [rail + w1 (1+3)] [root2 (3)] [rail + w2 (1+3)] = 14
+    # rows. With the two-row tail reserved, height=12 leaves room for the first
+    # three blocks (10 rows) and NOT the last: the last block is dropped WHOLE, so
+    # its box is never cut and its rail is never left behind without it.
+    short = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=12)
     short_joined = "\n".join(short)
     assert "one" in short_joined
     assert "two" not in short_joined, "a box must not be cut in half"
-    # The root box plus the first worker box, each whole.
-    assert short_joined.count("╭") == short_joined.count("╰") == 2
-    # And no label word is left behind anywhere.
+    # The two root boxes and the first worker box, each whole.
+    assert short_joined.count("╭") == short_joined.count("╰") == 3
     for word in OLD_GROUP_LABELS:
         assert word not in short_joined, word
 
@@ -4344,18 +4429,19 @@ def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
         "the footer does not share the pane with the notice"
 
 
-def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_refresh(
+def test_a_selected_worker_that_changes_state_keeps_the_caret_across_a_refresh(
         monkeypatch):
-    """THE REGRESSION the reviewer caught, driven through the real loop.
+    """The caret stays on the SELECTED session when a worker changes state.
 
-    A selected worker changes state, so it moves to another STATE GROUP and the
-    rows reorder underneath the selection. The view used to hold the INDEX across
-    the refresh, so the poll after the move left the selection on whichever worker
-    now occupied it — a different session, and Enter would have focused that one.
+    A state change no longer moves a worker — workers keep delegation order (see
+    `build_rows`) — so the caret the operator put on `w2` stays on `w2` across the
+    refresh: the box keeps both its index and its id, and the pane is not disturbed
+    by a worker finishing. This is the TUI-level guard on that: press `r` to
+    refresh after `w2` turns `working` and the bright box is still `w2`'s.
 
-    Here `w2` is selected at index 4 in the idle group, turns `working`, and its
-    box moves to index 3 in the working group while its sibling `w1` takes index
-    4. The selection follows the SESSION, so it lands on `w2`.
+    The id-following mechanism itself — `snap_selection` returning a session's new
+    index across an arbitrary reorder — is pinned directly in
+    `test_the_selection_follows_its_session_across_a_state_change_reorder`.
     """
     monkeypatch.delenv("HERDR_ENV", raising=False)
     before = [

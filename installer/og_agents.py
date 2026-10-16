@@ -16,14 +16,16 @@ per-row-per-poll fetch is a defect rather than a slow path.
 
 The shape of the view is the operator's C2 template, iterated against the pane's
 measured feedback: a rounded box per root drawn at column 0 (OUTDENTED relative
-to its workers), then the root's workers GROUPED BY STATE, each group opened by a
-breathing rail row and each worker a rounded box indented behind a four-column
-gutter. There are NO worded group labels: the animated glyph in the gutter says
-the state, and the breathing rail alone marks where one group ends and the next
-begins. The gutter is the rail's own column (`⦿` where an agent's box hangs off
-it, `│` on every other row), a space, the state glyph's column, and a space — so
-one unbroken line runs down the pane's left edge, with a node at each agent, out
-of the root box's own bottom-left corner and across the breathing rows.
+to its workers), then the root's workers in DELEGATION ORDER — the order they were
+dispatched — each a rounded box indented behind a four-column gutter, with ONE
+breathing rail row opening the list. DELEGATION ORDER IS LOAD-BEARING: the list
+doubles as a timeline of when each agent was dispatched, so a worker that finishes
+keeps its place instead of sinking to the bottom (the reported bug). There are NO
+worded group labels: the animated glyph in the gutter says the state, and the rail
+alone opens the list. The gutter is the rail's own column (`⦿` where an agent's
+box hangs off it, `│` on every other row), a space, the state glyph's column, and
+a space — so one unbroken line runs down the pane's left edge, with a node at each
+agent, out of the root box's own bottom-left corner and across the breathing row.
 SELECTION IS BRIGHTNESS: the selected AGENT's box — a worker's or the root's —
 paints normal while every other box paints dim — there is no caret glyph. The
 selection is cleared by `Esc` (which no longer quits) and by `Enter` acting on a
@@ -201,13 +203,14 @@ GUTTER = 4
 # "box" would be a lie.
 BOX_MIN = 4
 
-# The state groups, in the order they are DRAWN: what needs attention first.
-# `unknown` (a status `display_state` could not name) is its own group rather than
-# folded into `failed`, so its row keeps its own `?` glyph. A state outside this
-# tuple still gets a group, sorted last (see `_grouped`), so no worker is dropped.
-# The groups carry NO worded label: the state glyph in each box's gutter says it,
-# and a breathing rail row alone marks where one group ends and the next begins.
-# Only the ORDER survives, and it is still what puts what needs attention first.
+# The URGENCY PRECEDENCE of the display states: what needs attention first.
+# Workers are no longer BUCKETED by state — they keep delegation order (see
+# `build_rows`) — so this is no longer a sort order. It survives as the precedence
+# the root's single rail resolves its own state by: the most urgent state present
+# among the root's workers (`_rail_state`), `working` first. `unknown` (a status
+# `display_state` could not name) is still its own rung rather than folded into
+# `failed`. No worded label carries the state either way: the state glyph in each
+# box's own gutter says it.
 GROUP_ORDER = ("working", "blocked", "failed", "unknown", "idle")
 
 # The DISPLAY state `herdr_state` does not have. See `display_state` for why it
@@ -767,11 +770,12 @@ class Row:
       * a ROOT row (`is_root`): an outdented rounded box. `text` is the root's
         name and `harness` the label flush right on its one content row. It draws
         in column 0, OUTDENTED from its workers at column `GUTTER`, because it is
-        their parent; the group rail below it drops out of its bottom-left corner.
-      * a RAIL row (`rail`): the blank breathing row above a group, drawn as the
-        rail alone so the vertical line is unbroken between boxes. It carries the
-        group's state, but no text — the worded group label is gone and the state
-        is read from the animated glyph in each box's gutter.
+        their parent; the rail below it drops out of its bottom-left corner.
+      * a RAIL row (`rail`): the blank breathing row that opens a root's worker
+        list, drawn as the rail alone so the vertical line is unbroken between
+        boxes. It carries the most urgent state among that root's workers (see
+        `_rail_state`) but no text — there is no worded label, and each worker's
+        own state is read from the animated glyph in the box's gutter.
       * a WORKER row (none of the above): a rounded box. `text` is the task (the
         title with its `<role>_<agent>:` prefix removed); `agent`, `meta` and
         `harness` are its identity; `depth` is how far below the root it sits.
@@ -1331,28 +1335,30 @@ def build_rows(
     """The display rows for the selected roots' trees, in DISPLAY order (C2).
 
     The order built here IS the order on screen, and it is what the selection
-    indexes into: per root an outdented box row, then for each state group a
-    breathing rail row and the group's worker boxes. So the whole view reads top
-    to bottom the way it is painted.
+    indexes into: per root an outdented box row, then ONE breathing rail row
+    opening the root's worker list, then the workers THEMSELVES in `_worker_rows`
+    order — DELEGATION order, the order they were dispatched. So the whole view
+    reads top to bottom the way it is painted, and the list doubles as a TIMELINE
+    OF DELEGATION: a worker that finishes keeps its place rather than sinking to
+    the bottom. That is the fix for the reported bug — finished workers were
+    re-bucketed to the end — and it is why state MUST NOT group the rows here:
+    bucketing by state is exactly what is being removed.
 
-    THE GROUPING HAPPENS HERE, not in `_pane`, and that is load-bearing. If the
-    view grouped the workers while `Frame.rows` stayed in tree order, the arrow
-    keys — `move_selection` and `_run_tui`'s scroll — would walk the rows in
-    tree order while the eye read state order, and the selection would appear to
-    jump around at random. Sorting the ROWS themselves keeps every index-based
-    helper correct without a change; the SELECTION follows its session across
-    this reorder, because a held index would land on whichever worker now sits
-    there (see `snap_selection`).
+    THE ORDERING HAPPENS HERE, not in `_pane`, and that is load-bearing. `_pane`
+    composes only the rows it is handed, so a reorder introduced there would leave
+    `Frame.rows` in one order while the eye read another, and the arrow keys —
+    `move_selection` and `_run_tui`'s scroll — would appear to jump around at
+    random. Building the rows ALREADY in display order keeps every index-based
+    helper correct without a change; the SELECTION follows its SESSION across a
+    refresh (see `snap_selection`), which is what keeps Enter on the right agent
+    when a worker is added or removed and the indexes shift underneath the caret.
 
-    The sort is STABLE (`_grouped`), so two polls that brought the same set of
-    workers produce byte-identical rows; an unstable order would make otherwise
-    identical frames differ and defeat `paint_needed` forever.
+    The order is STABLE (pre-order is deterministic), so two polls that brought
+    the same set of workers produce byte-identical rows; an unstable order would
+    make otherwise identical frames differ and defeat `paint_needed` forever.
 
-    A worker can have children, and the tree is FLATTENED: a descendant is
-    grouped by its OWN state like any other worker, and the spine columns are not
-    drawn. Grouping by state and drawing a tree spine are mutually exclusive —
-    a child placed under its parent's group would sit under a state that disagrees
-    with its own — so the parent link is dropped rather than lied about. `depth`
+    A worker can have children, and the tree is FLATTENED: a descendant is a box
+    of its own, in `_preorder` order, and the spine columns are not drawn. `depth`
     is still carried, and nothing crashes on nesting.
 
     `now` is the clock the meta lines are measured against; it defaults to the
@@ -1369,13 +1375,15 @@ def build_rows(
             continue
         workers = _worker_rows(by_id, children, root_id, clock)
         rows.append(_root_row(by_id[root_id], root_id))
-        for state, group in _grouped(workers):
-            # The rail row opens the group: the ONE thing that marks where one
-            # group ends and the next begins, now the worded label is gone. It
-            # carries the group's state (never a mystery) and is the group's
-            # opening brace for `_blocks`' height trimming.
-            rows.append(Row(session_id="", text="", state=state, depth=1, rail=True))
-            rows.extend(group)
+        if workers:
+            # ONE rail opens the root's worker list. The workers are NOT
+            # re-bucketed by state — that is the reported bug — so the rail
+            # carries the most urgent state present among them (`_rail_state`)
+            # and each box's own gutter glyph and meta tell them apart. A root
+            # with no workers gets no rail: there would be nothing to open.
+            rows.append(Row(session_id="", text="", state=_rail_state(workers),
+                            depth=1, rail=True))
+            rows.extend(workers)
     return rows
 
 
@@ -1422,22 +1430,26 @@ def _worker_rows(by_id: dict, children: dict, root_id: str,
     return out
 
 
-def _grouped(workers: list[Row]) -> list[tuple[str, list[Row]]]:
-    """`workers` bucketed by state, groups in `GROUP_ORDER`, STABLE within a group.
+def _rail_state(workers: list[Row]) -> str:
+    """The state the root's SINGLE rail carries: the most urgent state present.
 
-    Stable is a requirement, not a nicety: two frames built from the same workers
-    must compose to identical lines, or `paint_needed` sees a difference that is
-    not one and the pane repaints forever. `sorted` is stable, so the pre-order
-    the walk produced is preserved inside each bucket. A state outside
-    `GROUP_ORDER` still gets its own group rather than being dropped, so an
-    unheard-of status can never silently lose a worker.
+    Workers keep DELEGATION order now (`build_rows`), so a root has exactly one
+    rail opening its worker list rather than one rail per state group. Which state
+    that rail shows still has to be chosen, and `GROUP_ORDER` is kept as the
+    PRECEDENCE rather than a bucket order: the most urgent state among the root's
+    workers, `working` first. That keeps the rail reading "something here is still
+    running" while anything is — the behaviour the grouped rails gave — and keeps
+    `GROUP_ORDER` meaningful instead of leaving it dead.
+
+    A state outside `GROUP_ORDER` (only reachable if `display_state` grows one) is
+    answered with the FIRST worker's own state rather than a fabricated `idle`, so
+    an unheard-of status is reported honestly instead of mislabelled. `workers` is
+    never empty: the caller emits a rail only when there is a worker to open.
     """
-    buckets: dict[str, list[Row]] = {}
-    for row in workers:
-        buckets.setdefault(row.state, []).append(row)
-    order = sorted(buckets, key=lambda st: GROUP_ORDER.index(st)
-                   if st in GROUP_ORDER else len(GROUP_ORDER))
-    return [(state, buckets[state]) for state in order]
+    for state in GROUP_ORDER:
+        if any(row.state == state for row in workers):
+            return state
+    return workers[0].state
 
 
 # ---------------------------------------------------------------------------
