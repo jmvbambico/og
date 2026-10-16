@@ -4187,6 +4187,53 @@ def test_enter_focuses_a_worker_whose_listing_carried_no_root(monkeypatch):
     assert not any("focus:" in text for text in screen.painted), screen.painted
 
 
+def test_enter_on_a_worker_row_resolves_the_spec_harness_for_the_callee(
+        spec_home, monkeypatch):
+    """REGRESSION for the v0.20.0 report: Enter on a WORKER row.
+
+    `build_rows` gives every worker row NO harness (`""`) and an agent name
+    parsed from its title; the row's MARK resolves the harness the agent's spec
+    declares. Enter must resolve it the SAME way, or `focus_agent_terminal` is
+    handed "" and declines EVERY worker as an unknown harness — even though the
+    worker's tab is visibly on screen, which is exactly what the user reported.
+    Built through `build_rows`, so the row is shaped as the pane really shapes it.
+    """
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    listing = [listed("root", status="running", title="conversation"),
+               listed("w1", parent="root", status="running",
+                      title="coder_zen:do-it")]
+    row = next(r for r in a.build_rows(listing, ["root"], now=NOW)
+               if r.session_id == "w1")
+    # Exactly what a worker row carries: no harness of its own, agent `zen`.
+    assert row.harness == "" and row.agent == "zen"
+    calls = _fake_focus_agent_terminal(monkeypatch)
+
+    assert a.focus_agent(row) is None
+    # The spec's harness — not the row's blank — reaches the callee.
+    assert calls == [("w1", "opencode-native", "root")], calls
+
+
+def test_enter_on_an_unresolvable_worker_degrades_to_the_callee_notice(
+        spec_home, monkeypatch):
+    """A worker whose agent has no installed spec either still degrades cleanly.
+
+    The resolution yields "" (there is nothing to guess), so Enter hands that
+    through and shows whatever the callee answers — its honest "unknown harness"
+    — rather than raising on the keypress.
+    """
+    listing = [listed("root", status="running", title="conversation"),
+               listed("w1", parent="root", status="running",
+                      title="coder_ghost:do-it")]
+    row = next(r for r in a.build_rows(listing, ["root"], now=NOW)
+               if r.session_id == "w1")
+    assert row.harness == "" and row.agent == "ghost"
+    notice = og_herdr_launch.NOTICE_FOCUS_UNKNOWN_HARNESS.format("this agent")
+    calls = _fake_focus_agent_terminal(monkeypatch, notice=notice)
+
+    assert a.focus_agent(row) == notice
+    assert calls == [("w1", "", "root")], calls
+
+
 def test_focus_resolution_adds_no_call_beyond_agent_focus():
     """The one-outbound-call guarantee survives the root resolution: resolving a
     TARGET is not a second call, and this path adds none (see

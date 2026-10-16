@@ -1242,6 +1242,31 @@ def harness_mark(harness: Any) -> str:
     return _vendor_mark(harness_vendors().get(harness))
 
 
+def worker_harness(harness: Any, agent: Any) -> str:
+    """The harness a WORKER row actually ran on, by the resolution order.
+
+    ONE definition of the order, shared by every reader that needs it —
+    `worker_mark`, `worker_vendor` and `focus_agent` — so they cannot drift
+    apart. This bug IS that drift: `focus_agent` read the ROW's harness straight
+    off the row, and a worker's LISTING row carries none (`_worker_rows` fills
+    ""), so Enter on ANY worker reached `focus_agent_terminal` with "" and was
+    declined as an unknown harness — reported against v0.20.0, the agent's tab
+    visible beside the pane while og refused to focus it. Roots were unaffected
+    because their harness comes from a detail fetch.
+
+    The order, highest first: the row's OWN harness when it carries one (any
+    source that supplies it is reporting what ACTUALLY ran, so it wins), then the
+    harness the agent's installed spec declares, found by `agent` through
+    `og_herdr.agent_harness`. Returns "" when neither answers — the honest blank,
+    which each caller turns into its own answer (the atom, a None colour, or the
+    "unknown harness" notice). Never raises: `agent_harness` never does.
+    """
+    if isinstance(harness, str) and harness.strip():
+        return harness
+    declared = agent_harness(agent)
+    return declared if isinstance(declared, str) else ""
+
+
 def worker_mark(harness: Any, agent: Any) -> str:
     """The brand mark for a WORKER row, by the resolution order (highest first).
 
@@ -1262,14 +1287,12 @@ def worker_mark(harness: Any, agent: Any) -> str:
     BLANK slot instead: there is nothing to mark, which is a different fact from
     "an agent I could not identify". Never raises.
     """
-    if isinstance(harness, str) and harness.strip():
-        return harness_mark(harness)
+    resolved = worker_harness(harness, agent)
+    if resolved:
+        return harness_mark(resolved)
     if not isinstance(agent, str) or not agent.strip():
         return _mark_slot("")
-    declared = agent_harness(agent)
-    if not declared:
-        return _vendor_mark(None)
-    return harness_mark(declared)
+    return _vendor_mark(None)
 
 
 def harness_vendor(harness: Any) -> Optional[str]:
@@ -1294,14 +1317,10 @@ def worker_vendor(harness: Any, agent: Any) -> Optional[str]:
     harness the agent's installed spec declares, then nothing (the atom or the
     blank slot) — so the mark and its colour agree by construction.
     """
-    if isinstance(harness, str) and harness.strip():
-        return harness_vendor(harness)
-    if not isinstance(agent, str) or not agent.strip():
+    resolved = worker_harness(harness, agent)
+    if not resolved:
         return None
-    declared = agent_harness(agent)
-    if not declared:
-        return None
-    return harness_vendor(declared)
+    return harness_vendor(resolved)
 
 
 def build_rows(
@@ -3704,7 +3723,13 @@ def focus_agent(row: Row) -> Optional[str]:
     try:
         return focus_agent_terminal(
             session_id=row.session_id,
-            harness=row.harness,
+            # The harness is resolved through the SAME order the row's MARK uses
+            # (`worker_harness`), NEVER read raw off the row: a worker's LISTING
+            # row carries no harness, so `row.harness` is "" for every worker and
+            # the callee declined each one as an unknown harness even though its
+            # tab was on screen — the v0.20.0 report. A root still resolves to its
+            # own detail-fetched harness through the same call.
+            harness=worker_harness(row.harness, row.agent),
             root_session_id=row.root_session_id or "",
         )
     except Exception as exc:
