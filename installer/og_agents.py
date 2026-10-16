@@ -189,10 +189,10 @@ NODE = "\u29bf"
 # The four columns a box spends BEFORE its rounded border: the NODE column (the
 # rail, or `⦿` where the box hangs off it), a space, the STATE glyph column, a
 # space. The node and the state glyph are drawn on the box's CONTENT row alone
-# and blank on its border and snippet rows, so the rail reads as one unbroken
-# line with a node at each agent — the rule the pre-C2 renderer already followed
-# for its caret. The breathing rails keep the rail in column 0 too, so the line
-# runs unbroken down the whole group.
+# and blank on the border rows above and below it, so the rail reads as one
+# unbroken line with a node at each agent — the rule the pre-C2 renderer already
+# followed for its caret. The breathing rails keep the rail in column 0 too, so
+# the line runs unbroken down the whole group.
 GUTTER = 4
 
 # The narrowest box there is: two corners and two rules is the smallest rectangle
@@ -214,14 +214,13 @@ GROUP_ORDER = ("working", "blocked", "failed", "unknown", "idle")
 # is derived here instead of being added to the shared vocabulary.
 FAILED_STATUSES = frozenset({"failed", "error", "errored", "cancelled", "canceled"})
 
-# Ceilings. The view is meant to run for a long time, so its two caches are
-# bounded rather than growing one entry per session the machine has ever seen.
-# Both are order-of-magnitude above anything real: MAX_ROOT_DETAILS is the
-# number of roots whose detail is worth a 121 KB fetch at startup (the "handful"
-# the design budgets for, and the ceiling on the cwd probe in `_match_cwd_root`
-# — same dict, same eviction), and MAX_SNIPPETS is a window of reports.
+# A ceiling. The view is meant to run for a long time, so its root-detail cache
+# is bounded rather than growing one entry per session the machine has ever seen.
+# MAX_ROOT_DETAILS is order-of-magnitude above anything real: the number of roots
+# whose detail is worth a 121 KB fetch at startup (the "handful" the design
+# budgets for, and the ceiling on the cwd probe in `_match_cwd_root` — same dict,
+# same eviction).
 MAX_ROOT_DETAILS = 32
-MAX_SNIPPETS = 256
 
 # The access panel (the `a` toggle). It is pinned to the bottom of the pane and
 # spans its FULL width, like the root box — it holds the QR block, one URL line
@@ -250,28 +249,41 @@ DEFAULT_WIDTH = 80
 
 # The footer. Its own constant so the tests can assert the binding is listed
 # without driving a tty. Enter FOCUSES the selected agent's own tab in herdr (see
-# `focus_agent`); snippet expand/collapse moved to SPACE when Enter was taken.
-# `Esc` IS named here now (`esc clear`): it clears the selection and never quits,
-# and that binding was undiscoverable while the full form sat at its 79-column
-# ceiling. Removing the `c cli` mirror freed the columns to surface it. See the
-# MEASURED WIDTHS below.
+# `focus_agent`).
+#
+# `Esc` IS DELIBERATELY BOUND BUT UNLISTED — do NOT add it back. It clears the
+# selection and never quits (see `_run_tui`), but the operator judged it
+# INSTINCTUAL and asked for it to stay out of the menu. Nothing on screen names
+# it, so its tests — not this line — are what keep it working; an unnamed binding
+# is exactly the kind that regresses silently. Every OTHER binding the view reads
+# IS listed here.
 #
 # THREE forms, chosen by width in `_footer`. The agents pane is a SPLIT of the
-# chat and is often only ~46 columns, while this full sentence is 75, so a single
-# fixed footer gets clipped by `_clip` — which is exactly how "space expand" and
-# "a access" used to fall off the end, leaving the operator without the key that
-# had just inherited expand from Enter. FOOTER_COMPACT swaps the Enter and Space
-# words for their key glyphs and drops the doubled spacing; FOOTER_KEYS is the
-# floor, naming every key with no labels at all. Only LABELS ever degrade, never
-# a key: a key with no label is still findable by pressing it, a key clipped off
-# the end is gone.
+# chat and is often only ~46 columns, while this full sentence is 50, so a single
+# fixed footer gets clipped by `_clip` — which is exactly how "a access" and
+# "q quit" used to fall off the end. FOOTER_COMPACT drops the `move` and `theme`
+# LABELS (their keys stay) and joins entries with a single space; FOOTER_KEYS is
+# the floor, naming every key with no labels at all. Only LABELS ever degrade,
+# never a key: a key with no label is still findable by pressing it, a key clipped
+# off the end is gone.
 #
-# THE FOOTER NAMES ITS KEYS IN ASCII AND ITS ONE SEPARATOR IN A NARROW GLYPH. The
-# move keys were once ↑/↓ (U+2191/U+2193), East Asian AMBIGUOUS — one column in a
-# Latin locale, TWO in a CJK one. `_display_width` charged them one, so the full
-# form measured exactly 64 and was chosen for a 64-column pane — but a CJK terminal
-# painted 66 and `_clip` cut the trailing keys off. They are ASCII now (`^/v`).
-# The separator is U+2219 BULLET OPERATOR, NARROW — `unicodedata.east_asian_width`
+# THE MOVE KEYS ARE ↑/↓ AGAIN, AND THAT IS A MEASURED COST. U+2191/U+2193 are East
+# Asian AMBIGUOUS — one column in a Latin locale, TWO in a CJK one — and
+# `_display_width` charges Ambiguous two, the pessimistic rule that is correct in
+# BOTH locales (see its docstring). So `↑/↓` costs FIVE measured columns where the
+# ASCII `^/v` it replaced cost three, and `↑↓` costs four where `^v` cost two: the
+# arrows buy the glyph vocabulary the footer already speaks (`⏎` for enter) at two
+# measured columns per form. `_display_width` and a CJK terminal still AGREE on
+# every form, so the form CHOSEN for a width is safe in both — the property that
+# matters, and the one the old ↑/↓ broke when the ruler charged them one while a
+# CJK terminal painted two. The arrows are the ONLY Ambiguous glyphs here; ⏎
+# (U+23CE) and ∙ (U+2219) stay Narrow, checked, not assumed. (The pane's BOX
+# borders — `│`, `╭`, `─` — are Ambiguous too and composed under the same `len`
+# ruler, so the arrows are consistent with the frame around them.)
+# `test_the_footer_is_measured_the_same_in_a_cjk_locale` keeps the two rulers in
+# agreement on every form.
+#
+# THE SEPARATOR IS U+2219 BULLET OPERATOR, NARROW — `unicodedata.east_asian_width`
 # reports "N", checked, not assumed — so it costs one column under BOTH locale
 # rules. AN AMBIGUOUS SEPARATOR IS WHAT SILENTLY COST THE PANE ITS LABELS: the
 # earlier ` · ` (U+00B7 MIDDLE DOT) is "A", charged TWO, which pushed the full form
@@ -279,30 +291,16 @@ DEFAULT_WIDTH = 80
 # to COMPACT and the ~46-column agents split fell all the way to the bare KEYS
 # form — the labels gone at the width the operator actually runs.
 # `test_the_footer_separator_is_not_ambiguous` is what stops that recurring.
-# ⏎ (U+23CE), ␣ (U+2423) and ∙ are the only non-ASCII glyphs here and each is
-# Narrow, so `_display_width` and a CJK terminal agree on every form. See
-# `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
 #
-# `t theme` JOINED ALL THREE FORMS WITHOUT MOVING ANY THRESHOLD, and that took a
-# deliberate choice about WHICH label degrades. The COMPACT form is the one the
-# ~46-column agents split actually shows, and appending ` t theme` to it would
-# have pushed it past that width — handing every real pane the bare KEYS form, a
-# far worse trade than losing one word. So COMPACT sheds `refresh` and keeps
-# `q quit`, `⏎ focus`, `␣ expand`, `a access` and `t theme`: the key `r` still
-# EXISTS in all three forms (the rule is that a key may never degrade, only its
-# label), and `r` is the one binding whose loss costs the operator nothing — it is
-# a convenience refresh, where every other binding is something you cannot guess.
-#
-# `c cli` — THE READ-ONLY MIRROR OF THE AGENT'S OWN HARNESS TUI — WAS REMOVED, AND
-# ITS COLUMNS WENT TO `esc`. The mirror is redundant now that Enter opens that
-# agent's real vendor CLI in its own tab INTERACTIVELY: a blocking permission
-# prompt is answerable from a real CLI, which a read-only mirror structurally
-# cannot do. Removing `c cli` freed 8 columns of the full form (79 → 71); `esc
-# clear` costs 12 (→ 83), past the 79-column ceiling the full form is sized for, so
-# the full form sheds `refresh`'s label too (→ 75) — the same cheap label COMPACT
-# already drops, and the one the paragraph above names as the binding whose loss
-# costs the operator nothing. MEASURED WIDTHS: 75 / 43 / 32. The key `esc` is in
-# all three forms.
+# THE BINDING SET HAS SHRUNK THREE TIMES. `c cli` (the read-only mirror of an
+# agent's harness TUI) went first: Enter opens that agent's real vendor CLI in its
+# own tab, INTERACTIVELY — what a blocking permission prompt needs and a read-only
+# mirror structurally cannot do. Then `␣ expand` went, by request: selecting an
+# agent now focuses its tab, which is what expanding was approximating, and a
+# live-but-unlisted binding is worse than either keeping or removing it. Then `r`
+# went: the operator does not want a manual refresh, and only the KEY is gone — the
+# POLLING machinery it triggers (the interval walk in `_run_tui`) is untouched.
+# Every binding the full form lists is LABELLED. MEASURED WIDTHS: 50 / 30 / 20.
 #
 # THE THREE FORMS ARE BUILT FROM (key, label) PAIRS, not typed out, so a key can
 # never appear in one form without its label and the separator can never be
@@ -332,7 +330,7 @@ def _footer_sep(entries: tuple) -> str:
 
 
 def _footer_form(entries: Iterable[tuple[str, str]], sep: str = FOOTER_SEP) -> str:
-    """One footer form from its `(key, label)` pairs: `q quit ∙ r refresh`.
+    """One footer form from its `(key, label)` pairs: `↑/↓ move ∙ ⏎ focus`.
 
     A label of "" is a KEY with no label (the compact and keys forms). The
     separator is `sep` between entries and a single space inside one, which is
@@ -342,17 +340,18 @@ def _footer_form(entries: Iterable[tuple[str, str]], sep: str = FOOTER_SEP) -> s
         key + (f" {label}" if label else "") for key, label in entries)
 
 
+# The order is the shape of the session: MOVE, then FOCUS, then the panel and
+# theme that dress the view, then QUIT. The two things an operator acts with come
+# first, the two things they look at next, and the exit last.
 FOOTER_ENTRIES = (
-    ("q", "quit"), ("r", ""), ("^/v", "move"), ("⏎", "focus"),
-    ("␣", "expand"), ("a", "access"), ("t", "theme"), ("esc", "clear"),
+    ("↑/↓", "move"), ("⏎", "focus"), ("t", "theme"), ("a", "access"),
+    ("q", "quit"),
 )
 FOOTER_COMPACT_ENTRIES = (
-    ("q", "quit"), ("r", ""), ("^v", ""), ("⏎", "focus"),
-    ("␣", "expand"), ("a", "access"), ("t", ""), ("esc", ""),
+    ("↑↓", ""), ("⏎", "focus"), ("t", ""), ("a", "access"), ("q", "quit"),
 )
 FOOTER_KEYS_ENTRIES = (
-    ("q", ""), ("r", ""), ("^v", ""), ("⏎", ""), ("␣", ""), ("a", ""),
-    ("t", ""), ("esc", ""),
+    ("↑↓", ""), ("⏎", ""), ("t", ""), ("a", ""), ("q", ""),
 )
 FOOTER = _footer_form(FOOTER_ENTRIES)
 FOOTER_COMPACT = _footer_form(FOOTER_COMPACT_ENTRIES, _footer_sep(FOOTER_COMPACT_ENTRIES))
@@ -468,57 +467,6 @@ Line = tuple[list[Span], str]
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
 # is `http://127.0.0.1:6767`.
 DEFAULT_PORT = urllib.parse.urlsplit(DEFAULT_BASE_URL).port or 6767
-
-
-# ---------------------------------------------------------------------------
-# pure: snippet extraction
-# ---------------------------------------------------------------------------
-
-def snippet_from_detail(detail: Any) -> Optional[str]:
-    """The report text of a session, from its DETAIL row, or None.
-
-    The snippet is the LAST `items` element that is an assistant message
-    (`type == "message"` and `data.role == "assistant"`), with its text taken
-    from the `output_text` parts of `data.content`:
-
-        {"id": "25f8b2d7…", "type": "message", "status": "completed",
-         "data": {"role": "assistant",
-                  "content": [{"type": "output_text", "text": "The work…"}]}}
-
-    The LAST one, not the first: the report is what the agent most recently
-    said, and older assistant messages are the turns before it. When that last
-    message carries no `output_text` the snippet is None rather than an earlier
-    message's text — falling back would show a stale line as if it were the
-    report, which is worse than showing nothing.
-
-    Every shape is tolerated without raising, because the detail row is an
-    enrichment and a missing one must cost the snippet and nothing else: a
-    missing/None/empty `items`, an element that is not a dict, `content` that is
-    not a list, and parts that are not dicts or carry no string `text`.
-    """
-    if not isinstance(detail, dict):
-        return None
-    items = detail.get("items")
-    if not isinstance(items, list):
-        return None
-    for item in reversed(items):
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        data = item.get("data")
-        if not isinstance(data, dict) or data.get("role") != "assistant":
-            continue
-        content = data.get("content")
-        if not isinstance(content, list):
-            return None
-        parts = [
-            part.get("text")
-            for part in content
-            if isinstance(part, dict)
-            and part.get("type") == "output_text"
-            and isinstance(part.get("text"), str)
-        ]
-        return "\n".join(parts) if parts else None
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -846,8 +794,6 @@ class Row:
     depth: int
     is_root: bool = False
     rail: bool = False
-    snippet: Optional[str] = None
-    expanded: bool = False
     agent: Optional[str] = None
     meta: str = ""
     harness: str = ""
@@ -1361,8 +1307,6 @@ def worker_vendor(harness: Any, agent: Any) -> Optional[str]:
 def build_rows(
     sessions: Iterable[dict],
     root_ids: Iterable[str],
-    snippets: Optional[dict[str, Optional[str]]] = None,
-    expanded_ids: Iterable[str] = (),
     now: Optional[float] = None,
 ) -> list[Row]:
     """The display rows for the selected roots' trees, in DISPLAY order (C2).
@@ -1397,8 +1341,6 @@ def build_rows(
     test passes it explicitly — a duration asserted against the real clock is a
     flake waiting for a slow machine.
     """
-    snippets = snippets or {}
-    expanded = set(expanded_ids)
     clock = time.time() if now is None else now
     sessions = list(sessions)
     by_id, children = _index(sessions)
@@ -1406,7 +1348,7 @@ def build_rows(
     for root_id in root_ids:
         if root_id not in by_id:
             continue
-        workers = _worker_rows(by_id, children, root_id, snippets, expanded, clock)
+        workers = _worker_rows(by_id, children, root_id, clock)
         rows.append(_root_row(by_id[root_id], root_id))
         for state, group in _grouped(workers):
             # The rail row opens the group: the ONE thing that marks where one
@@ -1438,7 +1380,7 @@ def _root_row(session: dict, root_id: str) -> Row:
 
 
 def _worker_rows(by_id: dict, children: dict, root_id: str,
-                 snippets: dict, expanded: set, clock: float) -> list[Row]:
+                 clock: float) -> list[Row]:
     """The worker Rows under one root, in pre-order (nesting flattened)."""
     out: list[Row] = []
     for sid, depth in _preorder(by_id, children, [root_id]):
@@ -1447,15 +1389,12 @@ def _worker_rows(by_id: dict, children: dict, root_id: str,
         session = by_id[sid]
         state = display_state(session)
         agent, task = split_title(session.get("title"))
-        snippet = snippets.get(sid)
         harness = session.get("harness")
         out.append(Row(
             session_id=sid,
             text=task,
             state=state,
             depth=depth,
-            snippet=snippet,
-            expanded=sid in expanded and snippet is not None,
             agent=agent,
             meta=worker_meta(session, state, clock),
             harness=harness if isinstance(harness, str) else "",
@@ -1486,11 +1425,6 @@ def _grouped(workers: list[Row]) -> list[tuple[str, list[Row]]]:
 # pure: the renderer (state -> lines)
 # ---------------------------------------------------------------------------
 
-def _oneline(text: str) -> str:
-    """Collapse a multi-line report to one line for the tree."""
-    return " ".join(text.split())
-
-
 def _clip(text: str, width: int) -> str:
     """`text` cut to `width` columns, with an ellipsis if it had to be cut.
 
@@ -1502,7 +1436,7 @@ def _clip(text: str, width: int) -> str:
     `_display_width` counts DISPLAY columns (a Wide/Ambiguous glyph as two). The
     two agree on everything the footer — the only line `_display_width` guards —
     now contains, since it is ASCII-plus-Narrow. They disagree on a wide glyph,
-    which a session snippet could still carry: such a row could be clipped a
+    which a session title could still carry: such a row could be clipped a
     column short or long. Reconciling them means width-aware clipping throughout
     the renderer (grapheme clusters included), a larger change than it looks and
     deliberately not made here.
@@ -1549,9 +1483,11 @@ def _display_width(text: str) -> int:
     AMBIGUOUS (East Asian "A") is charged two as well, deliberately. Its width is
     locale-dependent — one column in a Latin locale, two in a CJK one — so the
     only rule correct in BOTH is the pessimistic one; charging it one is how the
-    footer's old ↑/↓ cost 64 measured but 66 painted. The footer now names no
-    Ambiguous glyph, so this backstop does not move any current threshold: it only
-    bites a future edit that adds one. See the footer comment.
+    footer's old ↑/↓ cost 64 measured but 66 painted and a CJK terminal clipped the
+    trailing keys. It is NOT a dormant backstop now: the footer's move keys ↑/↓ are
+    Ambiguous, so this is what measures them two and keeps the CHOSEN form safe in
+    both locales — at the price of counting the arrows a column wider than a Latin
+    terminal paints them. See the footer comment.
 
     NOT the mark slot's ruler: `_slot_width` measures that column, because a
     title has to line up in the locale the operator RUNS, not in both. Do not
@@ -1842,13 +1778,11 @@ def worker_box(row: Row, width: int, selected: bool,
     unaffected: the selected box was already at full brightness, so it renders
     exactly as before.
 
-    The box is THREE rows — top border, ONE content row, bottom border — and FOUR
-    when the report is expanded (the extra row is the dimmed snippet, INSIDE the
-    box, never a loose line that would break the rectangle). The single content
-    row carries the harness mark in its fixed two-column slot and the title flush
-    left, with the meta (`2m14s`, `failed`, `waiting on you`) flush right on the
-    SAME row. The AGENT NAME is gone: the mark already names the harness the name
-    did, so the meta — the one thing on the row the mark does not say — is all
+    The box is THREE rows — top border, ONE content row, bottom border. The single
+    content row carries the harness mark in its fixed two-column slot and the title
+    flush left, with the meta (`2m14s`, `failed`, `waiting on you`) flush right on
+    the SAME row. The AGENT NAME is gone: the mark already names the harness the
+    name did, so the meta — the one thing on the row the mark does not say — is all
     that is left to draw. `_two_col` keeps the meta's columns and clips the TITLE
     first when the line is tight.
 
@@ -1932,10 +1866,7 @@ def worker_box(row: Row, width: int, selected: bool,
             (" ", PLAIN),
             (row.text, PLAIN)]
     content = _two_col(left, [(row.meta, META)], inner)
-    lines = [content]
-    if row.expanded and row.snippet:
-        lines.append([("  " + _clip(_oneline(row.snippet), inner - 2), PLAIN)])
-    boxed = _round_box_lines(lines, box_width)
+    boxed = _round_box_lines([content], box_width)
 
     out: list[list[Span]] = []
     for index, spans in enumerate(boxed):
@@ -3207,11 +3138,6 @@ class AgentModel:
          is ordered by recency — so the rule costs the roots more recent than the
          answer, and none of the ones after it. Also once per root, because the
          result is cached under the same session id.
-      3. once per worker that has gone IDLE, to capture the report it just
-         produced. An idle report stops changing, so it is fetched once and kept.
-      4. once for a row the user SELECTED, so its snippet can be read on demand
-         (and refetched when the user forces a refresh, while it is still
-         running).
 
     Never "one per row per poll": a session already in a cache is not fetched
     again, so a stable listing costs nothing after the first refresh. The detail
@@ -3231,10 +3157,6 @@ class AgentModel:
         self.all_roots = all_roots
         # root id -> {workspace?, harness?}, from one detail fetch each.
         self._root_info: dict[str, dict] = {}
-        # session id -> snippet (or None, meaning "asked, nothing there"). Cached
-        # so a running worker is not re-read every poll; dropped on a forced
-        # refresh of the selected row.
-        self._snippets: dict[str, Optional[str]] = {}
 
     # -- caches -------------------------------------------------------------
 
@@ -3248,12 +3170,6 @@ class AgentModel:
 
         The cache is FIFO-bounded at MAX_ROOT_DETAILS, which is also the bound
         on how far the cwd probe in `_match_cwd_root` can walk.
-
-        The report is extracted from the same response and seeded into the
-        snippet cache. It is already in hand, and a root that becomes the scope
-        — which is exactly what the cwd probe does to a quiet root — is idle by
-        definition, so without this the lazy "first idle" fetch would pay for a
-        SECOND 121 KB read of a row this one just read.
         """
         if session_id in self._root_info:
             return self._root_info[session_id]
@@ -3269,24 +3185,7 @@ class AgentModel:
             if isinstance(harness, str) and harness:
                 info["harness"] = harness
         self._root_info[session_id] = info
-        if session_id not in self._snippets:
-            self._snippets[session_id] = snippet_from_detail(detail)
         return info
-
-    def _snippet(self, session_id: str) -> Optional[str]:
-        """The report of a session, fetched once and cached.
-
-        `self.watcher._fetch_detail` already swallows a transport or decode
-        error and returns None, so a session whose detail cannot be read costs
-        its snippet and nothing else — the row still renders.
-        """
-        if session_id in self._snippets:
-            return self._snippets[session_id]
-        if len(self._snippets) >= MAX_SNIPPETS:
-            self._snippets.pop(next(iter(self._snippets)))
-        text = snippet_from_detail(self.watcher._fetch_detail(session_id))
-        self._snippets[session_id] = text
-        return text
 
     # -- refresh ------------------------------------------------------------
 
@@ -3335,20 +3234,15 @@ class AgentModel:
                 return sid
         return None
 
-    def refresh(
-        self,
-        selected_id: Optional[str] = None,
-        expanded_ids: Iterable[str] = (),
-        force: bool = False,
-    ) -> Frame:
+    def refresh(self) -> Frame:
         """One listing walk -> a `Frame`. The only method that touches the wire."""
         rows, truncated = self.watcher.fetch_listing(kind="any")
 
         # Only archived sessions are dropped. `og_herdr_watch.should_project` is
-        # NOT applied here on purpose: it drops an idle sub-agent, which is
-        # right for a herdr pane but wrong for this view — the whole point of
-        # the lazy "first idle" snippet is to read a worker's report AFTER it
-        # stopped, so an idle worker must stay on screen long enough to show it.
+        # NOT applied here on purpose: it drops an idle sub-agent, which is right
+        # for a herdr pane but wrong for this view — a finished worker is still
+        # part of the tree this view draws, and dropping it would make rows
+        # vanish the moment a worker went idle.
         sessions = [s for s in rows
                     if isinstance(s, dict) and not s.get("archived")]
 
@@ -3413,22 +3307,7 @@ class AgentModel:
             if sid not in asked:
                 del self._root_info[sid]
 
-        by_id, children = _index(merged)
-        order = _preorder(by_id, children, scope)
-
-        # The lazy fetches. An idle worker is read once and kept; a selected row
-        # is read once on selection, and re-read only on a forced refresh.
-        for sid, _depth in order:
-            if sid not in by_id:
-                continue
-            if display_state(by_id[sid]) == "idle":
-                self._snippet(sid)
-            if sid == selected_id:
-                if force:
-                    self._snippets.pop(sid, None)
-                self._snippet(sid)
-
-        frame_rows = build_rows(merged, scope, self._snippets, expanded_ids)
+        frame_rows = build_rows(merged, scope)
         return Frame(rows=frame_rows, truncated=truncated)
 
     @staticmethod
@@ -3842,11 +3721,10 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     the model.
 
     Keys: `q` quits (it is the ONLY quit), `Esc` CLEARS the selection and returns
-    every row to its undimmed look — it never quits — `r` forces a refresh, the
-    arrows (or `j`/`k`) move the selection over every agent row including the
+    every row to its undimmed look — it never quits — the arrows (or `j`/`k`) move
+    the selection over every agent row including the
     root, Enter UNDIMS the list and then FOCUSES the selected agent's OWN tab in
-    herdr (see `focus_agent`), Space expands or collapses
-    the selected row's snippet, `a` toggles the access panel, and `t` opens the
+    herdr (see `focus_agent`), `a` toggles the access panel, and `t` opens the
     theme picker. It sends
     nothing to a session and changes no session state: the focus is the ONE
     outbound call it makes, and it moves the operator's own terminal alone.
@@ -3924,7 +3802,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # `snap_selection`). Every index-keyed read below is guarded on it.
         selected: Optional[int] = None
         offset = 0
-        expanded: set[str] = set()
         # The one-line reason the last Enter could not focus, shown in the pane
         # through `Frame.notice` — on the FOOTER row, replacing it while it is up
         # (`_pane`). It is cleared on the NEXT keypress, so it sits for as long as
@@ -3938,11 +3815,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # whichever is live, the outage first — while the server is unreachable it
         # is the more important thing to say.
         listing_notice: Optional[str] = None
-        # `poll` asks for a refresh now; `force` additionally drops the selected
-        # row's cached report so it is read again. They are separate so Space can
-        # redraw the tree this tick without paying for a second 121 KB fetch.
+        # `poll` asks for a refresh now. It starts True so the first pass paints
+        # the listing without waiting out the interval.
         poll = True
-        force = True
         frame = Frame()
         show_access = start_access
         # Resolved once, on the toggle: the address does not change while the
@@ -4088,8 +3963,7 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 sel_id = ids[selected] if selected is not None \
                     and 0 <= selected < len(ids) else None
                 try:
-                    frame = model.refresh(selected_id=sel_id,
-                                          expanded_ids=expanded, force=force)
+                    frame = model.refresh()
                 except Exception as exc:
                     # THE PANE DEGRADES, IT DOES NOT DIE. `refresh` touches the
                     # wire in one place `og_herdr_watch` does not already swallow
@@ -4111,7 +3985,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                     selected = snap_selection(frame.rows, sel_id, selected)
                 next_poll = now + interval
                 poll = False
-                force = False
 
             # The panel is part of the frame, so `render` stays the source of
             # what is painted — and it is set HERE, not inside the refresh, so
@@ -4189,9 +4062,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 # repaints off the composed difference.
                 selected = None
                 continue
-            if key == ord("r"):
-                poll = force = True
-                continue
             if key == ord("a"):
                 show_access = not show_access
                 if show_access:
@@ -4199,7 +4069,7 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             elif key == ord("t"):
                 # The theme picker. It draws over the pane and drives its own keys,
                 # so it is entered and left in one blocking call; on the way back
-                # the pane's own state (selection, scroll, expanded, access) is
+                # the pane's own state (selection, scroll, access) is
                 # untouched, which is what "cancel puts back exactly what was
                 # there" means here.
                 chosen = _choose_theme(stdscr, curses, colours, active_theme,
@@ -4249,19 +4119,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                     row = frame.rows[selected]
                     selected = None                     # undim before focusing
                     notice = focus_agent(row)
-            elif key == ord(" "):
-                # Expand/collapse moved off Enter when Enter took focus. It DOES
-                # set `poll`: the expanded set feeds the rebuild, so the tree has
-                # to be redrawn, and the report is already cached, so this costs
-                # nothing beyond the listing walk. Like Enter, it does nothing at
-                # all while the pane is untouched: there is no row to expand.
-                if selected is not None and 0 <= selected < len(frame.rows):
-                    sid = frame.rows[selected].session_id
-                    if sid in expanded:
-                        expanded.discard(sid)
-                    else:
-                        expanded.add(sid)
-                    poll = True
 
     curses.wrapper(loop)
     return 0

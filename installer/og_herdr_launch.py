@@ -135,16 +135,16 @@ AGENTS_COMMAND = "og agents"
 # not the launcher's own.
 #
 # 0.7, not 0.8, because the agents pane must be able to show its OWN controls.
-# The `og agents` footer's full form is 75 display columns — the widest element
-# the pane renders. (The move keys are ASCII `^/v` and every glyph is Narrow, so
-# 75 is the width in every locale, CJK included.) Below that it DEGRADES rather
-# than clips: `og_agents._footer` picks a 43-column compact form, then a 32-column
-# bare key list, so every key stays discoverable at any width (only under 32
-# columns does the key list itself clip). The ratio is 0.7, not 0.8, because 0.8
-# gave the pane only ~43 columns on the operator's 215-column terminal — enough
-# for the compact form and nothing left for the 27-column QR — while 0.7 leaves
-# ~30% (~64 columns there), enough for a LABELLED footer form AND the QR. A pane
-# that cannot show its own controls is broken.
+# The `og agents` footer's full form is 50 display columns — the widest element
+# the pane renders. (The move keys are the East Asian AMBIGUOUS ↑/↓, charged two
+# columns by `_display_width`, so 50 is the width in every locale, CJK included.)
+# Below that it DEGRADES rather than clips: `og_agents._footer` picks a 30-column
+# compact form, then a 20-column bare key list, so every key stays discoverable at
+# any width (only under 20 columns does the key list itself clip). The ratio is
+# 0.7, not 0.8, because 0.8 gave the pane only ~43 columns on the operator's
+# 215-column terminal — too narrow for the full form — while 0.7 leaves ~30%
+# (~64 columns there), enough for the FULL footer form AND the 27-column QR. A
+# pane that cannot show its own controls is broken.
 AGENTS_PANE_RATIO = 0.7
 
 # Statuses that mean "this session is the one to come back to". `idle`

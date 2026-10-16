@@ -521,10 +521,6 @@ split pane.
 | Node title | session `title` |
 | Status icon | `status` + `pending_elicitations_count` |
 | Harness icon | `harness`, and `/v1/agents` for the agent catalog |
-| Snippet line | last assistant message in the detail row's `items` |
-
-The snippet is verbatim what the web UI shows: for `space-per-root` it is
-*"The work was already committed (`573414d`) before the interruptio…"*.
 
 ### The cost problem, and the fix
 
@@ -536,8 +532,9 @@ So the refresh is two-tier:
 
 - **Listing** drives the live view — cheap, already paginated and filtered in
   `og_herdr_watch.py`, gives the tree, titles and statuses.
-- **Detail** is fetched lazily for the snippet — on selection, or once when a
-  worker goes idle, which is when its report exists and stops changing.
+- **Detail** is fetched once per LIVE ROOT, to learn its `workspace` (the cwd
+  rule needs it) and its `harness` (the header label) — never per worker, never
+  per poll.
 
 ### Scope
 
