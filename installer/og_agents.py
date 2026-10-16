@@ -16,14 +16,16 @@ per-row-per-poll fetch is a defect rather than a slow path.
 
 The shape of the view is the operator's C2 template, iterated against the pane's
 measured feedback: a rounded box per root drawn at column 0 (OUTDENTED relative
-to its workers), then the root's workers GROUPED BY STATE, each group opened by a
-breathing rail row and each worker a rounded box indented behind a four-column
-gutter. There are NO worded group labels: the animated glyph in the gutter says
-the state, and the breathing rail alone marks where one group ends and the next
-begins. The gutter is the rail's own column (`⦿` where an agent's box hangs off
-it, `│` on every other row), a space, the state glyph's column, and a space — so
-one unbroken line runs down the pane's left edge, with a node at each agent, out
-of the root box's own bottom-left corner and across the breathing rows.
+to its workers), then the root's workers in DELEGATION ORDER — the order they were
+dispatched — each a rounded box indented behind a four-column gutter, with ONE
+breathing rail row opening the list. DELEGATION ORDER IS LOAD-BEARING: the list
+doubles as a timeline of when each agent was dispatched, so a worker that finishes
+keeps its place instead of sinking to the bottom (the reported bug). There are NO
+worded group labels: the animated glyph in the gutter says the state, and the rail
+alone opens the list. The gutter is the rail's own column (`⦿` where an agent's
+box hangs off it, `│` on every other row), a space, the state glyph's column, and
+a space — so one unbroken line runs down the pane's left edge, with a node at each
+agent, out of the root box's own bottom-left corner and across the breathing row.
 SELECTION IS BRIGHTNESS: the selected AGENT's box — a worker's or the root's —
 paints normal while every other box paints dim — there is no caret glyph. The
 selection is cleared by `Esc` (which no longer quits) and by `Enter` acting on a
@@ -201,13 +203,14 @@ GUTTER = 4
 # "box" would be a lie.
 BOX_MIN = 4
 
-# The state groups, in the order they are DRAWN: what needs attention first.
-# `unknown` (a status `display_state` could not name) is its own group rather than
-# folded into `failed`, so its row keeps its own `?` glyph. A state outside this
-# tuple still gets a group, sorted last (see `_grouped`), so no worker is dropped.
-# The groups carry NO worded label: the state glyph in each box's gutter says it,
-# and a breathing rail row alone marks where one group ends and the next begins.
-# Only the ORDER survives, and it is still what puts what needs attention first.
+# The URGENCY PRECEDENCE of the display states: what needs attention first.
+# Workers are no longer BUCKETED by state — they keep delegation order (see
+# `build_rows`) — so this is no longer a sort order. It survives as the precedence
+# the root's single rail resolves its own state by: the most urgent state present
+# among the root's workers (`_rail_state`), `working` first. `unknown` (a status
+# `display_state` could not name) is still its own rung rather than folded into
+# `failed`. No worded label carries the state either way: the state glyph in each
+# box's own gutter says it.
 GROUP_ORDER = ("working", "blocked", "failed", "unknown", "idle")
 
 # The DISPLAY state `herdr_state` does not have. See `display_state` for why it
@@ -423,10 +426,12 @@ NORMAL, SELECTED, DIM = "normal", "selected", "dim"
 #              not be expressed at all.
 #   FOOTER_KEY    a footer shortcut's KEY half, and FOOTER_LABEL its label half
 #              (and the `∙` between entries, and the strip's padding). They are
-#              two roles rather than one because the KEY is the prominent half —
-#              it takes the `text` slot and is `undim`-exempt — while the label
-#              recedes into `meta`. Both carry the footer's derived background
-#              strip, which is why they cannot just be PLAIN/META (see
+#              two roles rather than one because the halves differ in COLOUR: the
+#              KEY is the prominent half (`text`), the label the quieter one
+#              (`meta`). Both are `undim`-exempt so both stay bright on the footer
+#              line's DIM (a label dimmed twice read as too dim — the reported
+#              bug), leaving colour as the distinction. Both carry the footer's
+#              background strip, which is why they cannot just be PLAIN/META (see
 #              `_role_background`).
 PLAIN, META, ORCH = "plain", "meta", "orch"
 BORDER = "border"
@@ -767,11 +772,12 @@ class Row:
       * a ROOT row (`is_root`): an outdented rounded box. `text` is the root's
         name and `harness` the label flush right on its one content row. It draws
         in column 0, OUTDENTED from its workers at column `GUTTER`, because it is
-        their parent; the group rail below it drops out of its bottom-left corner.
-      * a RAIL row (`rail`): the blank breathing row above a group, drawn as the
-        rail alone so the vertical line is unbroken between boxes. It carries the
-        group's state, but no text — the worded group label is gone and the state
-        is read from the animated glyph in each box's gutter.
+        their parent; the rail below it drops out of its bottom-left corner.
+      * a RAIL row (`rail`): the blank breathing row that opens a root's worker
+        list, drawn as the rail alone so the vertical line is unbroken between
+        boxes. It carries the most urgent state among that root's workers (see
+        `_rail_state`) but no text — there is no worded label, and each worker's
+        own state is read from the animated glyph in the box's gutter.
       * a WORKER row (none of the above): a rounded box. `text` is the task (the
         title with its `<role>_<agent>:` prefix removed); `agent`, `meta` and
         `harness` are its identity; `depth` is how far below the root it sits.
@@ -1066,6 +1072,10 @@ _OG_COLOURS = {
     "working": "#ffff00",
     "failed": "#ff0000",
     "rail": "default",
+    # The optional `strip` role: the footer's background band, PICKED by the
+    # operator rather than derived (this row has no `bg` to shade). Kept
+    # byte-for-byte in step with the catalog row by a test.
+    "strip": "#232625",
 }
 
 # The one colour every worker META paints in under the `og` theme: ansi 109, a
@@ -1242,6 +1252,31 @@ def harness_mark(harness: Any) -> str:
     return _vendor_mark(harness_vendors().get(harness))
 
 
+def worker_harness(harness: Any, agent: Any) -> str:
+    """The harness a WORKER row actually ran on, by the resolution order.
+
+    ONE definition of the order, shared by every reader that needs it —
+    `worker_mark`, `worker_vendor` and `focus_agent` — so they cannot drift
+    apart. This bug IS that drift: `focus_agent` read the ROW's harness straight
+    off the row, and a worker's LISTING row carries none (`_worker_rows` fills
+    ""), so Enter on ANY worker reached `focus_agent_terminal` with "" and was
+    declined as an unknown harness — reported against v0.20.0, the agent's tab
+    visible beside the pane while og refused to focus it. Roots were unaffected
+    because their harness comes from a detail fetch.
+
+    The order, highest first: the row's OWN harness when it carries one (any
+    source that supplies it is reporting what ACTUALLY ran, so it wins), then the
+    harness the agent's installed spec declares, found by `agent` through
+    `og_herdr.agent_harness`. Returns "" when neither answers — the honest blank,
+    which each caller turns into its own answer (the atom, a None colour, or the
+    "unknown harness" notice). Never raises: `agent_harness` never does.
+    """
+    if isinstance(harness, str) and harness.strip():
+        return harness
+    declared = agent_harness(agent)
+    return declared if isinstance(declared, str) else ""
+
+
 def worker_mark(harness: Any, agent: Any) -> str:
     """The brand mark for a WORKER row, by the resolution order (highest first).
 
@@ -1262,14 +1297,12 @@ def worker_mark(harness: Any, agent: Any) -> str:
     BLANK slot instead: there is nothing to mark, which is a different fact from
     "an agent I could not identify". Never raises.
     """
-    if isinstance(harness, str) and harness.strip():
-        return harness_mark(harness)
+    resolved = worker_harness(harness, agent)
+    if resolved:
+        return harness_mark(resolved)
     if not isinstance(agent, str) or not agent.strip():
         return _mark_slot("")
-    declared = agent_harness(agent)
-    if not declared:
-        return _vendor_mark(None)
-    return harness_mark(declared)
+    return _vendor_mark(None)
 
 
 def harness_vendor(harness: Any) -> Optional[str]:
@@ -1294,14 +1327,10 @@ def worker_vendor(harness: Any, agent: Any) -> Optional[str]:
     harness the agent's installed spec declares, then nothing (the atom or the
     blank slot) — so the mark and its colour agree by construction.
     """
-    if isinstance(harness, str) and harness.strip():
-        return harness_vendor(harness)
-    if not isinstance(agent, str) or not agent.strip():
+    resolved = worker_harness(harness, agent)
+    if not resolved:
         return None
-    declared = agent_harness(agent)
-    if not declared:
-        return None
-    return harness_vendor(declared)
+    return harness_vendor(resolved)
 
 
 def build_rows(
@@ -1312,28 +1341,30 @@ def build_rows(
     """The display rows for the selected roots' trees, in DISPLAY order (C2).
 
     The order built here IS the order on screen, and it is what the selection
-    indexes into: per root an outdented box row, then for each state group a
-    breathing rail row and the group's worker boxes. So the whole view reads top
-    to bottom the way it is painted.
+    indexes into: per root an outdented box row, then ONE breathing rail row
+    opening the root's worker list, then the workers THEMSELVES in `_worker_rows`
+    order — DELEGATION order, the order they were dispatched. So the whole view
+    reads top to bottom the way it is painted, and the list doubles as a TIMELINE
+    OF DELEGATION: a worker that finishes keeps its place rather than sinking to
+    the bottom. That is the fix for the reported bug — finished workers were
+    re-bucketed to the end — and it is why state MUST NOT group the rows here:
+    bucketing by state is exactly what is being removed.
 
-    THE GROUPING HAPPENS HERE, not in `_pane`, and that is load-bearing. If the
-    view grouped the workers while `Frame.rows` stayed in tree order, the arrow
-    keys — `move_selection` and `_run_tui`'s scroll — would walk the rows in
-    tree order while the eye read state order, and the selection would appear to
-    jump around at random. Sorting the ROWS themselves keeps every index-based
-    helper correct without a change; the SELECTION follows its session across
-    this reorder, because a held index would land on whichever worker now sits
-    there (see `snap_selection`).
+    THE ORDERING HAPPENS HERE, not in `_pane`, and that is load-bearing. `_pane`
+    composes only the rows it is handed, so a reorder introduced there would leave
+    `Frame.rows` in one order while the eye read another, and the arrow keys —
+    `move_selection` and `_run_tui`'s scroll — would appear to jump around at
+    random. Building the rows ALREADY in display order keeps every index-based
+    helper correct without a change; the SELECTION follows its SESSION across a
+    refresh (see `snap_selection`), which is what keeps Enter on the right agent
+    when a worker is added or removed and the indexes shift underneath the caret.
 
-    The sort is STABLE (`_grouped`), so two polls that brought the same set of
-    workers produce byte-identical rows; an unstable order would make otherwise
-    identical frames differ and defeat `paint_needed` forever.
+    The order is STABLE (pre-order is deterministic), so two polls that brought
+    the same set of workers produce byte-identical rows; an unstable order would
+    make otherwise identical frames differ and defeat `paint_needed` forever.
 
-    A worker can have children, and the tree is FLATTENED: a descendant is
-    grouped by its OWN state like any other worker, and the spine columns are not
-    drawn. Grouping by state and drawing a tree spine are mutually exclusive —
-    a child placed under its parent's group would sit under a state that disagrees
-    with its own — so the parent link is dropped rather than lied about. `depth`
+    A worker can have children, and the tree is FLATTENED: a descendant is a box
+    of its own, in `_preorder` order, and the spine columns are not drawn. `depth`
     is still carried, and nothing crashes on nesting.
 
     `now` is the clock the meta lines are measured against; it defaults to the
@@ -1350,13 +1381,15 @@ def build_rows(
             continue
         workers = _worker_rows(by_id, children, root_id, clock)
         rows.append(_root_row(by_id[root_id], root_id))
-        for state, group in _grouped(workers):
-            # The rail row opens the group: the ONE thing that marks where one
-            # group ends and the next begins, now the worded label is gone. It
-            # carries the group's state (never a mystery) and is the group's
-            # opening brace for `_blocks`' height trimming.
-            rows.append(Row(session_id="", text="", state=state, depth=1, rail=True))
-            rows.extend(group)
+        if workers:
+            # ONE rail opens the root's worker list. The workers are NOT
+            # re-bucketed by state — that is the reported bug — so the rail
+            # carries the most urgent state present among them (`_rail_state`)
+            # and each box's own gutter glyph and meta tell them apart. A root
+            # with no workers gets no rail: there would be nothing to open.
+            rows.append(Row(session_id="", text="", state=_rail_state(workers),
+                            depth=1, rail=True))
+            rows.extend(workers)
     return rows
 
 
@@ -1403,22 +1436,26 @@ def _worker_rows(by_id: dict, children: dict, root_id: str,
     return out
 
 
-def _grouped(workers: list[Row]) -> list[tuple[str, list[Row]]]:
-    """`workers` bucketed by state, groups in `GROUP_ORDER`, STABLE within a group.
+def _rail_state(workers: list[Row]) -> str:
+    """The state the root's SINGLE rail carries: the most urgent state present.
 
-    Stable is a requirement, not a nicety: two frames built from the same workers
-    must compose to identical lines, or `paint_needed` sees a difference that is
-    not one and the pane repaints forever. `sorted` is stable, so the pre-order
-    the walk produced is preserved inside each bucket. A state outside
-    `GROUP_ORDER` still gets its own group rather than being dropped, so an
-    unheard-of status can never silently lose a worker.
+    Workers keep DELEGATION order now (`build_rows`), so a root has exactly one
+    rail opening its worker list rather than one rail per state group. Which state
+    that rail shows still has to be chosen, and `GROUP_ORDER` is kept as the
+    PRECEDENCE rather than a bucket order: the most urgent state among the root's
+    workers, `working` first. That keeps the rail reading "something here is still
+    running" while anything is — the behaviour the grouped rails gave — and keeps
+    `GROUP_ORDER` meaningful instead of leaving it dead.
+
+    A state outside `GROUP_ORDER` (only reachable if `display_state` grows one) is
+    answered with the FIRST worker's own state rather than a fabricated `idle`, so
+    an unheard-of status is reported honestly instead of mislabelled. `workers` is
+    never empty: the caller emits a rail only when there is a worker to open.
     """
-    buckets: dict[str, list[Row]] = {}
-    for row in workers:
-        buckets.setdefault(row.state, []).append(row)
-    order = sorted(buckets, key=lambda st: GROUP_ORDER.index(st)
-                   if st in GROUP_ORDER else len(GROUP_ORDER))
-    return [(state, buckets[state]) for state in order]
+    for state in GROUP_ORDER:
+        if any(row.state == state for row in workers):
+            return state
+    return workers[0].state
 
 
 # ---------------------------------------------------------------------------
@@ -2064,9 +2101,9 @@ def _pad_footer(spans: list[Span], width: int) -> list[Span]:
     so a footer that stopped at its last key would leave the window's own
     background showing between the keys and the pane edge — the strip has to be
     carried by a span that reaches the edge. The pad takes `FOOTER_LABEL` (never
-    PLAIN) so it shares the footer's derived background; under `og` that
-    background is None and the padding is invisible, which is the point — it costs
-    the theme-less pane nothing.
+    PLAIN) so it shares the footer's background — the DERIVED shade on a theme with
+    a `bg`, the DECLARED `strip` on `og` (see `footer_strip`) — and it is what makes
+    the strip span the WHOLE pane width, on `og` too rather than inert.
 
     The measure is `len` (`_spans_width`), the ruler the whole pane is composed
     under and the one `paint_line` positions by — so the pad lands in the pane's
@@ -2088,10 +2125,15 @@ def _footer_spans(width: int) -> list[Span]:
     which half is the thing to press. The KEY takes `text` (the body colour) and is
     hung through `undim`, so it stays at full brightness on a line the pane paints
     DIM — the footer is chrome and its LINE is dim, but the key is the content of
-    that chrome and must not be. The LABEL and the `∙` separator both take `meta`,
-    which is the dimmer of the two, so the separator recedes between the entries
-    exactly as a divider should. Both roles carry the derived strip background
-    (see `_role_background`).
+    that chrome and must not be. The LABEL takes `meta` (the quieter colour) and is
+    ALSO hung through `undim`, so it paints at NORMAL: the reported bug was that a
+    label was dimmed twice over — `meta`'s darker colour AND the line's DIM — and
+    read as too dim to use. The two halves are still told apart, now by COLOUR
+    (`text` vs `meta`) rather than by brightness, which is the cleaner distinction
+    for two pieces of the same instruction. The `∙` separator deliberately keeps
+    plain `meta` and its line's DIM, so it still recedes between the entries exactly
+    as a divider should rather than competing with the labels beside it. All three
+    roles carry the footer's strip background (see `_role_background`).
 
     ` ` joins a key to its label and `_footer_sep` picks what joins the entries,
     so the spans JOIN to exactly the string `_footer(width)` chooses — one form,
@@ -2106,7 +2148,7 @@ def _footer_spans(width: int) -> list[Span]:
             spans.append((sep, FOOTER_LABEL))
         spans.append((key, undim(FOOTER_KEY)))
         if label:
-            spans.append((f" {label}", FOOTER_LABEL))
+            spans.append((f" {label}", undim(FOOTER_LABEL)))
     return _pad_footer(spans, width)
 
 
@@ -2660,8 +2702,9 @@ def _theme_role(role: str) -> Optional[str]:
     BORDER NAMES `rail`, and that is the slot's documented purpose ("group rails
     and box borders") finally being reached: no role mapped to it before, so the
     access panel's frame — its title rule and its borders — is the first thing to
-    paint it. The footer's two roles name `text` and `meta`, the prominent half
-    and the recessed half of the same row.
+    paint it. The footer's two roles name `text` and `meta`, the prominent and the
+    quieter half of the same row — a COLOUR difference, not a brightness one, since
+    both are `undim`-exempt (see `_footer_spans`).
     """
     bare = _bare_role(role)
     if bare.startswith("mark:"):
@@ -2755,11 +2798,11 @@ def _mark_colour(vendor: str, theme: Optional[Theme] = None) -> Optional[int]:
 # the footer's background strip
 # ---------------------------------------------------------------------------
 #
-# The strip is a SHADE OF THE THEME'S OWN `bg`, not a ninth theme role. A role
-# would have meant editing `ROLES`, every row of installer/themes.json and the
-# loader's refusal rule — churn that was explicitly rejected — so the strip is
-# DERIVED, and deriving it has ONE failure mode that must be defended against,
-# because this bug is silent:
+# The strip is a colour OF THE THEME, not one the pane invents: a theme that names
+# its own footer band DECLARES it in the optional `strip` role (`og` — its `bg` is
+# the terminal's own, so it had nothing to shade); every other theme has one DERIVED
+# here as a shade of its `bg`. The DERIVED path has ONE failure mode that must be
+# defended against, because this bug is silent:
 #
 # TWO DIFFERENT HEXES ROUTINELY LAND ON THE SAME 256-COLOUR CELL, and this
 # terminal reports COLORS=256 and cannot redefine any of them (no `ccc`), so a
@@ -2793,30 +2836,53 @@ def _shade(srgb: tuple, amount: float) -> tuple:
 
 
 def footer_strip(theme: Optional[Theme]) -> Optional[str]:
-    """The footer's background strip for `theme`, as a hex — or None where there is
-    no known background to shade.
+    """The footer's background strip for `theme`, as a hex — or None where the
+    theme offers neither a declared strip nor a background to derive one from.
 
-    None for `og` (and for any theme whose `bg` is `"default"`): the pane is
-    transparent, there is no colour here to shade, and painting a strip anyway
-    would put a colour on the one theme that promises the terminal's own — the
-    same promise `apply_background` keeps.
+    THREE ANSWERS, in this ORDER, and the order is the whole design:
 
-    Otherwise a shade of the theme's `bg`, moved AWAY from it — lighter on a dark
-    pane, darker on a light one — because a shade that moved toward the background
-    would BE the background. Each candidate is resolved to its 256-cell and
-    rejected while it lands on a FORBIDDEN cell (see the block comment above: that
-    is the whole reason this is a loop and not one multiplication). Two cells are
-    forbidden — `bg`'s, because a strip that IS the background is invisible, and
-    `sel_bg`'s, because a strip that IS the selection makes the footer read as a
-    chosen row. If no step clears both, a DEFINED NEIGHBOUR of the background's own
-    cell is returned: the neighbour walk takes the nearest cell clear of BOTH, and
-    only where that is impossible does it give up the `sel_bg` requirement — never
-    the `bg` one, because an invisible strip is worse than one that resembles the
-    selection. `[16, 256)` keeps any neighbour out of the terminal's own first
-    sixteen ANSI slots, whose colours are the terminal's and not the catalog's.
+      1. the theme DECLARES a `strip` (the optional ninth catalog role, see
+         `og_themes.OPTIONAL_ROLES`) -> use it VERBATIM. An operator who has PICKED
+         a footer colour has answered the question this function exists to ask, so
+         nothing is derived over the top of it — the same authority the catalog
+         already gives a hand-picked cell (dracula's parchment is `#ffd7af`, chosen
+         from the cells, not computed). `og` is the reason the role exists: its `bg`
+         is the terminal's own, so there was no colour to shade and its strip was
+         invisible until the operator named one (`#232625`).
+      2. else the theme has a real `bg` -> the EXISTING derivation: a shade of `bg`
+         moved AWAY from it (lighter on a dark pane, darker on a light one),
+         resolved to its 256-cell and rejected while it lands on a FORBIDDEN cell
+         (see the block comment above — that is the whole reason this is a loop and
+         not one multiplication). Two cells are forbidden: `bg`'s, because a strip
+         that IS the background is invisible, and `sel_bg`'s, because a strip that
+         IS the selection makes the footer read as a chosen row. If no step clears
+         both, a DEFINED NEIGHBOUR of the background's own cell is returned: the
+         neighbour walk takes the nearest cell clear of BOTH, and only where that is
+         impossible does it give up the `sel_bg` requirement — never the `bg` one,
+         because an invisible strip is worse than one that resembles the selection.
+         `[16, 256)` keeps any neighbour out of the terminal's own first sixteen
+         ANSI slots, whose colours are the terminal's and not the catalog's. THIS
+         PATH IS UNCHANGED and must stay so: all 25 themes with a real `bg` derive
+         their strip here.
+      3. else (no declared strip AND no `bg`) -> None. A theme that named neither has
+         no colour to paint, and inventing one would spend a colour nobody chose.
+
+    WHY `og` IS ALLOWED A STRIP AT ALL, since this used to return None for every
+    transparent theme on the argument that a colour here breaks the row's promise of
+    the terminal's own background. THE PROMISE IS KEPT FOR THE PANE, NOT for the
+    footer chrome: `apply_background` still leaves `og`'s window background
+    untouched, and the footer band is a deliberate, user-requested EXCEPTION — a
+    menu strip that cannot be seen is not a menu strip, which is the bug that
+    produced the `strip` role in the first place.
+
+    Judge the result by its CELL, never its hex: two hexes routinely share one cell,
+    and the terminal paints only the cell (see the block comment above).
     """
     if theme is None:
         return None
+    declared = theme.strip()
+    if declared is not None:
+        return declared
     base = theme.background()
     if base is None:
         return None
@@ -2863,12 +2929,15 @@ def _role_background(role: str, theme: Optional[Theme] = None, *,
     actually testing. Under `og` both answers are None, which is why the golden
     render is unaffected.
 
-    AND EXCEPT THE FOOTER'S TWO ROLES, which take the STRIP — a shade of the same
-    `bg`, derived per theme by `footer_strip` so it is never the cell `bg` is, nor
-    the cell `sel_bg` is. That is the second thing `_role_background` is a per-span
-    property for: the footer is chrome, and a chrome band has to read as a band
-    rather than vanish into the pane OR into the selection. The strip is a bare 12%
-    away from `bg`, so text and labels chosen for `bg` keep their contrast on it.
+    AND EXCEPT THE FOOTER'S TWO ROLES, which take the STRIP — derived per theme by
+    `footer_strip`: a colour the theme DECLARES in its optional `strip` role when it
+    has one (`og` does), else a shade of `bg` (never the cell `bg` is, nor the cell
+    `sel_bg` is) on a theme with a real background. That is the second thing
+    `_role_background` is a per-span property for: the footer is chrome, and a
+    chrome band has to read as a band rather than vanish into the pane OR into the
+    selection. On an opaque theme the strip is a bare 12% away from `bg`, so text
+    and labels chosen for `bg` keep their contrast on it; on `og` it is the
+    operator's own pick (`#232625`), a dark band under the light default foreground.
     """
     if theme is None:
         return None
@@ -3704,7 +3773,13 @@ def focus_agent(row: Row) -> Optional[str]:
     try:
         return focus_agent_terminal(
             session_id=row.session_id,
-            harness=row.harness,
+            # The harness is resolved through the SAME order the row's MARK uses
+            # (`worker_harness`), NEVER read raw off the row: a worker's LISTING
+            # row carries no harness, so `row.harness` is "" for every worker and
+            # the callee declined each one as an unknown harness even though its
+            # tab was on screen — the v0.20.0 report. A root still resolves to its
+            # own detail-fetched harness through the same call.
+            harness=worker_harness(row.harness, row.agent),
             root_session_id=row.root_session_id or "",
         )
     except Exception as exc:

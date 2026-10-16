@@ -566,6 +566,10 @@ def test_og_is_the_only_row_exempt_from_contrast_and_says_why(themes):
         "bg": "default", "text": "default", "meta": "#87afaf",
         "sel_bg": "default", "idle": "#00ff00", "working": "#ffff00",
         "failed": "#ff0000", "rail": "default",
+        # The OPTIONAL ninth role: `og` is the one row that must DECLARE a footer
+        # strip, because it has no `bg` to derive one from and the operator picked
+        # this colour. See `og_agents.footer_strip`.
+        "strip": "#232625",
     }
     # The four transparent roles are what make the row worth having, so pin them
     # by name rather than by the dict above alone: a future edit that fills in
@@ -597,10 +601,15 @@ def test_every_row_defines_all_eight_roles(themes):
     decide which rows may use `"default"` at all (they may not, except `og` --
     see OG_EXEMPT). `failed` is the eighth: the operator asked for a red failed
     mark, so every row has to carry one beside `idle` and `working`.
+
+    A row MAY also declare the OPTIONAL `strip` role (its own footer-band colour),
+    which is why the shape is `ROLES <= roles <= ALL_ROLES` rather than equality:
+    `og` declares one, the other 25 derive their strip from `bg` and do not.
     """
     for slug, theme in themes.items():
         colors = theme["colors"]
-        assert set(colors) == set(ROLES), f"{slug}: roles {sorted(colors)}"
+        assert set(ROLES) <= set(colors) <= set(ROLES) | {"strip"}, \
+            f"{slug}: roles {sorted(colors)}"
         for role, value in colors.items():
             assert isinstance(value, str), f"{slug}.{role} is not a string"
             if value == DEFAULT:

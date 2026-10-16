@@ -12,7 +12,7 @@ for.
 
 A theme is DATA, not code — the same rule as registry.json. `themes.json` is the
 catalog and this module is the reader, the validator and the maths. A theme maps
-all SEVEN ROLES to a colour:
+all EIGHT ROLES to a colour:
 
     bg       the pane background
     text     the dominant body text
@@ -20,7 +20,12 @@ all SEVEN ROLES to a colour:
     sel_bg   the background of the SELECTED row
     idle     the idle status glyph
     working  the working status glyph
+    failed   the failed status glyph
     rail     group rails and box borders
+
+and MAY declare an OPTIONAL ninth, `strip` (see `OPTIONAL_ROLES`): a colour the
+operator has chosen for the footer's background band, used verbatim instead of
+the shade of `bg` a theme without one derives.
 
 A role's value is EITHER a `#rrggbb` hex OR the literal string `"default"`,
 which means curses `-1`: allocate no colour, inherit the terminal's own.
@@ -54,12 +59,24 @@ from typing import Iterable, Optional
 HERE = Path(__file__).resolve().parent
 CATALOG = HERE / "themes.json"
 
-# The eight roles, in catalog order. Every theme defines ALL of them; there is no
-# partial theme, because a partial one is a theme whose half is still hard-coded
-# somewhere else. `failed` joined the seven when the operator asked for a red
-# failed mark: it is a STATUS role beside `idle` and `working`, so it sits with
-# them and every row carries it — the loader refuses a row missing one.
+# The eight roles EVERY theme must define, in catalog order — there is no partial
+# theme, because a partial one is a theme whose half is still hard-coded somewhere
+# else. `failed` joined the seven when the operator asked for a red failed mark: it
+# is a STATUS role beside `idle` and `working`, so it sits with them and every row
+# carries it — the loader refuses a row missing one.
 ROLES = ("bg", "text", "meta", "sel_bg", "idle", "working", "failed", "rail")
+
+# Roles a row MAY define ON TOP of `ROLES`. `strip` is the footer's background
+# band: a theme that has PICKED its own footer colour names it here and
+# `og_agents.footer_strip` uses it verbatim, in preference to the shade derived
+# from `bg`. It exists because `og` has no `bg` to derive from — its background is
+# the terminal's own — so its footer strip had no colour at all until the operator
+# named one (`#232625`). OPTIONAL, not required: the 25 rows with a real `bg`
+# answer by derivation and must stay byte-identical, so a role they do not declare
+# cannot be demanded of them. Validated exactly as a required role is (see
+# `_parse_theme`), never around it.
+OPTIONAL_ROLES = ("strip",)
+ALL_ROLES = ROLES + OPTIONAL_ROLES
 
 # The one value that is not a colour: curses' `-1`, "allocate nothing, inherit the
 # terminal's own". Legal in every role (see the module docstring).
@@ -129,6 +146,18 @@ class Theme:
         value = self.colors[role]
         return -1 if value == DEFAULT else hex_to_ansi256(value)
 
+    def strip(self) -> Optional[str]:
+        """The theme's OWN declared footer strip, or None where it declares none.
+
+        The OPTIONAL `strip` role (see `OPTIONAL_ROLES`): a footer colour the
+        operator picked, used verbatim instead of the shade of `bg` a theme without
+        one has derived. `"default"` and an absent role BOTH mean "no declared
+        strip", so a theme that names nothing falls back to the derivation (or, with
+        no `bg` either, to no strip at all — the caller's decision, not this one's).
+        """
+        value = self.colors.get("strip")
+        return value if isinstance(value, str) and value != DEFAULT else None
+
 
 # The BUILT-IN fallback: ONE theme, the DEFAULT one (`og`), byte-for-byte the
 # catalog row. It is the whole of what the pane can paint with no `themes.json` at
@@ -151,6 +180,10 @@ BUILTIN: dict = {
             "working": "#ffff00",
             "failed": "#ff0000",
             "rail": "default",
+            # The footer strip, PICKED by the operator rather than derived: `og`
+            # has no `bg` to shade, so the colour is named (`#232625`, cell 235).
+            # Kept byte-for-byte in step with the catalog row by a test.
+            "strip": "#232625",
         },
     ),
 }
@@ -607,9 +640,12 @@ def _parse_theme(slug: str, raw) -> Theme:
     if not isinstance(colors, dict):
         raise ThemeError(f"theme {slug!r} has no 'colors' object")
 
-    for role in ROLES:
+    for role in ALL_ROLES:
         if role not in colors:
-            raise ThemeError(f"theme {slug!r} is missing the role {role!r}")
+            # Optional roles may be absent; a required one may not — the loud half.
+            if role in ROLES:
+                raise ThemeError(f"theme {slug!r} is missing the role {role!r}")
+            continue
         value = colors[role]
         if not isinstance(value, str):
             raise ThemeError(
@@ -620,7 +656,7 @@ def _parse_theme(slug: str, raw) -> Theme:
             raise ThemeError(
                 f"theme {slug!r} role {role!r} is {value!r}: expected "
                 f"'default' or lowercase #rrggbb")
-    for role in sorted(set(colors) - set(ROLES)):
+    for role in sorted(set(colors) - set(ALL_ROLES)):
         raise ThemeError(f"theme {slug!r} has no role {role!r} — a typo costs a colour")
 
     return Theme(slug=slug, label=label, order=order, colors=dict(colors))

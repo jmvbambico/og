@@ -3799,7 +3799,9 @@ def test_focus_agent_terminal_refuses_an_unknown_harness_distinctly(tmp_path,
     # `harness_has_terminal` has THREE answers and None is not one of the two
     # branches: with an unknown harness og cannot say whether the row's tab runs
     # a vendor CLI or a REPL, so it declines with its own line rather than
-    # opening a tab it cannot describe.
+    # opening a tab it cannot describe. The note here is CLI-role, and an
+    # unclassifiable harness only ever focuses a recorded `main` tab — so with
+    # none on record the decline stands and the screen is left alone.
     _note_tab("worker-1", "w1:t9", role=og_herdr.TAB_ROLE_CLI)
     _cli_terminal(monkeypatch)
     client = FakeClient()
@@ -3811,6 +3813,60 @@ def test_focus_agent_terminal_refuses_an_unknown_harness_distinctly(tmp_path,
         "brand-new-tui")
     assert notice != og_herdr_launch.NOTICE_FOCUS_NO_TAB
     assert client.calls == [], "an unknown harness must not move the screen"
+
+
+def test_focus_agent_terminal_focuses_a_recorded_tab_for_an_unknown_harness(
+        tmp_path, monkeypatch):
+    # FIX 2, the v0.20.0 report. The harness KIND decides which tab to PREFER and
+    # whether a vendor-CLI tab may be CREATED — it is NOT needed to focus a tab og
+    # has already RECORDED. A worker arrives with "" (its listing row carries no
+    # harness) and an id the registry does not know behaves identically: the
+    # recorded `main` tab is focused, and NOTHING is created.
+    _note_tab("worker-1", "w1:t7", role=og_herdr.TAB_ROLE_MAIN)
+    _cli_terminal(monkeypatch)  # a terminal IS resolvable; still must not create
+
+    for harness in ("", "brand-new-tui"):
+        client = FakeClient()
+        assert og_herdr_launch.focus_agent_terminal(
+            "worker-1", harness, env=_focus_env(), client=client) is None, harness
+        assert client.methods == ["tab.focus"], (harness, client.methods)
+        assert client.params_of("tab.focus") == [{"tab_id": "w1:t7"}], harness
+
+
+def test_focus_agent_terminal_unknown_harness_without_a_recorded_tab_still_declines(
+        tmp_path):
+    # The unknown answer is NOT removed: with no `main` tab on record there is
+    # nothing to focus, so og declines with its own line exactly as before — and
+    # the empty harness names "this agent" rather than an empty label.
+    client = FakeClient()
+
+    for harness, label in (("", "this agent"),
+                           ("brand-new-tui", "brand-new-tui")):
+        notice = og_herdr_launch.focus_agent_terminal(
+            "gone-1", harness, env=_focus_env(), client=client)
+        assert notice == og_herdr_launch.NOTICE_FOCUS_UNKNOWN_HARNESS.format(label), \
+            harness
+    assert client.calls == []
+
+
+def test_focus_agent_terminal_never_creates_a_tab_for_an_unknown_harness(
+        tmp_path, monkeypatch):
+    # og cannot know a vendor TUI is behind an unclassifiable harness, so it must
+    # NEVER open a tab onto nothing — the failure this third answer exists to
+    # prevent. A resolvable terminal AND a recorded `main` tab are both present,
+    # and `tab.create` still must not fire; it is the same with no tab at all.
+    _cli_terminal(monkeypatch)
+    _note_tab("worker-1", "w1:t7", role=og_herdr.TAB_ROLE_MAIN)
+
+    with_tab = FakeClient()
+    assert og_herdr_launch.focus_agent_terminal(
+        "worker-1", "brand-new-tui", env=_focus_env(), client=with_tab) is None
+    assert "tab.create" not in with_tab.methods, with_tab.methods
+
+    no_tab = FakeClient()
+    og_herdr_launch.focus_agent_terminal(
+        "gone-1", "brand-new-tui", env=_focus_env(), client=no_tab)
+    assert "tab.create" not in no_tab.methods, no_tab.methods
 
 
 def test_focus_agent_terminal_without_a_recorded_tab_says_so(tmp_path):

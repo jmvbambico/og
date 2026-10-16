@@ -2133,8 +2133,11 @@ NOTICE_FOCUS_OUTSIDE_HERDR = "focus: not inside herdr (no HERDR_ENV)"
 NOTICE_FOCUS_NO_AGENT = "focus: no agent on this row"
 # The THIRD answer `harness_has_terminal` can give, kept distinct rather than
 # collapsed into either branch: with an unknown harness og cannot say whether
-# the pane in this tab runs the real vendor CLI or a REPL, so it declines rather
-# than moving the operator somewhere it cannot describe.
+# the pane in this tab runs the real vendor CLI or a REPL, so it will not CREATE
+# one. It is returned only when no `main` tab is already on record for the agent
+# — a recorded tab is a fact og holds, and the harness kind is not needed to
+# focus it (the v0.20.0 report: a worker arrived as an unknown harness while its
+# own tab sat visibly beside the pane).
 NOTICE_FOCUS_UNKNOWN_HARNESS = ("focus: {0} is not a harness og knows, so its "
                                 "tab is unverified")
 NOTICE_FOCUS_NO_TAB = "focus: no herdr tab recorded for this agent"
@@ -2211,8 +2214,11 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
         is what that agent's tab already holds (the same view `og chat`'s
         down-arrow menu gives). Nothing is created.
       * **unknown** — the third answer from `harness_has_terminal`, NOT collapsed
-        into either branch: og cannot say what the row's tab is, so it declines
-        with its own line and leaves the operator's screen alone.
+        into either branch: og cannot say what the row's tab is, so it never
+        CREATES one and never guesses. It still focuses a `main` tab it has
+        ALREADY recorded for the agent — where the tab is a fact og holds the
+        kind decides nothing — and declines with its own line only when no tab is
+        on record.
 
     The tab is found from og's own records, keyed by ROLE (`og_herdr.TAB_ROLE_*`):
     `TAB_ROLE_CLI` is the vendor-CLI tab an agent may have, `TAB_ROLE_MAIN` the
@@ -2263,10 +2269,6 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
         kind = harness_has_terminal(harness)
     except Exception:
         kind = None
-    if kind is None:
-        label = harness if isinstance(harness, str) and harness.strip() \
-            else "this agent"
-        return _focus_line(NOTICE_FOCUS_UNKNOWN_HARNESS, label)
 
     try:
         state_path = default_state_path()
@@ -2288,8 +2290,23 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
             if terminal is None:
                 return NOTICE_FOCUS_NO_TERMINAL
     else:
+        # ACP (`kind is False`) and unknown (`kind is None`) share ONE lookup: the
+        # `main` tab og has ALREADY recorded for this agent. The harness KIND only
+        # decides which tab to PREFER and whether a vendor-CLI tab may be CREATED
+        # — it is not needed to focus a tab on record. Declining an unknown
+        # harness even when its tab was right there is the v0.20.0 report: a
+        # worker's listing carries no harness, so Enter arrived with "" and
+        # refused the agent's own visible tab. The `tab_id` truthy-check below
+        # keeps `_open_vendor_cli_tab` unreachable for an unknown harness: og
+        # cannot know a vendor TUI is behind it, and opening a tab onto nothing is
+        # the failure this third answer exists to prevent — focusing a recorded
+        # tab is not creating one.
         tab_id = _main_tab_id(tabs_path, state_path, session_id, root_session_id)
         if not tab_id:
+            if kind is None:
+                label = harness if isinstance(harness, str) and harness.strip() \
+                    else "this agent"
+                return _focus_line(NOTICE_FOCUS_UNKNOWN_HARNESS, label)
             return NOTICE_FOCUS_NO_TAB
 
     # ONE client for the whole call, built only once there is something to do

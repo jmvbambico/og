@@ -241,11 +241,15 @@ def test_renderer_shows_a_root_box_not_a_bare_line():
     assert "━" not in joined and "█" not in joined
 
 
-def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
-    """Workers are grouped by state, each group opened by a breathing rail — the
-    order on screen is the group order (working, blocked, failed, finished), not
-    listing order. The worded labels are gone: the glyph inside each box says the
-    state and the rail alone marks where one group ends and the next begins."""
+def test_workers_keep_delegation_order_and_are_not_reordered_by_state():
+    """REGRESSION for the reported bug: a finished worker stays in place.
+
+    Workers are drawn in DELEGATION order — the order they were dispatched — NOT
+    grouped by state. The list doubles as a timeline of delegation, so a worker
+    that finishes keeps its position; it used to sink to the bottom the moment it
+    went idle. State is still told apart by each box's own gutter glyph and meta,
+    so nothing is lost, and the worded labels stay gone.
+    """
     sessions = [
         dict(listed("root", title="conv", status="running"), harness="claude-native"),
         listed("w1", parent="root", status="idle", title="coder_zen:done-already"),
@@ -254,17 +258,17 @@ def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
     ]
     rows = a.build_rows(sessions, ["root"], now=NOW)
 
-    # The rows themselves are in display order, which is what the caret indexes.
+    # Listing order, verbatim — the idle worker stays FIRST, where it was
+    # dispatched, rather than sorting below the working one.
     boxes = [row.text for row in rows if a._is_box(row)]
-    assert boxes == ["busy", "broke", "done-already"]
+    assert boxes == ["done-already", "busy", "broke"]
 
     lines = a.render(a.Frame(rows=rows))
     # No worded group label survives anywhere in the render.
     for word in OLD_GROUP_LABELS:
         assert word not in lines, word
-    # A breathing rail row opens each of the three groups (rail, boxes, rail,
-    # boxes, rail, boxes) — the rail alone, in column 0.
-    assert sum(1 for line in lines if line == "│") == 3
+    # ONE rail opens the whole worker list; no per-state rail splits it.
+    assert sum(1 for line in lines if line == "│") == 1
     # The state is still told apart, by the glyph in each box's gutter: a working
     # spinner frame, and the static `×` and `✓`.
     joined = "\n".join(lines)
@@ -272,10 +276,91 @@ def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
     assert "×" in joined and "✓" in joined
 
 
+def test_a_worker_that_finishes_between_builds_keeps_its_index():
+    """THE REPORTED BUG, pinned on the row index the caret indexes.
+
+    A worker that transitions to idle between two builds must not move: the list
+    is a delegation timeline, and watching a worker finish used to re-sort it to
+    the bottom, out from under the operator's eye. The index is what the arrow
+    keys and Enter use, so it is what the fix has to preserve.
+    """
+    root = dict(listed("root", title="conv", status="running"),
+                harness="claude-native")
+
+    def build(first_status):
+        return a.build_rows(
+            [root,
+             listed("w1", parent="root", status=first_status, title="coder_zen:one"),
+             listed("w2", parent="root", status="running", title="coder_zen:two")],
+            ["root"], now=NOW)
+
+    def index_of(rows, sid):
+        return next(i for i, row in enumerate(rows) if row.session_id == sid)
+
+    running = build("running")
+    finished = build("idle")
+
+    assert index_of(running, "w1") == index_of(finished, "w1"), \
+        "w1 must not move when it finishes"
+    assert index_of(finished, "w1") < index_of(finished, "w2"), \
+        "delegation order puts w1 above w2, finished or not"
+
+
+def test_the_single_rail_carries_the_most_urgent_state_of_its_workers():
+    """The root's ONE rail resolves its state from `GROUP_ORDER` as a PRECEDENCE.
+
+    The most urgent state present among the workers wins, so the rail reads
+    "something here is still running" while anything is — the behaviour the
+    per-group rails gave — and `GROUP_ORDER` survives instead of going dead.
+    """
+    root = dict(listed("root", title="conv", status="running"),
+                harness="claude-native")
+
+    def rail_state(*workers):
+        rows = a.build_rows([root, *workers], ["root"], now=NOW)
+        return next(row for row in rows if row.rail).state
+
+    idle = lambda sid: listed(sid, parent="root", status="idle",
+                              title=f"coder_zen:{sid}")
+    # One idle and one working: `working` outranks `idle`.
+    assert rail_state(idle("w1"),
+                      listed("w2", parent="root", status="running",
+                             title="coder_zen:busy")) == "working"
+    # `blocked` (an elicitation) outranks `failed` and `idle`.
+    assert rail_state(listed("w1", parent="root", status="failed",
+                             title="coder_zen:bad"),
+                      listed("w2", parent="root", status="running", elicit=1,
+                             title="coder_zen:waiting")) == "blocked"
+    # Everything finished: the rail is idle.
+    assert rail_state(idle("w1"), idle("w2")) == "idle"
+
+
+def test_a_root_with_workers_in_mixed_states_emits_exactly_one_rail():
+    root = dict(listed("root", title="conv", status="running"),
+                harness="claude-native")
+    sessions = [root] + [
+        listed(f"w{i}", parent="root", status=status, title=f"coder_zen:t{i}")
+        for i, status in enumerate(("running", "idle", "failed", "running"))]
+
+    rows = a.build_rows(sessions, ["root"], now=NOW)
+
+    assert len([row for row in rows if row.rail]) == 1
+    assert len([row for row in rows if row.is_root]) == 1
+
+
+def test_a_root_without_workers_emits_no_rail():
+    # A rail opens a worker list; with no workers there is nothing to open, so it
+    # must not be emitted as a stray line under the root box.
+    rows = a.build_rows(
+        [dict(listed("root", title="quiet", status="idle"),
+              harness="claude-native")], ["root"], now=NOW)
+    assert len([row for row in rows if row.rail]) == 0
+
+
 def test_renderer_flattens_a_nested_worker():
-    """A grandchild is grouped by its OWN state like any other worker. Grouping
-    by state and drawing a spine are mutually exclusive, so the tree is
-    flattened."""
+    """A grandchild is a box of its own, in delegation order. The tree is
+    flattened — the parent link is dropped and the spine is not drawn — so the
+    child is never placed under a state that disagrees with its own."""
     root = dict(listed("root", status="running"), harness="claude-native")
     sessions = [
         root,
@@ -286,7 +371,7 @@ def test_renderer_flattens_a_nested_worker():
     lines = a.render(a.Frame(rows=rows))
 
     assert lines[0].startswith("╭"), "the root is a box at column 0"
-    # The grandchild is a box of its own, in the same (working) group...
+    # The grandchild is a box of its own, in the root's worker list...
     assert any("grandchild" in line and "╭" not in line for line in lines)
     # Every WORKER box sits in the gutter: the rail at column 0, the rounded
     # corner at column 4, and the whole line as wide as the pane. (The root box is
@@ -310,10 +395,11 @@ C2_WIDTH = 46
 
 def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     """The operator's iterated C2 template, line for line: the root as an
-    OUTDENTED rounded box at column 0, then a breathing rail opening each state
-    group, and a ROUNDED box per worker BEHIND a node+state gutter. Built through
-    `build_rows` from a listing, so the names, agents and glyphs are the ones the
-    model produces at width 46. The working box's glyph is the first spinner frame.
+    OUTDENTED rounded box at column 0, then ONE breathing rail opening the worker
+    list, and a ROUNDED box per worker in DELEGATION order BEHIND a node+state
+    gutter. Built through `build_rows` from a listing, so the names, agents and
+    glyphs are the ones the model produces at width 46. The working box's glyph is
+    the first spinner frame.
 
     A box is THREE rows: top border, ONE content row, bottom border. The content
     row is the operator's order — 2-column mark slot, title flush left — with the
@@ -353,15 +439,12 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╭────────────────────────────────────────╮",
         "⦿ ⠋ │ ▯  coders                         2m14s│",
         "│   ╰────────────────────────────────────────╯",
-        "│",
         "│   ╭────────────────────────────────────────╮",
         "⦿ ⏸ │ ⌘  reviewers             waiting on you│",
         "│   ╰────────────────────────────────────────╯",
-        "│",
         "│   ╭────────────────────────────────────────╮",
         "⦿ × │ 𝗙  scouts                        failed│",
         "│   ╰────────────────────────────────────────╯",
-        "│",
         "│   ╭────────────────────────────────────────╮",
         "⦿ ✓ │ ⌘  docs                            done│",
         "│   ╰────────────────────────────────────────╯",
@@ -390,12 +473,14 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
     assert lines[4].startswith("│   ╭"), "a worker box starts after the gutter"
     assert lines[4].index("╭") == a.GUTTER
     nodes = [i for i, line in enumerate(lines) if line.startswith("⦿")]
-    assert nodes == [5, 9, 13, 17], nodes
+    assert nodes == [5, 8, 11, 14], nodes
+    # ONE rail opens the worker list — no per-state rail splits it.
+    assert sum(1 for line in lines if line == "│") == 1
     # The state glyph rides the gutter's column 2, on the CONTENT row alone, and
     # is NOT inside the box: the spinner is w1's, and every non-content box row
     # carries a space there.
     assert lines[5][0] == "⦿" and lines[5][2] == a.SPIN_FRAMES[0]
-    assert lines[9][2] == "⏸" and lines[13][2] == "×" and lines[17][2] == "✓"
+    assert lines[8][2] == "⏸" and lines[11][2] == "×" and lines[14][2] == "✓"
     assert lines[6][:4] == "│   " and a.SPIN_FRAMES[0] not in lines[5][4:], \
         "the state glyph is in the gutter, never inside the box"
     # The AGENT NAME is dropped from every row: the mark carries it, so `zen`,
@@ -404,8 +489,8 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         assert name not in "\n".join(lines), name
     # The meta is right-aligned on the CONTENT row: each one ends at the box's
     # right edge, on the same line as the title.
-    for row_index, meta in ((5, "2m14s"), (9, "waiting on you"),
-                            (13, "failed"), (17, "done")):
+    for row_index, meta in ((5, "2m14s"), (8, "waiting on you"),
+                            (11, "failed"), (14, "done")):
         assert lines[row_index].endswith(meta + "│"), lines[row_index]
 
 
@@ -787,13 +872,16 @@ def test_enter_on_an_untouched_pane_focuses_nothing_and_shows_no_notice(monkeypa
 
 
 def test_the_selection_follows_its_session_across_a_state_change_reorder():
-    """THE HAZARD THE GROUPING CREATES, and why the selection tracks an id.
+    """THE HAZARD ANY REORDER CREATES, and why the selection tracks an id.
 
-    A selected worker that changes state moves from one group to another, so the
-    rows reorder underneath it. Holding the INDEX across that refresh lands the
-    selection on whichever worker now occupies it — here `w2`, selected at index 4
-    in the idle group, becomes `working` and moves to index 2, while index 4 in the
-    new rows is its sibling `w3`. The id is what survives the move.
+    Any refresh can reorder the rows — a worker added or removed, a root entering
+    or leaving scope — and holding the INDEX across that refresh lands the
+    selection on whichever worker now occupies it. The rows here are built BY HAND
+    to stand for such a reorder: `w2`, selected at index 4 in `before`, sits at
+    index 2 in `after` while index 4 is its sibling `w3`. The id survives the move.
+    (A state change no longer reorders anything — workers keep delegation order,
+    see `build_rows` — so this exercises the mechanism against an arbitrary
+    reorder rather than one a state transition still produces.)
     """
     before = [header(), rail("working"),
               worker("w1", "working", text="one"),
@@ -1002,24 +1090,22 @@ def test_every_harness_mark_fills_the_slot_and_every_title_starts_in_one_column(
         assert a.harness_mark(harnesses[vendor]) == mark + " ", vendor
 
 
-def test_a_breathing_rail_row_separates_one_state_group_from_the_next():
-    """The worded group label is gone, but a rail-only row still separates one
-    state group from the next and its boxes line up behind the same rail."""
+def test_a_breathing_rail_row_opens_the_worker_list_below_it():
+    """One rail row opens the list; it is the rail alone, and the boxes line up
+    behind the same gutter. The worded group label stays gone."""
     rows = [header(),
-            rail("working"), worker("w1", "working", text="one"),
-            rail("failed"), worker("w2", "failed", text="two")]
+            rail("working"),
+            worker("w1", "working", text="one"),
+            worker("w2", "idle", text="two")]
     lines = a.render(a.Frame(rows=rows), width=C2_WIDTH)
-    # A rail-only row (just "│") opens EACH of the two groups, so the eye still
-    # sees where one group ends — and no label word follows it.
     rails = [i for i, line in enumerate(lines) if line == "│"]
-    assert len(rails) == 2, rails
+    assert len(rails) == 1, rails
     for word in OLD_GROUP_LABELS:
         assert word not in lines, word
-    # Each group's box top follows its rail, at the same column.
-    assert lines[rails[0] + 1][0] == "│"
-    assert lines[rails[0] + 1].index("╭") == a.GUTTER
-    assert lines[rails[1] + 1][0] == "│"
-    assert lines[rails[1] + 1].index("╭") == a.GUTTER
+    # Both worker box tops follow the one rail, at the same gutter column.
+    for top in (rails[0] + 1, rails[0] + 4):
+        assert lines[top][0] == "│"
+        assert lines[top].index("╭") == a.GUTTER
 
 
 def test_multiple_roots_each_get_their_own_box():
@@ -1046,31 +1132,42 @@ def test_multiple_roots_each_get_their_own_box():
     assert "━" not in joined
 
 
-def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
-    """The trimmer works in whole blocks (a root, or a rail and its boxes), so a
-    box can never be cut in half and a group's rail never leaves its boxes. With
-    the worded labels gone there is no label left to orphan, which is why the
-    block is now just the rail and the boxes. The root block is THREE rows and a
-    worker box is THREE rows, so the block arithmetic below is a rail + three."""
-    rows = [header(), rail("working"),
+def test_height_trimming_keeps_a_whole_block_and_never_splits_a_box():
+    """The trimmer works in whole blocks — a root, or a rail and ALL the boxes it
+    opens — so a box can never be cut in half and a rail never leaves its boxes.
+    A root box is THREE rows and a worker box is THREE, so the arithmetic below is
+    a root (3) plus a rail-opened worker block (rail + 3 per box)."""
+    rows = [header(text="first", sid="root1"), rail("working"),
             worker("w1", "working", text="one"),
-            rail("idle"),
+            header(text="second", sid="root2"), rail("idle"),
             worker("w2", "idle", text="two")]
+
+    def rails(lines):
+        # A RAIL row is the rail glyph ALONE. A worker's row also carries a `│`
+        # inside its box, so match the whole stripped LINE, never the character.
+        return [line for line in lines if line.strip() == a.RAIL]
+
     full = a.render(a.Frame(rows=rows), width=C2_WIDTH)
     joined = "\n".join(full)
-    # The root box plus the two worker boxes.
-    assert joined.count("╭") == 3 and joined.count("╰") == 3
+    # The two roots plus the two worker boxes, and one rail per root.
+    assert joined.count("╭") == 4 and joined.count("╰") == 4
+    assert len(rails(full)) == 2, rails(full)
 
-    # Room for the root block (3 rows) and the first group (rail + 3-row box = 4
-    # rows) but not the second group: the second group is dropped WHOLE, so its box
-    # is never cut and its rail is never left behind without it.
-    short = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=10)
+    # Blocks: [root1 (3)] [rail + w1 (1+3)] [root2 (3)] [rail + w2 (1+3)] = 14
+    # rows. With the two-row tail reserved, height=12 leaves room for the first
+    # three blocks (10 rows) and NOT the last: the last block is dropped WHOLE, so
+    # its box is never cut and its rail is never left behind without it.
+    short = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=12)
     short_joined = "\n".join(short)
     assert "one" in short_joined
     assert "two" not in short_joined, "a box must not be cut in half"
-    # The root box plus the first worker box, each whole.
-    assert short_joined.count("╭") == short_joined.count("╰") == 2
-    # And no label word is left behind anywhere.
+    # The two root boxes and the first worker box, each whole.
+    assert short_joined.count("╭") == short_joined.count("╰") == 3
+    # ...and root2's RAIL went WITH the w2 block it opened: exactly one rail
+    # survives. This is the other half of the invariant — a rail is never left
+    # behind without its boxes — which the BOX counts cannot see: dropping w2's box
+    # while keeping its rail leaves ╭/╰ unchanged and `two` still absent.
+    assert len(rails(short)) == 1, rails(short)
     for word in OLD_GROUP_LABELS:
         assert word not in short_joined, word
 
@@ -3634,8 +3731,14 @@ def test_the_kilo_mark_paints_kilos_brand_lemon(monkeypatch):
     # On the colour, not the pair NUMBER: pairs are spent on first use, so the
     # index depends on what else the frame happened to paint first (here the idle
     # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    # The last two pairs are the FOOTER's, which now carries a strip under `og` too
+    # (its DECLARED `strip` role, `#232625`): the key (`default` fg) and the
+    # label/meta, both on the strip's cell. They are incidental to the mark claim but
+    # are part of the frame's spend, so they are named rather than filtered out.
+    strip_bg = a.hex_to_ansi256(a.footer_strip(_theme("og")))
     assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
-        (a._STATE_COLOURS["idle"], -1), (227, -1), (a.META_COLOR, -1)]
+        (a._STATE_COLOURS["idle"], -1), (227, -1), (a.META_COLOR, -1),
+        (-1, strip_bg), (a.META_COLOR, strip_bg)]
     mark = _writes_for(writes, a.harness_mark(harness))
     assert mark, writes
     for attr in mark:
@@ -3663,11 +3766,12 @@ def test_the_freebuff_mark_paints_freebuffs_brand_sage(monkeypatch):
     frame = a.Frame(rows=[worker("w1", "idle", harness=harness, meta="12s")],
                     selected=0)
     fake, writes = _colour_paint(monkeypatch, frame, colors=256, color_pairs=256)
-    # On the colour, not the pair NUMBER: pairs are spent on first use, so the
-    # index depends on what else the frame happened to paint first (here the idle
-    # glyph takes pair 1) and is an allocation detail, not the claim under test.
+    # On the colour, not the pair NUMBER (see the kilo test above); the last two
+    # pairs are the footer's strip under `og`, incidental to this mark claim.
+    strip_bg = a.hex_to_ansi256(a.footer_strip(_theme("og")))
     assert [(fg, bg) for _pair, fg, bg in fake.init_pair_calls] == [
-        (a._STATE_COLOURS["idle"], -1), (108, -1), (a.META_COLOR, -1)]
+        (a._STATE_COLOURS["idle"], -1), (108, -1), (a.META_COLOR, -1),
+        (-1, strip_bg), (a.META_COLOR, strip_bg)]
     mark = _writes_for(writes, a.harness_mark(harness))
     assert mark, writes
     for attr in mark:
@@ -4187,6 +4291,53 @@ def test_enter_focuses_a_worker_whose_listing_carried_no_root(monkeypatch):
     assert not any("focus:" in text for text in screen.painted), screen.painted
 
 
+def test_enter_on_a_worker_row_resolves_the_spec_harness_for_the_callee(
+        spec_home, monkeypatch):
+    """REGRESSION for the v0.20.0 report: Enter on a WORKER row.
+
+    `build_rows` gives every worker row NO harness (`""`) and an agent name
+    parsed from its title; the row's MARK resolves the harness the agent's spec
+    declares. Enter must resolve it the SAME way, or `focus_agent_terminal` is
+    handed "" and declines EVERY worker as an unknown harness — even though the
+    worker's tab is visibly on screen, which is exactly what the user reported.
+    Built through `build_rows`, so the row is shaped as the pane really shapes it.
+    """
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    listing = [listed("root", status="running", title="conversation"),
+               listed("w1", parent="root", status="running",
+                      title="coder_zen:do-it")]
+    row = next(r for r in a.build_rows(listing, ["root"], now=NOW)
+               if r.session_id == "w1")
+    # Exactly what a worker row carries: no harness of its own, agent `zen`.
+    assert row.harness == "" and row.agent == "zen"
+    calls = _fake_focus_agent_terminal(monkeypatch)
+
+    assert a.focus_agent(row) is None
+    # The spec's harness — not the row's blank — reaches the callee.
+    assert calls == [("w1", "opencode-native", "root")], calls
+
+
+def test_enter_on_an_unresolvable_worker_degrades_to_the_callee_notice(
+        spec_home, monkeypatch):
+    """A worker whose agent has no installed spec either still degrades cleanly.
+
+    The resolution yields "" (there is nothing to guess), so Enter hands that
+    through and shows whatever the callee answers — its honest "unknown harness"
+    — rather than raising on the keypress.
+    """
+    listing = [listed("root", status="running", title="conversation"),
+               listed("w1", parent="root", status="running",
+                      title="coder_ghost:do-it")]
+    row = next(r for r in a.build_rows(listing, ["root"], now=NOW)
+               if r.session_id == "w1")
+    assert row.harness == "" and row.agent == "ghost"
+    notice = og_herdr_launch.NOTICE_FOCUS_UNKNOWN_HARNESS.format("this agent")
+    calls = _fake_focus_agent_terminal(monkeypatch, notice=notice)
+
+    assert a.focus_agent(row) == notice
+    assert calls == [("w1", "", "root")], calls
+
+
 def test_focus_resolution_adds_no_call_beyond_agent_focus():
     """The one-outbound-call guarantee survives the root resolution: resolving a
     TARGET is not a second call, and this path adds none (see
@@ -4297,18 +4448,19 @@ def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
         "the footer does not share the pane with the notice"
 
 
-def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_refresh(
+def test_a_selected_worker_that_changes_state_keeps_the_caret_across_a_refresh(
         monkeypatch):
-    """THE REGRESSION the reviewer caught, driven through the real loop.
+    """The caret stays on the SELECTED session when a worker changes state.
 
-    A selected worker changes state, so it moves to another STATE GROUP and the
-    rows reorder underneath the selection. The view used to hold the INDEX across
-    the refresh, so the poll after the move left the selection on whichever worker
-    now occupied it — a different session, and Enter would have focused that one.
+    A state change no longer moves a worker — workers keep delegation order (see
+    `build_rows`) — so the caret the operator put on `w2` stays on `w2` across the
+    refresh: the box keeps both its index and its id, and the pane is not disturbed
+    by a worker finishing. This is the TUI-level guard on that: press `r` to
+    refresh after `w2` turns `working` and the bright box is still `w2`'s.
 
-    Here `w2` is selected at index 4 in the idle group, turns `working`, and its
-    box moves to index 3 in the working group while its sibling `w1` takes index
-    4. The selection follows the SESSION, so it lands on `w2`.
+    The id-following mechanism itself — `snap_selection` returning a session's new
+    index across an arbitrary reorder — is pinned directly in
+    `test_the_selection_follows_its_session_across_a_state_change_reorder`.
     """
     monkeypatch.delenv("HERDR_ENV", raising=False)
     before = [
@@ -4519,10 +4671,13 @@ def test_the_footer_separator_is_not_ambiguous():
     assert width not in ("W", "F"), "a Wide/Fullwidth separator would shear the row"
 
 
-def test_the_footer_key_is_prominent_and_its_label_recedes():
-    """1a. Each entry is TWO spans, so the KEY reads as the prominent half: the key
-    takes the theme's `text` slot AND is exempt from the footer line's DIM, while
-    the label and the ` ∙ ` separator take `meta` and dim with the chrome."""
+def test_the_footer_key_and_label_are_both_bright_and_differ_in_colour():
+    """1a. Each entry is TWO spans, and the two halves are told apart by COLOUR, not
+    brightness: the KEY takes the theme's `text` slot and the LABEL its `meta`, and
+    BOTH are exempt from the footer line's DIM. The label used to take plain `meta`
+    and dim with the chrome — dimmed twice over (darker colour AND the line's DIM) —
+    which the operator reported as too dim to read. The ` ∙ ` separator stays plain
+    `meta`, so it still recedes between the entries."""
     spans = a._footer_spans(120)          # wide enough for the full form
 
     key_text = "".join(t for t, role in spans
@@ -4535,19 +4690,30 @@ def test_the_footer_key_is_prominent_and_its_label_recedes():
         assert key in key_text, (key, key_text)
     for label in ("move", "focus", "theme", "access", "quit"):
         assert label in label_text, (label, label_text)
-    # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES, and there is exactly one per
-    # join between entries.
+    # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES: it takes plain `meta`, and there
+    # is exactly one per join between entries.
     assert label_text.count(a.FOOTER_SEP) == len(a.FOOTER_ENTRIES) - 1
-    # ONLY the key is exempt from the line's brightness: the exemption and the role
-    # are the same fact, and nothing else carries it.
-    for _text, role in spans:
-        assert role.startswith(a.UNDIM) == (a._bare_role(role) == a.FOOTER_KEY), role
-    # And the two roles name the theme slots the task asked for.
+    assert any(text == a.FOOTER_SEP and role == a.FOOTER_LABEL
+               for text, role in spans), "the separator must NOT be undimmed"
+    # BOTH halves carry the exemption — the key `undim:footer-key`, the label
+    # `undim:footer-label` — and NOTHING else does: the separator and the strip's
+    # padding stay plain (still `meta`, still dimmed). The first assertion is the
+    # reported fix made explicit: without a label span that IS `undim:footer-label`,
+    # every label dims twice over and reads too dim.
+    assert any(role == a.undim(a.FOOTER_LABEL) for _text, role in spans), \
+        "every label must be undim-exempt, or it dims twice and reads too dim"
+    for text, role in spans:
+        exempt = role.startswith(a.UNDIM)
+        expected = role in (a.undim(a.FOOTER_KEY), a.undim(a.FOOTER_LABEL))
+        assert exempt == expected, (text, role)
+    # And the two roles name the theme slots the task asked for: two halves, two
+    # colours, so a key is still distinguishable from its label with the brightness
+    # axis taken away from them.
     assert a._theme_role(a.FOOTER_KEY) == "text"
     assert a._theme_role(a.FOOTER_LABEL) == a.META == "meta"
-    # The key is the `text` slot at FULL brightness; the label is `meta` on the
-    # line's DIM — so the pairing is prominence, not merely two colours.
+    # BOTH halves paint at FULL brightness now; the separator still recedes.
     assert a._role_brightness(a.undim(a.FOOTER_KEY)) == a.NORMAL
+    assert a._role_brightness(a.undim(a.FOOTER_LABEL)) == a.NORMAL
     assert a._role_brightness(a.FOOTER_LABEL) is None
 
 
@@ -4657,10 +4823,17 @@ def test_the_window_background_is_filled_for_an_opaque_theme(monkeypatch):
 
 
 def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
-    """AND NOT FOR `og`. Setting the background to a pair allocated for some
-    other role would put a colour on the pane nobody chose; the whole of what
-    this row promises is that the terminal's own background keeps coming
-    through. NO CALL AT ALL is the claim, so that is what is asserted."""
+    """AND NOT FOR `og`. Setting the WINDOW background to a pair allocated for some
+    other role would put a colour on the pane nobody chose; the whole of what this
+    row promises is that the terminal's own background keeps coming through. NO
+    CALL AT ALL is the claim, so that is what is asserted.
+
+    THE FOOTER STRIP IS THE ONE DELIBERATE EXCEPTION. `og` has no `bg` to shade, so
+    it DECLARES its strip in the catalog's optional `strip` role (`#232625`) for the
+    footer chrome alone (a user-requested fix — an invisible strip is no strip). So
+    the background set is no longer `{-1}`: every PANE role still paints on the
+    terminal's own background, and the strip's single cell is the only colour, spent
+    on the footer row."""
     frame = a.Frame(rows=[header()], selected=0)
     fake = FakeCurses(colors=256, color_pairs=256)
     monkeypatch.setitem(sys.modules, "curses", fake)
@@ -4669,10 +4842,8 @@ def test_the_window_background_is_left_alone_for_the_og_theme(monkeypatch):
     a._run_tui(_StubModel(frame), a.DEFAULT_INTERVAL, "http://x",
                theme=_theme("og"))
     assert scr.bkgd_calls == [], "og leaves the window background untouched"
-    # Every background is the terminal's own (-1). The footer's label/meta spans
-    # spend a pair of their own now, so this is a SET of backgrounds, not one —
-    # what `og` promises is that none of them is a colour.
-    assert set(bg for _p, _fg, bg in fake.init_pair_calls) == {-1}
+    strip = a.hex_to_ansi256(a.footer_strip(_theme("og")))
+    assert set(bg for _p, _fg, bg in fake.init_pair_calls) == {-1, strip}
 
 
 def test_the_window_background_is_set_by_a_CALL_a_terminal_will_accept():
@@ -4868,16 +5039,26 @@ def test_the_footer_strip_is_a_different_cell_from_the_background_of_every_theme
     background's OWN cell would be invisible and the feature would do nothing at
     all, silently — and one that resolved to `sel_bg`'s cell would paint the footer
     exactly as a SELECTED row. Every theme the catalog ships is checked for both
-    separations here, and `og` — whose `bg` is the terminal's own — is checked to
-    have NO strip, because there is no colour to shade. Before the guard covered
-    `sel_bg`, six shipped themes (ayu-dark, bearded-dark, dracula, github-dark,
-    monokai-dark, one-dark) put the strip on the selection's own cell."""
+    separations here. Before the guard covered `sel_bg`, six shipped themes
+    (ayu-dark, bearded-dark, dracula, github-dark, monokai-dark, one-dark) put the
+    strip on the selection's own cell.
+
+    A TRANSPARENT theme (`og` alone) has no `bg` cell to differ from, so it is
+    checked against its own requirement instead: its strip is DECLARED (the optional
+    `strip` role) and must be a real, DARK cell in the palette."""
     themes = th.ordered_themes(th.load_catalog())
     opaque = 0
     for theme in themes:
         strip = a.footer_strip(theme)
         if theme.background() is None:
-            assert strip is None, theme.slug
+            # A transparent theme has no `bg` cell to differ from; it has a strip
+            # only by DECLARING one (its optional `strip` role), and that must be a
+            # real, DARK cell in the palette. `og` is the only such row today.
+            assert theme.strip() is not None, theme.slug
+            assert strip is not None, theme.slug
+            assert th.relative_luminance(strip) < 0.5, \
+                f"{theme.slug}: a declared strip must be DARK"
+            assert 16 <= th.hex_to_ansi256(strip) < 256, theme.slug
             continue
         opaque += 1
         cell = a.hex_to_ansi256(strip)
@@ -4920,22 +5101,83 @@ def test_the_strip_falls_back_to_a_neighbour_cell_when_no_shade_separates(
     assert a.hex_to_ansi256(a.footer_strip(theme)) == base + 1
 
 
-def test_an_og_footer_has_no_strip_and_spends_no_pair_for_one():
-    """`og` PROMISES THE TERMINAL'S OWN BACKGROUND, and a strip is a colour this
-    process would be inventing for a pane that has no background to shade. So there
-    is none, the footer's roles resolve to `default`, and the key's own span spends
-    no pair at all."""
+def test_og_declares_its_footer_strip_and_it_resolves_to_its_cell():
+    """`og` DRAWS ON THE TERMINAL'S OWN BACKGROUND, so there is no `bg` to shade and
+    its footer strip had no colour at all — the bug the user reported ("what about
+    the background for the full menu strip?"). The operator NAMED one, so it is
+    DECLARED in the catalog's optional `strip` role (`#232625`) rather than derived.
+    The CELL is the claim, never the hex — two hexes routinely share one cell, and
+    `#232625` resolves to cell 235."""
     og = _theme("og")
     assert og.background() is None
-    assert a.footer_strip(og) is None
+    assert og.strip() == "#232625", "og must DECLARE its strip, not derive one"
+    strip = a.footer_strip(og)
+    assert strip == "#232625"
+    assert a.hex_to_ansi256(strip) == 235, a.hex_to_ansi256(strip)
+    assert th.relative_luminance(strip) < 0.5, "the strip must be dark"
     assert a.footer_strip(None) is None
-    assert a._role_background(a.FOOTER_KEY, og) is None
-    assert a._role_background(a.FOOTER_LABEL, og) is None
+    # The footer's TWO roles resolve to that strip; a PANE role does not.
+    assert a._role_background(a.FOOTER_KEY, og) == strip
+    assert a._role_background(a.FOOTER_LABEL, og) == strip
+    assert a._role_background("meta", og) is None
 
     fake = FakeCurses(colors=256, color_pairs=256)
     colours = a._Colours(fake, og)
-    assert colours.role_attr(a.undim(a.FOOTER_KEY), og) == 0, \
-        "a `default` foreground on no background is pair 0, not a new pair"
+    # The key's `default` foreground on the strip's background DOES spend a pair:
+    # `default` is the terminal's own TEXT, not the terminal's own CELL, so it has
+    # to be painted ON the strip. Only both-ends-default is pair 0 now.
+    assert colours.role_attr(a.undim(a.FOOTER_KEY), og) != 0
+    assert colours.role_attr("plain", og) == 0, \
+        "a pane role with no background still spends no pair"
+
+
+def test_a_declared_strip_wins_over_any_derivation(tmp_path):
+    """An explicit `strip` role BEATS the `bg` derivation: `footer_strip` returns the
+    declared colour VERBATIM, never a shade of `bg` the operator did not pick."""
+    derived = a.footer_strip(_hand_edited_theme(tmp_path, bg="#282a36"))
+    declared = a.footer_strip(
+        _hand_edited_theme(tmp_path, bg="#282a36", strip="#123456"))
+
+    assert a.hex_to_ansi256(declared) == a.hex_to_ansi256("#123456")
+    # The SAME `bg` without a declared strip derives something ELSE, which is what
+    # makes the assertion above a test of PRECEDENCE and not of coincidence.
+    assert declared != derived, (declared, derived)
+
+
+def test_the_footer_strip_is_unchanged_for_a_theme_with_an_explicit_background():
+    """The 25 explicit-bg themes are NOT touched by `og`'s declared strip: none of
+    them declares one, so the strip is still a shade of `bg` moved AWAY from it —
+    lighter on a dark theme, darker on a light one. Pinned on one of each so a later
+    "always dark" refactor fails loudly: a dark strip on a LIGHT theme is dark-on-
+    dark. All 25 stay byte-identical to the pre-`strip`-role derivation."""
+    # A dark theme: no declared strip, and the strip differs from `bg` as a CELL.
+    dark = _theme("dracula")
+    assert dark.strip() is None, "an opaque theme must not declare a strip"
+    dark_strip = a.footer_strip(dark)
+    assert dark_strip is not None and dark_strip != dark.colour("bg")
+    assert a.hex_to_ansi256(dark_strip) != a.hex_to_ansi256(dark.colour("bg"))
+
+    # A LIGHT theme: it declares no strip, and its derived strip stays LIGHT —
+    # darker than the light pane, but nowhere near `og`'s declared dark band. This
+    # is the assertion an "always dark" refactor breaks.
+    light = _theme("catppuccin-latte")
+    assert light.strip() is None
+    assert th.relative_luminance(light.colour("bg")) > 0.5, \
+        "the fixture is no longer a light theme"
+    light_strip = a.footer_strip(light)
+    assert light_strip is not None
+    assert a.hex_to_ansi256(light_strip) != a.hex_to_ansi256(light.colour("bg"))
+    assert th.relative_luminance(light_strip) > 0.5, \
+        "a light theme must keep a LIGHT strip, not inheriting og's dark band"
+
+
+def test_a_theme_with_no_declared_strip_and_no_background_has_no_strip(tmp_path):
+    """A theme that declares NO `strip` and has no real `bg` names no footer colour
+    at all, so the strip is None — inventing one would spend a colour nobody chose.
+    (`og` is not this case: it has no `bg` but DOES declare a strip.)"""
+    theme = _hand_edited_theme(tmp_path)          # every role default, no strip
+    assert theme.background() is None and theme.strip() is None
+    assert a.footer_strip(theme) is None
 
 
 def test_an_opaque_theme_spends_no_sel_bg_pair_while_the_pane_is_untouched(monkeypatch):

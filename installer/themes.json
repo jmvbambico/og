@@ -74,9 +74,10 @@
         "idle": "#00ff00",
         "working": "#ffff00",
         "failed": "#ff0000",
-        "rail": "default"
+        "rail": "default",
+        "strip": "#232625"
       },
-      "_note": "NOT a theme: today's colours, preserved as a choice. bg/text/sel_bg/rail are 'default' (curses -1, the terminal's own background) because that is exactly what the pane painted before themes existed. The four hexes are the exact sRGB of the indices the code shipped and are EXEMPT from every contrast assertion in tests/test_og_themes_catalog.py -- 'default' has no computable luminance, so a contrast test over this row crashes or silently skips, and inventing hexes to satisfy one would destroy the only property this row exists for."
+      "_note": "NOT a theme: today's colours, preserved as a choice. bg/text/sel_bg/rail are 'default' (curses -1, the terminal's own background) because that is exactly what the pane painted before themes existed. The four hexes are the exact sRGB of the indices the code shipped and are EXEMPT from every contrast assertion in tests/test_og_themes_catalog.py -- 'default' has no computable luminance, so a contrast test over this row crashes or silently skips, and inventing hexes to satisfy one would destroy the only property this row exists for. strip is the optional ninth role: the operator's PICKED footer-strip colour (#232625, cell 235), named because this is the one row with no bg to derive a strip from."
     },
     "andromeda": {
       "label": "Andromeda",
