@@ -4946,6 +4946,54 @@ def test_remember_agent_tab_if_absent_refuses_ids_it_cannot_use(tmp_path):
     assert not path.exists(), "nothing usable means no file is written"
 
 
+def test_remember_agent_tab_if_absent_is_atomic_under_concurrent_writers(
+        tmp_path):
+    # THE LOCK AND THE CAS TOGETHER, which no injected-note simulation can prove.
+    # Several REAL threads call the compare-and-set on the SAME session+role at
+    # once, released together by a barrier. `state_lock` is an flock on a sidecar
+    # whose depth counter is per THREAD (its own docstring notes that a second
+    # thread must take the lock rather than sail past), so the decision at the
+    # write is genuinely serialised by the OS: exactly one thread claims, every
+    # other is handed the SAME winner id, and the file on disk holds that winner's
+    # tab. Deterministic by construction — the threads block on the lock, so there
+    # is no sleep and no timing assumption.
+    path = tmp_path / "og-agent-tabs.json"
+    role = m.TAB_ROLE_CLI
+    n = 8
+    barrier = threading.Barrier(n)
+    results: list = []
+    collect = threading.Lock()
+
+    def claim(i):
+        barrier.wait()
+        outcome = m.remember_agent_tab_if_absent(
+            path, "worker-1", "w1:t{0}".format(i), "w1", role=role)
+        with collect:
+            results.append((i, outcome))
+
+    threads = [threading.Thread(target=claim, args=(i,)) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == n, results
+    winners = [r for r in results if r[1][0]]
+    losers = [r for r in results if not r[1][0]]
+    assert len(winners) == 1, results
+    assert len(losers) == n - 1, results
+    # The single winner wrote; it was not told it had lost.
+    assert winners[0][1][1] is None, winners
+    # EVERY loser sees the SAME winner id, and none of them wrote.
+    assert all(loser[1][1] is not None for loser in losers), losers
+    assert len({loser[1][1] for loser in losers}) == 1, losers
+    # The sidecar FILE holds the winner's tab — read back, not from a return —
+    # and it is exactly the tab the single claimer wrote.
+    winner_tab = losers[0][1][1]
+    assert m.agent_tab_record(path, "worker-1", role)["tab_id"] == winner_tab
+    assert winner_tab == "w1:t{0}".format(winners[0][0])
+
+
 def test_the_bridge_notes_the_tab_when_it_creates_one(seams):
     # A WORKER's tab — the pane running its vendor CLI — is noted as `_setup_pane`
     # runs, which is the only moment the session id and the tab id are both in

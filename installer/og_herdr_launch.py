@@ -2451,11 +2451,15 @@ def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
     ever recorded. The loser's tab is closed and the winner's id returned, so the
     focus lands on one tab and nothing is orphaned.
 
-    EVERY failure becomes a notice, and a tab that cannot be recorded is CLOSED
-    AGAIN before returning: an on-screen tab nothing records is how the next
-    Enter opens a second one. If that close ALSO fails the operator gets
-    `NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED` — the PR #39 lesson: a mitigation (og
-    cannot force herdr to release a tab), stated so they can close it by hand.
+    EVERY failure becomes a notice, and any tab this call opened but could not
+    use is CLOSED AGAIN before returning: an on-screen tab nothing records is how
+    the next Enter opens a second one. There are THREE such paths — a partial
+    create, a failed `pane_run`, and a compare-and-set that did not claim — and
+    all three go through `_close_tab_or_report`, so if the close ALSO fails the
+    operator gets `NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED` instead of a generic
+    failure with an orphan left on screen. That is the PR #38/#39 lesson (og
+    cannot force herdr to release a tab, so the notice is a mitigation) made
+    structural rather than repeated at each call site, where it was missed twice.
     """
     ws_id, cwd = _agent_space(tabs_path, state_path, session_id, root_session_id)
     if not ws_id:
@@ -2483,31 +2487,50 @@ def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
     if not (tab_id and pane_id):
         # A tab without a pane is an empty tab og created and cannot use: close
         # whatever came back, the same rule `_open_space` applies to a partial
-        # create.
-        if tab_id:
-            _close_tab_quietly(opened, tab_id)
-        return _focus_line(NOTICE_FOCUS_FAILED,
-                           "herdr returned no tab or pane id"), None
+        # create. `tab_id` may be falsy — herdr returned no tab at all — and then
+        # there is nothing to orphan, so the plain failure is the whole truth.
+        notice = _focus_line(NOTICE_FOCUS_FAILED,
+                             "herdr returned no tab or pane id")
+        if not tab_id:
+            return notice, None
+        return _close_tab_or_report(opened, tab_id, (notice, None))
     try:
         opened.pane_run(pane_id, command)
     except Exception as exc:
-        _close_tab_quietly(opened, tab_id)
-        return _focus_line(NOTICE_FOCUS_FAILED, exc), None
+        return _close_tab_or_report(
+            opened, tab_id, (_focus_line(NOTICE_FOCUS_FAILED, exc), None))
     claimed, winner = remember_agent_tab_if_absent(
         tabs_path, session_id, tab_id, ws_id, role=TAB_ROLE_CLI)
     if claimed:
         return None, tab_id
     # Not claimed: either a second pane opened this agent's tab first (there is a
     # WINNER) or the note could not be written. Either way OUR tab is not the one
-    # on record, so it is closed — and if the close fails too, the operator is
-    # told it was left open rather than given a clean "not recorded".
-    if not _close_tab_quietly(opened, tab_id):
-        return NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED, None
-    if winner:
-        # Lost the race cleanly: focus the winner so the operator still lands on
-        # one tab and no duplicate is left behind.
-        return None, winner
-    return NOTICE_FOCUS_NOT_RECORDED, None
+    # on record, so it is closed — through the one close-and-report helper, which
+    # names a left-open tab when the close fails instead of a clean "not recorded".
+    return _close_tab_or_report(
+        opened, tab_id,
+        (None, winner) if winner else (NOTICE_FOCUS_NOT_RECORDED, None))
+
+
+def _close_tab_or_report(opened, tab_id: str, closed_result: tuple) -> tuple:
+    """Close a tab this call opened; return the `(notice, tab_id)` its fate fits.
+
+    THE ONE PLACE `_open_vendor_cli_tab` CLOSES A TAB IT OPENED AND COULD NOT USE,
+    AND THE ONE PLACE THAT PICKS THE NOTICE. `closed_result` is what to hand back
+    when herdr DID close the tab. When the close FAILS the operator is told a tab
+    was left open instead (`NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED`), because a tab on
+    screen with nothing recording it is exactly how the next Enter opens a second
+    one — a defect class that has now appeared three times (PR #38, PR #39, and the
+    CAS path it was first fixed on). Structural so it cannot recur a fourth: every
+    close-and-report in that function goes through here, so no caller can close a
+    tab and forget to say it was left open.
+
+    A FALSY `tab_id` is deliberately NOT routed here — there is no tab to orphan,
+    so a caller keeps its plain notice (see the partial-create branch).
+    """
+    if _close_tab_quietly(opened, tab_id):
+        return closed_result
+    return NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED, None
 
 
 def _close_tab_quietly(opened, tab_id: str) -> bool:
@@ -2519,6 +2542,10 @@ def _close_tab_quietly(opened, tab_id: str) -> bool:
     recovery close worked — when it did not, the operator is told
     (`NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED`) instead of being left to discover the
     orphan. That is the PR #39 lesson, kept from the mirror.
+
+    Callers close a FAILED attempt through `_close_tab_or_report`, which is the one
+    place that pairs this return with the notice; calling this bare and dropping
+    the bool is the defect that helper exists to make impossible.
 
     NOT `_close_quietly`, which is a different thing that already exists further
     up this file: the LAUNCHER's own "close the space I just opened", taking a

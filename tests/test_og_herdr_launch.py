@@ -3496,6 +3496,87 @@ def test_focus_agent_terminal_reports_a_tab_it_could_not_record_or_close(
         _notes_path(), "worker-1", og_herdr.TAB_ROLE_CLI) == {}
 
 
+def test_focus_agent_terminal_says_a_tab_was_left_open_when_the_attach_fails(
+        tmp_path, monkeypatch):
+    # BLOCKING, recovery path 2 of 3: `pane_run` fails, so the tab created a
+    # moment earlier is closed again — and THAT close fails too, leaving an
+    # unrecorded tab on screen. Before the close-and-report helper this branch
+    # discarded `_close_tab_quietly`'s return and returned a generic "focus: …",
+    # so the operator was never told an orphan was there.
+    _note_tab("worker-1", "w1:t1")
+    _cli_terminal(monkeypatch)
+    client = FakeClient()
+
+    def refuse_send(pane_id, command):
+        raise OSError("herdr refused the send")
+
+    def refuse_close(tab_id):
+        raise OSError("herdr refused the close")
+
+    client.pane_run = refuse_send
+    client.tab_close = refuse_close
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED
+    assert "left open" in notice
+    assert client.params_of("tab.focus") == [], "an orphan is not focused"
+    assert og_herdr.agent_tab_record(
+        _notes_path(), "worker-1", og_herdr.TAB_ROLE_CLI) == {}
+
+
+def test_focus_agent_terminal_says_a_tab_was_left_open_on_a_partial_create(
+        tmp_path, monkeypatch):
+    # BLOCKING, recovery path 3 of 3: `tab.create` answers with a tab but NO pane,
+    # so the tab is unusable and is closed again — and the close fails. Same
+    # orphan, same notice, through the same helper. (When no tab comes back at all
+    # there is nothing to orphan and the generic failure stands — the next test.)
+    _note_tab("worker-1", "w1:t1")
+    _cli_terminal(monkeypatch)
+    client = FakeClient(tab_create={"type": "tab_created",
+                                    "tab": {"tab_id": "w1:t9"}})
+
+    def refuse_close(tab_id):
+        raise OSError("herdr refused the close")
+
+    client.tab_close = refuse_close
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice == og_herdr_launch.NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED
+    assert "left open" in notice
+    assert client.params_of("tab.create"), "the unusable tab WAS created"
+    assert client.params_of("tab.focus") == []
+    assert og_herdr.agent_tab_record(
+        _notes_path(), "worker-1", og_herdr.TAB_ROLE_CLI) == {}
+
+
+def test_focus_agent_terminal_keeps_the_generic_notice_when_the_close_succeeds(
+        tmp_path, monkeypatch):
+    # The OTHER half of the distinction, so the two notices stay separable: the
+    # same `pane_run` failure, but the recovery close WORKS, so no tab is left on
+    # screen and the operator gets the plain reason rather than the orphan notice.
+    _note_tab("worker-1", "w1:t1")
+    _cli_terminal(monkeypatch)
+    client = FakeClient()
+
+    def refuse_send(pane_id, command):
+        raise OSError("herdr refused the send")
+
+    client.pane_run = refuse_send
+
+    notice = og_herdr_launch.focus_agent_terminal(
+        "worker-1", "claude-native", env=_focus_env(), client=client)
+
+    assert notice is not None and notice.startswith("focus: ")
+    assert notice != og_herdr_launch.NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED
+    assert "herdr refused the send" in notice
+    # The recovery close ran and worked, so nothing is orphaned.
+    assert client.params_of("tab.close") == [{"tab_id": "w1:t9"}]
+
+
 def test_focus_agent_terminal_leaves_exactly_one_tab_when_two_panes_race(
         tmp_path, monkeypatch):
     # BLOCKING 2, the TOCTOU. Enter reads the `cli` note, finds none and creates a
