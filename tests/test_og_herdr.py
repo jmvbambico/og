@@ -4901,6 +4901,51 @@ def test_remember_agent_tab_refuses_ids_it_cannot_use(tmp_path):
     assert not path.exists(), "nothing usable means no file is written"
 
 
+def test_remember_agent_tab_if_absent_claims_it_exactly_once(tmp_path):
+    # THE COMPARE-AND-SET, and the whole point of it. `remember_agent_tab` writes
+    # unconditionally, so a caller that reads "no note", opens a tab and THEN
+    # writes has a TOCTOU window: two panes both read absent, both create, and
+    # both write — two tabs, one id overwriting the other, the loser orphaned
+    # forever. Here the decision is at the WRITE: the first caller claims it, the
+    # second is handed the WINNER's id and the winner's note is left untouched.
+    path = tmp_path / "og-agent-tabs.json"
+    role = m.TAB_ROLE_CLI
+
+    assert m.remember_agent_tab_if_absent(
+        path, "worker-1", "w1:t9", "w1", role=role) == (True, None)
+    assert m.agent_tab_record(path, "worker-1", role)["tab_id"] == "w1:t9"
+
+    # The loser: refused, told who won, and the winner's note is NOT overwritten.
+    assert m.remember_agent_tab_if_absent(
+        path, "worker-1", "w1:t4", "w1", role=role) == (False, "w1:t9")
+    assert m.agent_tab_record(path, "worker-1", role)["tab_id"] == "w1:t9"
+
+
+def test_remember_agent_tab_if_absent_keeps_the_roles_apart(tmp_path):
+    # The compare-and-set is per SESSION+ROLE. An agent's own `main` tab must not
+    # refuse the `cli` tab it does not have yet — nor the reverse.
+    path = tmp_path / "og-agent-tabs.json"
+    m.remember_agent_tab(path, "worker-1", "w1:t1", "w1", role=m.TAB_ROLE_MAIN)
+
+    assert m.remember_agent_tab_if_absent(
+        path, "worker-1", "w1:t9", "w1", role=m.TAB_ROLE_CLI) == (True, None)
+    assert m.agent_tab_record(
+        path, "worker-1", m.TAB_ROLE_MAIN)["tab_id"] == "w1:t1"
+    assert m.agent_tab_record(
+        path, "worker-1", m.TAB_ROLE_CLI)["tab_id"] == "w1:t9"
+
+
+def test_remember_agent_tab_if_absent_refuses_ids_it_cannot_use(tmp_path):
+    # Same contract as its sibling: unusable inputs write nothing, and there is no
+    # winner to hand back — `(False, None)` is "not claimed, nothing to focus".
+    path = tmp_path / "og-agent-tabs.json"
+    assert m.remember_agent_tab_if_absent(path, "", "w1:t7") == (False, None)
+    assert m.remember_agent_tab_if_absent(path, "worker-1", None) == (False, None)
+    assert m.remember_agent_tab_if_absent(
+        path, "worker-1", "w1:t7", role="bogus") == (False, None)
+    assert not path.exists(), "nothing usable means no file is written"
+
+
 def test_the_bridge_notes_the_tab_when_it_creates_one(seams):
     # A WORKER's tab — the pane running its vendor CLI — is noted as `_setup_pane`
     # runs, which is the only moment the session id and the tab id are both in

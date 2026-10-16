@@ -92,10 +92,13 @@ from og_herdr import (
     default_home,
     default_state_path,
     load_state,
-    # The writer of the note `focus_agent_terminal` reads back. Load-bearing
-    # here: the return says whether the write LANDED, and a vendor-CLI tab whose
-    # note did not land is closed again rather than left to be duplicated.
-    remember_agent_tab,
+    # The writer of the note `focus_agent_terminal` reads back, in its
+    # COMPARE-AND-SET form. Load-bearing here, twice over: the return says whether
+    # the write LANDED (a vendor-CLI tab whose note did not land is closed again
+    # rather than left to be duplicated), and the "existing" half decides the
+    # winner when two panes race to open one agent's tab — so both never win and
+    # leave a duplicate. See `remember_agent_tab_if_absent`.
+    remember_agent_tab_if_absent,
     # The pane environment is stated ONCE, in og_herdr, next to the pane
     # commands it is about — the bridge opens panes too and had no copy of the
     # rule at all, which is how `og start herdr` left panes that opened a
@@ -2151,6 +2154,15 @@ NOTICE_FOCUS_NO_SPACE = "focus: this agent has no herdr space to open a tab in"
 # Enter to duplicate. See the commit that fixed the same shape twice before —
 # an unrecorded pane is a duplicate waiting to happen.
 NOTICE_FOCUS_NOT_RECORDED = "focus: the new CLI tab could not be recorded"
+# The SAME failure, one worse: the note did not land AND the recovery close
+# failed. The tab is on screen with nothing recording it, which is exactly how
+# the next Enter opens a SECOND one. og cannot force herdr to release a tab, so
+# this is a MITIGATION, not a cure — say so plainly so the operator can close it
+# by hand. This is the PR #39 lesson (`NOTICE_CLI_NOT_RECORDED_OR_CLOSED`) carried
+# over from the mirror: a close that silently fails must not be reported as a
+# clean "not recorded".
+NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED = (
+    "focus: a CLI tab was left open (could not record or close it)")
 NOTICE_FOCUS_FAILED = "focus: {0}"
 
 
@@ -2291,7 +2303,7 @@ def focus_agent_terminal(session_id: str, harness: Optional[str],
         if not tab_id:
             notice, tab_id = _open_vendor_cli_tab(
                 session_id, harness, environ, opened, tabs_path, state_path,
-                terminal)
+                terminal, root_session_id)
             if notice is not None:
                 return notice
         opened.tab_focus(tab_id)
@@ -2329,6 +2341,17 @@ def _main_tab_id(tabs_path: Path, state_path: Path, session_id: str,
     whose own notes are gone: the conversation it is working in, which is at least
     the right space. Both are og's own records — herdr cannot be asked (measured;
     see `og_herdr.remember_agent_tab`).
+
+    THE ROOT FALLBACK IS DELIBERATE AND REVIEWED, not an oversight. An independent
+    reviewer read it as violating "never touch the main pane"; the user ruled to
+    KEEP it, and the reasoning is recorded here so it is not "fixed" into a dead
+    end where selecting a reaped ACP agent does nothing at all. FOCUSING an
+    existing tab is not REPURPOSING it: og never retypes, retargets, splits or
+    closes the main pane, so landing the operator on the root conversation when a
+    reaped agent's own view is gone is a benign last resort — the root IS the
+    conversation that agent works in, the nearest true view left to show. Only the
+    ACP branch reaches this; a NATIVE agent never comes here (its view is the
+    vendor CLI; see `focus_agent_terminal` and the `cli`/`main` role split).
     """
     tab_id = _noted_tab(tabs_path, session_id, TAB_ROLE_MAIN)
     if tab_id:
@@ -2405,7 +2428,7 @@ def _cli_tab_label(harness: Optional[str], session_id: str) -> str:
 
 def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
                          opened, tabs_path: Path, state_path: Path,
-                         terminal: tuple) -> tuple:
+                         terminal: tuple, root_session_id: str = "") -> tuple:
     """Open an agent's vendor-CLI tab, note it, and return `(notice, tab_id)`.
 
     ONE tab in the agent's space, running the interactive attach that
@@ -2417,18 +2440,36 @@ def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
     create must not move the operator's screen on its own, and the focus call is
     also what raises the workspace (measured), so doing both would be two jumps.
 
+    `root_session_id` is the worker's root when it has one: a worker with no note
+    of its own and no space record of its OWN still lives in its ROOT's space, so
+    it is passed on to `_agent_space` (omitting it made Enter answer "no space"
+    for exactly that case).
+
+    THE NOTE IS A COMPARE-AND-SET, NOT A CHECK-THEN-WRITE. Two `og agents` panes
+    can both see "no cli note" and both create a tab; `remember_agent_tab_if_absent`
+    decides the winner INSIDE the sidecar's lock, at the write, so only one tab is
+    ever recorded. The loser's tab is closed and the winner's id returned, so the
+    focus lands on one tab and nothing is orphaned.
+
     EVERY failure becomes a notice, and a tab that cannot be recorded is CLOSED
     AGAIN before returning: an on-screen tab nothing records is how the next
-    Enter opens a second one, which is the duplicate-pane defect this project has
-    already paid for. The close is best effort —
-    if it also fails the operator is told the tab could not be recorded, which is
-    the honest state of affairs — and a close that fails does not change what is
-    reported.
+    Enter opens a second one. If that close ALSO fails the operator gets
+    `NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED` — the PR #39 lesson: a mitigation (og
+    cannot force herdr to release a tab), stated so they can close it by hand.
     """
-    ws_id, cwd = _agent_space(tabs_path, state_path, session_id)
+    ws_id, cwd = _agent_space(tabs_path, state_path, session_id, root_session_id)
     if not ws_id:
         return NOTICE_FOCUS_NO_SPACE, None
-    command = read_only_attach_command(*terminal)
+    try:
+        command = read_only_attach_command(*terminal)
+    except Exception as exc:
+        # `terminal` is a `(socket, target)` pair, always two strings when
+        # `terminal_behind` supplies it — but this sits OUTSIDE the create's try,
+        # and `read_only_attach_command` unpacks and shell-quotes it, so a
+        # malformed tuple (wrong arity, a non-string member) would escape. Guarded
+        # so "every failure becomes a notice" stays literally true, and so nothing
+        # is created for a terminal og cannot name.
+        return _focus_line(NOTICE_FOCUS_FAILED, exc), None
     try:
         created = opened.tab_create(
             ws_id, cwd or os.getcwd(), _cli_tab_label(harness, session_id),
@@ -2452,19 +2493,32 @@ def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
     except Exception as exc:
         _close_tab_quietly(opened, tab_id)
         return _focus_line(NOTICE_FOCUS_FAILED, exc), None
-    if not remember_agent_tab(tabs_path, session_id, tab_id, ws_id,
-                              role=TAB_ROLE_CLI):
-        _close_tab_quietly(opened, tab_id)
-        return NOTICE_FOCUS_NOT_RECORDED, None
-    return None, tab_id
+    claimed, winner = remember_agent_tab_if_absent(
+        tabs_path, session_id, tab_id, ws_id, role=TAB_ROLE_CLI)
+    if claimed:
+        return None, tab_id
+    # Not claimed: either a second pane opened this agent's tab first (there is a
+    # WINNER) or the note could not be written. Either way OUR tab is not the one
+    # on record, so it is closed — and if the close fails too, the operator is
+    # told it was left open rather than given a clean "not recorded".
+    if not _close_tab_quietly(opened, tab_id):
+        return NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED, None
+    if winner:
+        # Lost the race cleanly: focus the winner so the operator still lands on
+        # one tab and no duplicate is left behind.
+        return None, winner
+    return NOTICE_FOCUS_NOT_RECORDED, None
 
 
-def _close_tab_quietly(opened, tab_id: str) -> None:
+def _close_tab_quietly(opened, tab_id: str) -> bool:
     """Close a tab this call just opened, best effort. Never raises.
 
-    Named for its role in `_open_vendor_cli_tab`: the tab is being unmade because
-    the note that would have let the NEXT Enter find it did not land, and a close
-    that itself fails must not replace the real failure with its own.
+    Returns True when herdr closed it, False when it did not. THE RETURN IS
+    LOAD-BEARING: a tab on screen that nothing records is how the next Enter opens
+    a second one, so a caller whose note did not land must know whether its own
+    recovery close worked — when it did not, the operator is told
+    (`NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED`) instead of being left to discover the
+    orphan. That is the PR #39 lesson, kept from the mirror.
 
     NOT `_close_quietly`, which is a different thing that already exists further
     up this file: the LAUNCHER's own "close the space I just opened", taking a
@@ -2475,7 +2529,8 @@ def _close_tab_quietly(opened, tab_id: str) -> None:
     try:
         opened.tab_close(tab_id)
     except Exception:
-        pass
+        return False
+    return True
 
 
 def _focus_line(template: str, value) -> str:

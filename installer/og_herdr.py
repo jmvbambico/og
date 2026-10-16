@@ -3448,6 +3448,64 @@ def remember_agent_tab(path: Path, session_id: object, tab_id: object,
     return _update_agent_tabs(path, put)
 
 
+def remember_agent_tab_if_absent(path: Path, session_id: object, tab_id: object,
+                                 workspace_id: object = None,
+                                 role: str = TAB_ROLE_MAIN) -> tuple:
+    """Record a tab ONLY if no note for this session+role already exists. Never raises.
+
+    Returns `(claimed, existing_tab_id)`:
+
+      * `(True, None)`  — no note existed and OURS was written.
+      * `(False, id)`   — a note ALREADY existed; nothing was written, and `id`
+                          is the winning tab the caller should focus instead.
+      * `(False, None)` — nothing was written and there is no winner: the inputs
+                          were unusable, or the locked read/write failed.
+
+    CHECK-THEN-WRITE IS NOT ATOMIC, and this is the fix. A caller that reads the
+    note, finds none, opens a tab and THEN writes has a TOCTOU window: two callers
+    (two `og agents` panes on one agent) both read "absent", both `tab.create`,
+    and only then serialise their writes — leaving TWO tabs on screen with one
+    recorded and the other orphaned forever. So the DECISION moves under the lock,
+    to the write: the first writer wins, and the loser is handed the winner's id
+    and closes its own tab. Same duplicate-tab defect the mirror's `cli_pane_id`
+    paid for twice.
+
+    The lock still wraps only the read-modify-write, never `tab.create`: holding a
+    file lock across an RPC would stall every other writer for its duration.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return False, None
+    if not isinstance(tab_id, str) or not tab_id:
+        return False, None
+    if role not in TAB_ROLES:
+        return False, None
+
+    found: dict = {}
+
+    def put(tabs: dict):
+        entry = tabs.get(session_id)
+        roles = entry if isinstance(entry, dict) else {}
+        existing = _read_tab_record(roles.get(role))
+        if existing:
+            # Someone got there first (or this very tab is already noted): keep
+            # THEIR note. `None` means "write nothing", which is what makes this a
+            # compare-and-set rather than an overwrite.
+            found["existing"] = existing["tab_id"]
+            return None
+        rec = {"tab_id": tab_id}
+        if isinstance(workspace_id, str) and workspace_id:
+            rec["workspace_id"] = workspace_id
+        roles = dict(roles)
+        roles[role] = rec
+        tabs[session_id] = roles
+        return tabs
+
+    ok = _update_agent_tabs(path, put)
+    if found.get("existing"):
+        return False, found["existing"]
+    return bool(ok), None
+
+
 def forget_agent_tab(path: Path, session_id: object,
                      role: object = None) -> bool:
     """Drop a session's tab record — one role, or all of them. Never raises.
