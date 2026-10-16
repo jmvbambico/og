@@ -56,20 +56,30 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from og_herdr import (
-    # The shared state-record key for the optional CLI-mirror pane. Defined in
-    # og_herdr so this launcher and `_read_spaces` — the loader that would
-    # otherwise DROP it as an unknown field — name it with ONE spelling. See
-    # og_herdr.CLI_PANE_FIELD for why the whitelist has to carry it.
-    CLI_PANE_FIELD,
     DEFAULT_SPACE_CAP,
     OWNER_LAUNCHER,
     SPACE_LIVE,
     _id_of,
+    # The note of which herdr tab carries which agent, written by the bridge
+    # when it creates a tab and read here to move the operator to it. Named in
+    # og_herdr so the writer and this reader cannot drift about the file or its
+    # shape — see `remember_agent_tab` for why herdr cannot answer it.
+    # The two ROLES a note can be keyed by. `TAB_ROLE_MAIN` is the agent's
+    # Omnigent view (a root's own pane), `TAB_ROLE_CLI` the vendor-CLI tab
+    # `focus_agent_terminal` opens on demand — the distinction that keeps Enter
+    # off a root's chat pane. Named in og_herdr so the writer and this reader
+    # cannot drift.
+    TAB_ROLE_CLI,
+    TAB_ROLE_MAIN,
+    agent_tab_record,
+    agent_tabs_path,
     attach_command,
     # Whether a harness is hosted as a real terminal TUI is a REGISTRY fact
     # (`kind`), so it is read from the registry rather than inferred from the
@@ -82,6 +92,13 @@ from og_herdr import (
     default_home,
     default_state_path,
     load_state,
+    # The writer of the note `focus_agent_terminal` reads back, in its
+    # COMPARE-AND-SET form. Load-bearing here, twice over: the return says whether
+    # the write LANDED (a vendor-CLI tab whose note did not land is closed again
+    # rather than left to be duplicated), and the "existing" half decides the
+    # winner when two panes race to open one agent's tab — so both never win and
+    # leave a duplicate. See `remember_agent_tab_if_absent`.
+    remember_agent_tab_if_absent,
     # The pane environment is stated ONCE, in og_herdr, next to the pane
     # commands it is about — the bridge opens panes too and had no copy of the
     # rule at all, which is how `og start herdr` left panes that opened a
@@ -121,17 +138,16 @@ AGENTS_COMMAND = "og agents"
 # not the launcher's own.
 #
 # 0.7, not 0.8, because the agents pane must be able to show its OWN controls.
-# The `og agents` footer's full form ("q quit  r refresh  ^/v move  enter focus
-# space expand  a access") is 64 display columns — the widest element the pane
-# renders, now that Enter focuses and expand moved to Space. (The move keys are
-# ASCII `^/v`, not ↑/↓, so 64 is the width in every locale, CJK included.) It no
-# longer CLIPS at a narrower pane: `og_agents._footer` degrades it to a 45-column
-# compact form and then to a 12-column key list, so every key stays discoverable
-# at any width. The ratio is still 0.7 because 0.8 gave the pane only ~43 columns on the
-# operator's 215-column terminal, where the footer would fall all the way to the
-# bare key list; 0.7 leaves ~30% (~64 columns there), enough for the whole
-# readable footer AND the 27-column QR. A pane that cannot show its own controls
-# is broken.
+# The `og agents` footer's full form is 50 display columns — the widest element
+# the pane renders. (The move keys are the East Asian AMBIGUOUS ↑/↓, charged two
+# columns by `_display_width`, so 50 is the width in every locale, CJK included.)
+# Below that it DEGRADES rather than clips: `og_agents._footer` picks a 30-column
+# compact form, then a 20-column bare key list, so every key stays discoverable at
+# any width (only under 20 columns does the key list itself clip). The ratio is
+# 0.7, not 0.8, because 0.8 gave the pane only ~43 columns on the operator's
+# 215-column terminal — too narrow for the full form — while 0.7 leaves ~30%
+# (~64 columns there), enough for the FULL footer form AND the 27-column QR. A
+# pane that cannot show its own controls is broken.
 AGENTS_PANE_RATIO = 0.7
 
 # Statuses that mean "this session is the one to come back to". `idle`
@@ -1742,13 +1758,13 @@ def _chat_degrade(line: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# the agent's own terminal: a READ-ONLY mirror of the native harness TUI
+# the agent's own terminal: attaching a vendor-CLI tab to the native harness TUI
 # ---------------------------------------------------------------------------
 # herdr gives an agent ONE pane, the Omnigent chat view. The ACTUAL harness (the
 # real Claude Code / codex / opencode TUI) is hosted by Omnigent as an
 # interactive terminal inside a PRIVATE tmux server, one server per harness
-# session, and is invisible from herdr. This section opens a second, read-only
-# pane that mirrors it.
+# session, and is invisible from herdr. This section RESOLVES that terminal so
+# `focus_agent_terminal` can open a tab attached to it.
 #
 # `OMNIGENT_TMUX_SOCK` is popped from the environment for security, so the only
 # handle left is on disk, under
@@ -1773,8 +1789,8 @@ BRIDGE_SESSION_KEYS = ("conversation_id", "active_session_id")
 # record measured so far carries, so it is the honest default rather than a guess.
 DEFAULT_TMUX_TARGET = "main"
 
-# The client flags the mirror attaches with. SPELLED OUT HERE BECAUSE THEY ARE
-# THE SAFETY PROPERTY, not a cosmetic choice — this is the one thing in this
+# The client flags the vendor-CLI attach runs with. SPELLED OUT HERE BECAUSE THEY
+# ARE THE SAFETY PROPERTY, not a cosmetic choice — this is the one thing in this
 # feature that can harm a LIVE agent:
 #
 #   * THE SIZING HAZARD. tmux sizes a window to the clients attached to it, and
@@ -1784,54 +1800,17 @@ DEFAULT_TMUX_TARGET = "main"
 #     this suite could catch it, because it only happens against a real socket.
 #     `ignore-size` is tmux's own answer: "the client does not affect the size of
 #     other clients", so the running agent's geometry is untouched.
-#   * `read-only` means the mirror cannot TYPE into the agent — only keys bound
-#     to detach-client/switch-client have any effect — so it is a view and never
-#     a second hand on somebody's keyboard.
+#   * The attach must be INTERACTIVE. Omnigent's web bridge deliberately keeps
+#     `ignore-size` and does NOT pass `-r` (read-only) because tmux >= 3.7
+#     rejects `send-keys` from a read-only client. We want the real vendor CLI
+#     to be typeable; dropping `read-only` gives up the "no second hand" guard
+#     in exchange for interactivity. The sizing guard `ignore-size` remains.
 #
-# Together these are exactly what tmux's `-r` is an alias for; they are spelled
-# out so the reason travels with the flags. Verified against tmux 3.8 (`man
-# tmux`, attach-session): "-f sets a comma-separated list of client flags ...
-# ignore-size the client does not affect the size of other clients ... read-only
-# the client is read-only". See `test_the_cli_attach_cannot_resize_or_type`.
-TMUX_ATTACH_FLAGS = "read-only,ignore-size"
-
-# The mirror's share when it is split in BELOW the chat. See `_open_cli_pane`
-# for why "down" and not the agents pane's "right".
-CLI_PANE_RATIO = 0.5
-
-# The OPTIONAL state key naming the CLI pane on an agent's space record. Its
-# absence is the whole point of adding it additively: a record written before
-# this feature has no such key and reads as "no CLI pane open". The key itself
-# lives in og_herdr (imported above) so the loader that must CARRY it and this
-# launcher name it once. See `cli_pane_toggle`.
-
-# What the pane says when there is nothing to mirror. Kept short so they survive
-# `_clip` in a narrow pane, and kept DISTINCT so the operator can tell "this can
-# never work here" (an ACP harness has no terminal by construction) from "try
-# again" (a native session whose record is gone).
-NOTICE_CLI_OUTSIDE_HERDR = "cli: not inside herdr (no HERDR_ENV)"
-NOTICE_CLI_FAILED = "cli: {0}"
-NOTICE_CLI_NO_SPACE = "cli: no herdr space recorded for this agent"
-NOTICE_CLI_NO_TAB = "cli: could not read this tab's panes from herdr"
-NOTICE_CLI_NO_PANE = "cli: herdr split but reported no new pane id"
-NOTICE_CLI_NOT_FOUND = "cli: no live terminal found (the session may have ended)"
-NOTICE_CLI_NO_TMUX = "cli: tmux is not on PATH to mirror the terminal"
-NOTICE_CLI_ACP = "{0} runs on an ACP harness, which has no terminal to show"
-# The mirror pane is on screen but og's state file does not name it: the write
-# that was supposed to remember it landed nowhere (disk full, permissions, a
-# concurrent writer). The next `c` press would then read "no CLI pane open" and
-# split a SECOND mirror beside this one — the duplicate-pane defect the
-# `_read_spaces` whitelist fix on the other side of this toggle exists to kill,
-# arriving here through a second route. Returned from `_open_cli_pane` after
-# closing the unrecorded pane, and from `_close_cli_pane` when the clear itself
-# failed and the record still names a dead pane.
-NOTICE_CLI_NOT_RECORDED = "cli: the mirror pane was not recorded"
-# The state write failed AND the recovery `pane_close` failed: an unrecorded
-# mirror pane stays on screen, and the next c press can split a second one
-# beside it. og cannot force a pane herdr will not release, so this is a
-# mitigation — tell the operator explicitly so they can close it by hand — not
-# a cure. Comments state the real failure; this is it.
-NOTICE_CLI_NOT_RECORDED_OR_CLOSED = "cli: the mirror pane was not recorded and could not be closed"
+# `ignore-size` alone is interactive and non-resizing. Verified against tmux
+# 3.8 (`man tmux`, attach-session): "-f sets a comma-separated list of client
+# flags ... ignore-size the client does not affect the size of other clients ...
+# read-only the client is read-only". See `test_the_cli_attach_cannot_resize_or_type`.
+TMUX_ATTACH_FLAGS = "ignore-size"
 
 
 def omnigent_tmp_root(environ: Optional[dict] = None) -> Optional[Path]:
@@ -1943,261 +1922,667 @@ def _is_socket(path: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# the runner's view of a session's terminals — the AUTHORITATIVE path
+# ---------------------------------------------------------------------------
+# The filesystem scan above resolves `claude-native` and nothing else, and that
+# is measured rather than suspected: the claude-native harness writes a
+# `tmux.json` beside its `bridge.json`, while `codex-native` writes NO
+# `tmux.json` at all — its `bridge.json` is an MCP config — so a codex
+# sub-agent has no on-disk record for the scan to find and is unresolvable by
+# it today (see omnigent/runtime/harnesses/codex_native/bridge.py).
+#
+# The Omnigent web UI never guesses at files. It asks the RUNNER for a
+# session's terminal RESOURCES — `GET /v1/sessions/{id}/resources/terminals`,
+# the route its terminal tabs are built from — and each terminal's metadata
+# carries the tmux socket and target. The runner owns the registry that
+# launched the terminal, so that answer is authoritative; the scan is a
+# FALLBACK kept for the case the runner cannot be reached at all.
+RUNNER_TERMINALS_ROUTE = "/v1/sessions/{0}/resources/terminals"
+# The resource `type` this reads. The same listing carries `environment`
+# resources (the default one and a per-terminal one) whose metadata has no
+# `tmux_socket`; naming the type says so once rather than depending on a
+# missing key.
+TERMINAL_RESOURCE_TYPE = "terminal"
+# Where the runner's terminal metadata carries the tmux coordinates
+# (omnigent.entities.session_resources.terminal_resource_view; measured against
+# a live server). Deliberately NOT `socket_path`/`tmux_target`: that is the
+# spelling of OUR `tmux.json`, and the two schemas are read by two functions
+# because they are two different documents.
+RESOURCE_SOCKET_KEY = "tmux_socket"
+RESOURCE_TARGET_KEY = "tmux_target"
+
+# og's server is reached by URL, and the URL is derived from the install, not
+# invented here: bin/og exports `OG_PORT` from og.env and `og setup` records the
+# same number as `port` in og-install.json. `OG_SERVER` is the explicit override
+# (and the seam a test uses); `OG_PORT` is next because og.env is what bin/og
+# actually reads; the install plan is the fallback for a caller with neither.
+RUNNER_URL_ENV = "OG_SERVER"
+PORT_CONFIG_KEY = "port"
+
+# How long the runner lookup may take before it reads as "no answer". BOUNDED
+# on purpose, and this is the one thing here that is not just a copy of the
+# watcher's transport: `SessionWatcher`'s own opener passes no timeout at all,
+# and this call happens on a keypress in `og agents`, so a server that is up
+# but wedged would hang the pane forever — strictly worse than the tab not
+# opening. The timeout is carried by an OPENER rather than by the watcher so
+# the shared transport keeps its own behaviour.
+RUNNER_TIMEOUT_SECONDS = 3.0
+
+
+def runner_base_url(env: Optional[dict] = None) -> str:
+    """The Omnigent server a session's terminal resources are asked of.
+
+    `OG_SERVER` wins outright (the explicit override, and the seam a test uses
+    so it never reaches a developer's live server). `OG_PORT` is next: it is what
+    bin/og sources from og.env and what its own server is started on. The install
+    plan's `port` is the same number for an install that never exported it, and
+    `DEFAULT_SERVER` is the last resort so a caller with no environment at all
+    still asks somewhere plausible rather than raising.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get(RUNNER_URL_ENV)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().rstrip("/")
+    port = env.get("OG_PORT")
+    if isinstance(port, str) and port.strip().isdigit():
+        return "http://127.0.0.1:{0}".format(port.strip())
+    configured = install_config().get(PORT_CONFIG_KEY)
+    if isinstance(configured, int) and not isinstance(configured, bool) \
+            and configured > 0:
+        return "http://127.0.0.1:{0}".format(configured)
+    return DEFAULT_SERVER
+
+
+def _runner_opener(timeout: float):
+    """A urlopen bound to `timeout`, for `SessionWatcher(opener=...)`.
+
+    The transport and the auth stay the watcher's (`_get_json` adds this
+    server's bearer token and nothing else does); only the patience is ours.
+    """
+    def open_request(request):
+        return urllib.request.urlopen(request, timeout=timeout)
+
+    return open_request
+
+
+def _runner_watcher(base_url: str):
+    """A watcher for `base_url`, carrying that server's token. Lazy import."""
+    from og_herdr_watch import SessionWatcher
+
+    return SessionWatcher(
+        base_url=base_url,
+        token=SessionWatcher.discover_token(base_url),
+        opener=_runner_opener(RUNNER_TIMEOUT_SECONDS))
+
+
+def resolve_runner_terminal(session_id: Optional[str],
+                            env: Optional[dict] = None,
+                            watcher=None) -> Optional[tuple]:
+    """`(socket_path, tmux_target)` from the runner's terminal resources, or None.
+
+    NEVER raises, and the contract is absolute: a runner that is absent, an HTTP
+    error, a timeout, malformed JSON, no terminal resource for the session, a
+    `socket_path` that is no longer a socket on disk — every one reads as "no
+    terminal", never as an exception. `og agents` is a view an operator leaves
+    open all day, so this must not be able to kill the pane on a keypress.
+
+    `watcher` is the injection seam: a caller (or a test) can hand in something
+    with `base_url` and `_get_json`, which is the same shape `SessionWatcher`
+    already presents and the same method the launcher's `/v1/hosts` lookup rides
+    (see `online_host_id`) — one transport, one place this server's token is
+    added. None means "build the real one", and a build that fails is "no
+    terminal" like every other miss.
+
+    A stale entry is SKIPPED rather than fatal: a listing that names two
+    terminals, one of them dead, still resolves the live one. The scan checks
+    the socket on disk for exactly this reason (see `_read_terminal`).
+    """
+    if not session_id:
+        return None
+    if watcher is None:
+        try:
+            watcher = _runner_watcher(runner_base_url(env))
+        except Exception:
+            return None
+    try:
+        base = str(getattr(watcher, "base_url", "") or runner_base_url(env))
+        url = base.rstrip("/") + RUNNER_TERMINALS_ROUTE.format(
+            urllib.parse.quote(str(session_id), safe=""))
+        payload = watcher._get_json(url)
+    except Exception:
+        return None
+    return _terminal_from_resources(payload)
+
+
+def _terminal_from_resources(payload: Any) -> Optional[tuple]:
+    """`(socket_path, target)` out of a terminal-resources page, or None.
+
+    The page is a `PaginatedList` (`{"object": "list", "data": [resource, …]}`).
+    Every shape here is read defensively because this parses a document this
+    module does not own: a top level that is not an object, no `data`, an entry
+    that is not an object, metadata that is not one, a `tmux_socket` that is not
+    a non-empty string — each is skipped, and a page with nothing usable in it is
+    `None` rather than an exception.
+    """
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if not isinstance(item, dict) or item.get("type") != TERMINAL_RESOURCE_TYPE:
+            continue
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        socket_path = metadata.get(RESOURCE_SOCKET_KEY)
+        if not isinstance(socket_path, str) or not socket_path:
+            continue
+        if not _is_socket(socket_path):
+            continue
+        target = metadata.get(RESOURCE_TARGET_KEY)
+        if not isinstance(target, str) or not target:
+            target = DEFAULT_TMUX_TARGET
+        return (socket_path, target)
+    return None
+
+
+def terminal_behind(session_id: Optional[str],
+                           env: Optional[dict] = None,
+                           watcher=None) -> Optional[tuple]:
+    """The harness terminal behind a session: the runner's answer, else the scan.
+
+    THE ORDER IS THE POINT. The runner knows which tmux server it launched for
+    this session and answers for every native harness, codex included; the
+    filesystem scan knows only the harnesses that write a `tmux.json`, so asking
+    it first would leave the codex case broken for no reason. It is kept as the
+    FALLBACK, tried only when the runner gave no answer, because the runner is
+    not always reachable (a bridge running against a server that has since
+    stopped, a `og agents` pane on a machine whose runner is down) and the scan
+    resolves a live `claude-native` session with no network at all.
+
+    Never raises, for the reasons both halves give.
+    """
+    terminal = resolve_runner_terminal(session_id, env, watcher)
+    if terminal is not None:
+        return terminal
+    return resolve_harness_terminal(session_id, env)
+
+
 def read_only_attach_command(socket_path: str, target: str) -> str:
-    """The command a CLI pane runs to mirror a harness, read-only.
+    """The command a vendor-CLI tab runs to attach to an agent's harness.
 
     The flags come from `TMUX_ATTACH_FLAGS` and carry the resize/typing safety
-    property documented there. The socket and target are shell-quoted because
-    both reach a shell in the pane: a `$TMPDIR` with a space in it is unusual but
-    not impossible, and an unquoted path would silently split the command.
+    trade-off documented there (non-resizing via `ignore-size`, interactive).
+    The socket and target are shell-quoted because both reach a shell in the
+    pane: a `$TMPDIR` with a space in it is unusual but not impossible, and an
+    unquoted path would silently split the command.
     """
     return "tmux -S {0} attach -f {1} -t {2}".format(
         shlex.quote(socket_path), TMUX_ATTACH_FLAGS, shlex.quote(target))
 
 
-def cli_terminal_notice(harness: Optional[str]) -> str:
-    """The honest line for "there is no terminal to mirror", keyed on the kind.
+# ---------------------------------------------------------------------------
+# move the operator to an agent's tab: Enter in `og agents`
+# ---------------------------------------------------------------------------
+# What `focus_agent_terminal` says when it cannot move the operator. One line
+# each and DISTINCT on purpose, so "this can never work here" reads differently
+# from "try again"; short so they survive a narrow pane's `_clip`.
+NOTICE_FOCUS_OUTSIDE_HERDR = "focus: not inside herdr (no HERDR_ENV)"
+NOTICE_FOCUS_NO_AGENT = "focus: no agent on this row"
+# The THIRD answer `harness_has_terminal` can give, kept distinct rather than
+# collapsed into either branch: with an unknown harness og cannot say whether
+# the pane in this tab runs the real vendor CLI or a REPL, so it declines rather
+# than moving the operator somewhere it cannot describe.
+NOTICE_FOCUS_UNKNOWN_HARNESS = ("focus: {0} is not a harness og knows, so its "
+                                "tab is unverified")
+NOTICE_FOCUS_NO_TAB = "focus: no herdr tab recorded for this agent"
+# A NATIVE agent whose harness terminal cannot be resolved: the vendor CLI is
+# gone (the harness exited, the runner is offline, the codex-native record does
+# not exist), so there is no real CLI to show. Distinct from NO_TAB, which is
+# "we never noted a tab", and from the unknown-harness line: this one means "the
+# harness is one you should be able to attach to, and there is nothing there".
+NOTICE_FOCUS_NO_TERMINAL = ("focus: no live terminal for this agent (its harness "
+                            "may have exited)")
+# Nowhere to put the tab: the agent's space is not in og's notes or the state
+# file, so og cannot open a tab for it without guessing at a space id.
+NOTICE_FOCUS_NO_SPACE = "focus: this agent has no herdr space to open a tab in"
+# The tab was opened and the note recording it did NOT land. The tab is closed
+# again before this is returned (see `_open_vendor_cli_tab`), so what the
+# operator reads is the whole story: nothing was left on screen for the next
+# Enter to duplicate. See the commit that fixed the same shape twice before —
+# an unrecorded pane is a duplicate waiting to happen.
+NOTICE_FOCUS_NOT_RECORDED = "focus: the new CLI tab could not be recorded"
+# The SAME failure, one worse: the note did not land AND the recovery close
+# failed. The tab is on screen with nothing recording it, which is exactly how
+# the next Enter opens a SECOND one. og cannot force herdr to release a tab, so
+# this is a MITIGATION, not a cure — say so plainly so the operator can close it
+# by hand. This is the PR #39 lesson (`NOTICE_CLI_NOT_RECORDED_OR_CLOSED`) carried
+# over from the mirror: a close that silently fails must not be reported as a
+# clean "not recorded".
+NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED = (
+    "focus: a CLI tab was left open (could not record or close it)")
+NOTICE_FOCUS_FAILED = "focus: {0}"
 
-    An ACP harness is TERMINAL-LESS BY CONSTRUCTION — a plain stdio JSON-RPC
-    child with no pty — so the operator is told that rather than sent hunting for
-    a pane that can never exist. Any other harness (native but with no live
-    record, or a harness this build cannot classify) gets the "may have ended"
-    line, which is the truth for a session that is gone and a shrug for one we
-    cannot name. NEVER opens an empty pane for either.
+
+def focus_agent_terminal(session_id: str, harness: Optional[str],
+                         root_session_id: str = "",
+                         env: Optional[dict] = None,
+                         client=None) -> Optional[str]:
+    """Focus the tab showing this agent's real CLI. None on success, else why.
+
+    THE INTERFACE `og agents` USES for Enter. `session_id` is the SELECTED row's
+    own session (root or worker), `root_session_id` that row's root when it has
+    one, and `harness` the row's harness id — the `og agents` pane resolves all
+    three off the row it has (a root's `harness` comes from its detail fetch, a
+    worker's from the install's agent spec). `client` and `env` are the test
+    seams; None builds the real herdr client from `env`.
+
+    Returns None when the operator's herdr UI moved, or a short one-line notice
+    saying why it did not — the same shape and the same contract as
+    `focus_in_herdr` in `og_agents`, and for the same reason: this pane is left
+    open all day, so a herdr that is absent, a socket that is down, a socket
+    that WILL NOT CONNECT and a state file that cannot be read must each become
+    a notice rather than a traceback that kills the view. It NEVER raises, and
+    the formatting is guarded too, so a failure whose own message cannot be
+    rendered still comes back as text.
+
+    WHY A TAB AND NOT `agent.focus`. herdr's `agent.get`/`agent.list` carry a
+    `tab_id`, but nothing links an OMNIGENT session id to one of those records:
+    `agent.get {target}` resolves a live agent NAME or the PANE id hosting the
+    agent, and a session id answers `agent_not_found` — measured against the
+    live server, on both the CLI and the socket API (see
+    `og_herdr.remember_agent_tab`, which is where og records the tab it minted
+    for exactly this reason). A TAB ID, unlike a session id, is something herdr
+    will act on directly, so `tab.focus` is the one call that can work.
+
+    WHAT IT REACHES, per harness kind, and this is the whole decision:
+
+      * **native** (`claude-native`, `codex-native`, …) — the agent's REAL vendor
+        CLI, in a tab of its own. If that tab is not there yet it is OPENED HERE,
+        on demand, in the agent's space: a tab the bridge never made, holding the
+        same interactive `tmux attach` a native worker's harness terminal needs
+        (`read_only_attach_command`).
+        A launcher-created ROOT therefore behaves exactly like a bridge-created
+        one — the operator gets the agent's CLI in a NEW tab and the conversation's
+        own pane is left exactly as it was. THE MAIN PANE IS NEVER REPURPOSED.
+      * **ACP** (`acp:*`) — the agent's own og chat view, `omnigent attach`, which
+        is what that agent's tab already holds (the same view `og chat`'s
+        down-arrow menu gives). Nothing is created.
+      * **unknown** — the third answer from `harness_has_terminal`, NOT collapsed
+        into either branch: og cannot say what the row's tab is, so it declines
+        with its own line and leaves the operator's screen alone.
+
+    The tab is found from og's own records, keyed by ROLE (`og_herdr.TAB_ROLE_*`):
+    `TAB_ROLE_CLI` is the vendor-CLI tab an agent may have, `TAB_ROLE_MAIN` the
+    tab holding its Omnigent view. For an ACP agent the `main` note is read first,
+    then the state file's `spaces[session_id].tab_id` (a root whose space the
+    LAUNCHER opened — the bridge only CLAIMED it, so it never made a tab to note),
+    then the root's tab for a worker whose own note is gone. For a native agent the
+    `cli` note is read, and the state file's record is NOT used as a fallback: that
+    tab is the Omnigent view (`_pane_command` notes a root's own tab as `main`
+    precisely so this stays true), and sending the operator there is the failure
+    this whole role distinction exists to prevent. Notes are dropped when the panes
+    go (`Bridge._forget_tab`), so a tab id is never aimed at after herdr re-used it.
+
+    IDEMPOTENCE IS THE PROPERTY THAT MATTERS MOST HERE: pressing Enter on the same
+    agent twice must land on the SAME tab. That is what the `cli` note buys — the
+    second call finds the note and focuses it, and `tab.create` is not reached. And
+    the mirror of it: if the note write does NOT land, the tab that was just opened
+    is CLOSED again (`NOTICE_FOCUS_NOT_RECORDED`), because a tab on screen that
+    nothing records is exactly how the next Enter opens a second one — the
+    duplicate-pane defect this project has already paid for twice.
+
+    The focus itself is ONE call. Measured against a live server: `tab.focus` also
+    raises the WORKSPACE holding the tab (see `og_herdr_client.tab_focus`), so no
+    `workspace.focus` is sent first — agents routinely live in a space other than
+    the one on screen, and one call moves both.
     """
-    if harness_has_terminal(harness) is False:
-        label = harness_labels().get(harness, harness) if harness else "this agent"
-        return NOTICE_CLI_ACP.format(label)
-    return NOTICE_CLI_NOT_FOUND
-
-
-def cli_pane_toggle(root_session_id: str, session_id: str,
-                    harness: Optional[str] = None, *,
-                    environ: Optional[dict] = None, client=None,
-                    state_path: Optional[Path] = None) -> Optional[str]:
-    """Open the read-only CLI pane for an agent, or close it if it is open.
-
-    Returns None when the toggle happened, or a short one-line notice saying why
-    it did not (the caller shows it in the pane, like the focus notices). NEVER
-    raises: `og agents` is a view an operator leaves open all day, so a herdr or
-    tmux that is absent, a socket that is down, or a state file that cannot be
-    read must each become a notice rather than a traceback that kills the pane.
-
-    ONE RECORD, ADDITIVE. herdr has no method to ask what a pane is RUNNING
-    (`pane.list` returns only pane_id/tab_id/workspace_id — no command, no
-    process), so og must itself remember whether the CLI pane is open. That
-    memory is one extra OPTIONAL key on the agent's space record: PRESENT means
-    open (and is the pane id to close), ABSENT means closed. A record written
-    before this feature has no such key and reads as closed — which is why the
-    field is additive and never a version bump. Because the record is the only
-    memory, opening twice cannot open two panes: the second toggle closes.
-
-    `root_session_id` keys the SPACE (a worker's own id addresses no space, so
-    the caller passes its ROOT — see `focus_target`), while `session_id` is the
-    agent whose TUI is mirrored (the selected row's OWN). They are equal for a
-    root. Splitting the two is what lets Enter's rule — only a root has a pane —
-    coexist with mirroring whichever agent is selected.
-    """
-    env = os.environ if environ is None else environ
-    if not is_inside(env):
-        return NOTICE_CLI_OUTSIDE_HERDR
-    if not root_session_id or not session_id:
-        return NOTICE_CLI_NO_SPACE
-    path = state_path if state_path is not None else default_state_path()
-
-    record = _space_record(path, root_session_id)
-    if not record or not record.get("workspace_id"):
-        return NOTICE_CLI_NO_SPACE
-
-    open_pane = record.get(CLI_PANE_FIELD)
-    if open_pane:
-        return _close_cli_pane(path, root_session_id, open_pane, client)
-
-    terminal = resolve_harness_terminal(session_id, env)
-    if terminal is None:
-        return cli_terminal_notice(harness)
-    if shutil.which("tmux") is None:
-        return NOTICE_CLI_NO_TMUX
-    return _open_cli_pane(path, root_session_id, record, terminal, env, client)
-
-
-def _space_record(state_path: Path, session_id: str) -> dict:
-    """The `spaces` record for a session, or `{}`. Never raises."""
+    environ = dict(os.environ) if env is None else dict(env)
+    if not session_id:
+        return NOTICE_FOCUS_NO_AGENT
+    # Inside the guard, and before anything else: this pane must render in ANY
+    # terminal, so a probe that raises has to become a notice like every other
+    # failure rather than killing the view on a keypress.
     try:
-        state = load_state(state_path)
+        inside = is_inside(environ)
     except Exception:
-        return {}
-    record = (state.get("spaces") or {}).get(session_id)
-    return record if isinstance(record, dict) else {}
-
-
-def _open_cli_pane(state_path: Path, root_session_id: str, record: dict,
-                   terminal: tuple, env: dict, client) -> Optional[str]:
-    """Split a pane in beside the chat and run the read-only attach there.
-
-    The split is "down", NOT the agents pane's "right". The agents pane's whole
-    job is its WIDTH — `AGENTS_PANE_RATIO` exists to keep its footer readable —
-    so a right-split of the chat would squeeze it below the columns it needs,
-    while a down-split in the chat column gives the mirror the FULL width of that
-    column, which is what a terminal TUI wants. The chat is the anchor (the
-    record's own `pane_id`), which is the pane `split_agents_pane` already splits
-    to place the agents pane.
-    """
-    ws_id = record.get("workspace_id")
-    tab_id = record.get("tab_id")
-    anchor = record.get("pane_id")
-    if not (tab_id and anchor):
-        return NOTICE_CLI_NO_SPACE
-    socket_path, target = terminal
-    command = read_only_attach_command(socket_path, target)
-    if client is None:
-        try:
-            from og_herdr_client import HerdrClient
-            client = HerdrClient()
-        except Exception as exc:
-            return _cli_failure(exc)
-    # Read BEFORE the split so the pane it makes can be told from the ones the
-    # operator already had in this tab (see `tab_pane_ids`); a listing that
-    # cannot be read refuses rather than splitting onto an unknown baseline.
-    baseline = tab_pane_ids(client, ws_id, tab_id)
-    if baseline is None:
-        return NOTICE_CLI_NO_TAB
-    params = {"target_pane_id": anchor, "direction": "down", "focus": False,
-              "ratio": CLI_PANE_RATIO}
-    cwd = record.get("cwd")
-    if cwd:
-        params["cwd"] = cwd
-    pane_env = pane_env_for(env)
-    if pane_env:
-        params["env"] = pane_env
+        return NOTICE_FOCUS_OUTSIDE_HERDR
+    if not inside:
+        return NOTICE_FOCUS_OUTSIDE_HERDR
+    # Both reads are guarded even though neither is documented as raising: this
+    # function's "NEVER raises" is absolute, and these are the two seams that
+    # touch something outside it. `harness_has_terminal` reads the registry (a
+    # catalog that is not this module's), and `default_state_path` resolves
+    # $OMNIGENT_HOME through `Path.home()`, which a sandboxed pane can leave
+    # unresolvable. A failure in either is exactly "og cannot tell" and "there is
+    # no tab to find" — the notices this already has — never a traceback that
+    # kills the view.
     try:
-        reply = client.call("pane.split", params)
-    except Exception as exc:
-        return _cli_failure(exc)
-    pane_id = _split_pane_id(client, ws_id, tab_id, anchor, reply, baseline)
-    if not pane_id:
-        return NOTICE_CLI_NO_PANE
+        kind = harness_has_terminal(harness)
+    except Exception:
+        kind = None
+    if kind is None:
+        label = harness if isinstance(harness, str) and harness.strip() \
+            else "this agent"
+        return _focus_line(NOTICE_FOCUS_UNKNOWN_HARNESS, label)
+
     try:
-        client.pane_run(pane_id, command)
+        state_path = default_state_path()
+        tabs_path = agent_tabs_path(state_path)
+    except Exception:
+        return NOTICE_FOCUS_NO_TAB
+
+    terminal = None
+    tab_id = None
+    if kind is True:
+        tab_id = _noted_tab(tabs_path, session_id, TAB_ROLE_CLI)
+        if not tab_id:
+            # No vendor-CLI tab yet: resolve the terminal FIRST, so an
+            # unresolvable one is an honest notice and never an empty tab.
+            try:
+                terminal = terminal_behind(session_id, environ)
+            except Exception:
+                terminal = None
+            if terminal is None:
+                return NOTICE_FOCUS_NO_TERMINAL
+    else:
+        tab_id = _main_tab_id(tabs_path, state_path, session_id, root_session_id)
+        if not tab_id:
+            return NOTICE_FOCUS_NO_TAB
+
+    # ONE client for the whole call, built only once there is something to do
+    # with it — and closed here when we built it. Constructing one does not
+    # connect (see `_chat_client`).
+    try:
+        opened = client if client is not None else _chat_client(environ)
     except Exception as exc:
-        # No command in the pane means an empty pane og created and left behind
-        # — the exact thing `_open_space` refuses to leave. Close it.
-        try:
-            client.pane_close(pane_id)
-        except Exception:
-            pass
-        return _cli_failure(exc)
-    # The pane is open, but if the state write did not LAND then nothing on disk
-    # remembers it: the next `c` press reads "no CLI pane open" and splits a
-    # SECOND mirror beside this one. Closing the pane we just opened is the
-    # same recovery the `pane_run` failure path above already uses — an orphan
-    # pane the next keypress can misread is worse than a degraded notice — so
-    # the write's return value is load-bearing here, not cosmetic.
-    if not _set_cli_pane(state_path, root_session_id, pane_id):
-        try:
-            client.pane_close(pane_id)
-        except Exception:
-            # The state write failed AND the recovery close failed: an
-            # unrecorded mirror pane stays on screen, and the next c press can
-            # split a second one beside it. Say so explicitly so the operator
-            # can close it by hand — a mitigation, not a cure; og cannot force
-            # a pane herdr will not release.
-            return NOTICE_CLI_NOT_RECORDED_OR_CLOSED
-        return NOTICE_CLI_NOT_RECORDED
+        return _focus_line(NOTICE_FOCUS_FAILED, exc)
+    try:
+        if not tab_id:
+            notice, tab_id = _open_vendor_cli_tab(
+                session_id, harness, environ, opened, tabs_path, state_path,
+                terminal, root_session_id)
+            if notice is not None:
+                return notice
+        opened.tab_focus(tab_id)
+    except Exception as exc:
+        # Belt and braces: every step above turns its own failure into a notice,
+        # and anything that got past them must still not kill the pane.
+        return _focus_line(NOTICE_FOCUS_FAILED, exc)
+    finally:
+        if client is None:
+            try:
+                opened.close()
+            except Exception:
+                pass
     return None
 
 
-def _close_cli_pane(state_path: Path, root_session_id: str, pane_id: str,
-                    client) -> Optional[str]:
-    """Close the recorded CLI pane and clear the field.
-
-    The close is best effort: the pane may already be gone (the operator closed
-    it, or the attach exited), and a record naming a dead pane would make the
-    next toggle try to close a pane that is not there instead of opening one — so
-    the field is cleared either way.
-    """
-    if client is None:
-        try:
-            from og_herdr_client import HerdrClient
-            client = HerdrClient()
-        except Exception as exc:
-            return _cli_failure(exc)
+def _noted_tab(tabs_path: Path, session_id: str, role: str) -> Optional[str]:
+    """The tab id noted for one agent and role, or None. Never raises."""
     try:
-        client.pane_close(pane_id)
+        record = agent_tab_record(tabs_path, session_id, role)
     except Exception:
-        pass
-    # Best-effort close, but the FIELD is cleared either way: a record that
-    # still names a dead pane makes the next toggle try to close a pane that is
-    # not there instead of opening one. If the clear itself failed to land, the
-    # record may still name this pane, so say so rather than silently leaving a
-    # stale pointer the next keypress will misread.
-    if not _set_cli_pane(state_path, root_session_id, None):
-        return NOTICE_CLI_NOT_RECORDED
+        return None
+    tab_id = record.get("tab_id") if isinstance(record, dict) else None
+    return tab_id if isinstance(tab_id, str) and tab_id else None
+
+
+def _main_tab_id(tabs_path: Path, state_path: Path, session_id: str,
+                 root_session_id: str = "") -> Optional[str]:
+    """The tab holding an agent's Omnigent view, or None. Never raises.
+
+    The sidecar first — written by whoever created the tab, and dropped when its
+    pane goes — then the state file, which is where the LAUNCHER records the space
+    it opened for `og chat`. That record is the only trace of a root whose space
+    the bridge merely CLAIMED. `root_session_id` is the last resort, for a worker
+    whose own notes are gone: the conversation it is working in, which is at least
+    the right space. Both are og's own records — herdr cannot be asked (measured;
+    see `og_herdr.remember_agent_tab`).
+
+    THE ROOT FALLBACK IS DELIBERATE AND REVIEWED, not an oversight. An independent
+    reviewer read it as violating "never touch the main pane"; the user ruled to
+    KEEP it, and the reasoning is recorded here so it is not "fixed" into a dead
+    end where selecting a reaped ACP agent does nothing at all. FOCUSING an
+    existing tab is not REPURPOSING it: og never retypes, retargets, splits or
+    closes the main pane, so landing the operator on the root conversation when a
+    reaped agent's own view is gone is a benign last resort — the root IS the
+    conversation that agent works in, the nearest true view left to show. Only the
+    ACP branch reaches this; a NATIVE agent never comes here (its view is the
+    vendor CLI; see `focus_agent_terminal` and the `cli`/`main` role split).
+    """
+    tab_id = _noted_tab(tabs_path, session_id, TAB_ROLE_MAIN)
+    if tab_id:
+        return tab_id
+    try:
+        spaces = load_state(state_path).get("spaces") or {}
+    except Exception:
+        return None
+    if not isinstance(spaces, dict):
+        return None
+    for candidate in (session_id, root_session_id):
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        record = spaces.get(candidate)
+        tab_id = record.get("tab_id") if isinstance(record, dict) else None
+        if isinstance(tab_id, str) and tab_id:
+            return tab_id
     return None
 
 
-def _set_cli_pane(state_path: Path, session_id: str,
-                  pane_id: Optional[str]) -> bool:
-    """Set (or clear) the CLI pane field on a space record, ADDITIVELY.
+def _agent_space(tabs_path: Path, state_path: Path, session_id: str,
+                 root_session_id: str = "") -> tuple:
+    """`(workspace_id, cwd)` of the space an agent's tabs live in, or (None, None).
 
-    A merge into the existing record through `og_herdr.state_update` — never a
-    wholesale replace — so the workspace/tab/chat pane ids the record already
-    holds survive, and a record for a session that is not there is left alone.
-    Clearing REMOVES the key rather than setting it null, so a closed toggle
-    leaves the v2 record shaped exactly as one written before this feature.
+    The `main` note carries the workspace id, and for a WORKER that IS its root's
+    space (the bridge records a worker's tab against the space it created it in),
+    so the note normally answers this on its own. The state file's record is the
+    fallback for a root whose space the launcher opened; its `cwd` rides along
+    because a tab has to be created with one.
 
-    `state_update`'s contract: `decide(state)` returns the state to write, or a
-    falsy value to write nothing at all — "a claim that found no record". We
-    use it deliberately, and the asymmetry is the point:
-
-    * record present — set or clear: `put` returns the updated state and the
-      write lands; `_set_cli_pane` reports whether `_write_state` succeeded.
-    * record absent and SETTING: nothing exists to record the pane under, so
-      `put` returns falsey and `state_update` writes NOTHING — an unchanged
-      file, not a pointless rewrite — and `_set_cli_pane` returns False.
-      `_open_cli_pane` therefore closes the pane it just opened and declines,
-      so an unrecorded mirror can never sit on screen and the next c press
-      cannot split a second one.
-    * record absent and CLEARING: there is nothing stale left to remove, which
-      is exactly the goal, so `_set_cli_pane` returns True and `_close_cli_pane`
-      stays silent rather than warning the operator about a non-problem.
-
-    NEVER-RAISING by design: `_open_cli_pane` and `_close_cli_pane` convert a
-    failed write into a notice, and a notice is always better than killing the
-    `og agents` pane over a state-file write. The return is load-bearing:
-    `_open_cli_pane` closes a pane whose write did not land, because a mirror
-    on screen with no record naming it is exactly how the next `c` press splits
-    a SECOND mirror — the defect this whole function exists to kill.
+    Never raises: an unreadable state file is "no space known", which the caller
+    turns into a notice rather than a tab in a guessed space.
     """
-    def put(state: dict) -> Optional[dict]:
-        record = (state.get("spaces") or {}).get(session_id)
+    try:
+        noted = agent_tab_record(tabs_path, session_id, TAB_ROLE_MAIN)
+    except Exception:
+        noted = {}
+    ws_id = noted.get("workspace_id") if isinstance(noted, dict) else None
+    if isinstance(ws_id, str) and ws_id:
+        return ws_id, None
+    try:
+        spaces = load_state(state_path).get("spaces") or {}
+    except Exception:
+        spaces = {}
+    if not isinstance(spaces, dict):
+        spaces = {}
+    for candidate in (session_id, root_session_id):
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        record = spaces.get(candidate)
         if not isinstance(record, dict):
-            # No space record for this session. A set records nothing: return
-            # falsey so state_update writes nothing rather than rewriting an
-            # unchanged file. A clear has nothing left to remove: return the
-            # state unchanged so it reports success (nothing stale remains).
-            return state if pane_id is None else None
-        if pane_id:
-            record[CLI_PANE_FIELD] = pane_id
-        else:
-            record.pop(CLI_PANE_FIELD, None)
-        return state
+            continue
+        ws_id = record.get("workspace_id")
+        if isinstance(ws_id, str) and ws_id:
+            cwd = record.get("cwd")
+            return ws_id, cwd if isinstance(cwd, str) and cwd else None
+    return None, None
 
+
+def _cli_tab_label(harness: Optional[str], session_id: str) -> str:
+    """What the on-demand vendor-CLI tab is called.
+
+    The harness's product name ("Claude Code") when the registry names it, which
+    is the same string the agent column shows, so the new tab reads as that
+    agent's CLI beside it; the session id's short form otherwise. The ` (cli)`
+    suffix is what tells it apart at a glance from the agent's own tab, which
+    carries the conversation title.
+    """
+    name = harness_labels().get(harness) if isinstance(harness, str) else None
+    if not isinstance(name, str) or not name:
+        name = str(session_id)[:8]
+    return "{0} (cli)".format(name)
+
+
+def _open_vendor_cli_tab(session_id: str, harness: Optional[str], environ: dict,
+                         opened, tabs_path: Path, state_path: Path,
+                         terminal: tuple, root_session_id: str = "") -> tuple:
+    """Open an agent's vendor-CLI tab, note it, and return `(notice, tab_id)`.
+
+    ONE tab in the agent's space, running the interactive attach that
+    `read_only_attach_command` builds — the one command the tab attach uses, so
+    there is one spelling of the safety trade-off (`ignore-size`, and NOT `-r`;
+    see `TMUX_ATTACH_FLAGS`).
+
+    `focus=False` on the create and `tab.focus` afterwards, deliberately: the
+    create must not move the operator's screen on its own, and the focus call is
+    also what raises the workspace (measured), so doing both would be two jumps.
+
+    `root_session_id` is the worker's root when it has one: a worker with no note
+    of its own and no space record of its OWN still lives in its ROOT's space, so
+    it is passed on to `_agent_space` (omitting it made Enter answer "no space"
+    for exactly that case).
+
+    THE NOTE IS A COMPARE-AND-SET, NOT A CHECK-THEN-WRITE. Two `og agents` panes
+    can both see "no cli note" and both create a tab; `remember_agent_tab_if_absent`
+    decides the winner INSIDE the sidecar's lock, at the write, so only one tab is
+    ever recorded. The loser's tab is closed and the winner's id returned, so the
+    focus lands on one tab and nothing is orphaned.
+
+    EVERY failure becomes a notice, and any tab this call opened but could not
+    use is CLOSED AGAIN before returning: an on-screen tab nothing records is how
+    the next Enter opens a second one. There are THREE such paths — a partial
+    create, a failed `pane_run`, and a compare-and-set that did not claim — and
+    all three go through `_close_tab_or_report`, so if the close ALSO fails the
+    operator gets `NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED` instead of a generic
+    failure with an orphan left on screen. That is the PR #38/#39 lesson (og
+    cannot force herdr to release a tab, so the notice is a mitigation) made
+    structural rather than repeated at each call site, where it was missed twice.
+    """
+    ws_id, cwd = _agent_space(tabs_path, state_path, session_id, root_session_id)
+    if not ws_id:
+        return NOTICE_FOCUS_NO_SPACE, None
     try:
-        return bool(state_update(state_path, put))
+        command = read_only_attach_command(*terminal)
+    except Exception as exc:
+        # `terminal` is a `(socket, target)` pair, always two strings when
+        # `terminal_behind` supplies it — but this sits OUTSIDE the create's try,
+        # and `read_only_attach_command` unpacks and shell-quotes it, so a
+        # malformed tuple (wrong arity, a non-string member) would escape. Guarded
+        # so "every failure becomes a notice" stays literally true, and so nothing
+        # is created for a terminal og cannot name.
+        return _focus_line(NOTICE_FOCUS_FAILED, exc), None
+    try:
+        created = opened.tab_create(
+            ws_id, cwd or os.getcwd(), _cli_tab_label(harness, session_id),
+            focus=False, env=pane_env_for(environ))
+    except Exception as exc:
+        # A `tab.create` that TIMES OUT may still have LANDED server-side: the
+        # client's default is 10s and `_read_frame` raises `HerdrError("timeout")`,
+        # so a failure here can mean a tab now EXISTS that this call never saw the
+        # id of. There is then nothing to close and nothing to note, so the result
+        # is a rare orphan tab the operator must close by hand — and a later Enter,
+        # finding no note, opens another. It is NOT SPECIFIC TO THIS PATH: every
+        # create in og has the same shape (`_add_tab`, `_open_space`), because the
+        # herdr protocol has no idempotency key and the client cannot ask whether
+        # its create landed.
+        #
+        # RECONCILING BY LABEL IS DELIBERATELY NOT DONE. `_cli_tab_label` is the
+        # harness PRODUCT name ("Claude Code (cli)"), not unique per session, so
+        # listing tabs and matching it could adopt or close ANOTHER agent's tab —
+        # a wrong-tab bug, worse than the rare orphan it would fix. The real fix
+        # belongs in the herdr protocol (an idempotency key, or a
+        # create-if-absent), not here. Recorded so the next reader does not "fix"
+        # this with exactly that label reconcile.
+        return _focus_line(NOTICE_FOCUS_FAILED, exc), None
+    if not isinstance(created, dict):
+        created = {}
+    tab_id = _id_of(created.get("tab"), "tab_id")
+    pane_id = _id_of(created.get("root_pane"), "pane_id")
+    if not (tab_id and pane_id):
+        # A tab without a pane is an empty tab og created and cannot use: close
+        # whatever came back, the same rule `_open_space` applies to a partial
+        # create. `tab_id` may be falsy — herdr returned no tab at all — and then
+        # there is nothing to orphan, so the plain failure is the whole truth.
+        notice = _focus_line(NOTICE_FOCUS_FAILED,
+                             "herdr returned no tab or pane id")
+        if not tab_id:
+            return notice, None
+        return _close_tab_or_report(opened, tab_id, (notice, None))
+    try:
+        opened.pane_run(pane_id, command)
+    except Exception as exc:
+        return _close_tab_or_report(
+            opened, tab_id, (_focus_line(NOTICE_FOCUS_FAILED, exc), None))
+    claimed, winner = remember_agent_tab_if_absent(
+        tabs_path, session_id, tab_id, ws_id, role=TAB_ROLE_CLI)
+    if claimed:
+        return None, tab_id
+    # Not claimed: either a second pane opened this agent's tab first (there is a
+    # WINNER) or the note could not be written. Either way OUR tab is not the one
+    # on record, so it is closed — through the one close-and-report helper, which
+    # names a left-open tab when the close fails instead of a clean "not recorded".
+    return _close_tab_or_report(
+        opened, tab_id,
+        (None, winner) if winner else (NOTICE_FOCUS_NOT_RECORDED, None))
+
+
+def _close_tab_or_report(opened, tab_id: str, closed_result: tuple) -> tuple:
+    """Close a tab this call opened; return the `(notice, tab_id)` its fate fits.
+
+    THE ONE PLACE `_open_vendor_cli_tab` CLOSES A TAB IT OPENED AND COULD NOT USE,
+    AND THE ONE PLACE THAT PICKS THE NOTICE. `closed_result` is what to hand back
+    when herdr DID close the tab. When the close FAILS the operator is told a tab
+    was left open instead (`NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED`), because a tab on
+    screen with nothing recording it is exactly how the next Enter opens a second
+    one — a defect class that has now appeared three times (PR #38, PR #39, and the
+    CAS path it was first fixed on). Structural so it cannot recur a fourth: every
+    close-and-report in that function goes through here, so no caller can close a
+    tab and forget to say it was left open.
+
+    A FALSY `tab_id` is deliberately NOT routed here — there is no tab to orphan,
+    so a caller keeps its plain notice (see the partial-create branch).
+    """
+    if _close_tab_quietly(opened, tab_id):
+        return closed_result
+    return NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED, None
+
+
+def _close_tab_quietly(opened, tab_id: str) -> bool:
+    """Close a tab this call just opened, best effort. Never raises.
+
+    Returns True when herdr closed it, False when it did not. THE RETURN IS
+    LOAD-BEARING: a tab on screen that nothing records is how the next Enter opens
+    a second one, so a caller whose note did not land must know whether its own
+    recovery close worked — when it did not, the operator is told
+    (`NOTICE_FOCUS_NOT_RECORDED_OR_CLOSED`) instead of being left to discover the
+    orphan. That is the PR #39 lesson, kept from the mirror.
+
+    Callers close a FAILED attempt through `_close_tab_or_report`, which is the one
+    place that pairs this return with the notice; calling this bare and dropping
+    the bool is the defect that helper exists to make impossible.
+
+    NOT `_close_quietly`, which is a different thing that already exists further
+    up this file: the LAUNCHER's own "close the space I just opened", taking a
+    ctx and a workspace id. Two same-named module-level functions would mean the
+    later one silently wins for every caller — the launcher's space cleanup would
+    have started calling `tab.close` on a workspace id.
+    """
+    try:
+        opened.tab_close(tab_id)
     except Exception:
-        # `state_update` itself never raises (it wraps `_write_state`), but
-        # defend in depth: a failed write must become a False, never a traceback
-        # that reaches `cli_pane_toggle`'s caller.
         return False
+    return True
 
 
-def _cli_failure(exc: BaseException) -> str:
-    """One notice line for a herdr failure. NEVER raises — even formatting it."""
+def _focus_line(template: str, value) -> str:
+    """One notice line. NEVER raises — even while formatting."""
     try:
-        return NOTICE_CLI_FAILED.format(exc)
+        return template.format(value)
     except Exception:
-        return NOTICE_CLI_FAILED
+        return template.split("{")[0].strip() or template
 
 
 # ---------------------------------------------------------------------------

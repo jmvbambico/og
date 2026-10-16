@@ -24,8 +24,11 @@ begins. The gutter is the rail's own column (`⦿` where an agent's box hangs of
 it, `│` on every other row), a space, the state glyph's column, and a space — so
 one unbroken line runs down the pane's left edge, with a node at each agent, out
 of the root box's own bottom-left corner and across the breathing rows.
-SELECTION IS BRIGHTNESS: the selected worker's box paints normal while every
-other box paints dim — there is no caret glyph. Inside the box the harness brand
+SELECTION IS BRIGHTNESS: the selected AGENT's box — a worker's or the root's —
+paints normal while every other box paints dim — there is no caret glyph. The
+selection is cleared by `Esc` (which no longer quits) and by `Enter` acting on a
+row, so the dim state is always escapable; `q` is the only quit. Inside the box
+the harness brand
 mark and the title sit flush left with the meta flush right; the WORKING glyph is
 a braille spinner (see SPIN_FRAMES), so a live row visibly animates while
 blocked, failed and finished rows stay static. A boxed access panel — pane-width
@@ -39,14 +42,14 @@ must run in any terminal. It sends NOTHING to a session — no prompting, no
 answering an elicitation, no dispatches — and changes no session state. Its read
 path is GET-only and goes entirely through `og_herdr_watch`, which owns the
 transport, pagination, `kind=any` default, truncation handling and per-server
-token matching; none of that is re-implemented here. It makes exactly ONE
-outbound call of its own: `agent.focus` (see `focus_in_herdr`), which moves the
-operator's own herdr UI to the pane a row belongs to — a worker's ROOT, the only
-session herdr has a pane for, see `focus_target` — and touches no session state. That
-call is reached lazily — the herdr client is imported inside the handler, so `og
-agents` still runs with no herdr installed, outside a herdr pane, or with the
-socket down — and it is pinned by the AST guard in tests/test_og_agents.py, which
-asserts `agent.focus` is the ONLY method this module ever hands to `call`.
+token matching; none of that is re-implemented here. Its ONE outbound call is
+herdr's `agent.focus` (see `focus_in_herdr`), pinned as the only method this
+module ever hands to `call` by the AST guard in tests/test_og_agents.py. `Enter`
+focuses the SELECTED row's OWN agent tab through `og_herdr_launch.focus_agent_terminal`
+(see `focus_agent`) — the selected agent itself, roots included — and touches no
+session state. Both paths are reached lazily — the herdr modules are imported
+INSIDE the handler, so `og agents` still runs with no herdr installed, outside a
+herdr pane, or with the socket down.
 """
 from __future__ import annotations
 
@@ -186,10 +189,10 @@ NODE = "\u29bf"
 # The four columns a box spends BEFORE its rounded border: the NODE column (the
 # rail, or `⦿` where the box hangs off it), a space, the STATE glyph column, a
 # space. The node and the state glyph are drawn on the box's CONTENT row alone
-# and blank on its border and snippet rows, so the rail reads as one unbroken
-# line with a node at each agent — the rule the pre-C2 renderer already followed
-# for its caret. The breathing rails keep the rail in column 0 too, so the line
-# runs unbroken down the whole group.
+# and blank on the border rows above and below it, so the rail reads as one
+# unbroken line with a node at each agent — the rule the pre-C2 renderer already
+# followed for its caret. The breathing rails keep the rail in column 0 too, so
+# the line runs unbroken down the whole group.
 GUTTER = 4
 
 # The narrowest box there is: two corners and two rules is the smallest rectangle
@@ -211,14 +214,13 @@ GROUP_ORDER = ("working", "blocked", "failed", "unknown", "idle")
 # is derived here instead of being added to the shared vocabulary.
 FAILED_STATUSES = frozenset({"failed", "error", "errored", "cancelled", "canceled"})
 
-# Ceilings. The view is meant to run for a long time, so its two caches are
-# bounded rather than growing one entry per session the machine has ever seen.
-# Both are order-of-magnitude above anything real: MAX_ROOT_DETAILS is the
-# number of roots whose detail is worth a 121 KB fetch at startup (the "handful"
-# the design budgets for, and the ceiling on the cwd probe in `_match_cwd_root`
-# — same dict, same eviction), and MAX_SNIPPETS is a window of reports.
+# A ceiling. The view is meant to run for a long time, so its root-detail cache
+# is bounded rather than growing one entry per session the machine has ever seen.
+# MAX_ROOT_DETAILS is order-of-magnitude above anything real: the number of roots
+# whose detail is worth a 121 KB fetch at startup (the "handful" the design
+# budgets for, and the ceiling on the cwd probe in `_match_cwd_root` — same dict,
+# same eviction).
 MAX_ROOT_DETAILS = 32
-MAX_SNIPPETS = 256
 
 # The access panel (the `a` toggle). It is pinned to the bottom of the pane and
 # spans its FULL width, like the root box — it holds the QR block, one URL line
@@ -246,25 +248,42 @@ MAX_META = 28
 DEFAULT_WIDTH = 80
 
 # The footer. Its own constant so the tests can assert the binding is listed
-# without driving a tty. Enter FOCUSES the selected worker in herdr (see
-# `focus_in_herdr`); snippet expand/collapse moved to SPACE when Enter was taken.
+# without driving a tty. Enter FOCUSES the selected agent's own tab in herdr (see
+# `focus_agent`).
+#
+# `Esc` IS DELIBERATELY BOUND BUT UNLISTED — do NOT add it back. It clears the
+# selection and never quits (see `_run_tui`), but the operator judged it
+# INSTINCTUAL and asked for it to stay out of the menu. Nothing on screen names
+# it, so its tests — not this line — are what keep it working; an unnamed binding
+# is exactly the kind that regresses silently. Every OTHER binding the view reads
+# IS listed here.
 #
 # THREE forms, chosen by width in `_footer`. The agents pane is a SPLIT of the
-# chat and is often only ~46 columns, while this full sentence is 64, so a single
-# fixed footer gets clipped by `_clip` — which is exactly how "space expand" and
-# "a access" used to fall off the end, leaving the operator without the key that
-# had just inherited expand from Enter. FOOTER_COMPACT swaps the Enter and Space
-# words for their key glyphs and drops the doubled spacing; FOOTER_KEYS is the
-# floor, naming every key with no labels at all. Only LABELS ever degrade, never
-# a key: a key with no label is still findable by pressing it, a key clipped off
-# the end is gone.
+# chat and is often only ~46 columns, while this full sentence is 50, so a single
+# fixed footer gets clipped by `_clip` — which is exactly how "a access" and
+# "q quit" used to fall off the end. FOOTER_COMPACT drops the `move` and `theme`
+# LABELS (their keys stay) and joins entries with a single space; FOOTER_KEYS is
+# the floor, naming every key with no labels at all. Only LABELS ever degrade,
+# never a key: a key with no label is still findable by pressing it, a key clipped
+# off the end is gone.
 #
-# THE FOOTER NAMES ITS KEYS IN ASCII AND ITS ONE SEPARATOR IN A NARROW GLYPH. The
-# move keys were once ↑/↓ (U+2191/U+2193), East Asian AMBIGUOUS — one column in a
-# Latin locale, TWO in a CJK one. `_display_width` charged them one, so the full
-# form measured exactly 64 and was chosen for a 64-column pane — but a CJK terminal
-# painted 66 and `_clip` cut the trailing keys off. They are ASCII now (`^/v`).
-# The separator is U+2219 BULLET OPERATOR, NARROW — `unicodedata.east_asian_width`
+# THE MOVE KEYS ARE ↑/↓ AGAIN, AND THAT IS A MEASURED COST. U+2191/U+2193 are East
+# Asian AMBIGUOUS — one column in a Latin locale, TWO in a CJK one — and
+# `_display_width` charges Ambiguous two, the pessimistic rule that is correct in
+# BOTH locales (see its docstring). So `↑/↓` costs FIVE measured columns where the
+# ASCII `^/v` it replaced cost three, and `↑↓` costs four where `^v` cost two: the
+# arrows buy the glyph vocabulary the footer already speaks (`⏎` for enter) at two
+# measured columns per form. `_display_width` and a CJK terminal still AGREE on
+# every form, so the form CHOSEN for a width is safe in both — the property that
+# matters, and the one the old ↑/↓ broke when the ruler charged them one while a
+# CJK terminal painted two. The arrows are the ONLY Ambiguous glyphs here; ⏎
+# (U+23CE) and ∙ (U+2219) stay Narrow, checked, not assumed. (The pane's BOX
+# borders — `│`, `╭`, `─` — are Ambiguous too and composed under the same `len`
+# ruler, so the arrows are consistent with the frame around them.)
+# `test_the_footer_is_measured_the_same_in_a_cjk_locale` keeps the two rulers in
+# agreement on every form.
+#
+# THE SEPARATOR IS U+2219 BULLET OPERATOR, NARROW — `unicodedata.east_asian_width`
 # reports "N", checked, not assumed — so it costs one column under BOTH locale
 # rules. AN AMBIGUOUS SEPARATOR IS WHAT SILENTLY COST THE PANE ITS LABELS: the
 # earlier ` · ` (U+00B7 MIDDLE DOT) is "A", charged TWO, which pushed the full form
@@ -272,33 +291,16 @@ DEFAULT_WIDTH = 80
 # to COMPACT and the ~46-column agents split fell all the way to the bare KEYS
 # form — the labels gone at the width the operator actually runs.
 # `test_the_footer_separator_is_not_ambiguous` is what stops that recurring.
-# ⏎ (U+23CE), ␣ (U+2423) and ∙ are the only non-ASCII glyphs here and each is
-# Narrow, so `_display_width` and a CJK terminal agree on every form. See
-# `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
 #
-# `t theme` JOINED ALL THREE FORMS WITHOUT MOVING ANY THRESHOLD, and that took a
-# deliberate choice about WHICH label degrades. The full form could simply grow to
-# 73, but the COMPACT form is the one the ~46-column agents split actually shows,
-# and appending ` t theme` to it would have pushed it to 53 — handing every real
-# pane the bare KEYS form, a far worse trade than losing one word. So COMPACT
-# sheds `refresh` and keeps `q quit`, `⏎ focus`, `␣ expand`, `a access` and
-# `t theme`: the key `r` still EXISTS in all three forms (the rule is that a key
-# may never degrade, only its label), and `r` is the one binding whose loss costs
-# the operator nothing — it is a convenience refresh, where every other binding is
-# something you cannot guess.
-#
-# `c cli` — THE MIRROR OF THE AGENT'S OWN HARNESS TUI — WAS THE SECOND BINDING TO
-# MOVE A THRESHOLD, and it did so against the SAME 79-column ceiling. The full
-# form already measured exactly 79 (an 80-column terminal is the classic case it
-# is sized for), so a new entry could not be appended without pushing it over and
-# dropping that terminal back to COMPACT. The columns were bought back by
-# spelling Enter and Space with their KEY GLYPHS in the full form too (`⏎ focus`,
-# `␣ expand` — the exact spelling COMPACT already uses), which is -8 columns and
-# keeps every binding LABELLED; the alternative — dropping a label — would have
-# left a bare key beside labelled ones. COMPACT then had to shed one more label
-# to stay <= 45, and it shed `theme` (the `t` key stays: a cosmetic picker, where
-# `access` is the sharing panel the operator cannot guess). MEASURED WIDTHS:
-# 79 / 45 / 30. The key `c` is in all three forms.
+# THE BINDING SET HAS SHRUNK THREE TIMES. `c cli` (the read-only mirror of an
+# agent's harness TUI) went first: Enter opens that agent's real vendor CLI in its
+# own tab, INTERACTIVELY — what a blocking permission prompt needs and a read-only
+# mirror structurally cannot do. Then `␣ expand` went, by request: selecting an
+# agent now focuses its tab, which is what expanding was approximating, and a
+# live-but-unlisted binding is worse than either keeping or removing it. Then `r`
+# went: the operator does not want a manual refresh, and only the KEY is gone — the
+# POLLING machinery it triggers (the interval walk in `_run_tui`) is untouched.
+# Every binding the full form lists is LABELLED. MEASURED WIDTHS: 50 / 30 / 20.
 #
 # THE THREE FORMS ARE BUILT FROM (key, label) PAIRS, not typed out, so a key can
 # never appear in one form without its label and the separator can never be
@@ -307,13 +309,12 @@ DEFAULT_WIDTH = 80
 # one span per half. `_footer_sep` is the one place the SEPARATOR that JOINs those
 # pairs is chosen, so the text form and the painted spans can never disagree about
 # it. THE SEPARATOR IS SPACED IN THE LABELLED FORMS AND ABSENT FROM COMPACT: the
-# Ambiguous ` · ` charged two columns per entry, so the MEASURED widths were
-# 85 / 63 / 32 and neither the 80-column terminal nor the ~46-column split got a
-# LABELLED form — the labels vanished at the width the operator actually runs.
-# ` ∙ ` (U+2219, Narrow) charges one, and COMPACT joins its entries with a single
-# space — its pre-separator spelling — so the MEASURED widths become 79 / 45 / 26.
-# That is why `test_the_footer_chooses_a_form_by_measured_width` pins the measured
-# numbers rather than the printed ones.
+# Ambiguous ` · ` charged two columns per entry, so neither the 80-column terminal
+# nor the ~46-column split got a LABELLED form — the labels vanished at the width
+# the operator actually runs. ` ∙ ` (U+2219, Narrow) charges one, and COMPACT
+# joins its entries with a single space — its pre-separator spelling. That is why
+# `test_the_footer_chooses_a_form_by_measured_width` pins the measured numbers
+# rather than the printed ones.
 FOOTER_SEP = " \u2219 "
 
 
@@ -329,7 +330,7 @@ def _footer_sep(entries: tuple) -> str:
 
 
 def _footer_form(entries: Iterable[tuple[str, str]], sep: str = FOOTER_SEP) -> str:
-    """One footer form from its `(key, label)` pairs: `q quit ∙ r refresh`.
+    """One footer form from its `(key, label)` pairs: `↑/↓ move ∙ ⏎ focus`.
 
     A label of "" is a KEY with no label (the compact and keys forms). The
     separator is `sep` between entries and a single space inside one, which is
@@ -339,17 +340,18 @@ def _footer_form(entries: Iterable[tuple[str, str]], sep: str = FOOTER_SEP) -> s
         key + (f" {label}" if label else "") for key, label in entries)
 
 
+# The order is the shape of the session: MOVE, then FOCUS, then the panel and
+# theme that dress the view, then QUIT. The two things an operator acts with come
+# first, the two things they look at next, and the exit last.
 FOOTER_ENTRIES = (
-    ("q", "quit"), ("r", "refresh"), ("^/v", "move"), ("⏎", "focus"),
-    ("␣", "expand"), ("a", "access"), ("t", "theme"), ("c", "cli"),
+    ("↑/↓", "move"), ("⏎", "focus"), ("t", "theme"), ("a", "access"),
+    ("q", "quit"),
 )
 FOOTER_COMPACT_ENTRIES = (
-    ("q", "quit"), ("r", ""), ("^v", ""), ("⏎", "focus"),
-    ("␣", "expand"), ("a", "access"), ("t", ""), ("c", "cli"),
+    ("↑↓", ""), ("⏎", "focus"), ("t", ""), ("a", "access"), ("q", "quit"),
 )
 FOOTER_KEYS_ENTRIES = (
-    ("q", ""), ("r", ""), ("^v", ""), ("⏎", ""), ("␣", ""), ("a", ""),
-    ("t", ""), ("c", ""),
+    ("↑↓", ""), ("⏎", ""), ("t", ""), ("a", ""), ("q", ""),
 )
 FOOTER = _footer_form(FOOTER_ENTRIES)
 FOOTER_COMPACT = _footer_form(FOOTER_COMPACT_ENTRIES, _footer_sep(FOOTER_COMPACT_ENTRIES))
@@ -465,57 +467,6 @@ Line = tuple[list[Span], str]
 # The port used when the server URL names none. Matches DEFAULT_BASE_URL, which
 # is `http://127.0.0.1:6767`.
 DEFAULT_PORT = urllib.parse.urlsplit(DEFAULT_BASE_URL).port or 6767
-
-
-# ---------------------------------------------------------------------------
-# pure: snippet extraction
-# ---------------------------------------------------------------------------
-
-def snippet_from_detail(detail: Any) -> Optional[str]:
-    """The report text of a session, from its DETAIL row, or None.
-
-    The snippet is the LAST `items` element that is an assistant message
-    (`type == "message"` and `data.role == "assistant"`), with its text taken
-    from the `output_text` parts of `data.content`:
-
-        {"id": "25f8b2d7…", "type": "message", "status": "completed",
-         "data": {"role": "assistant",
-                  "content": [{"type": "output_text", "text": "The work…"}]}}
-
-    The LAST one, not the first: the report is what the agent most recently
-    said, and older assistant messages are the turns before it. When that last
-    message carries no `output_text` the snippet is None rather than an earlier
-    message's text — falling back would show a stale line as if it were the
-    report, which is worse than showing nothing.
-
-    Every shape is tolerated without raising, because the detail row is an
-    enrichment and a missing one must cost the snippet and nothing else: a
-    missing/None/empty `items`, an element that is not a dict, `content` that is
-    not a list, and parts that are not dicts or carry no string `text`.
-    """
-    if not isinstance(detail, dict):
-        return None
-    items = detail.get("items")
-    if not isinstance(items, list):
-        return None
-    for item in reversed(items):
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        data = item.get("data")
-        if not isinstance(data, dict) or data.get("role") != "assistant":
-            continue
-        content = data.get("content")
-        if not isinstance(content, list):
-            return None
-        parts = [
-            part.get("text")
-            for part in content
-            if isinstance(part, dict)
-            and part.get("type") == "output_text"
-            and isinstance(part.get("text"), str)
-        ]
-        return "\n".join(parts) if parts else None
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -831,8 +782,10 @@ class Row:
     the agent's installed spec declares, found by `agent` (see `worker_box` and
     `worker_mark`). "" is the honest blank, never a guessed vendor.
 
-    Only a WORKER row is selectable (see `_is_box`): selection is a property of a
-    box, so the rails and the roots are stepped over by the selection.
+    EVERY agent row is selectable — a worker's box AND the root's — and only the
+    breathing RAILS are not (see `_selectable`): a root is the orchestrator, and
+    selecting it is how the operator reaches its own terminal (`focus_agent`). A
+    rail row holds no agent, so there is nothing on it to focus.
     """
 
     session_id: str
@@ -841,20 +794,17 @@ class Row:
     depth: int
     is_root: bool = False
     rail: bool = False
-    snippet: Optional[str] = None
-    expanded: bool = False
     agent: Optional[str] = None
     meta: str = ""
     harness: str = ""
-    # The ROOT session this row's pane belongs to, needed because a sub-agent's
-    # OWN `session_id` addresses no herdr pane: herdr writes a pane record (and so
-    # an `agent_session_id` a focus target can match) only for a root, so Enter on
-    # a worker must aim at the root instead — see `focus_target`. It has to be a
-    # FIELD rather than re-derived at focus time: `build_rows` FLATTENS the tree
-    # and groups by state, so with `--all` several roots' workers interleave and a
-    # worker's root is not recoverable from a walk of `Frame.rows`. Set for every
-    # worker in `_worker_rows`; a root row leaves it "" and resolves to its own
-    # `session_id` through `is_root`.
+    # The ROOT session this row's pane belongs to. It has to be a FIELD rather
+    # than re-derived at focus time: `build_rows` FLATTENS the tree and groups by
+    # state, so with `--all` several roots' workers interleave and a worker's root
+    # is not recoverable from a walk of `Frame.rows`. Set for every worker in
+    # `_worker_rows`; a root row leaves it "" (a root IS its own root, so
+    # `focus_agent` passes "" for it). Enter focuses the row's OWN session (see
+    # `focus_agent`) and passes this root alongside it, because a worker's tab
+    # hangs off its ROOT's space (`og_herdr_launch._agent_space`).
     root_session_id: str = ""
 
 
@@ -1357,8 +1307,6 @@ def worker_vendor(harness: Any, agent: Any) -> Optional[str]:
 def build_rows(
     sessions: Iterable[dict],
     root_ids: Iterable[str],
-    snippets: Optional[dict[str, Optional[str]]] = None,
-    expanded_ids: Iterable[str] = (),
     now: Optional[float] = None,
 ) -> list[Row]:
     """The display rows for the selected roots' trees, in DISPLAY order (C2).
@@ -1393,8 +1341,6 @@ def build_rows(
     test passes it explicitly — a duration asserted against the real clock is a
     flake waiting for a slow machine.
     """
-    snippets = snippets or {}
-    expanded = set(expanded_ids)
     clock = time.time() if now is None else now
     sessions = list(sessions)
     by_id, children = _index(sessions)
@@ -1402,7 +1348,7 @@ def build_rows(
     for root_id in root_ids:
         if root_id not in by_id:
             continue
-        workers = _worker_rows(by_id, children, root_id, snippets, expanded, clock)
+        workers = _worker_rows(by_id, children, root_id, clock)
         rows.append(_root_row(by_id[root_id], root_id))
         for state, group in _grouped(workers):
             # The rail row opens the group: the ONE thing that marks where one
@@ -1434,7 +1380,7 @@ def _root_row(session: dict, root_id: str) -> Row:
 
 
 def _worker_rows(by_id: dict, children: dict, root_id: str,
-                 snippets: dict, expanded: set, clock: float) -> list[Row]:
+                 clock: float) -> list[Row]:
     """The worker Rows under one root, in pre-order (nesting flattened)."""
     out: list[Row] = []
     for sid, depth in _preorder(by_id, children, [root_id]):
@@ -1443,15 +1389,12 @@ def _worker_rows(by_id: dict, children: dict, root_id: str,
         session = by_id[sid]
         state = display_state(session)
         agent, task = split_title(session.get("title"))
-        snippet = snippets.get(sid)
         harness = session.get("harness")
         out.append(Row(
             session_id=sid,
             text=task,
             state=state,
             depth=depth,
-            snippet=snippet,
-            expanded=sid in expanded and snippet is not None,
             agent=agent,
             meta=worker_meta(session, state, clock),
             harness=harness if isinstance(harness, str) else "",
@@ -1482,11 +1425,6 @@ def _grouped(workers: list[Row]) -> list[tuple[str, list[Row]]]:
 # pure: the renderer (state -> lines)
 # ---------------------------------------------------------------------------
 
-def _oneline(text: str) -> str:
-    """Collapse a multi-line report to one line for the tree."""
-    return " ".join(text.split())
-
-
 def _clip(text: str, width: int) -> str:
     """`text` cut to `width` columns, with an ellipsis if it had to be cut.
 
@@ -1498,7 +1436,7 @@ def _clip(text: str, width: int) -> str:
     `_display_width` counts DISPLAY columns (a Wide/Ambiguous glyph as two). The
     two agree on everything the footer — the only line `_display_width` guards —
     now contains, since it is ASCII-plus-Narrow. They disagree on a wide glyph,
-    which a session snippet could still carry: such a row could be clipped a
+    which a session title could still carry: such a row could be clipped a
     column short or long. Reconciling them means width-aware clipping throughout
     the renderer (grapheme clusters included), a larger change than it looks and
     deliberately not made here.
@@ -1545,9 +1483,11 @@ def _display_width(text: str) -> int:
     AMBIGUOUS (East Asian "A") is charged two as well, deliberately. Its width is
     locale-dependent — one column in a Latin locale, two in a CJK one — so the
     only rule correct in BOTH is the pessimistic one; charging it one is how the
-    footer's old ↑/↓ cost 64 measured but 66 painted. The footer now names no
-    Ambiguous glyph, so this backstop does not move any current threshold: it only
-    bites a future edit that adds one. See the footer comment.
+    footer's old ↑/↓ cost 64 measured but 66 painted and a CJK terminal clipped the
+    trailing keys. It is NOT a dormant backstop now: the footer's move keys ↑/↓ are
+    Ambiguous, so this is what measures them two and keeps the CHOSEN form safe in
+    both locales — at the price of counting the arrows a column wider than a Latin
+    terminal paints them. See the footer comment.
 
     NOT the mark slot's ruler: `_slot_width` measures that column, because a
     title has to line up in the locale the operator RUNS, not in both. Do not
@@ -1838,13 +1778,11 @@ def worker_box(row: Row, width: int, selected: bool,
     unaffected: the selected box was already at full brightness, so it renders
     exactly as before.
 
-    The box is THREE rows — top border, ONE content row, bottom border — and FOUR
-    when the report is expanded (the extra row is the dimmed snippet, INSIDE the
-    box, never a loose line that would break the rectangle). The single content
-    row carries the harness mark in its fixed two-column slot and the title flush
-    left, with the meta (`2m14s`, `failed`, `waiting on you`) flush right on the
-    SAME row. The AGENT NAME is gone: the mark already names the harness the name
-    did, so the meta — the one thing on the row the mark does not say — is all
+    The box is THREE rows — top border, ONE content row, bottom border. The single
+    content row carries the harness mark in its fixed two-column slot and the title
+    flush left, with the meta (`2m14s`, `failed`, `waiting on you`) flush right on
+    the SAME row. The AGENT NAME is gone: the mark already names the harness the
+    name did, so the meta — the one thing on the row the mark does not say — is all
     that is left to draw. `_two_col` keeps the meta's columns and clips the TITLE
     first when the line is tight.
 
@@ -1928,10 +1866,7 @@ def worker_box(row: Row, width: int, selected: bool,
             (" ", PLAIN),
             (row.text, PLAIN)]
     content = _two_col(left, [(row.meta, META)], inner)
-    lines = [content]
-    if row.expanded and row.snippet:
-        lines.append([("  " + _clip(_oneline(row.snippet), inner - 2), PLAIN)])
-    boxed = _round_box_lines(lines, box_width)
+    boxed = _round_box_lines([content], box_width)
 
     out: list[list[Span]] = []
     for index, spans in enumerate(boxed):
@@ -1957,18 +1892,39 @@ def worker_box(row: Row, width: int, selected: bool,
     return out, 0
 
 
-def _is_box(row: Row) -> bool:
-    """Whether a row is a worker box — the only rows the selection can land on.
+def _selectable(row: Row) -> bool:
+    """Whether the selection can land on `row`: EVERY drawn agent row.
 
-    The roots and the breathing rails draw no box of their own to select; the
-    selection steps over them (`_workers`, `move_selection`).
+    A worker's box AND the root's are selectable; only a breathing RAIL row is
+    not. The rails were always stepped over (they hold no agent), but roots were
+    too, and that made the root the one agent an operator could never point at —
+    the reported "I cannot select the orchestrator".
+
+    This is NOT `_is_box`, deliberately. `_is_box` means "a box that draws a
+    status spinner", which a root does not (`frame_working` relies on that to
+    avoid ticking the clock for a working root), and the renderer groups rows by
+    `row.is_root` / `row.rail` directly; neither should move when SELECTABILITY
+    widens. So the two predicates are kept apart rather than raising `_is_box`'s
+    meaning for the callers that need the old one.
+    """
+    return not row.rail
+
+
+def _is_box(row: Row) -> bool:
+    """Whether a row is a WORKER's box: not a root, not a breathing rail.
+
+    NOT the selectability predicate any more — see `_selectable` for that. This
+    is the ANIMATION predicate: only a worker's box draws a status spinner, so
+    `frame_working` uses it to decide whether a frame can animate at all. A root
+    draws no spinner, so counting it here would tick the clock forever for a
+    working orchestrator with nothing on screen to advance.
     """
     return not (row.is_root or row.rail)
 
 
-def _workers(rows: list[Row]) -> list[int]:
-    """The indexes of the rows that draw a box — the selectable worker rows."""
-    return [i for i, row in enumerate(rows) if _is_box(row)]
+def _selectable_rows(rows: list[Row]) -> list[int]:
+    """The indexes of the rows the selection can land on: every agent row."""
+    return [i for i, row in enumerate(rows) if _selectable(row)]
 
 
 def snap_selection(rows: list[Row], selected_id: Optional[str] = None,
@@ -1982,7 +1938,7 @@ def snap_selection(rows: list[Row], selected_id: Optional[str] = None,
     and an index held across that refresh lands on a DIFFERENT worker — the
     operator presses Enter and focuses the wrong session. `selected_id` is the
     session id of the row that was selected; when that session is still on screen
-    as a BOX the caret returns to it wherever the reorder moved it.
+    as a selectable row the caret returns to it wherever the reorder moved it.
 
     NONE MEANS UNTOUCHED, and this function returning it is the whole change. It
     used to return an `int` unconditionally, and with no `selected_id` to follow it
@@ -2004,64 +1960,65 @@ def snap_selection(rows: list[Row], selected_id: Optional[str] = None,
     nobody picked, in the one place the eye reads as deliberate.
 
     So the pane opens UNTOUCHED: `selected` None, every box NORMAL, no DIM, no
-    `sel_bg`, no SELECTED line anywhere. The first movement key adopts a worker
-    (`move_selection`), so the cost of the fix is that an operator who wants to
-    press Enter straight away presses a key first — and they get a visible
-    response to that key, which the old behaviour also gave them. Nobody has to
-    press anything twice.
+    `sel_bg`, no SELECTED line anywhere. The first movement key adopts the first
+    agent row (`move_selection`), so the cost of the fix is that an operator who
+    wants to press Enter straight away presses a key first — and they get a
+    visible response to that key, which the old behaviour also gave them. Nobody
+    has to press anything twice.
 
     The near-the-old-index fallback is UNCHANGED for every case where a selection
     already existed: that path is about a caret that was following a session that
     has just disappeared, and snapping back to untouched there would silently
     throw away the operator's place in a list they were reading. It keeps the
     caret near the old index rather than teleporting it to the top, a tie goes to
-    the upper box, and an id that is on screen but is not a BOX (the root's, a
-    rail's empty string) never captures it.
+    the upper row, and an id that is on screen but is NOT selectable — a rail's
+    empty string — never captures it.
 
-    Returns None when there are no worker rows at all AND nothing was selected —
-    nothing to follow and nothing to keep. With a selection already made and no
-    workers left it returns the old index unchanged, which no row can match, so
-    the pane paints untinted rather than crashing.
+    Returns None when there are no selectable rows at all AND nothing was
+    selected — nothing to follow and nothing to keep. With a selection already
+    made and no selectable rows left it returns the old index unchanged, which no
+    row can match, so the pane paints untinted rather than crashing.
     """
     if selected is None:
         return None                       # untouched: there is no caret to keep
-    workers = _workers(rows)
-    if not workers:
+    places = _selectable_rows(rows)
+    if not places:
         return selected                   # nowhere to land it; paints nothing
     if selected_id:
-        for index in workers:
+        for index in places:
             if rows[index].session_id == selected_id:
                 return index
-    return min(workers, key=lambda index: (abs(index - selected), index))
+    return min(places, key=lambda index: (abs(index - selected), index))
 
 
 def move_selection(rows: list[Row], selected: Optional[int],
                    delta: int) -> Optional[int]:
-    """The selection after a keypress: the next or previous WORKER.
+    """The selection after a keypress: the next or previous AGENT row.
 
-    Roots and rails are stepped over instead of landed on, for the same reason
-    `snap_selection` prefers a worker: the caret belongs to a box. Because
-    `Frame.rows` is in DISPLAY order (`build_rows`), this walks the workers in
-    the order the eye reads them.
+    Every agent row is landed on — a worker's box and the ROOT's — and only the
+    breathing RAILS are stepped over (see `_selectable`): a rail holds no agent.
+    Because `Frame.rows` is in DISPLAY order (`build_rows`), this walks the rows
+    in the order the eye reads them, the root first.
 
     A `selected` of None is the UNTOUCHED pane, and the keypress that moves off
-    it ADOPTS the first worker rather than being swallowed — down once and the
-    first worker is selected, up once and it is the same worker, not the one
-    above the top of the list. Stepping from -1 instead (what a None would have
-    got through the general path) would land on the first worker for one
-    direction and then refuse to move at all for the other, so an operator
-    pressing up would get no visible response to the key they just pressed.
+    it ADOPTS the first agent row rather than being swallowed — down once and the
+    first row (the root, on a tree with one) is selected, up once and it is the
+    same row, not the one above the top of the list. Stepping from -1 instead
+    (what a None would have got through the general path) would land on the first
+    row for one direction and then refuse to move at all for the other, so an
+    operator pressing up would get no visible response to the key they just
+    pressed.
 
-    With no worker rows there is nothing to adopt, so the state is returned
+    With no selectable rows there is nothing to adopt, so the state is returned
     unchanged: None stays None, an index stays that index.
     """
-    workers = _workers(rows)
-    if not workers:
-        return selected                   # no boxes: nothing to adopt, nowhere to go
+    places = _selectable_rows(rows)
+    if not places:
+        return selected                   # no rows: nothing to adopt, nowhere to go
     if selected is None:
-        return workers[0]                 # the first movement key adopts, and shows
-    at = workers.index(selected) if selected in workers else -1
-    return workers[min(max(at + (1 if delta > 0 else -1), 0), len(workers) - 1)]
+        return places[0]                  # the first movement key adopts, and shows
+    at = places.index(selected) if selected in places else -1
+    return places[min(max(at + (1 if delta > 0 else -1), 0), len(places) - 1)]
 
 
 def _footer_entries(width: int) -> tuple:
@@ -2368,7 +2325,17 @@ def _blocks(frame: Frame, width: int) -> list[list[Line]]:
         if unit is None:
             unit = []
         if row.is_root:
-            unit.extend((spans, NORMAL) for spans in _root_lines(row, width))
+            # THE ROOT IS SELECTABLE TOO (see `_selectable`), so it carries the
+            # SELECTED line exactly as a worker's box does: `_run_tui` scans for
+            # `role == SELECTED` to find the block to scroll to, and a selected
+            # root that hung no such line would silently stop scrolling into view
+            # the moment the list outgrew the pane. Its OTHER lines stay NORMAL,
+            # so a selected root reads uniformly white — as a selected box always
+            # has — while every worker's box goes DIM beneath it.
+            root_selected = not untouched and index == frame.selected
+            for position, spans in enumerate(_root_lines(row, width)):
+                unit.append((spans,
+                             SELECTED if root_selected and position == 0 else NORMAL))
         elif row.rail:
             unit.append(([(RAIL, PLAIN)], NORMAL))
         else:
@@ -3171,11 +3138,6 @@ class AgentModel:
          is ordered by recency — so the rule costs the roots more recent than the
          answer, and none of the ones after it. Also once per root, because the
          result is cached under the same session id.
-      3. once per worker that has gone IDLE, to capture the report it just
-         produced. An idle report stops changing, so it is fetched once and kept.
-      4. once for a row the user SELECTED, so its snippet can be read on demand
-         (and refetched when the user forces a refresh, while it is still
-         running).
 
     Never "one per row per poll": a session already in a cache is not fetched
     again, so a stable listing costs nothing after the first refresh. The detail
@@ -3195,10 +3157,6 @@ class AgentModel:
         self.all_roots = all_roots
         # root id -> {workspace?, harness?}, from one detail fetch each.
         self._root_info: dict[str, dict] = {}
-        # session id -> snippet (or None, meaning "asked, nothing there"). Cached
-        # so a running worker is not re-read every poll; dropped on a forced
-        # refresh of the selected row.
-        self._snippets: dict[str, Optional[str]] = {}
 
     # -- caches -------------------------------------------------------------
 
@@ -3212,12 +3170,6 @@ class AgentModel:
 
         The cache is FIFO-bounded at MAX_ROOT_DETAILS, which is also the bound
         on how far the cwd probe in `_match_cwd_root` can walk.
-
-        The report is extracted from the same response and seeded into the
-        snippet cache. It is already in hand, and a root that becomes the scope
-        — which is exactly what the cwd probe does to a quiet root — is idle by
-        definition, so without this the lazy "first idle" fetch would pay for a
-        SECOND 121 KB read of a row this one just read.
         """
         if session_id in self._root_info:
             return self._root_info[session_id]
@@ -3233,24 +3185,7 @@ class AgentModel:
             if isinstance(harness, str) and harness:
                 info["harness"] = harness
         self._root_info[session_id] = info
-        if session_id not in self._snippets:
-            self._snippets[session_id] = snippet_from_detail(detail)
         return info
-
-    def _snippet(self, session_id: str) -> Optional[str]:
-        """The report of a session, fetched once and cached.
-
-        `self.watcher._fetch_detail` already swallows a transport or decode
-        error and returns None, so a session whose detail cannot be read costs
-        its snippet and nothing else — the row still renders.
-        """
-        if session_id in self._snippets:
-            return self._snippets[session_id]
-        if len(self._snippets) >= MAX_SNIPPETS:
-            self._snippets.pop(next(iter(self._snippets)))
-        text = snippet_from_detail(self.watcher._fetch_detail(session_id))
-        self._snippets[session_id] = text
-        return text
 
     # -- refresh ------------------------------------------------------------
 
@@ -3299,20 +3234,15 @@ class AgentModel:
                 return sid
         return None
 
-    def refresh(
-        self,
-        selected_id: Optional[str] = None,
-        expanded_ids: Iterable[str] = (),
-        force: bool = False,
-    ) -> Frame:
+    def refresh(self) -> Frame:
         """One listing walk -> a `Frame`. The only method that touches the wire."""
         rows, truncated = self.watcher.fetch_listing(kind="any")
 
         # Only archived sessions are dropped. `og_herdr_watch.should_project` is
-        # NOT applied here on purpose: it drops an idle sub-agent, which is
-        # right for a herdr pane but wrong for this view — the whole point of
-        # the lazy "first idle" snippet is to read a worker's report AFTER it
-        # stopped, so an idle worker must stay on screen long enough to show it.
+        # NOT applied here on purpose: it drops an idle sub-agent, which is right
+        # for a herdr pane but wrong for this view — a finished worker is still
+        # part of the tree this view draws, and dropping it would make rows
+        # vanish the moment a worker went idle.
         sessions = [s for s in rows
                     if isinstance(s, dict) and not s.get("archived")]
 
@@ -3377,22 +3307,7 @@ class AgentModel:
             if sid not in asked:
                 del self._root_info[sid]
 
-        by_id, children = _index(merged)
-        order = _preorder(by_id, children, scope)
-
-        # The lazy fetches. An idle worker is read once and kept; a selected row
-        # is read once on selection, and re-read only on a forced refresh.
-        for sid, _depth in order:
-            if sid not in by_id:
-                continue
-            if display_state(by_id[sid]) == "idle":
-                self._snippet(sid)
-            if sid == selected_id:
-                if force:
-                    self._snippets.pop(sid, None)
-                self._snippet(sid)
-
-        frame_rows = build_rows(merged, scope, self._snippets, expanded_ids)
+        frame_rows = build_rows(merged, scope)
         return Frame(rows=frame_rows, truncated=truncated)
 
     @staticmethod
@@ -3650,10 +3565,6 @@ def _tty_available() -> bool:
 NOTICE_FOCUS_OUTSIDE_HERDR = "focus: not inside herdr (no HERDR_ENV)"
 NOTICE_FOCUS_UNAVAILABLE = "focus: herdr client unavailable"
 NOTICE_FOCUS_FAILED = "focus: {0}"
-# Enter on a row that resolves to no herdr pane at all — a worker whose listing
-# carried no root, or a malformed row. Deliberately NOT sent as a target: an id
-# known to match no record would only draw herdr's own `agent_not_found` back.
-NOTICE_FOCUS_NO_ROOT = "focus: no root session to focus"
 
 # What the pane says INSTEAD of a traceback when the listing itself could not be
 # read — the one wire failure the live view must survive rather than die on. A
@@ -3689,33 +3600,13 @@ def listing_failure_notice(server: str, exc: BaseException) -> str:
         return f"server unreachable: {server}"
 
 
-def focus_target(row: Row) -> Optional[str]:
-    """The session id herdr can resolve for `row`: a root is its own, a worker's is its root.
-
-    WHY A WORKER TARGETS ITS ROOT. herdr matches an `agent.focus` target against
-    its PANE RECORDS, and it opens a pane — writing a record that carries
-    `agent_session_id` — only for a ROOT session (see `og_herdr.py`). A sub-agent
-    never gets a pane of its own, so its own id matches no record and herdr answers
-    `agent_not_found`: on every worker, every time, which is the failure this
-    resolves. The worker's work IS visible, though — in its ROOT's pane — so the
-    root is the one target herdr can match and the one Enter should send. A root
-    row owns its own pane and so targets itself.
-
-    None when the row carries no resolvable root (a worker built without one, a
-    malformed row). The caller declines with `NOTICE_FOCUS_NO_ROOT` rather than
-    sending an id it knows will fail.
-    """
-    if row.is_root:
-        return row.session_id or None
-    return row.root_session_id or None
-
-
 def focus_in_herdr(session_id: str,
                    environ: Optional[dict] = None) -> Optional[str]:
     """Jump the operator's herdr UI to `session_id`. None on success, else why not.
 
     `session_id` is the id the CALLER has already resolved to something herdr can
-    match — a root's own id, or a sub-agent's ROOT (see `focus_target`). It is not
+    match — a root's own id, or a sub-agent's ROOT (herdr records a pane, and so an
+    `agent_session_id` to match, only for a ROOT — see `og_herdr.py`). It is not
     necessarily the selected row's own session: only a root has a pane record, so
     a sub-agent's own id would draw `agent_not_found`. This function sends whatever
     it is given, unchanged; the row-to-root resolution belongs to the caller that
@@ -3727,6 +3618,12 @@ def focus_in_herdr(session_id: str,
     starts nothing, answers nothing, and changes no session state. The AST guard
     in tests/test_og_agents.py asserts `agent.focus` is the only method this
     module ever hands to `HerdrClient.call`.
+
+    ENTER USES `focus_agent` NOW, NOT THIS. Enter aims at the selected row's OWN
+    agent tab (`og_herdr_launch.focus_agent_terminal`), which is the operator's
+    "focus the thing I selected"; a worker's own id is exactly what this function
+    would draw `agent_not_found` for. This stays as the module's one direct
+    `agent.focus` call — pinned by the AST guard in tests/test_og_agents.py.
 
     Returns None when the UI moved, or a short one-line notice saying why it did
     not, which `_run_tui` shows in the pane (`Frame.notice`). It NEVER raises: an
@@ -3775,60 +3672,46 @@ def focus_in_herdr(session_id: str,
     return None
 
 
-# What the pane says when the CLI mirror could not be opened or closed, one line
-# each. The same shape and the same reasons as the focus notices above: short so
-# they survive `_clip`, and distinct so "this can never work here" reads
-# differently from "try again". The ACP and "no terminal" reasons are formed in
-# `og_herdr_launch.cli_terminal_notice`, which is the half that knows the harness
-# kind; these three are the ones this module can produce on its own.
-NOTICE_CLI_OUTSIDE_HERDR = "cli: not inside herdr (no HERDR_ENV)"
-NOTICE_CLI_UNAVAILABLE = "cli: herdr client unavailable"
-NOTICE_CLI_FAILED = "cli: {0}"
-# A rail or a root row that carries no session id at all: there is no agent to
-# mirror, and saying so is better than opening a pane onto nothing.
-NOTICE_CLI_NO_AGENT = "cli: no agent on this row to mirror"
+def focus_agent(row: Row) -> Optional[str]:
+    """Enter's handler: focus the SELECTED agent's OWN tab. None on success.
 
+    THE REPORTED BUG, AND WHY THIS IS NOT THE OLD ROOT RESOLUTION. Enter used to
+    resolve a row to its ROOT — the only session herdr once had a pane for — so
+    selecting a worker focused its root and never the worker itself, and the
+    orchestrator could not be focused at all. Enter now hands `focus_agent_terminal`
+    the row's OWN `session_id` (a root's is its own, a worker's is the worker's),
+    so selecting `claude` reaches claude's tab.
 
-def cli_pane_for_row(row: Row, environ: Optional[dict] = None) -> Optional[str]:
-    """Open/close the read-only CLI pane for `row`'s agent. None on success.
+    `root_session_id` rides along because the callee needs it to attach a pane
+    when the agent has none yet; a root row carries "" for it, which is what the
+    callee expects for a tab that is already a root's own.
 
-    The mirror of `focus_in_herdr`, and built the same way for the same reason:
-    this view is deliberately not herdr-specific and must start in any terminal,
-    so `og_herdr_launch` — and with it every herdr client — is imported INSIDE
-    the handler, never at module load. It NEVER raises: an `og agents` pane an
-    operator leaves open all day must survive a herdr that is absent, a terminal
-    outside a herdr pane, or a socket that is down, so every failure becomes a
-    notice rather than a traceback that kills the pane.
+    Imported HERE, inside the handler, exactly as `focus_in_herdr` imports
+    `og_herdr_launch`: this view is deliberately not herdr-specific and must start
+    in any terminal, so an import failure — herdr absent — degrades to a notice
+    rather than killing the pane.
 
-    `row.session_id` is the agent whose TUI is mirrored; `focus_target(row)` —
-    its ROOT — keys the SPACE, because only a root has one (see `focus_target`).
-    The harness comes from the row's own id where a root has one, else from the
-    installed spec for the row's agent name (a worker's listing row carries no
-    harness), which is what tells an ACP harness from a native one so the honest
-    "no terminal" line can be chosen.
-
-    The whole open/close decision belongs to `og_herdr_launch.cli_pane_toggle`:
-    it owns the state record that remembers whether the pane is open, and it is
-    the only place a herdr pane is split or closed for this feature — which is
-    also what keeps this module's outbound traffic to `agent.focus` alone (see
-    `test_source_only_makes_read_only_calls`).
+    Returns None when the UI moved, or a short one-line notice saying why it did
+    not, which `_run_tui` paints on the footer row through `Frame.notice`. It
+    NEVER raises: the callee promises that too, but an unexpected error still
+    becomes a notice rather than a traceback that kills the TUI loop on a
+    keypress.
     """
-    env = os.environ if environ is None else environ
-    if not row.session_id:
-        return NOTICE_CLI_NO_AGENT
     try:
-        from og_herdr_launch import cli_pane_toggle
+        from og_herdr_launch import focus_agent_terminal
     except Exception:
-        return NOTICE_CLI_UNAVAILABLE
+        return NOTICE_FOCUS_UNAVAILABLE
     try:
-        harness = row.harness or agent_harness(row.agent) or ""
-        return cli_pane_toggle(focus_target(row) or "", row.session_id, harness,
-                               environ=env)
+        return focus_agent_terminal(
+            session_id=row.session_id,
+            harness=row.harness,
+            root_session_id=row.root_session_id or "",
+        )
     except Exception as exc:
         try:
-            return NOTICE_CLI_FAILED.format(exc)
+            return NOTICE_FOCUS_FAILED.format(exc)
         except Exception:
-            return NOTICE_CLI_FAILED
+            return NOTICE_FOCUS_FAILED
 
 
 def _run_tui(model: AgentModel, interval: float, server: str,
@@ -3837,13 +3720,13 @@ def _run_tui(model: AgentModel, interval: float, server: str,
     """The live view. curses paints exactly what `render` returns; keys drive
     the model.
 
-    Keys: `q` quits, `r` forces a refresh, the arrows (or `j`/`k`) move the
-    selection, Enter FOCUSES the selected row in herdr (jumping the operator's
-    herdr UI to the pane it belongs to — a worker's ROOT, see `focus_target` and
-    `focus_in_herdr`), Space expands or collapses
-    the selected row's snippet, `a` toggles the access panel, and `t` opens the
+    Keys: `q` quits (it is the ONLY quit), `Esc` CLEARS the selection and returns
+    every row to its undimmed look — it never quits — the arrows (or `j`/`k`) move
+    the selection over every agent row including the
+    root, Enter UNDIMS the list and then FOCUSES the selected agent's OWN tab in
+    herdr (see `focus_agent`), `a` toggles the access panel, and `t` opens the
     theme picker. It sends
-    nothing to a session and changes no session state: `agent.focus` is the ONE
+    nothing to a session and changes no session state: the focus is the ONE
     outbound call it makes, and it moves the operator's own terminal alone.
 
     `theme` None means "whatever is configured" (`load_theme`: `$OG_AGENTS_THEME`,
@@ -3919,7 +3802,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # `snap_selection`). Every index-keyed read below is guarded on it.
         selected: Optional[int] = None
         offset = 0
-        expanded: set[str] = set()
         # The one-line reason the last Enter could not focus, shown in the pane
         # through `Frame.notice` — on the FOOTER row, replacing it while it is up
         # (`_pane`). It is cleared on the NEXT keypress, so it sits for as long as
@@ -3933,11 +3815,9 @@ def _run_tui(model: AgentModel, interval: float, server: str,
         # whichever is live, the outage first — while the server is unreachable it
         # is the more important thing to say.
         listing_notice: Optional[str] = None
-        # `poll` asks for a refresh now; `force` additionally drops the selected
-        # row's cached report so it is read again. They are separate so Space can
-        # redraw the tree this tick without paying for a second 121 KB fetch.
+        # `poll` asks for a refresh now. It starts True so the first pass paints
+        # the listing without waiting out the interval.
         poll = True
-        force = True
         frame = Frame()
         show_access = start_access
         # Resolved once, on the toggle: the address does not change while the
@@ -4083,8 +3963,7 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                 sel_id = ids[selected] if selected is not None \
                     and 0 <= selected < len(ids) else None
                 try:
-                    frame = model.refresh(selected_id=sel_id,
-                                          expanded_ids=expanded, force=force)
+                    frame = model.refresh()
                 except Exception as exc:
                     # THE PANE DEGRADES, IT DOES NOT DIE. `refresh` touches the
                     # wire in one place `og_herdr_watch` does not already swallow
@@ -4106,7 +3985,6 @@ def _run_tui(model: AgentModel, interval: float, server: str,
                     selected = snap_selection(frame.rows, sel_id, selected)
                 next_poll = now + interval
                 poll = False
-                force = False
 
             # The panel is part of the frame, so `render` stays the source of
             # what is painted — and it is set HERE, not inside the refresh, so
@@ -4168,10 +4046,21 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             # Any real keypress dismisses the last focus notice: it was painted
             # for the operator to read, and they have now acted.
             notice = None
-            if key in (ord("q"), 27):
+            if key == ord("q"):
                 return
-            if key == ord("r"):
-                poll = force = True
+            if key == 27:
+                # ESC CLEARS THE SELECTION — IT DOES NOT QUIT ANY MORE. Esc and `q`
+                # both used to quit, so `q` is now the ONLY quit and Esc is the way
+                # OUT OF the selection: moving with the arrows dims every
+                # unselected agent to highlight the selected one, and before this
+                # there was no way back — the operator reported a list that stayed
+                # dimmed for the rest of the session once an arrow key was pressed.
+                # Clearing `selected` returns every row to the freshly-opened,
+                # undimmed look (see `_blocks`); with nothing selected it is a
+                # harmless no-op that still must not quit. It sets no `poll`: this
+                # changes no data, only which row is bright, and `paint_needed`
+                # repaints off the composed difference.
+                selected = None
                 continue
             if key == ord("a"):
                 show_access = not show_access
@@ -4180,7 +4069,7 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             elif key == ord("t"):
                 # The theme picker. It draws over the pane and drives its own keys,
                 # so it is entered and left in one blocking call; on the way back
-                # the pane's own state (selection, scroll, expanded, access) is
+                # the pane's own state (selection, scroll, access) is
                 # untouched, which is what "cancel puts back exactly what was
                 # there" means here.
                 chosen = _choose_theme(stdscr, curses, colours, active_theme,
@@ -4201,56 +4090,35 @@ def _run_tui(model: AgentModel, interval: float, server: str,
             elif key in (curses.KEY_DOWN, ord("j")):
                 selected = move_selection(frame.rows, selected, 1)
             elif key in (curses.KEY_ENTER, 10, 13):
-                # Enter FOCUSES the selected row in herdr — it jumps the
-                # operator's own terminal to the pane that row belongs to. The
-                # TARGET is resolved first (`focus_target`): a worker sends its
-                # ROOT's id, because a worker's OWN id matches no herdr pane (only
-                # a root gets a pane record), and a root sends its own. It
-                # deliberately does NOT set `poll`: focus changes nothing this view
-                # draws, so a refetch would be a listing walk for nothing. A failed
-                # focus, or a row that resolves to no pane at all, sets a notice,
-                # and the next paint shows it. See `focus_in_herdr` for every way
-                # it can decline.
+                # Enter UNDIMS first and then FOCUSES the selected agent's OWN tab
+                # in herdr (see `focus_agent`): the row's own session id goes on the
+                # wire — a worker's own, a root's own — not the worker's ROOT, which
+                # is what used to happen and is why selecting a worker never focused
+                # the worker itself.
+                #
+                # UNDIM FIRST: `selected` is cleared before the focus call, so the
+                # operator is not left staring at a dimmed list after acting — the
+                # same complaint Esc answers. The row is read BEFORE the clear, since
+                # `selected` is the only handle on it.
+                #
+                # It deliberately does NOT set `poll`: focus changes nothing this
+                # view draws, so a refetch would be a listing walk for nothing. A
+                # failed focus sets a notice, and the next paint shows it. See
+                # `focus_agent` for every way it can decline.
                 #
                 # ON AN UNTOUCHED PANE IT DOES NOTHING, and it says nothing. There
-                # is no target to focus, so there is no wrong pane to jump the
+                # is no row to focus, so there is no wrong tab to jump the
                 # operator's terminal into; a notice here would be reporting a
                 # failure the operator did not cause, and the fix — a movement key
                 # first — is a single obvious keystroke they have just been told
-                # about by the caret appearing. Focusing the nearest worker
-                # instead would be the one genuinely dangerous option: Enter moves
-                # the operator's OWN terminal, and moving it somewhere they never
+                # about by the caret appearing. Focusing the nearest agent instead
+                # would be the one genuinely dangerous option: Enter moves the
+                # operator's OWN terminal, and moving it somewhere they never
                 # pointed is worse than not moving it.
                 if selected is not None and 0 <= selected < len(frame.rows):
-                    target = focus_target(frame.rows[selected])
-                    notice = focus_in_herdr(target) if target is not None \
-                        else NOTICE_FOCUS_NO_ROOT
-            elif key == ord(" "):
-                # Expand/collapse moved off Enter when Enter took focus. It DOES
-                # set `poll`: the expanded set feeds the rebuild, so the tree has
-                # to be redrawn, and the report is already cached, so this costs
-                # nothing beyond the listing walk. Like Enter, it does nothing at
-                # all while the pane is untouched: there is no row to expand.
-                if selected is not None and 0 <= selected < len(frame.rows):
-                    sid = frame.rows[selected].session_id
-                    if sid in expanded:
-                        expanded.discard(sid)
-                    else:
-                        expanded.add(sid)
-                    poll = True
-            elif key == ord("c"):
-                # Open/close the READ-ONLY mirror of the selected agent's own
-                # harness TUI, in a second pane in that agent's space. Like
-                # Enter, it does nothing at all while the pane is untouched —
-                # there is no agent to mirror — and like Enter it does NOT set
-                # `poll`: the mirror lives in another pane, so nothing this view
-                # draws changes; a refetch would be a listing walk for nothing.
-                # The notice (why the mirror did not open, or a stale one) is
-                # shown on the next paint. See `cli_pane_for_row` for every way
-                # it can decline, and `og_herdr_launch.cli_pane_toggle` for the
-                # resize-safe attach it runs.
-                if selected is not None and 0 <= selected < len(frame.rows):
-                    notice = cli_pane_for_row(frame.rows[selected])
+                    row = frame.rows[selected]
+                    selected = None                     # undim before focusing
+                    notice = focus_agent(row)
 
     curses.wrapper(loop)
     return 0

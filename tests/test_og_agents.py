@@ -141,8 +141,7 @@ def detail(sid, workspace=None, harness=None, items=None, parent=None, **extra):
 NOW = 1_700_000_000.0
 
 
-def worker(sid, state, *, text="t", snippet=None, expanded=False,
-           agent=None, meta="", harness=""):
+def worker(sid, state, *, text="t", agent=None, meta="", harness=""):
     """A worker Row assembled directly, for the renderer tests.
 
     Deliberately NOT built through `build_rows`: these tests are about the box
@@ -155,8 +154,7 @@ def worker(sid, state, *, text="t", snippet=None, expanded=False,
     line.
     """
     return a.Row(session_id=sid, text=text, state=state, depth=1,
-                 snippet=snippet, expanded=expanded, agent=agent, meta=meta,
-                 harness=harness)
+                 agent=agent, meta=meta, harness=harness)
 
 
 def header(text="conversation", harness="claude-native", *, sid="root",
@@ -274,9 +272,8 @@ def test_workers_are_grouped_by_state_and_separated_by_breathing_rails():
     assert "×" in joined and "✓" in joined
 
 
-def test_renderer_flattens_a_nested_worker_and_shows_an_expanded_snippet():
-    """A grandchild is grouped by its OWN state like any other worker, and the
-    expanded report is a row INSIDE the rounded box, not a loose line. Grouping
+def test_renderer_flattens_a_nested_worker():
+    """A grandchild is grouped by its OWN state like any other worker. Grouping
     by state and drawing a spine are mutually exclusive, so the tree is
     flattened."""
     root = dict(listed("root", status="running"), harness="claude-native")
@@ -285,18 +282,12 @@ def test_renderer_flattens_a_nested_worker_and_shows_an_expanded_snippet():
         listed("w1", parent="root", status="running", title="coder_zen:worker"),
         listed("g1", parent="w1", status="running", title="coder_zen:grandchild"),
     ]
-    rows = a.build_rows(
-        sessions, ["root"],
-        snippets={"g1": "a child report"}, expanded_ids={"g1"}, now=NOW)
+    rows = a.build_rows(sessions, ["root"], now=NOW)
     lines = a.render(a.Frame(rows=rows))
 
     assert lines[0].startswith("╭"), "the root is a box at column 0"
     # The grandchild is a box of its own, in the same (working) group...
     assert any("grandchild" in line and "╭" not in line for line in lines)
-    # ...and the report is drawn inside a box: the row that carries it is a body
-    # row (`│…│`), never a loose line.
-    report = [line for line in lines if "a child report" in line]
-    assert report and report[0].startswith("│") and report[0].endswith("│")
     # Every WORKER box sits in the gutter: the rail at column 0, the rounded
     # corner at column 4, and the whole line as wide as the pane. (The root box is
     # the one `╭` at column 0.)
@@ -376,7 +367,7 @@ def test_c2_shape_is_verbatim_root_box_gutter_nodes_and_rounded_boxes():
         "│   ╰────────────────────────────────────────╯",
         "",
         # The 46-column footer: now that the separator is U+2219 (Narrow) and
-        # COMPACT carries none at all, the compact form measures 45 and a
+        # COMPACT carries none at all, the compact form measures 30 and a
         # ~46-column pane gets it — the LABELLED form, as it should be (see
         # `test_the_footer_chooses_a_form_by_measured_width`). Whatever form it is,
         # the row is padded out to the pane with the strip.
@@ -499,12 +490,10 @@ def test_the_node_and_spinner_sit_in_the_gutter_not_in_the_box():
     assert "▸" not in "\n".join(lines)
 
 
-def test_a_worker_box_is_three_rows_and_four_when_expanded():
+def test_a_worker_box_is_three_rows():
     """The box collapsed from FOUR rows to THREE: top border, ONE content row,
-    bottom border. The second content row held the agent name and is gone. SPACE
-    still reveals the report as an EXTRA row INSIDE the box — now the only way to
-    read a report — so an expanded box is four rows and the snippet is a box body
-    row, never a loose line."""
+    bottom border. The second content row held the agent name and is gone; the box
+    carries the harness mark, the title and the meta on its single content row."""
     spans, selected_row = a.worker_box(
         worker("w", "working", text="task", agent="zen", meta="12s"),
         C2_WIDTH, True)
@@ -521,19 +510,6 @@ def test_a_worker_box_is_three_rows_and_four_when_expanded():
     assert plain[1].rstrip("│").endswith("12s")
     # The agent name appears NOWHERE in the box: the mark carries it.
     assert "zen" not in "\n".join(plain)
-
-    spans, selected_row = a.worker_box(
-        worker("w", "working", text="task", agent="zen", meta="12s",
-               snippet="the report", expanded=True), C2_WIDTH, True)
-    assert len(spans) == 4, spans
-    assert selected_row == 0
-    expanded = _fmts(spans)
-    assert expanded[0].startswith("│   ╭") and expanded[3].startswith("│   ╰")
-    assert all(len(line) == C2_WIDTH for line in expanded)
-    # The report is a body row INSIDE the box, BELOW the content row.
-    assert "the report" in expanded[2]
-    assert expanded[2].startswith("│   │") and expanded[2].endswith("│")
-    assert "task" in expanded[1] and expanded[1].rstrip("│").endswith("12s")
 
 
 def test_the_title_yields_to_the_meta_on_the_shared_content_row():
@@ -681,13 +657,17 @@ def test_a_quiet_pane_renders_the_same_lines_and_schedules_no_repaint():
     assert a.frame_working(a.Frame(rows=[header(), rail("working")])) is False
 
 
-def test_the_selection_moves_between_workers_in_the_order_they_are_displayed():
+def test_the_selection_walks_every_agent_row_in_the_order_they_are_displayed():
     """THE HAZARD: grouping by state reorders the rows, so the selection must walk
     them in the order the eye reads — not in tree order. `Frame.rows` is itself
     in display order, which is what makes `move_selection` correct unchanged.
 
+    EVERY agent row is now in the ring, the ROOT included (it used to be stepped
+    over): the operator asked to be able to select the orchestrator, so the walk
+    starts on the root and steps down through its workers.
+
     The walk starts from an ADOPTED selection rather than an assumed one: the
-    pane opens untouched, and the first movement key is what takes a worker."""
+    pane opens untouched, and the first movement key is what takes a row."""
     rows = [header(),
             rail("working"),
             worker("w1", "working", text="one"),
@@ -698,29 +678,38 @@ def test_the_selection_moves_between_workers_in_the_order_they_are_displayed():
     # nothing is selected and every box paints at the same brightness.
     assert a.snap_selection(rows) is None
     assert a.snap_selection(rows, None, None) is None
-    # And the first movement key ADOPTS the first worker in BOTH directions,
-    # rather than being swallowed and costing a second keypress.
-    assert a.move_selection(rows, None, 1) == 2, "down adopts the first WORKER"
-    assert a.move_selection(rows, None, -1) == 2, "up adopts it too, not the top"
+    # And the first movement key ADOPTS the first AGENT row in BOTH directions —
+    # the root, at the top, now that roots are selectable — rather than being
+    # swallowed and costing a second keypress.
+    assert a.move_selection(rows, None, 1) == 0, "down adopts the first agent: the root"
+    assert a.move_selection(rows, None, -1) == 0, "up adopts it too, not the last"
     frame = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))
-    assert frame.selected == 2, "w1, the first worker box"
-    worker_text = {i: row.text for i, row in enumerate(rows) if a._is_box(row)}
+    assert frame.selected == 0, "the root, the first agent row"
+    # Every selectable row's text, by index — the root included (it is not an
+    # `_is_box`: that predicate means "a box that animates", see `_selectable`).
+    row_text = {i: row.text for i, row in enumerate(rows) if a._selectable(row)}
 
     seen = []
-    for step in (1, 1, -1, -1):
+    for step in (1, 1, 1, -1, -1, -1):
         frame.selected = a.move_selection(rows, frame.selected, step)
-        seen.append(worker_text[frame.selected])
+        seen.append(row_text[frame.selected])
         items = a._pane(frame, 48).items
-        # Exactly one box is the selected (bright) one.
+        # Exactly one row is the selected (bright) one.
         assert sum(1 for _t, role in items if role == a.SELECTED) == 1
-    assert seen == ["two", "three", "two", "one"], "display order, not tree order"
+    assert seen == ["one", "two", "three", "two", "one", "conversation"], \
+        "display order (root first), not tree order"
 
-    # No workers at all: there is nothing to adopt and nowhere to move to, so
-    # the state passes through unchanged in both directions rather than crashing
-    # or inventing a selection.
+    # No selectable rows at all: there is nothing to adopt and nowhere to move
+    # to, so the state passes through unchanged in both directions rather than
+    # crashing or inventing a selection.
+    assert a.move_selection([rail()], None, -1) is None, "still untouched"
+    assert a.move_selection([rail()], 0, 1) == 0, "the index is left alone"
+    assert a.snap_selection([rail()], None, 3) == 3, "and so is snap's"
+    # A single ROOT row is itself the whole ring, so both moves clamp onto it.
     assert a.move_selection([header()], 0, 1) == 0
-    assert a.move_selection([header()], None, -1) is None, "still untouched"
-    assert a.snap_selection([header()], None, 3) == 3, "the index is left alone"
+    assert a.move_selection([header()], None, -1) == 0, "it adopts the root"
+    assert a.snap_selection([header()], None, 3) == 0, "the only row to land on"
+
 
 
 def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selected():
@@ -742,7 +731,7 @@ def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selecte
 
     pane = a._pane(a.Frame(rows=rows), 48)
     # The LIST only: it is the selection axis. The tail below it — the access
-    # panel (pane-width, and NORMAL like the root box, since it is not a worker
+    # panel (pane-width, and NORMAL like the root box, since it is not an agent
     # the caret can be on) and the footer — carries no selection either way.
     items = pane.items[:pane.list_rows]
 
@@ -752,12 +741,14 @@ def test_an_untouched_pane_paints_every_box_identically_and_none_of_them_selecte
         "and dimming is what says 'not the one your cursor is on'"
     assert {role for _t, role in items} == {a.NORMAL}
 
-    # ONE key, and the pane has a selection: adopted on w1, which now reads
-    # SELECTED on its first row while w2's whole box goes DIM.
+    # ONE key, and the pane has a selection: adopted on the ROOT (the first agent
+    # row now that roots are selectable), which reads SELECTED on its first row
+    # while BOTH workers' boxes go DIM.
     moved = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))
     moved_items = a._pane(moved, 48).items
     assert sum(1 for _t, role in moved_items if role == a.SELECTED) == 1
-    assert moved_items[4][1] == a.SELECTED, "w1's box, first row"
+    assert moved_items[0][1] == a.SELECTED, "the root box, first row"
+    assert [role for _t, role in moved_items[4:7]] == [a.DIM] * 3, "w1's box"
     assert [role for _t, role in moved_items[7:10]] == [a.DIM] * 3, "w2's box"
 
 
@@ -779,47 +770,20 @@ def test_enter_on_an_untouched_pane_focuses_nothing_and_shows_no_notice(monkeypa
     than not moving it at all.
     """
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch)
+    calls = _fake_focus_agent_terminal(monkeypatch)
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
 
     screen = _run_tui_capture(monkeypatch, [ENTER, QUIT], model=_model(opener))
 
-    assert calls == [], f"nothing was on the wire: {calls}"
+    assert calls == [], f"nothing was focused: {calls}"
     assert screen.painted, "the pane was painted"
     assert not any("focus:" in text for text in screen.painted)
     # Enter changed NOTHING — the frame after it is the frame before it, spinner
-    # aside, so the key did not quietly adopt the first worker either. The
-    # contrast is the point: one DOWN first and the very same Enter focuses.
+    # aside, so the key did not quietly adopt the first row either. The contrast
+    # is the point: one DOWN first and the very same Enter focuses.
     assert _unsprung(screen.frames[-1]) == _unsprung(screen.frames[0])
     focused = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=_model(opener))
-    assert calls == [("agent.focus", {"target": "root"})], calls
-
-
-def test_space_on_an_untouched_pane_expands_nothing(monkeypatch):
-    """Same shape as Enter: with no row selected there is nothing to expand.
-
-    Space does not move the operator's terminal, so the stakes are lower, but the
-    contract is the same one — the untouched pane has no row to act on and must
-    not quietly act on the first worker instead.
-    """
-    monkeypatch.delenv("HERDR_ENV", raising=False)
-
-    def model():
-        return _model(RoutingOpener(
-            [_live_listing()],
-            details={"root": ROOT_DETAIL,
-                     "w1": detail("w1", items=[ASSISTANT_MESSAGE])}))
-
-    report = "The work was already committed"
-
-    untouched = _run_tui_capture(monkeypatch, [SPACE, QUIT], model=model())
-    assert not any(report in text for text in untouched.frames[-1]), \
-        "space expanded a row nobody had selected"
-
-    # One arrow key first, and the very same key expands the row it adopted.
-    adopted = _run_tui_capture(monkeypatch, [ord("j"), SPACE, QUIT], model=model())
-    assert any(report in text for text in adopted.frames[-1]), \
-        "the adopted row expands exactly as before"
+    assert calls == [("root", "claude-native", "")], calls
 
 
 def test_the_selection_follows_its_session_across_a_state_change_reorder():
@@ -849,25 +813,24 @@ def test_the_selection_follows_its_session_across_a_state_change_reorder():
     assert a.snap_selection(after, "w2", 4) == 2, "the selection follows w2"
 
     # The session GONE (it fell off the listing or the scope moved) falls back to
-    # the box NEAREST the old index — so the selection stays where the operator's
+    # the row NEAREST the old index — so the selection stays where the operator's
     # eye is, rather than teleporting to the top of the pane.
     assert a.snap_selection(after, "no-such-session", 4) == 4
     assert a.snap_selection(after, "no-such-session", 9) == 4, "clamped, not off the end"
-    assert a.snap_selection(after, "no-such-session", 0) == 2, "the first worker"
-    # A tie between the box above and the box below goes to the UPPER one: index 3
+    assert a.snap_selection(after, "no-such-session", 0) == 0, "the root, at the top"
+    # A tie between the row above and the row below goes to the UPPER one: index 3
     # in `before` sits between w1 (2) and w2 (4).
     assert a.snap_selection(before, "no-such-session", 3) == 2
-    # An id that IS on screen but is not a BOX never captures the selection — not
-    # the root's (the initial selection is index 0) and not a rail's, which is the
-    # empty string.
-    assert a.snap_selection(before, before[0].session_id, 0) == 2
+    # The ROOT's id captures the caret now that roots are selectable — index 0
+    # here. A rail's empty string still never does: rails hold no agent.
+    assert a.snap_selection(before, before[0].session_id, 0) == 0
     assert a.snap_selection(before, "", 3) == 2
-    # The no-id first frame is UNTOUCHED, not open-on-the-first-worker: nothing was
+    # The no-id first frame is UNTOUCHED, not open-on-the-first-row: nothing was
     # selected before the refresh, so there is nothing to snap onto and nothing to
     # snap FROM. Every box paints NORMAL and the pane opens with no bar behind any
     # of them — which is the whole point of the fix.
     assert a.snap_selection(after, None, None) is None
-    assert a.snap_selection(after, None, 0) == 2, \
+    assert a.snap_selection(after, None, 0) == 0, \
         "once a selection exists, an unreadable id still falls back to nearest"
 
 
@@ -994,7 +957,7 @@ def test_a_selection_move_still_repaints_the_pane():
             rail("idle"),
             worker("w1", "idle", text="one"),
             worker("w2", "idle", text="two")]
-    frame = a.Frame(rows=rows, selected=a.move_selection(rows, None, 1))   # w1
+    frame = a.Frame(rows=rows, selected=2)   # w1
     before = a._pane(frame, 48).items
 
     frame.selected = a.move_selection(rows, frame.selected, 1)       # w2
@@ -1110,31 +1073,6 @@ def test_height_trimming_keeps_a_whole_group_and_never_splits_a_box():
     # And no label word is left behind anywhere.
     for word in OLD_GROUP_LABELS:
         assert word not in short_joined, word
-
-
-def test_height_trimming_never_splits_an_expanded_four_row_box():
-    """The trim arithmetic follows the shorter box automatically, and it must
-    still keep an EXPANDED box whole. A block is a rail + a three-row box (four
-    when expanded); across a range of heights a box is either absent or complete —
-    its borders always come as a pair and the report row never outlives them.
-
-    The root block (3 rows) is always the first block and is always kept, so the
-    counts below are one `╭`/`╰` for the root plus one for the worker when it fits.
-    """
-    rows = [header(), rail("working"),
-            worker("w1", "working", text="one", snippet="the report",
-                   expanded=True)]
-    for height in range(6, 14):
-        lines = a.render(a.Frame(rows=rows), width=C2_WIDTH, height=height)
-        joined = "\n".join(lines)
-        assert joined.count("╭") == joined.count("╰"), (height, lines)
-        # The expanded worker box is either absent (root box alone) or complete —
-        # its report row never outlives its borders.
-        if "the report" in joined:
-            assert "one" in joined, (height, lines)
-            assert joined.count("╰") == 2, (height, lines)
-        else:
-            assert joined.count("╰") == 1, (height, lines)
 
 
 def test_a_worker_row_never_exceeds_the_pane_at_any_width():
@@ -1269,50 +1207,6 @@ def test_scope_ignores_a_root_with_no_workspace():
 
 
 # ---------------------------------------------------------------------------
-# 4. snippet extraction
-# ---------------------------------------------------------------------------
-
-def test_snippet_from_the_verbatim_assistant_message():
-    assert a.snippet_from_detail({"items": [ASSISTANT_MESSAGE]}) == \
-        "The work was already committed (`573414d`) before the interruption…"
-
-
-def test_snippet_is_the_last_assistant_message():
-    first = {"type": "message", "data": {"role": "assistant",
-             "content": [{"type": "output_text", "text": "first"}]}}
-    last = {"type": "message", "data": {"role": "assistant",
-            "content": [{"type": "output_text", "text": "last"}]}}
-    user = {"type": "message", "data": {"role": "user",
-            "content": [{"type": "input_text", "text": "do it"}]}}
-    assert a.snippet_from_detail({"items": [first, user, last]}) == "last"
-
-
-def test_snippet_none_without_an_assistant_message():
-    user = {"type": "message", "data": {"role": "user",
-            "content": [{"type": "input_text", "text": "do it"}]}}
-    assert a.snippet_from_detail({"items": [user]}) is None
-    assert a.snippet_from_detail({"items": []}) is None
-    assert a.snippet_from_detail({}) is None
-
-
-def test_snippet_none_when_the_message_has_no_output_text():
-    tool = {"type": "message", "data": {"role": "assistant",
-             "content": [{"type": "tool_use", "id": "x"}]}}
-    assert a.snippet_from_detail({"items": [tool]}) is None
-
-
-def test_snippet_none_when_content_is_not_a_list():
-    bad = {"type": "message", "data": {"role": "assistant", "content": "hello"}}
-    assert a.snippet_from_detail({"items": [bad]}) is None
-
-
-def test_snippet_tolerates_junk_without_raising():
-    assert a.snippet_from_detail({"items": "nope"}) is None
-    assert a.snippet_from_detail(None) is None
-    assert a.snippet_from_detail({"items": [None, 7, "x"]}) is None
-
-
-# ---------------------------------------------------------------------------
 # 5. the budget: no detail fetch per row per poll
 # ---------------------------------------------------------------------------
 
@@ -1346,38 +1240,21 @@ def test_three_refreshes_fetch_each_root_detail_once_not_once_per_row_per_poll()
     assert len(opener.detail_requests) == 1, [r.full_url for r in opener.detail_requests]
 
 
-def test_a_selected_worker_is_fetched_once_not_every_refresh():
-    opener = RoutingOpener(
-        [_live_listing()] * 3,
-        details={"root": ROOT_DETAIL,
-                 "w1": detail("w1", items=[ASSISTANT_MESSAGE])})
-    model = _model(opener)
-
-    model.refresh()
-    model.refresh(selected_id="w1")
-    model.refresh(selected_id="w1")
-
-    # root once, and w1 once even though it stayed selected across two refreshes.
-    assert len(opener.detail_requests) == 2, [r.full_url for r in opener.detail_requests]
-
-
-def test_an_idle_worker_is_read_once_when_it_finishes():
+def test_an_idle_worker_costs_no_detail_fetch():
     listing = [
         listed("root", status="running", title="conversation"),
         listed("w1", parent="root", status="idle", title="done-worker"),
     ]
-    opener = RoutingOpener([listing] * 3,
-                           details={"root": ROOT_DETAIL,
-                                    "w1": detail("w1", items=[ASSISTANT_MESSAGE])})
+    opener = RoutingOpener([listing] * 3, details={"root": ROOT_DETAIL})
     model = _model(opener)
 
     for _ in range(3):
         model.refresh()
 
-    assert len(opener.detail_requests) == 2, [r.full_url for r in opener.detail_requests]
-    # ...and the report it captured is there when the row is expanded.
-    joined = "\n".join(a.render(model.refresh(expanded_ids={"w1"})))
-    assert "The work was already committed" in joined
+    # Only the live root's detail is fetched. An idle worker's report used to be
+    # read once and kept, to expand it on demand; with the expand view gone there
+    # is nothing to fetch, and the count must not creep back up.
+    assert len(opener.detail_requests) == 1, [r.full_url for r in opener.detail_requests]
 
 
 def test_a_quiet_root_with_no_workers_is_not_fetched():
@@ -1395,24 +1272,21 @@ def test_a_quiet_root_with_no_workers_is_not_fetched():
 
 
 def test_an_idle_root_with_a_finished_worker_still_shows():
-    # The case the whole lazy "first idle" snippet exists for: the orchestrator
-    # has answered, the worker is done, and its report is what the operator
-    # wants to read. The root is live because it has a worker.
+    # An orchestrator that has answered and a worker that is done must still draw
+    # their tree: the root is live because it has a worker, so an idle
+    # conversation is not dropped from the view.
     listing = [
         listed("root", status="idle", title="conversation"),
         listed("w1", parent="root", status="idle", title="done-worker"),
     ]
-    opener = RoutingOpener([listing],
-                           details={"root": ROOT_DETAIL,
-                                    "w1": detail("w1", items=[ASSISTANT_MESSAGE])})
+    opener = RoutingOpener([listing], details={"root": ROOT_DETAIL})
     model = _model(opener)
 
-    lines = a.render(model.refresh(expanded_ids={"w1"}))
+    lines = a.render(model.refresh())
 
     assert lines[0].startswith("╭"), "the root is a box"
     assert "conversation" in lines[1]
     assert any("done-worker" in line for line in lines)
-    assert any("The work was already committed" in line for line in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1556,7 +1430,7 @@ def test_the_newer_root_wins_when_a_stale_sibling_in_the_same_repo_is_live():
     assert [row.session_id for row in frame.rows] == ["fresh"], frame.rows
     assert frame.rows[0].is_root, "it narrowed to the operator's own tree"
     # The stale tree is not merely unshown behind the new one — it is absent,
-    # including the finished worker whose report is the tempting thing on screen.
+    # including its finished worker.
     assert not any("old work" in row.text for row in frame.rows), frame.rows
 
 
@@ -1580,12 +1454,11 @@ def test_all_still_forces_the_wide_view_with_two_roots_in_one_repo():
     ids = [row.session_id for row in frame.rows if not row.rail]
     assert ids == ["stale", "s1"], frame.rows
     # The quiet root was never even asked: `--all` is a liveness decision, and
-    # liveness is free (the listing row already says idle-with-no-workers). What
-    # IS fetched is `stale`'s own label and `s1`'s report — both pre-existing,
-    # both for the worker the lazy "first idle" snippet exists to read.
+    # liveness is free (the listing row already says idle-with-no-workers). The one
+    # fetch is `stale`'s own label; a worker's report is no longer read (that went
+    # with the expand view), so `s1` costs nothing.
     assert [r.full_url for r in opener.detail_requests] == [
         "http://x/v1/sessions/stale",
-        "http://x/v1/sessions/s1",
     ], [r.full_url for r in opener.detail_requests]
 
 
@@ -1780,19 +1653,6 @@ def test_a_live_root_in_the_cwd_still_wins_over_a_more_recent_root_elsewhere():
 # ---------------------------------------------------------------------------
 # 7. a detail fetch that fails still renders the row
 # ---------------------------------------------------------------------------
-
-def test_a_failed_snippet_fetch_still_renders_the_row():
-    opener = RoutingOpener(
-        [_live_listing()],
-        details={"root": ROOT_DETAIL, "w1": URLError("server down")})
-    model = _model(opener)
-
-    frame = model.refresh(selected_id="w1", expanded_ids={"w1"})
-    lines = a.render(frame)
-
-    assert any(a.SPIN_FRAMES[0] in line and "w1" in line for line in lines), lines
-    assert not any("The work" in line for line in lines)
-
 
 def test_a_failed_root_detail_still_renders_the_tree():
     opener = RoutingOpener([_live_listing()], details={"root": URLError("down")})
@@ -2832,13 +2692,15 @@ def test_access_panel_drops_the_qr_when_the_pane_is_too_narrow():
     # has and says where it stopped.
     assert any(line.strip("│ ").startswith("http://192.168.100.17")
                for line in lines)
-    # 26 columns IS the bare KEYS floor exactly: below both labelled forms, so it
-    # falls to the key list rather than being clipped mid-word (see `_footer`).
+    # 26 columns is below the bare KEYS floor (32), so the footer picks the bare
+    # key list rather than either labelled form — and that list is itself wider
+    # than this pane, so it is clipped to 26, losing a couple of trailing keys.
+    # That is the FLOOR form's point: a trailing KEY clipped off is recoverable by
+    # pressing it, where a LABEL clipped mid-word is not. See the footer comment.
     assert lines[0] == "" and lines[-1] == _footer_text(26)
-    # The row is the bare key list, exactly the KEYS width, so nothing is padded —
-    # and the pane's own ruler (`len`) agrees with `_display_width`, because every
-    # footer glyph including the separator is Narrow now (see
-    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`).
+    # The row fills the pane (clipped to its last column); the footer glyphs stay
+    # Narrow so the pane's own ruler is unambiguous. See
+    # `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
     assert len(lines[-1]) <= 26
     assert len(a.access_lines(acc, 26)) == 4, "borders, address, caveat, borders"
 
@@ -3210,7 +3072,7 @@ class _StubModel:
     def __init__(self, frame):
         self._frame = frame
 
-    def refresh(self, selected_id=None, expanded_ids=(), force=False):
+    def refresh(self):
         return self._frame
 
 
@@ -3978,11 +3840,12 @@ def test_a_status_glyph_is_neon_and_undimmed_on_an_unselected_row(monkeypatch):
     """
     for state, glyphs in (("idle", {"✓"}), ("working", set(a.SPIN_FRAMES)),
                           ("failed", {"×"})):
-        # w1 is SELECTED and w2 carries the state under test, so w2's box is the
-        # unselected one. The selection lives in the loop, not on the frame, so
-        # DOWN is what puts it there — which is why a SINGLE-worker frame could
-        # not say this before: with nothing else to move to, the first key adopted
-        # the only box and there was no unselected box to test.
+        # w2 carries the state under test and is UNSELECTED, so its box is the
+        # dimmed one. The selection lives in the loop, not on the frame, so DOWN
+        # is what puts it there — on the root now that every agent row is
+        # selectable, which still leaves BOTH workers unselected. A SINGLE-worker
+        # frame could not say this: with nothing else to move to, the first key
+        # adopted the only row and there was no unselected box to test.
         frame = a.Frame(rows=[header(),
                               worker("w1", "blocked", text="one"),
                               worker("w2", state, text="two", meta="12s")])
@@ -4041,19 +3904,20 @@ def test_bold_roles_still_bold_on_a_monochrome_terminal(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 16. Enter focuses the selected worker in herdr; Space expands its snippet
+# 16. Enter focuses the selected agent in herdr; Esc clears the selection
 # ---------------------------------------------------------------------------
 #
-# `focus_in_herdr` imports `og_herdr_client` LAZILY, so a fake module dropped
-# into sys.modules IS the client it reaches — the same trick the curses stub
-# above uses, and here it is what keeps every test off a real socket. HERDR_ENV
-# is set or deleted per test so the "inside herdr" question is never answered by
-# whatever environment the suite happens to run in (an operator running pytest
-# from inside a herdr pane has HERDR_ENV=1 for real).
+# `focus_agent` imports `og_herdr_launch.focus_agent_terminal` LAZILY, so patching
+# that MODULE ATTRIBUTE is the seam the view reaches (the real function ships on
+# the other branch and is not here). The older `focus_in_herdr` imports
+# `og_herdr_client` the same lazy way, so a fake module dropped into sys.modules
+# is the client IT reaches — that trick keeps the remaining tests off a real
+# socket. HERDR_ENV is set or deleted per test so the "inside herdr" question is
+# never answered by whatever environment the suite happens to run in.
 
 ENTER = 13          # what the view treats as Enter (curses.KEY_ENTER, 10 or 13)
-SPACE = 32
 QUIT = ord("q")
+ESC = 27            # Esc: clears the selection, and MUST NOT quit (was q's twin)
 # The pane opens UNTOUCHED, so every test that acts ON a row has to move the caret
 # there first. `j` is one of the two keys the view reads as down (the other is
 # curses.KEY_DOWN, which `FakeCurses` numbers 258).
@@ -4140,12 +4004,36 @@ def _fake_herdr_client(monkeypatch, error=None):
     return calls
 
 
-def _run_tui_capture(monkeypatch, keys, model=None):
+def _fake_focus_agent_terminal(monkeypatch, notice=None):
+    """Install a fake `og_herdr_launch.focus_agent_terminal`; return its call log.
+
+    `focus_agent` imports it LAZILY (`from og_herdr_launch import
+    focus_agent_terminal`) on the keypress, so patching the MODULE ATTRIBUTE is
+    the seam the view actually reaches. The real function ships on the other
+    branch and is NOT on this one, which is why the attribute is installed with
+    `raising=False` — it does not exist here until this creates it. Each call is
+    recorded as `(session_id, harness, root_session_id)`.
+    """
+    calls = []
+
+    def fake(session_id, harness="", root_session_id=""):
+        calls.append((session_id, harness, root_session_id))
+        return notice
+
+    monkeypatch.setattr(og_herdr_launch, "focus_agent_terminal", fake,
+                        raising=False)
+    return calls
+
+
+def _run_tui_capture(monkeypatch, keys, model=None, interval=None):
     """Run the live view with a faked curses; return the screen it painted.
 
     Every Enter/Space test needs the frame the loop actually wrote, which the
     stock `FakeScreen` stub does not expose. `model` defaults to the shared
-    `_tui_model()` (root + three running workers, `w1` selected).
+    `_tui_model()` (a root and three running workers, opening UNTOUCHED).
+    `interval` defaults to `DEFAULT_INTERVAL`; a test that needs the loop's NEXT
+    TICK to re-poll immediately (there is no manual-refresh key any more) passes
+    a small one.
     """
     fake = _fake_curses(monkeypatch)
     screens: list[_KeyScreen] = []
@@ -4157,28 +4045,96 @@ def _run_tui_capture(monkeypatch, keys, model=None):
     fake.wrapper = wrapper
 
     a._run_tui(model if model is not None else _tui_model(),
-               a.DEFAULT_INTERVAL, "http://x")
+               a.DEFAULT_INTERVAL if interval is None else interval, "http://x")
     return screens[0]
 
 
-def test_enter_on_a_sub_agent_row_focuses_its_root_session(monkeypatch):
-    """REGRESSION: the reported bug was `agent_not_found` for every worker.
+# ---- Esc clears the selection; `q` is the only quit ------------------------
+#
+# The reported defect: pressing an arrow key dims every unselected row, and there
+# was no way back — Esc used to quit alongside `q`, so the list stayed dimmed for
+# the rest of the session. Esc was rebound to clear the selection, which cost it
+# the quit; these tests are the guard on BOTH halves of that trade.
 
-    `w1` is a SUB-AGENT of `root` (`parent_session_id == "root"`), and only the
-    root has a herdr pane record for `agent.focus` to match. So Enter must send
-    the ROOT's id, `root` — not w1's own, which is what used to go on the wire
-    and matched no record.
+def test_esc_clears_the_selection_and_undims_every_row(monkeypatch):
+    """Esc puts the pane back to its freshly-opened look: no agent row dimmed.
+
+    Dim is a PAINT attribute, not a glyph, so it is read off the writes. The
+    agent rows are picked out by their NODE column (`⦿`, the content row of each
+    worker box) so the pane's one permanently dim line — the footer — cannot
+    masquerade as an unselected agent.
+    """
+    screen = _run_tui_capture(monkeypatch, [DOWN, ESC, QUIT])
+    dim = sys.modules["curses"].A_DIM
+
+    def dim_node_rows(frame_writes):
+        rows = _rows_with_attr(frame_writes)
+        return [text for text, attr in rows.values()
+                if text.startswith(a.NODE) and attr & dim]
+
+    # Frames: the untouched paint, then DOWN's — the root selected and all three
+    # worker boxes dimmed to mark them unselected.
+    assert len(dim_node_rows(screen.frame_writes[1])) == 3, \
+        "DOWN dims every unselected agent"
+    # ...and the frame Esc produced is undimmed again.
+    assert dim_node_rows(screen.frame_writes[-1]) == [], \
+        "Esc must return every row to its normal, undimmed appearance"
+    # And Esc did not quit: the q that followed is what ended the loop.
+    assert screen.keys == [], "Esc did not quit"
+
+
+def test_esc_with_no_selection_does_nothing_and_does_not_quit(monkeypatch):
+    """THE REGRESSION GUARD: Esc used to quit, and this is the behaviour removed.
+
+    With nothing selected Esc is a harmless no-op: it changes nothing, so not a
+    single repaint is even scheduled — and, above all, it does NOT quit. The proof
+    it kept running is that the `q` behind it was read and ended the loop. This is
+    the assertion someone "restoring" Esc-quit would break.
+    """
+    # An all-idle frame, so the spinner cannot schedule a repaint either: the only
+    # thing that could paint a second frame here is Esc itself.
+    quiet = a.Frame(rows=[header(state="idle"), rail("idle"),
+                          worker("w1", "idle", text="one")])
+    screen = _run_tui_capture(monkeypatch, [ESC, QUIT], model=_StubModel(quiet))
+
+    assert screen.keys == [], \
+        "Esc must not quit: the q that followed is what ended the loop"
+    assert len(screen.frames) == 1, \
+        "Esc on an untouched pane changed nothing, so it painted nothing new"
+    assert any("conversation" in text for text in screen.painted), \
+        "the pane was painted and is still running"
+
+
+def test_q_quits_unconditionally_even_with_a_row_selected(monkeypatch):
+    """`q` is now the ONLY quit — it must end the loop whatever is selected."""
+    screen = _run_tui_capture(monkeypatch, [DOWN, QUIT])
+
+    assert screen.keys == [], "the q was read: the loop quit on it"
+    assert len(screen.frames) >= 2, "DOWN painted before q ended the loop"
+
+
+
+def test_enter_on_a_sub_agent_row_focuses_its_own_session_not_its_root(monkeypatch):
+    """REGRESSION: Enter used to aim at a worker's ROOT, never the worker.
+
+    `w1` is a SUB-AGENT of `root` (`parent_session_id == "root"`). The reported
+    defect was that selecting a worker and pressing Enter focused the ROOT's tab
+    (the old resolution climbed a worker to its root) instead of the worker's own —
+    and selecting the orchestrator focused nothing at all. Enter must now hand
+    `focus_agent_terminal` the SELECTED row's OWN session id — `w1`, not `root` —
+    with the worker's own harness and its root alongside.
     """
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch)
+    calls = _fake_focus_agent_terminal(monkeypatch)
     opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
     model = _model(opener)
 
-    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=model)
+    # DOWN adopts the root (the first agent row), the second DOWN adopts w1.
+    screen = _run_tui_capture(monkeypatch, [DOWN, DOWN, ENTER, QUIT], model=model)
 
-    # DOWN adopts w1, the first worker, so it is the selected row, so the RESOLVED target — its
-    # root — is what went on the wire.
-    assert calls == [("agent.focus", {"target": "root"})], calls
+    # The SELECTED row's own session — w1 — is what went through, with its own
+    # (empty) harness and the root it hangs off. Never the root as the target.
+    assert calls == [("w1", "", "root")], calls
     # Focus is not a reason to refetch: exactly the one listing walk for the
     # first paint, and none from the keypress.
     assert len(opener.listing_requests) == 1, "Enter must not trigger a refetch"
@@ -4187,39 +4143,37 @@ def test_enter_on_a_sub_agent_row_focuses_its_root_session(monkeypatch):
     assert not any("focus:" in text for text in screen.painted)
 
 
-def test_focus_target_climbs_to_the_root_not_the_immediate_parent():
-    """A worker nested two deep resolves to the TOP root — the pane that exists —
-    not its immediate parent, which is itself a pane-less sub-agent."""
-    sessions = [
-        listed("root", status="running", title="conversation"),
-        listed("w1", parent="root", status="running", title="coder_zen:worker"),
-        listed("g1", parent="w1", status="running", title="coder_zen:grandchild"),
-    ]
-    rows = a.build_rows(sessions, ["root"], now=NOW)
-    by_sid = {row.session_id: row for row in rows}
-    assert a.focus_target(by_sid["w1"]) == "root"
-    assert a.focus_target(by_sid["g1"]) == "root"
+def test_enter_on_the_root_row_focuses_the_root_itself(monkeypatch):
+    """The ROOT is selectable and focuses its OWN tab (the `is_root` case).
 
-
-def test_focus_target_of_a_root_row_is_its_own_session_id():
-    """A root owns its own herdr pane and targets itself — unchanged."""
-    assert a.focus_target(header(sid="root")) == "root"
-    assert a.focus_target(header(sid="abc123")) == "abc123"
-
-
-def test_a_row_whose_root_cannot_be_resolved_declines_and_does_not_call_out(
-        monkeypatch):
-    """No root to resolve -> decline in one line, never send a doomed target.
-
-    A worker row carrying no `root_session_id` (a malformed listing, say)
-    resolves to nothing; focusing must not guess an id herdr would only answer
-    `agent_not_found` for. It declines locally and calls out not at all.
+    Selecting the orchestrator was impossible before — roots were stepped over —
+    so this is the other half of the fix: the root row must reach
+    `focus_agent_terminal` with its own id, its own harness and NO root of its
+    own (`root_session_id` is "" for a root).
     """
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch)
-    # `worker()` leaves `root_session_id` empty: a Box with no root.
+    calls = _fake_focus_agent_terminal(monkeypatch)
+    opener = RoutingOpener([_live_listing()], details={"root": ROOT_DETAIL})
+
+    _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=_model(opener))
+
+    # One DOWN adopts the root, so the root's own session and harness go through.
+    assert calls == [("root", "claude-native", "")], calls
+
+
+def test_enter_focuses_a_worker_whose_listing_carried_no_root(monkeypatch):
+    """A worker with no `root_session_id` is still focused by its OWN id.
+
+    The old path resolved a worker to its root and declined when there was none;
+    Enter now focuses the row's own session, so a missing root no longer blocks
+    anything — `""` is simply what is passed for it.
+    """
+    monkeypatch.setenv("HERDR_ENV", "1")
+    calls = _fake_focus_agent_terminal(monkeypatch)
+    # `worker()` leaves `root_session_id` empty: a worker whose listing carried no
+    # root. It is still its OWN agent, so it is still focusable.
     orphan = worker("w1", "idle", text="one")
-    assert a._is_box(orphan), "the row must be a selectable worker box"
+    assert a._selectable(orphan), "the row must be a selectable agent row"
 
     class OneRow:
         def refresh(self, **kwargs):
@@ -4227,9 +4181,10 @@ def test_a_row_whose_root_cannot_be_resolved_declines_and_does_not_call_out(
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT], model=OneRow())
 
-    assert calls == [], "a row with no resolvable root must not call out"
-    assert any(a.NOTICE_FOCUS_NO_ROOT in text for text in screen.painted), \
-        screen.painted
+    # Enter no longer needs the root to resolve anything: it focuses the row's own
+    # session, passing "" for the root the row does not have.
+    assert calls == [("w1", "", "")], calls
+    assert not any("focus:" in text for text in screen.painted), screen.painted
 
 
 def test_focus_resolution_adds_no_call_beyond_agent_focus():
@@ -4239,22 +4194,32 @@ def test_focus_resolution_adds_no_call_beyond_agent_focus():
     _assert_only_agent_focus(Path(a.__file__).read_text())
 
 
-def test_enter_outside_herdr_makes_no_call_and_shows_a_notice(monkeypatch):
+def test_enter_outside_herdr_paints_the_callee_notice(monkeypatch):
+    """The "not inside herdr" answer the callee returns is shown in the pane.
+
+    The gate lives in `focus_agent_terminal` now (this branch does not have it, so
+    the stub returns it): the TUI's job is to paint whatever notice comes back
+    through the ONE existing notice path — the footer row.
+    """
     monkeypatch.delenv("HERDR_ENV", raising=False)
-    calls = _fake_herdr_client(monkeypatch)
+    calls = _fake_focus_agent_terminal(monkeypatch,
+                                       notice=a.NOTICE_FOCUS_OUTSIDE_HERDR)
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
-    assert calls == [], "no herdr pane, no call"
+    # The callee was reached with the selected row's own id (the root, on a
+    # single DOWN) and its notice was painted.
+    assert calls == [("root", "claude-native", "")], calls
     assert any(a.NOTICE_FOCUS_OUTSIDE_HERDR in text for text in screen.painted), \
         screen.painted
 
 
-def test_focus_degrades_when_the_herdr_client_cannot_be_imported(monkeypatch):
-    # `None` in sys.modules makes `from og_herdr_client import ...` raise
-    # ImportError: a client present in name only. The view still has to run.
+def test_focus_degrades_when_og_herdr_launch_cannot_be_imported(monkeypatch):
+    # `None` in sys.modules makes `from og_herdr_launch import ...` raise
+    # ImportError: the lazy import `focus_agent` does. The view still has to run,
+    # degrading to the "unavailable" notice rather than a traceback.
     monkeypatch.setenv("HERDR_ENV", "1")
-    monkeypatch.setitem(sys.modules, "og_herdr_client", None)
+    monkeypatch.setitem(sys.modules, "og_herdr_launch", None)
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
@@ -4262,55 +4227,18 @@ def test_focus_degrades_when_the_herdr_client_cannot_be_imported(monkeypatch):
         screen.painted
 
 
-def test_the_c_key_drives_cli_pane_for_the_selected_row(monkeypatch):
-    """The footer names `c cli`, but nothing asserted the `c` key actually
-    reaches `cli_pane_for_row` with the selected row's ids — a keypath break
-    (a row's agent dropped, or the root never resolved) would pass on the
-    footer test alone.
-
-    `cli_pane_toggle` is the dependency `cli_pane_for_row` delegates the whole
-    open/close decision to (it owns the state record and is the only place a
-    pane is split for this feature), so a recording fake there proves the
-    keypath without monkeypatching the function under test itself.
-    """
-    monkeypatch.setenv("HERDR_ENV", "1")
-    calls = []
-
-    def fake_toggle(root_session_id, session_id, harness, *,
-                    environ=None, client=None, state_path=None):
-        calls.append((root_session_id, session_id, harness))
-        return None
-
-    monkeypatch.setattr(og_herdr_launch, "cli_pane_toggle", fake_toggle)
-
-    frame = a.Frame(rows=[
-        header(sid="root"),
-        a.Row(session_id="w1", text="one", state="idle", depth=1,
-              harness="claude-native", root_session_id="root"),
-    ])
-    screen = _run_tui_capture(
-        monkeypatch, [DOWN, ord("c"), QUIT],
-        model=_StubModel(frame))
-
-    # DOWN adopts the first selectable box (w1; the root row is not selectable),
-    # so `c` acts on w1: its own session is the agent to mirror, its root is
-    # the space the pane splits into.
-    assert calls == [("root", "w1", "claude-native")], calls
-    # And a successful toggle paints no notice.
-    assert not any("cli:" in text for text in screen.painted), screen.painted
-
-
 def test_a_focus_that_cannot_reach_herdr_shows_a_notice_and_the_loop_runs_on(
         monkeypatch):
     monkeypatch.setenv("HERDR_ENV", "1")
-    calls = _fake_herdr_client(monkeypatch,
-                               error=RuntimeError("connect: no such socket"))
+    calls = _fake_focus_agent_terminal(
+        monkeypatch, notice="focus: connect: no such socket")
 
-    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, ENTER, QUIT])
+    # Enter clears the selection (undims), so a SECOND Enter needs a second DOWN
+    # to re-adopt a row: two presses, two calls, and the loop still takes keys.
+    screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, DOWN, ENTER, QUIT])
 
-    # One Enter per press: the failure neither swallows the key nor retries, and
-    # the loop is still taking keys after the first failure.
-    assert [method for method, _params in calls] == ["agent.focus", "agent.focus"]
+    # One call per press: the failure neither swallows the key nor retries.
+    assert len(calls) == 2, calls
     assert any("focus: " in text for text in screen.painted), screen.painted
 
 
@@ -4357,7 +4285,8 @@ def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
     # End to end through the loop: after a failed Enter the notice IS the pane's
     # last row and the footer's line is gone from that frame.
     monkeypatch.delenv("HERDR_ENV", raising=False)
-    _fake_herdr_client(monkeypatch)
+    _fake_focus_agent_terminal(monkeypatch,
+                               notice=a.NOTICE_FOCUS_OUTSIDE_HERDR)
 
     screen = _run_tui_capture(monkeypatch, [DOWN, ENTER, QUIT])
 
@@ -4366,32 +4295,6 @@ def test_a_failed_focus_paints_the_notice_on_the_bottom_row(monkeypatch):
     assert bottom == a.NOTICE_FOCUS_OUTSIDE_HERDR, rows
     assert a._footer(80) not in [text for text, _attr in rows.values()], \
         "the footer does not share the pane with the notice"
-
-
-def test_space_expands_and_collapses_the_selected_snippet(monkeypatch):
-    monkeypatch.delenv("HERDR_ENV", raising=False)
-
-    def model():
-        return _model(RoutingOpener(
-            [_live_listing()],
-            details={"root": ROOT_DETAIL,
-                     "w1": detail("w1", items=[ASSISTANT_MESSAGE])}))
-
-    report = "The work was already committed"
-
-    expanded = _run_tui_capture(monkeypatch, [DOWN, SPACE, QUIT], model=model())
-    assert any(report in text for text in expanded.frames[-1]), \
-        "space expanded the selected snippet"
-
-    # A second space collapses it: the report is in the frame the first space
-    # produced and gone from the last one. `frames[0]` is the untouched pane,
-    # `frames[1]` the frame DOWN adopted a row in, `frames[2]` the first expand.
-    collapsed = _run_tui_capture(monkeypatch, [DOWN, SPACE, SPACE, QUIT],
-                               model=model())
-    assert any(report in text for text in collapsed.frames[2]), \
-        "the first space expanded the snippet"
-    assert not any(report in text for text in collapsed.frames[-1]), \
-        "the second space collapsed it"
 
 
 def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_refresh(
@@ -4421,25 +4324,18 @@ def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_ref
     opener = RoutingOpener([before, after],
                            details={"root": ROOT_DETAIL,
                                     "w1": detail("w1"), "w2": detail("w2")})
-    inner = _model(opener)
-    seen: list = []
+    model = _model(opener)
 
-    class Recording:
-        def refresh(self, **kwargs):
-            seen.append(kwargs.get("selected_id"))
-            return inner.refresh(**kwargs)
+    # The pane opens UNTOUCHED, so the caret has to be ADOPTED before it can be
+    # moved: the first `j` takes the root, the second w1, the third w2. `r` forces
+    # the refresh that reorders the rows; `q` ends the loop after that frame is
+    # painted.
+    screen = _run_tui_capture(monkeypatch, [DOWN, DOWN, DOWN, ord("r"), ord("q")],
+                              model=model)
 
-    # The pane opens UNTOUCHED, so the caret has to be ADOPTED before it can be moved:
-# the first `j` takes w1, the second takes w2. `r` forces the refresh that reorders
-    # the rows; `q` ends the loop after that frame is painted.
-    screen = _run_tui_capture(monkeypatch, [DOWN, DOWN, ord("r"), ord("q")],
-                              model=Recording())
-
-    # The refresh was handed the SESSION under the selection, not an index.
-    assert seen == [None, "w2"], seen
-    # And the box it resolved points at w2 — its task says "two" — not at w1's box,
-    # which is what the old index-preserving snap would have chosen. Selection is
-    # a paint ATTRIBUTE now (bright vs DIM), so read it off the painted attrs: a
+    # The box the caret lands on points at w2 — its task says "two" — not at w1's
+    # box, which is what the old index-preserving snap would have chosen. Selection
+    # is a paint ATTRIBUTE now (bright vs DIM), so read it off the painted attrs: a
     # line is written span by span, so reassemble the rows first, and the bright
     # (non-DIM) worker content row is w2's.
     lines = _rows_with_attr(screen.frame_writes[-1])
@@ -4452,15 +4348,13 @@ def test_the_selection_follows_a_selected_worker_that_changes_group_across_a_ref
     assert len(dimmed) == 1 and "one" in dimmed[0], node_rows
 
 
-def test_the_footer_names_the_focus_and_expand_bindings():
-    # The FULL form spells Enter and Space with their KEY GLYPHS now (`⏎ focus`,
-    # `␣ expand`), not the words — that is the 8 columns `c cli` was bought with,
-    # and it is the same vocabulary COMPACT already used. Every binding stays
-    # LABELLED; only the word became a glyph. See `FOOTER_ENTRIES`.
+def test_the_footer_names_its_bindings():
+    # The FULL form labels every binding it lists. Esc is bound but deliberately
+    # UNLISTED (see the footer comment); `c cli`, `␣ expand` and `r` are gone.
+    assert "↑/↓ move" in a.FOOTER, "the footer must name the move binding"
     assert "⏎ focus" in a.FOOTER, "the footer must name the Enter binding"
-    assert "␣ expand" in a.FOOTER, "the footer must name the Space binding"
     assert "a access" in a.FOOTER, "the existing bindings must survive"
-    assert "c cli" in a.FOOTER, "the footer must name the CLI mirror binding"
+    assert "esc" not in a.FOOTER, "Esc is bound but unlisted on purpose"
 
 
 def _cjk_width(text: str) -> int:
@@ -4468,9 +4362,8 @@ def _cjk_width(text: str) -> int:
 
     A footer FORM must fit under BOTH this and the Latin rule, and `_display_width`
     charges Ambiguous two, so `_footer` choosing with it is what guarantees that.
-    Nothing in the footer is Ambiguous any more — the ` ∙ ` separator is U+2219,
-    Narrow — so the two rulers agree on every form; this stays as the independent
-    check that keeps that true. See
+    The footer's move arrows ↑/↓ ARE Ambiguous, so both rulers charge them two and
+    agree on every form; this stays the independent check that keeps that true. See
     `test_the_footer_is_measured_the_same_in_a_cjk_locale`.
     """
     import unicodedata
@@ -4479,11 +4372,9 @@ def _cjk_width(text: str) -> int:
 
 
 def test_the_footer_names_every_key_at_every_width():
-    # The regression this pins: the full footer is 64 columns and the agents pane
-    # is a ~46-column split, so a FIXED footer was clipped mid-word — "space
-    # expand" and "a access" fell off the end, leaving the operator without the
-    # two keys they most needed (Space, which had just inherited expand from
-    # Enter).
+    # The regression this pins: the full footer is 50 columns and the agents pane
+    # is a ~46-column split, so a FIXED footer was clipped mid-word — "a access"
+    # and "q quit" fell off the end.
     #
     # The FORM is measured with the pessimistic ruler, so the form a width gets
     # fits that width under BOTH locale rules and no key can be clipped in either.
@@ -4496,43 +4387,44 @@ def test_the_footer_names_every_key_at_every_width():
         assert a._display_width(form) <= width, (width, form)
         assert _cjk_width(form) <= width, (width, form)
         assert row.rstrip() == form and len(row) == width, (width, row)
-        for letter in ("q", "r", "a", "t", "c"):
-            assert letter in row, (width, letter, row)
-        assert ("^/v" in row or "^v" in row), (width, row)
-        # Enter and Space are words at full width and glyphs when compact, but a
-        # key must be named EITHER way.
+        for key in ("q", "a", "t"):
+            assert key in row, (width, key, row)
+        assert ("↑/↓" in row or "↑↓" in row), (width, row)
+        # Enter is named by its key glyph; Esc is bound but deliberately UNLISTED —
+        # it must never appear.
         assert ("enter" in row or "⏎" in row), (width, row)
-        assert ("space" in row or "␣" in row), (width, row)
+        assert "esc" not in row, (width, row)
 
 
 def test_the_footer_chooses_a_form_by_measured_width():
     # The threshold is each form's own width, measured — not a magic number
     # that can drift out of step with the strings.
     #
-    # THE NUMBERS MOVED TWICE. `t theme` first cost COMPACT the word `refresh` (it
-    # shed a label rather than growing past the ~46-column split). Then a spaced
+    # THE NUMBERS MOVED REPEATEDLY. `t theme` first cost COMPACT the word `refresh`
+    # (it shed a label rather than growing past the ~46-column split). Then a spaced
     # separator was added and its glyph — U+00B7 MIDDLE DOT, East Asian AMBIGUOUS —
     # cost TWO measured columns each, which `_display_width` (the ruler `_footer`
     # chooses with) charged in full: the full form grew to 85, so a plain 80-column
     # terminal showed COMPACT and the ~46-column split fell all the way to the bare
     # KEYS form. THE SEPARATOR IS NOW U+2219 BULLET OPERATOR, NARROW — one column
     # under both rulers — and COMPACT carries none at all (its entries are joined by
-    # a single space, its pre-separator spelling), so the forms measure 79 / 45 / 26
-    # and an 80-column terminal gets the full form back. The key `r` is still in all
-    # three forms: only labels degrade.
+    # a single space, its pre-separator spelling). A key is still in all three forms:
+    # only labels degrade.
     #
-    # THE NUMBERS MOVED A THIRD TIME, for `c cli` (the read-only harness mirror).
-    # The full form was already exactly 79, so Enter and Space were respelled as
-    # their key glyphs (`⏎ focus`, `␣ expand`, -8) to buy the new entry without
-    # dropping any label, and COMPACT shed `theme`'s label (`t` stays) to stay at
-    # 45. So the three forms measure 79 / 45 / 30.
+    # THE ARROWS COST TWO COLUMNS EACH, AND THAT IS MEASURED, NOT ASSUMED. `^/v`
+    # was swapped for `↑/↓` (and `^v` for `↑↓`): U+2191/U+2193 are East Asian
+    # AMBIGUOUS, so `_display_width` charges each TWO and the move entry grows from
+    # 3 measured columns to 5 (2 to 4 in COMPACT/KEYS). Both rulers still agree on
+    # every form, so the CHOICE stays safe in both locales. The same move also
+    # dropped `c cli`, `␣ expand` and `r` entirely. So the three forms measure
+    # 50 / 30 / 20, and `esc` — bound but deliberately unlisted — is in NONE.
     assert a._footer(79) == a.FOOTER
     assert a._footer(80) == a.FOOTER, "the full form fits the classic 80 columns again"
     assert a._footer(45) == a.FOOTER_COMPACT
-    assert a._footer(44) == a.FOOTER_KEYS
-    assert a._display_width(a.FOOTER) == 79
-    assert a._display_width(a.FOOTER_COMPACT) == 45
-    assert a._display_width(a.FOOTER_KEYS) == 30
+    assert a._footer(29) == a.FOOTER_KEYS
+    assert a._display_width(a.FOOTER) == 50
+    assert a._display_width(a.FOOTER_COMPACT) == 30
+    assert a._display_width(a.FOOTER_KEYS) == 20
     # And the boundary is the MEASUREMENT, checked from both sides of each form,
     # so a future edit to the strings cannot quietly move a threshold. FOOTER_KEYS
     # is excluded from the lower side on purpose: it is the FLOOR, and `_footer`
@@ -4544,11 +4436,12 @@ def test_the_footer_chooses_a_form_by_measured_width():
     floor = a._display_width(a.FOOTER_KEYS)
     assert a._footer(floor) == a.FOOTER_KEYS
     assert all(a._footer(w) == a.FOOTER_KEYS for w in range(0, floor + 1))
-    # Only labels degrade: every form names every key, `t` and `c` included.
+    # Only labels degrade: every form names every key it lists, and `esc` — bound
+    # but deliberately unlisted — is in NONE of them.
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
-        assert "q" in form and "r" in form and "a" in form and "t" in form, form
-        assert "c" in form, form
-        assert ("^/v" in form or "^v" in form), form
+        assert "q" in form and "a" in form and "t" in form, form
+        assert "esc" not in form, form
+        assert ("↑/↓" in form or "↑↓" in form), form
     # THE SEPARATOR IS SPACED IN THE TWO LABELLED FORMS AND ABSENT FROM COMPACT:
     # COMPACT is the degraded form and has already given up words, so it carries no
     # separator glyph of its own.
@@ -4560,18 +4453,19 @@ def test_the_footer_chooses_a_form_by_measured_width():
 def test_the_footer_is_measured_the_same_in_a_cjk_locale():
     # The regression this pins, in the locale that re-created it: ↑ (U+2191) and
     # ↓ (U+2193) are East Asian AMBIGUOUS — one column in a Latin locale, TWO in a
-    # CJK one. While they were in the footer, `_footer` measured the full form as
-    # 64 and chose it for a 64-column pane, but a CJK terminal painted 66 and
-    # `_clip` cut "a access" off. That is the bug the three forms exist to end.
+    # CJK one. The FIRST time they were in the footer the ruler charged them one, so
+    # `_footer` measured the full form at 64 and chose it for a 64-column pane while
+    # a CJK terminal painted 66 and `_clip` cut keys off. They are BACK now, and what
+    # keeps them safe is that BOTH rulers charge them two: `_display_width` and this
+    # test's CJK rule agree on every form, so the form chosen for a width fits it in
+    # either locale. That agreement is the invariant — NOT "no Ambiguous glyph".
     #
-    # THE SAME TRAP WAS LATER SET BY THE SEPARATOR — ` · ` (U+00B7) is also
-    # AMBIGUOUS, charged two, which pushed the full form to 85 and cost the pane its
-    # labels — and it is now U+2219 BULLET OPERATOR, NARROW. So NO footer glyph
-    # depends on the locale any more, and `_display_width` and the CJK rule agree on
-    # every form; the only disagreement left is against `len`, which is the ruler
-    # the whole pane is composed for (the box borders are Ambiguous and composed the
-    # same way), so the trailing strip reaches the pane edge in the western terminal
-    # this ships to.
+    # THE SAME TRAP WAS ALSO SET BY THE SEPARATOR — ` · ` (U+00B7) is AMBIGUOUS,
+    # charged two, which pushed the full form to 85 and cost the pane its labels —
+    # and it is U+2219 BULLET OPERATOR, NARROW. The only disagreement left is against
+    # `len`, the ruler the whole pane is composed for (the box borders are Ambiguous
+    # and composed the same way), so the trailing strip reaches the pane edge in the
+    # western terminal this ships to.
     import unicodedata
 
     # The separator is NARROW, so both rulers charge it the same three columns.
@@ -4579,13 +4473,19 @@ def test_the_footer_is_measured_the_same_in_a_cjk_locale():
     assert a._display_width(a.FOOTER_SEP) == _cjk_width(a.FOOTER_SEP) == 3
     for form in (a.FOOTER, a.FOOTER_COMPACT, a.FOOTER_KEYS):
         assert a._display_width(form) == _cjk_width(form), form
-        # NO footer glyph is Wide, Fullwidth or Ambiguous — the property that keeps
-        # the two rulers in agreement, and the one an Ambiguous separator broke.
+        # The MOVE ARROWS are the only Ambiguous glyph the footer carries, and both
+        # rulers charge them two — that agreement is the whole point, so any OTHER
+        # Wide/Fullwidth/Ambiguous glyph reaching a form is the bug this catches.
         for ch in form:
-            assert unicodedata.east_asian_width(ch) not in ("W", "F", "A"), (ch, form)
+            if unicodedata.east_asian_width(ch) in ("W", "F", "A"):
+                assert ch in ("↑", "↓"), (ch, form)
 
-    # ⏎, ␣ and ∙ stay Narrow — checked, not assumed.
-    for glyph in ("⏎", "␣", "∙"):
+    # The arrows ARE Ambiguous — the fact that makes the two-column charge load-
+    # bearing, and the reason they cost 5 measured columns, not 3. ⏎ and ∙ stay
+    # Narrow — checked, not assumed.
+    for glyph in ("↑", "↓"):
+        assert unicodedata.east_asian_width(glyph) == "A", glyph
+    for glyph in ("⏎", "∙"):
         assert unicodedata.east_asian_width(glyph) == "N", glyph
 
     # Every form `_footer` picks for a pane at least as wide as the KEYS floor
@@ -4629,12 +4529,11 @@ def test_the_footer_key_is_prominent_and_its_label_recedes():
                        if a._bare_role(role) == a.FOOTER_KEY)
     label_text = "".join(t for t, role in spans
                          if a._bare_role(role) == a.FOOTER_LABEL)
-    # The full form names Enter, Space and the CLI mirror by their KEY GLYPHS and
-    # letter (`⏎`, `␣`, `c`) — the words became glyphs to buy `c cli` its columns.
-    for key in ("q", "r", "^/v", "⏎", "␣", "a", "t", "c"):
+    # The full form labels every binding it lists, naming the move keys `↑/↓` and
+    # Enter by its key glyph (`⏎`); Esc is bound but deliberately UNLISTED.
+    for key in ("↑/↓", "⏎", "t", "a", "q"):
         assert key in key_text, (key, key_text)
-    for label in ("quit", "refresh", "move", "focus", "expand", "access",
-                  "theme", "cli"):
+    for label in ("move", "focus", "theme", "access", "quit"):
         assert label in label_text, (label, label_text)
     # THE SEPARATOR IS THE DIMMER OF THE TWO ROLES, and there is exactly one per
     # join between entries.
@@ -5614,9 +5513,11 @@ def test_a_failed_listing_keeps_the_last_rows_and_names_the_server_and_status(
     """The pane survives a failed poll: prior rows stay, the footer explains it."""
     opener = RoutingOpener([_live_listing(), _listing_404()],
                            details={"root": ROOT_DETAIL})
-    # `r` forces the poll that fails; the startup poll succeeded, so there ARE
-    # prior rows to keep.
-    screen = _run_tui_capture(monkeypatch, [ord("r"), QUIT], model=_model(opener))
+    # The first poll succeeds, so there ARE prior rows to keep; the next TICK
+    # polls again and fails. There is no manual-refresh key any more, so the
+    # interval is shortened to zero and an inert key buys the second tick.
+    screen = _run_tui_capture(monkeypatch, [ord("z"), QUIT],
+                              model=_model(opener), interval=0.0)
 
     assert screen.frames, "the pane kept painting"
     last = "\n".join(screen.frames[-1])
@@ -5629,7 +5530,10 @@ def test_the_pane_recovers_on_the_next_tick_once_the_server_answers(monkeypatch)
     """A server that comes back heals the pane with no restart: rows, no notice."""
     opener = RoutingOpener([_listing_404(), _live_listing()],
                            details={"root": ROOT_DETAIL})
-    screen = _run_tui_capture(monkeypatch, [ord("r"), QUIT], model=_model(opener))
+    # The server answers again on the NEXT TICK (no manual-refresh key any more):
+    # the interval is shortened to zero and an inert key buys the second tick.
+    screen = _run_tui_capture(monkeypatch, [ord("z"), QUIT],
+                              model=_model(opener), interval=0.0)
 
     assert screen.frames
     first, after = screen.frames[0], screen.frames[-1]
