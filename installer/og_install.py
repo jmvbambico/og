@@ -203,6 +203,14 @@ def find_free_port(start: int, tries: int = 20) -> int | None:
 # each have a different fix and the CLI's own stderr names it.
 LAST_LIST_ERROR = ""
 
+# Same idea for the free-fallback probe: why list_free_models() came back
+# empty, so the skipped fallback question can say WHY it was skipped instead
+# of looking like the row simply has no fallback. An empty result and a failed
+# probe are both non-blocking (setup continues), but they have different fixes
+# -- "no free model right now" versus "blink is too old / probe crashed" -- and
+# the message must name which one it was.
+LAST_FREE_ERROR = ""
+
 
 def list_models(agent: dict) -> list:
     """Ask the vendor CLI what it can run. Empty list on any failure.
@@ -319,6 +327,92 @@ def _parse_bare_ids(stdout: str) -> list:
         if model_id and " " not in model_id and model_id == model_id.lower():
             models.append(model_id)
     return models
+
+
+def list_free_models(agent: dict) -> list:
+    """Run the row's JSON catalog probe (`model.list_cmd_json`) and return the
+    FREE, id-mapped model ids -- the candidates for a fallback pin.
+
+    Only a row that declares `list_cmd_json` is probed at all, so the extra
+    subprocess never runs during ordinary setup; a row with no fallback leaves
+    the common path exactly as fast as before. Returns [] on any failure and
+    sets LAST_FREE_ERROR to the reason. An empty list is not fatal: the caller
+    skips the fallback question and setup continues, because a blink too old to
+    speak `--list-models --json` simply ignores an unset BLINK_FALLBACK_MODEL.
+    """
+    global LAST_FREE_ERROR
+    LAST_FREE_ERROR = ""
+    cmd = (agent.get("model") or {}).get("list_cmd_json")
+    if not cmd:
+        return []
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+    except subprocess.TimeoutExpired:
+        LAST_FREE_ERROR = (f"`{' '.join(cmd)}` timed out after 120s")
+        return []
+    except (OSError, subprocess.SubprocessError) as e:
+        LAST_FREE_ERROR = f"`{' '.join(cmd)}` failed: {e}"
+        return []
+    if out.returncode != 0:
+        # A blink too old to know the flag exits non-zero here -- the expected
+        # response, not an error to fix -- so the reason names the exit code
+        # rather than demanding a retry.
+        tail = [l for l in out.stderr.splitlines() if l.strip()][-3:]
+        LAST_FREE_ERROR = (f"`{' '.join(cmd)}` exited {out.returncode}"
+                           + (": " + " | ".join(tail) if tail else "")
+                           + " (an older blink without --json does this)")
+        return []
+    free = _parse_free_catalog(out.stdout)
+    if free is None:
+        LAST_FREE_ERROR = f"`{' '.join(cmd)}` did not print the expected JSON catalog"
+        return []
+    if not free:
+        LAST_FREE_ERROR = "the catalog lists no free (price 0) models right now"
+    return free
+
+
+def _parse_free_catalog(stdout: str) -> list | None:
+    """The FREE, pinnable ids from blink's `--list-models --json` catalog.
+
+    The JSON form is an object, not the bare array `_parse_model_listing`
+    handles: `{"schema": 1, "models": [{...}, ...]}`. Each entry's
+    `price_per_hour` decides: `0` (the picker's genuine `unlimited` section) is
+    free, while `null` is a PAID model freebuff no longer prints a per-hour
+    figure for -- `null is not free`. An entry whose `id` is null could not be
+    mapped to a pinnable id and would fail at dispatch, so it is dropped even
+    when its price is 0.
+
+    Returns None (not []) when the body is not this shape at all -- a bare-id
+    listing, a malformed object, or a top-level array -- so the caller reports
+    a probe failure rather than the false "no free models". A well-formed
+    catalog with no free entries is []: a legitimate state, reported as such.
+    """
+    body = stdout.strip()
+    if not body.startswith("{"):
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    models = data.get("models")
+    if not isinstance(models, list):
+        return None
+    free = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id")
+        if not isinstance(mid, str) or not mid:
+            continue
+        price = item.get("price_per_hour")
+        # `price == 0` alone would also match False (bool is int in Python);
+        # JSON `false` is not a price, so exclude booleans explicitly.
+        if (isinstance(price, (int, float)) and not isinstance(price, bool)
+                and price == 0):
+            free.append(mid)
+    return free
 
 
 def _expand_xdg(path: str) -> Path:
@@ -574,43 +668,7 @@ def pick_model(agent: dict, current: str | None) -> str | None:
     for pid, kind, why in unlisted_logins(agent, options):
         warn(f"{pid}: logged in ({kind}) but not listed. {why}")
     if options:
-        # A stale `prefer` (Zen rotates its lineup) must not become the default
-        # just because it is written in the registry.
-        prefer = spec.get("prefer")
-        default = current or (prefer if prefer in options else None) or options[0]
-        pool = options
-        while True:
-            shown = []
-            for provider, ids in grouped_models(agent, pool):
-                if provider:
-                    say(f"  {C['dim']}{provider}/{C['x']}")
-                for m in ids[:MODELS_PER_PROVIDER]:
-                    shown.append(m)
-                    mark = f" {C['g']}(current){C['x']}" if m == current else ""
-                    say(f"  {len(shown):2}. {m}{mark}")
-                if len(ids) > MODELS_PER_PROVIDER:
-                    say(f"      {C['dim']}… {len(ids)-MODELS_PER_PROVIDER} more {provider}/ ids; "
-                        f"type part of a name to search, or a full id{C['x']}")
-            got = ask("model id (number, full id, or text to search)", default)
-            if got in options:
-                return got
-            if got.isdigit():
-                if 1 <= int(got) <= len(shown):
-                    return shown[int(got) - 1]
-                # A bare number outside the menu is a typo, not a model id --
-                # storing "30" as the pin would fail at the first dispatch.
-                err(f"enter 1-{len(shown)}, or a full model id")
-                continue
-            # Anything else narrows the menu. No match: accept it verbatim only
-            # if the user insists, since the tool did not list it.
-            hits = search_models(options, got)
-            if hits:
-                pool = hits
-                say(f"  {C['dim']}{len(hits)} match(es) for {got!r}{C['x']}")
-                continue
-            if ask_yes(f"{got!r} is not in the list; pin it anyway?", default=False):
-                return got
-            pool = options
+        return choose_model(agent, options, current)
 
     if spec.get("list_cmd"):
         warn(f"could not list models: `{' '.join(spec['list_cmd'])}` "
@@ -621,6 +679,108 @@ def pick_model(agent: dict, current: str | None) -> str | None:
         die(f"{agent['label']} requires a pinned model; an unpinned worker inherits the "
             "orchestrator's model id and the dispatch fails.")
     return got or None
+
+
+def choose_model(agent: dict, options: list, current: str | None,
+                 label: str = "model id", allow_unlisted: bool = True) -> str:
+    """The shared numbered model menu: grouped by provider prefix, searchable by
+    substring, selectable by number, full id or typed text.
+
+    Extracted from pick_model so the free-fallback picker is the SAME menu over
+    a filtered list rather than a second bespoke prompt -- the two exercise one
+    code path, so a fix or a rendering change reaches both. Returns a choice:
+    an id in `options`, or -- only when `allow_unlisted` (the pin path) -- the
+    verbatim text the user insisted on pinning even though the tool did not
+    list it. The fallback picker passes allow_unlisted=False, so it can return
+    only a free, mapped id and never a paid one typed past the menu.
+    """
+    spec = agent.get("model") or {}
+    # A stale `prefer` (Zen rotates its lineup) must not become the default just
+    # because it is written in the registry.
+    prefer = spec.get("prefer")
+    default = current or (prefer if prefer in options else None) or options[0]
+    pool = options
+    while True:
+        shown = []
+        for provider, ids in grouped_models(agent, pool):
+            if provider:
+                say(f"  {C['dim']}{provider}/{C['x']}")
+            for m in ids[:MODELS_PER_PROVIDER]:
+                shown.append(m)
+                mark = f" {C['g']}(current){C['x']}" if m == current else ""
+                say(f"  {len(shown):2}. {m}{mark}")
+            if len(ids) > MODELS_PER_PROVIDER:
+                say(f"      {C['dim']}… {len(ids)-MODELS_PER_PROVIDER} more {provider}/ ids; "
+                    f"type part of a name to search, or a full id{C['x']}")
+        got = ask(f"{label} (number, full id, or text to search)", default)
+        if got in options:
+            return got
+        if got.isdigit():
+            if 1 <= int(got) <= len(shown):
+                return shown[int(got) - 1]
+            # A bare number outside the menu is a typo, not a model id --
+            # storing "30" as the pin would fail at the first dispatch.
+            err(f"enter 1-{len(shown)}, or a full model id")
+            continue
+        # Anything else narrows the menu. No match: accept it verbatim only if
+        # the user insists, since the tool did not list it.
+        hits = search_models(options, got)
+        if hits:
+            pool = hits
+            say(f"  {C['dim']}{len(hits)} match(es) for {got!r}{C['x']}")
+            continue
+        if allow_unlisted and ask_yes(f"{got!r} is not in the list; pin it anyway?", default=False):
+            return got
+        pool = options
+
+
+def pick_fallback_model(agent: dict, current: str | None = None) -> str | None:
+    """Offer a FREE fallback model for a row that declares one, after its pin.
+
+    Only a row carrying `model.fallback_env_var` is asked at all (freebuff, for
+    the hours economy the registry note explains), so every other agent's setup
+    is untouched. The question DEFAULTS TO NO and is answered 'no' by Enter, and
+    a non-interactive plan simply carries no fallback key -- so declining or
+    skipping is always available.
+
+    Degrades without blocking: if the JSON probe fails, prints no free model, or
+    an older blink exits non-zero on `--json`, the question is skipped with a
+    plain reason and None is returned. That leaves the fallback env var unset,
+    which is safe because a blink that does not read it ignores it.
+    """
+    spec = agent.get("model") or {}
+    if not spec.get("fallback_env_var"):
+        return None
+    free = list_free_models(agent)
+    if not free:
+        warn(f"skipping the free fallback model for {agent['label']}: "
+             f"{LAST_FREE_ERROR or 'the free-model probe returned nothing'}. "
+             f"{spec['fallback_env_var']} stays unset; setup continues.")
+        return None
+    say()
+    say(f"{C['b']}Free fallback model for {agent['label']}{C['x']}")
+    if spec.get("fallback_note"):
+        say(f"  {C['dim']}{spec['fallback_note']}{C['x']}")
+    if not ask_yes("Configure a free fallback model, used when the pin is "
+                   "unusable for quota/hours reasons?", default=False):
+        return None
+    return choose_model(agent, free, current if current in free else None,
+                        label="fallback model id", allow_unlisted=False)
+
+
+def pin_entry(agent: dict, agent_id: str, priority: int,
+              prev_model: str | None, prev_fallback: str | None) -> dict:
+    """One plan entry: the model pin, then -- for a row that declares one -- the
+    free fallback chosen AFTER the pin. The `fallback_model` key is written only
+    when the row supports it AND the user said yes, so declining, skipping or a
+    failed probe leaves the key absent, BLINK_FALLBACK_MODEL unset, and the
+    rendered command exactly as it was before this feature."""
+    entry = {"id": agent_id, "priority": priority,
+             "model": pick_model(agent, prev_model)}
+    fallback = pick_fallback_model(agent, prev_fallback)
+    if fallback:
+        entry["fallback_model"] = fallback
+    return entry
 
 
 # --------------------------------------------------------------------------
@@ -918,21 +1078,21 @@ def build_plan_interactive(state: dict) -> dict:
         coder_opts, [c["id"] for c in state.get("coders", [])])
 
     prev_models = {c["id"]: c.get("model") for c in state.get("coders", [])}
-    coders = []
-    for i, cid in enumerate(coder_ids, 1):
-        model = pick_model(reg[cid], prev_models.get(cid))
-        coders.append({"id": cid, "priority": i, "model": model})
+    prev_fallbacks = {c["id"]: c.get("fallback_model") for c in state.get("coders", [])}
+    coders = [pin_entry(reg[cid], cid, i, prev_models.get(cid), prev_fallbacks.get(cid))
+              for i, cid in enumerate(coder_ids, 1)]
 
     # --- reviewer ---
     rev_opts = opts("reviewer")
     if not rev_opts:
         die("no detected CLI can act as a reviewer.")
     rev_prev = {e["id"]: e.get("model") for e in chain(state, "reviewer")}
+    rev_fb = {e["id"]: e.get("fallback_model") for e in chain(state, "reviewer")}
     reviewer_ids = pick_many_ordered(
         "Which agents REVIEW the batched diff? (reads only, never edits — "
         "preference order, the next takes over when one is out of quota)",
         rev_opts, [e["id"] for e in chain(state, "reviewer")])
-    reviewers = [{"id": rid, "priority": i, "model": pick_model(reg[rid], rev_prev.get(rid))}
+    reviewers = [pin_entry(reg[rid], rid, i, rev_prev.get(rid), rev_fb.get(rid))
                  for i, rid in enumerate(reviewer_ids, 1)]
 
     # --- optional roles, one row each (scout) ---
@@ -948,6 +1108,7 @@ def build_plan_interactive(state: dict) -> dict:
         o_opts = opts(r.role)
         cur = [e["id"] for e in chain(state, r.key)]
         prev_models = {e["id"]: e.get("model") for e in chain(state, r.key)}
+        prev_fb = {e["id"]: e.get("fallback_model") for e in chain(state, r.key)}
         optional[r.key] = []
         if not o_opts:
             continue
@@ -956,7 +1117,7 @@ def build_plan_interactive(state: dict) -> dict:
         if not ask_yes(f"Install an optional {r.key} worker?", default=bool(cur)):
             continue
         optional[r.key] = [
-            {"id": oid, "priority": i, "model": pick_model(reg[oid], prev_models.get(oid))}
+            pin_entry(reg[oid], oid, i, prev_models.get(oid), prev_fb.get(oid))
             for i, oid in enumerate(pick_many_ordered(r.ask, o_opts, cur), 1)]
 
     # --- runtime knobs ---
@@ -2154,7 +2315,7 @@ def render_spec(plan: dict, role: Role, entry: dict, name: str) -> str:
 SHIM_TOKEN = re.compile(r"\{shim:([^}]+)\}")
 
 
-def acp_command(agent: dict, model: str | None) -> str:
+def acp_command(agent: dict, model: str | None, fallback: str | None = None) -> str:
     """The ACP launch command, with the model pin baked in where the CLI needs it.
 
     Omnigent's generic ACP executor never delivers a model pin to the agent:
@@ -2176,7 +2337,12 @@ def acp_command(agent: dict, model: str | None) -> str:
 
     Newer rows name the variable inline as `model.env_var` (e.g. a freebuff/blink
     pin must reach `BLINK_MODEL`). Read it from there first, then the legacy
-    top-level `model_env` -- never hardcode an agent name.
+    top-level `model_env` -- never hardcode an agent name. A row that also
+    declares `model.fallback_env_var` (freebuff's BLINK_FALLBACK_MODEL) gets a
+    SECOND `VAR=value` in the same `env` prefix, after the pin and from the
+    plan's `fallback_model`. The order is fixed (pin first, then fallback) so
+    the rendered command -- and hence the config.yaml diff -- is byte-stable;
+    either value may be absent independently and the other still renders.
 
     A row may also carry `{shim:<name>}` inside `acp_command`. The token
     expands to the absolute path of a helper script materialized by
@@ -2190,9 +2356,16 @@ def acp_command(agent: dict, model: str | None) -> str:
     executor exec's the argv with no shell -- no $VAR may survive unexpanded.
     """
     cmd = SHIM_TOKEN.sub(lambda mt: shlex.quote(str(OMNI / "shims" / mt.group(1))), agent["acp_command"])
-    var = (agent.get("model") or {}).get("env_var") or agent.get("model_env")
+    spec = agent.get("model") or {}
+    var = spec.get("env_var") or agent.get("model_env")
+    fallback_var = spec.get("fallback_env_var")
+    env = []
     if var and model:
-        return f"env {var}={shlex.quote(model)} {cmd}"
+        env.append(f"{var}={shlex.quote(model)}")
+    if fallback_var and fallback:
+        env.append(f"{fallback_var}={shlex.quote(fallback)}")
+    if env:
+        return f"env {' '.join(env)} {cmd}"
     return cmd
 
 
@@ -2261,7 +2434,7 @@ def patch_global_config(plan: dict) -> list:
         by_name = {r.get("name"): r for r in rows if isinstance(r, dict)}
         for c in want:
             a = reg[c["id"]]
-            row = {"command": acp_command(a, c.get("model")), "name": a["label"],
+            row = {"command": acp_command(a, c.get("model"), c.get("fallback_model")), "name": a["label"],
                    "omnigent_mcp": a.get("omnigent_mcp", False)}
             if c.get("model"):
                 row["model"] = c["model"]
@@ -2852,11 +3025,18 @@ def emit_questions() -> None:
              "ask": r.ask}
         if r.spec:
             # The same static model list under every role that pins one, so an
-            # AI installer can answer for each entry of the chain.
+            # AI installer can answer for each entry of the chain. The fallback
+            # has no static choices: its lineup comes from `blink --list-models
+            # --json` at interactive time, so it is a plain string question
+            # (blank = none) and only freebuff actually consumes it.
             q["per_item"] = {
                 "model": "Model id to pin. REQUIRED for agents where "
                          "registry.model.required is true.",
-                "choices": model_choices}
+                "choices": model_choices,
+                "fallback_model": "Free fallback model id (blank = none). Only "
+                                  "freebuff uses it; the choice is exported as "
+                                  "BLINK_FALLBACK_MODEL alongside BLINK_MODEL.",
+            }
         role_questions.append(q)
     say(json.dumps({
         "detected": {k: reg[k]["label"] for k in found},
@@ -2936,36 +3116,44 @@ def show(state: dict) -> None:
     for c in state["coders"]:
         live = "" if c["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {c['model']}" if c.get("model") else ""
+        fb = f" (fallback: {c['fallback_model']})" if c.get("fallback_model") \
+            else " (fallback: none)"
         say(f"{C['b']}coder #{c['priority']}{C['x']}      "
-            f"{worker_name(c['id'])} ({reg[c['id']]['label']}){pin}{live}")
+            f"{worker_name(c['id'])} ({reg[c['id']]['label']}){pin}{fb}{live}")
     for i, e in enumerate(revs):
         live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {e['model']}" if e.get("model") else ""
+        fb = f" (fallback: {e['fallback_model']})" if e.get("fallback_model") \
+            else " (fallback: none)"
         if i == 0:
             tail = " (primary)" if len(revs) > 1 else ""
-            say(f"{C['b']}reviewer{C['x']}      {reg[e['id']]['label']}{pin}{tail}{live}")
+            say(f"{C['b']}reviewer{C['x']}      {reg[e['id']]['label']}{pin}{fb}{tail}{live}")
         else:
             say(f"{C['b']}  backup #{e['priority']}{C['x']}  {reg[e['id']]['label']}"
-                f"{pin}{live}")
+                f"{pin}{fb}{live}")
     for i, e in enumerate(scs):
         live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {e['model']}" if e.get("model") else ""
+        fb = f" (fallback: {e['fallback_model']})" if e.get("fallback_model") \
+            else " (fallback: none)"
         if i == 0:
             tail = " (primary)" if len(scs) > 1 else ""
-            say(f"{C['b']}scout{C['x']}         {reg[e['id']]['label']}{pin}{tail}{live}")
+            say(f"{C['b']}scout{C['x']}         {reg[e['id']]['label']}{pin}{fb}{tail}{live}")
         else:
             say(f"{C['b']}scout #{e['priority']}{C['x']}     {reg[e['id']]['label']}"
-                f"{pin}{live}")
+                f"{pin}{fb}{live}")
     igs = chain(state, "integrator")
     for i, e in enumerate(igs):
         live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {e['model']}" if e.get("model") else ""
+        fb = f" (fallback: {e['fallback_model']})" if e.get("fallback_model") \
+            else " (fallback: none)"
         if i == 0:
             tail = " (primary)" if len(igs) > 1 else ""
-            say(f"{C['b']}integrator{C['x']}    {reg[e['id']]['label']}{pin}{tail}{live}")
+            say(f"{C['b']}integrator{C['x']}    {reg[e['id']]['label']}{pin}{fb}{tail}{live}")
         else:
             say(f"{C['b']}integrator #{e['priority']}{C['x']} {reg[e['id']]['label']}"
-                f"{pin}{live}")
+                f"{pin}{fb}{live}")
     say(f"{C['b']}port{C['x']}          {state['port']}")
     say(f"{C['b']}ngrok{C['x']}         {state.get('ngrok_domain') or '(ephemeral)'}")
     say(f"{C['b']}tunnel{C['x']}        {state.get('tunnel_provider', 'ngrok')}")
