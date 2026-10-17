@@ -2514,6 +2514,134 @@ def test_list_models_json_tolerates_an_empty_array(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# free fallback: the JSON catalog probe and the free-only picker
+# --------------------------------------------------------------------------
+def _catalog(models):
+    """The object shape blink's `--list-models --json` prints."""
+    return json.dumps({"schema": 1, "models": models})
+
+
+def test_list_free_models_keeps_only_free_and_mapped(monkeypatch):
+    """A mix of free / paid / unmapped entries: only price_per_hour == 0
+    entries with a usable id are fallback candidates. A nonzero price is paid,
+    the null price freebuff now prints for paid models is NOT free, and an
+    id-less entry is one blink could not map to a pinnable id."""
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(_catalog([
+        {"id": "upstage/solar-pro4", "price_per_hour": 0, "section": "unlimited"},
+        {"id": "z-ai/glm-5.3-flash", "price_per_hour": 5},
+        {"id": None, "price_per_hour": 0},
+        {"id": "mimo/mimo-v2.6-pro", "price_per_hour": None},
+        {"id": "upstage/solar-mini4", "price_per_hour": 0},
+    ])))
+    agent = m.agents_by_id()["freebuff"]
+    assert m.list_free_models(agent) == ["upstage/solar-pro4", "upstage/solar-mini4"]
+
+
+def test_list_free_models_noop_without_a_json_probe():
+    """A row with no `list_cmd_json` is never probed -- the fallback feature
+    cannot slow down an agent that does not use it."""
+    assert m.list_free_models({"model": {"list_cmd": ["blink", "--list-models"]}}) == []
+
+
+def test_list_free_models_reports_a_nonzero_exit(monkeypatch):
+    """An older blink without `--json` exits non-zero; the reason names the
+    exit code so the skip message can explain it rather than demand a retry."""
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("boom", returncode=2))
+    assert m.list_free_models(m.agents_by_id()["freebuff"]) == []
+    assert "exited 2" in m.LAST_FREE_ERROR
+
+
+def test_list_free_models_reports_a_malformed_catalog(monkeypatch):
+    """A body that is not the expected JSON object is a probe failure, not the
+    false "no free models"."""
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("upstage/solar-pro4\n"))
+    assert m.list_free_models(m.agents_by_id()["freebuff"]) == []
+    assert "JSON catalog" in m.LAST_FREE_ERROR
+
+
+def test_pick_fallback_offers_only_the_free_mapped_ids_after_yes(monkeypatch, capsys):
+    """On yes the SAME numbered menu is shown over the free, mapped ids only;
+    a paid id the probe returned never reaches the menu."""
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(_catalog([
+        {"id": "upstage/solar-pro4", "price_per_hour": 0},
+        {"id": "z-ai/glm-5.3-flash", "price_per_hour": 5},
+        {"id": "upstage/solar-mini4", "price_per_hour": 0},
+    ])))
+    monkeypatch.setattr(m, "ask_yes", lambda prompt, default=False: True)
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "1")
+    assert m.pick_fallback_model(m.agents_by_id()["freebuff"], None) == "upstage/solar-pro4"
+    out = capsys.readouterr().out
+    assert "upstage/solar-pro4" in out
+    assert "z-ai/glm-5.3-flash" not in out
+
+
+def test_pick_fallback_defaults_to_no(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(
+        _catalog([{"id": "upstage/solar-pro4", "price_per_hour": 0}])))
+    seen = {}
+
+    def fake_ask_yes(prompt, default=False):
+        seen["default"] = default
+        return default
+
+    monkeypatch.setattr(m, "ask_yes", fake_ask_yes)
+    assert m.pick_fallback_model(m.agents_by_id()["freebuff"], None) is None
+    assert seen["default"] is False
+
+
+def test_pick_fallback_skips_on_a_failed_probe_with_a_reason(monkeypatch, capsys):
+    """A failing probe (here an older/too-old blink) must NOT block setup: the
+    question is skipped, a plain reason is printed, and None is returned so no
+    env var is rendered and the pin command is byte-for-byte unchanged."""
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("boom", returncode=1))
+    reg = m.agents_by_id()
+    assert m.pick_fallback_model(reg["freebuff"], None) is None
+    out = capsys.readouterr().out
+    assert "skipping the free fallback model" in out
+    assert "BLINK_FALLBACK_MODEL" in out
+    assert m.acp_command(reg["freebuff"], "mimo/mimo-v2.6-pro") == \
+        "env BLINK_MODEL=mimo/mimo-v2.6-pro blink"
+
+
+def test_pick_fallback_skips_when_the_catalog_has_no_free_models(monkeypatch, capsys):
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(
+        _catalog([{"id": "z-ai/glm-5.3-flash", "price_per_hour": 5}])))
+    assert m.pick_fallback_model(m.agents_by_id()["freebuff"], None) is None
+    assert "no free" in capsys.readouterr().out
+
+
+def test_pick_fallback_not_offered_for_rows_without_the_capability(monkeypatch):
+    """Only a row declaring model.fallback_env_var is asked; every other agent's
+    setup is untouched and never spawns the JSON probe."""
+    called = []
+
+    def spy(*a, **k):
+        called.append(a)
+
+    monkeypatch.setattr(m.subprocess, "run", spy)
+    assert m.pick_fallback_model(m.agents_by_id()["opencode"], None) is None
+    assert called == []
+
+
+def test_pin_entry_records_the_fallback_only_when_chosen(monkeypatch):
+    """Declining writes no fallback key (so no env var renders); accepting
+    records the free id chosen through the shared menu."""
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "list_models", lambda agent: ["mimo/mimo-v2.6-pro"])
+    monkeypatch.setattr(m, "list_free_models", lambda agent: ["upstage/solar-pro4"])
+    monkeypatch.setattr(m, "ask_yes", lambda prompt, default=False: False)
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: default)
+    declined = m.pin_entry(reg["freebuff"], "freebuff", 1, None, None)
+    assert declined == {"id": "freebuff", "priority": 1, "model": "mimo/mimo-v2.6-pro"}
+
+    monkeypatch.setattr(m, "ask_yes", lambda prompt, default=False: True)
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "1")
+    accepted = m.pin_entry(reg["freebuff"], "freebuff", 1, None, None)
+    assert accepted["model"] == "mimo/mimo-v2.6-pro"
+    assert accepted["fallback_model"] == "upstage/solar-pro4"
+
+
+# --------------------------------------------------------------------------
 # pick_model: live probe wins, stale `choices` is the fallback only
 # --------------------------------------------------------------------------
 def test_pick_model_uses_live_ids_when_the_probe_succeeds(monkeypatch):
@@ -2649,7 +2777,13 @@ def test_pick_model_offers_choices_by_number(monkeypatch):
     # the static lineup is what the numbered menu shows when it does not. The
     # early-return bail-out no longer fires, so the fallback is shown through
     # the same numbered menu and selectable by number.
+    #
+    # The probe is stubbed to [] on purpose: without this the test ran the real
+    # `blink`, so it passed only on a machine WITHOUT blink installed (CI) and
+    # failed for a developer who has one -- the menu showed the live lineup
+    # instead of `choices`.
     reg = m.agents_by_id()
+    monkeypatch.setattr(m, "list_models", lambda agent: [])
     answers = iter(["5"])
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
     assert m.pick_model(reg["freebuff"], None) == "deepseek/deepseek-v4-flash"
@@ -2840,6 +2974,36 @@ def test_patch_global_config_renders_env_var_for_freebuff(tmp_path, monkeypatch)
     cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
     row = next(r for r in cfg["acp"]["agents"] if r["name"] == "Freebuff")
     assert row["command"].startswith("env BLINK_MODEL=deepseek/deepseek-v4.1-flash blink")
+
+
+def test_acp_command_renders_the_fallback_after_the_pin():
+    """Both vars render in a fixed order -- pin first, then fallback -- so the
+    command (and the config.yaml diff) is byte-stable. Either value may be
+    absent independently, and a row without fallback_env_var (Cline) ignores a
+    fallback even when one is passed."""
+    reg = m.agents_by_id()
+    assert m.acp_command(reg["freebuff"], "mimo/mimo-v2.6-pro",
+                         "upstage/solar-pro4") == \
+        "env BLINK_MODEL=mimo/mimo-v2.6-pro BLINK_FALLBACK_MODEL=upstage/solar-pro4 blink"
+    assert m.acp_command(reg["freebuff"], None, "upstage/solar-pro4") == \
+        "env BLINK_FALLBACK_MODEL=upstage/solar-pro4 blink"
+    assert m.acp_command(reg["freebuff"], "mimo/mimo-v2.6-pro") == \
+        "env BLINK_MODEL=mimo/mimo-v2.6-pro blink"
+    assert m.acp_command(reg["cline"], "deepseek/deepseek-v4-flash", "x/y") == \
+        "env CLINE_MODEL=deepseek/deepseek-v4-flash cline --acp --auto-approve true"
+
+
+def test_patch_global_config_renders_the_fallback_env_var_for_freebuff(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "OMNI", tmp_path)
+    (tmp_path / "config.yaml").write_text("{}\n")
+    plan = _base_plan(coders=[{"id": "freebuff", "priority": 1,
+                               "model": "mimo/mimo-v2.6-pro",
+                               "fallback_model": "upstage/solar-pro4"}])
+    m.patch_global_config(plan)
+    cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
+    row = next(r for r in cfg["acp"]["agents"] if r["name"] == "Freebuff")
+    assert row["command"] == ("env BLINK_MODEL=mimo/mimo-v2.6-pro "
+                              "BLINK_FALLBACK_MODEL=upstage/solar-pro4 blink")
 
 
 # --------------------------------------------------------------------------

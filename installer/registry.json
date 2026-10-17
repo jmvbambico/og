@@ -526,7 +526,12 @@
           "blink",
           "--list-models"
         ],
-        "note": "At setup time og runs `blink --list-models` and offers every id it prints; that live probe is the source of truth because the lineup ROTATES server-side. `choices` below is a FALLBACK used only when the probe fails or an older blink lacks `--list-models` -- never an empty list. Model ids are provider-prefixed or opaque hashes (e.g. `z-ai/glm-5.3-flash`, `mimo/mimo-v2.6-pro`, `openai/gpt-6-luna`, `upstage/solar-pro4`, `deepseek/deepseek-v4-flash`, `m-79293c5b7d`), so a pin is always written with its prefix and never matched against a splash display name. Pinning one exports BLINK_MODEL=<id> into the worker env; a blink that honours BLINK_MODEL selects it, an older blink accepts freebuff's default. A pin naming a model freebuff is not offering fails the dispatch loudly rather than running the default. Vendor follows the model: a deepseek/* pick makes Freebuff same-vendor with Cline for review purposes.",
+        "list_cmd_json": [
+          "blink",
+          "--list-models",
+          "--json"
+        ],
+        "note": "At setup time og runs `blink --list-models` and offers every id it prints; that live probe is the source of truth because the lineup ROTATES server-side. `choices` below is a FALLBACK used only when the probe fails or an older blink lacks `--list-models` -- never an empty list. Model ids are provider-prefixed or opaque hashes (e.g. `z-ai/glm-5.3-flash`, `mimo/mimo-v2.6-pro`, `openai/gpt-6-luna`, `upstage/solar-pro4`, `deepseek/deepseek-v4-flash`, `m-79293c5b7d`), so a pin is always written with its prefix and never matched against a splash display name. Pinning one exports BLINK_MODEL=<id> into the worker env; a blink that honours BLINK_MODEL selects it, an older blink accepts freebuff's default. A pin naming a model freebuff is not offering fails the dispatch loudly rather than running the default. Vendor follows the model: a deepseek/* pick makes Freebuff same-vendor with Cline for review purposes. The HOURS ECONOMY is why a fallback pin is worth configuring: each launch draws from freebuff's small DAILY pool of hours at the pinned model's per-hour rate, so a costly pin can exhaust the pool and every later dispatch is refused with 'not enough Freebucks'. The picker's `unlimited` section is genuinely FREE (price_per_hour 0), so og probes the JSON catalog (`list_cmd_json`) for the free, id-mapped models and, after the pin is chosen, offers a SECOND free-only picker; the choice is exported as BLINK_FALLBACK_MODEL alongside BLINK_MODEL, and blink falls back to it when the pin is unusable. A blink too old to accept the variable ignores it, so leaving BLINK_FALLBACK_MODEL unset is always safe.",
         "choices": [
           "z-ai/glm-5.3-flash",
           "mimo/mimo-v2.6-pro",
@@ -535,7 +540,10 @@
           "deepseek/deepseek-v4-flash"
         ],
         "prefer": "z-ai/glm-5.3-flash",
-        "env_var": "BLINK_MODEL"
+        "env_var": "BLINK_MODEL",
+        "fallback_env_var": "BLINK_FALLBACK_MODEL",
+        "fallback_note": "A free model (price 0) used only when the pinned model is unusable for quota/hours reasons. The picker's `unlimited` section is genuinely free, so it never draws on the paid hours pool. Optional: leaving it unset changes nothing, and an older blink that does not read BLINK_FALLBACK_MODEL ignores it.",
+        "list_cmd_json_note": "The `--json` probe is the ONLY source of per-model prices: the plain listing prints bare ids with no price, so free models (price_per_hour 0) are discoverable from this JSON form alone. Entries whose `id` is null could not be mapped to a pinnable id and are dropped; `price_per_hour` null means a paid model with no printed per-hour figure, not free. Run only for the fallback picker, so setup for agents without a fallback is not slowed down."
       },
       "install": {
         "cargo": "cargo install --git https://github.com/jmvbambico/bufflink --tag v0.1.2"
