@@ -3025,11 +3025,18 @@ def emit_questions() -> None:
              "ask": r.ask}
         if r.spec:
             # The same static model list under every role that pins one, so an
-            # AI installer can answer for each entry of the chain.
+            # AI installer can answer for each entry of the chain. The fallback
+            # has no static choices: its lineup comes from `blink --list-models
+            # --json` at interactive time, so it is a plain string question
+            # (blank = none) and only freebuff actually consumes it.
             q["per_item"] = {
                 "model": "Model id to pin. REQUIRED for agents where "
                          "registry.model.required is true.",
-                "choices": model_choices}
+                "choices": model_choices,
+                "fallback_model": "Free fallback model id (blank = none). Only "
+                                  "freebuff uses it; the choice is exported as "
+                                  "BLINK_FALLBACK_MODEL alongside BLINK_MODEL.",
+            }
         role_questions.append(q)
     say(json.dumps({
         "detected": {k: reg[k]["label"] for k in found},
@@ -3109,36 +3116,44 @@ def show(state: dict) -> None:
     for c in state["coders"]:
         live = "" if c["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {c['model']}" if c.get("model") else ""
+        fb = f" (fallback: {c['fallback_model']})" if c.get("fallback_model") \
+            else " (fallback: none)"
         say(f"{C['b']}coder #{c['priority']}{C['x']}      "
-            f"{worker_name(c['id'])} ({reg[c['id']]['label']}){pin}{live}")
+            f"{worker_name(c['id'])} ({reg[c['id']]['label']}){pin}{fb}{live}")
     for i, e in enumerate(revs):
         live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {e['model']}" if e.get("model") else ""
+        fb = f" (fallback: {e['fallback_model']})" if e.get("fallback_model") \
+            else " (fallback: none)"
         if i == 0:
             tail = " (primary)" if len(revs) > 1 else ""
-            say(f"{C['b']}reviewer{C['x']}      {reg[e['id']]['label']}{pin}{tail}{live}")
+            say(f"{C['b']}reviewer{C['x']}      {reg[e['id']]['label']}{pin}{fb}{tail}{live}")
         else:
             say(f"{C['b']}  backup #{e['priority']}{C['x']}  {reg[e['id']]['label']}"
-                f"{pin}{live}")
+                f"{pin}{fb}{live}")
     for i, e in enumerate(scs):
         live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {e['model']}" if e.get("model") else ""
+        fb = f" (fallback: {e['fallback_model']})" if e.get("fallback_model") \
+            else " (fallback: none)"
         if i == 0:
             tail = " (primary)" if len(scs) > 1 else ""
-            say(f"{C['b']}scout{C['x']}         {reg[e['id']]['label']}{pin}{tail}{live}")
+            say(f"{C['b']}scout{C['x']}         {reg[e['id']]['label']}{pin}{fb}{tail}{live}")
         else:
             say(f"{C['b']}scout #{e['priority']}{C['x']}     {reg[e['id']]['label']}"
-                f"{pin}{live}")
+                f"{pin}{fb}{live}")
     igs = chain(state, "integrator")
     for i, e in enumerate(igs):
         live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {e['model']}" if e.get("model") else ""
+        fb = f" (fallback: {e['fallback_model']})" if e.get("fallback_model") \
+            else " (fallback: none)"
         if i == 0:
             tail = " (primary)" if len(igs) > 1 else ""
-            say(f"{C['b']}integrator{C['x']}    {reg[e['id']]['label']}{pin}{tail}{live}")
+            say(f"{C['b']}integrator{C['x']}    {reg[e['id']]['label']}{pin}{fb}{tail}{live}")
         else:
             say(f"{C['b']}integrator #{e['priority']}{C['x']} {reg[e['id']]['label']}"
-                f"{pin}{live}")
+                f"{pin}{fb}{live}")
     say(f"{C['b']}port{C['x']}          {state['port']}")
     say(f"{C['b']}ngrok{C['x']}         {state.get('ngrok_domain') or '(ephemeral)'}")
     say(f"{C['b']}tunnel{C['x']}        {state.get('tunnel_provider', 'ngrok')}")

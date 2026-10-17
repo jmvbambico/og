@@ -882,6 +882,26 @@ def test_show_renders_both_chains_in_order_with_the_primary_first(tmp_path, monk
     assert "→ auto" in out                    # the backup's own pin is shown
 
 
+def test_show_renders_a_configured_fallback(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"freebuff": "/bin/blink"})
+    state = _base_plan(coders=[{"id": "freebuff", "priority": 1,
+                                "model": "mimo/mimo-v2.6-pro",
+                                "fallback_model": "upstage/solar-pro4"}])
+    m.show(state)
+    out = capsys.readouterr().out
+    assert "fallback: upstage/solar-pro4" in out
+
+
+def test_show_renders_unconfigured_fallback_without_an_empty_field(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan", lambda: {"freebuff": "/bin/blink"})
+    state = _base_plan(coders=[{"id": "freebuff", "priority": 1,
+                                "model": "mimo/mimo-v2.6-pro"}])
+    m.show(state)
+    out = capsys.readouterr().out
+    assert "fallback: none" in out
+    # the unconfigured case prints an explicit marker, never an empty field
+
+
 def test_emit_questions_offers_orchestrator_and_reviewer_as_ordered_chains(monkeypatch, capsys):
     monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "codex": "/bin/codex"})
     monkeypatch.setattr(m, "load_state", lambda: {})
@@ -2926,6 +2946,24 @@ def test_emit_questions_carries_choices(monkeypatch, capsys):
         "upstage/solar-pro4", "deepseek/deepseek-v4-flash"]
     # rows without choices are simply absent, not empty
     assert "cline" not in coder_q["per_item"]["choices"]
+
+
+def test_emit_questions_carries_a_fallback_model_question(monkeypatch, capsys):
+    # --questions must let an AI installer configure a fallback, mirroring the
+    # model pin. The fallback has no static choices (its lineup comes from the
+    # live `blink --list-models --json` probe), so it is a plain string
+    # question with blank meaning none.
+    monkeypatch.setattr(m, "scan", lambda: {"freebuff": "/bin/blink"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    coder_q = next(x for x in q["questions"] if x["key"] == "coders")
+    assert "fallback_model" in coder_q["per_item"]
+    fb = coder_q["per_item"]["fallback_model"]
+    assert isinstance(fb, str)
+    assert "BLINK_FALLBACK_MODEL" in fb
+    # a plain string, not a choices dict: the lineup comes from the live probe
 
 
 def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
