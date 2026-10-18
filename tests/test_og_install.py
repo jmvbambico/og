@@ -319,7 +319,118 @@ def test_primary_collision_warning_reads_as_immediate_not_failover():
 def test_validate_errors_when_orchestrator_cannot_relay():
     plan = _base_plan(orchestrator="cline")
     issues = m.validate(plan)
-    assert any(level == "error" and "cannot dispatch sub-agents" in msg for level, msg in issues)
+    msg = next(msg for level, msg in issues
+               if level == "error" and "cannot dispatch sub-agents" in msg)
+    # The refusal names the offender by id, cites WHY, and always lists which
+    # agents here CAN orchestrate.
+    assert "cline cannot be the orchestrator" in msg
+    assert "Orchestrator-capable agents here:" in msg
+
+
+# --------------------------------------------------------------------------
+# any agent, any role: the roles whitelist is gone; capability is MEASURED
+# --------------------------------------------------------------------------
+def test_dispatch_capability_measures_from_omnigent_caps(monkeypatch):
+    # The authoritative source is Omnigent's own capabilities[<harness>].
+    # subagents; a measured False beats a stale registry `relay: true`.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS",
+                        {"claude-native": True, "grok": False, "acp": False})
+    reg = m.agents_by_id()
+    grok = m.dispatch_capability(reg["grok"])       # relay still says true
+    assert grok.can is False and grok.source == "measured"
+    claude = m.dispatch_capability(reg["claude"])
+    assert claude.can is True and claude.source == "measured"
+
+
+def test_dispatch_capability_falls_back_to_the_registry_flag(monkeypatch):
+    # Omnigent is a separate homebrew install and is often NOT importable from
+    # the interpreter running the installer. A probe that cannot run must not
+    # crash setup: fall back to the `relay` flag and SAY that is the source.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", None)
+    reg = m.agents_by_id()
+    claude = m.dispatch_capability(reg["claude"])
+    assert claude.can is True and claude.source == "registry-flag"
+    cline = m.dispatch_capability(reg["cline"])
+    assert cline.can is False and cline.source == "registry-flag"
+
+
+def test_dispatch_capability_asks_the_shared_acp_key(monkeypatch):
+    # An `acp:<slug>` harness has no capability key of its own; Omnigent exposes
+    # ONE shared `acp` entry for the whole ACP transport. Ask it next, before
+    # falling back to the registry flag -- and record which key answered.
+    reg = m.agents_by_id()
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", {"acp": True})
+    cap = m.dispatch_capability(reg["cmdcode"])     # harness acp:command-code, relay false
+    assert cap.can is True and cap.source == "measured" and cap.shared_key == "acp"
+    # With no shared key either, the registry flag stands.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", {"claude-native": True})
+    fallback = m.dispatch_capability(reg["cmdcode"])
+    assert fallback.can is False and fallback.source == "registry-flag"
+
+
+def test_measured_subagent_caps_returns_none_when_omnigent_is_unimportable(monkeypatch):
+    # A failed import (or any probe error) is swallowed into None -- never an
+    # exception that would kill setup -- and memoized so the picker does not
+    # re-import per row.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", m._UNSET)
+    monkeypatch.setitem(sys.modules, "omnigent", None)   # forces ImportError
+    assert m.measured_subagent_caps() is None
+    assert m._SUBAGENT_CAPS is None                       # cached, not _UNSET
+
+
+def test_validate_refuses_a_dead_orchestrator_and_names_the_capable_agents(monkeypatch):
+    # cmdcode's row has no `orchestrator` role, but the picker no longer reads
+    # `roles` -- so it IS selectable, and the only thing that may stop it is the
+    # MEASURED dispatch bar. The refusal cites the measurement and its source
+    # and names every agent that can orchestrate here.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", {
+        "acp": False, "claude-native": True, "codex-native": True,
+        "opencode-native": True, "devin-native": True})
+    errors = [msg for level, msg in m.validate(_base_plan(orchestrator="cmdcode"))
+              if level == "error"]
+    msg = next(msg for msg in errors if "cannot be the orchestrator" in msg)
+    assert "cmdcode cannot be the orchestrator" in msg
+    assert "omnigent reports harness 'acp:command-code'" in msg
+    assert "via shared key 'acp'" in msg
+    assert "cannot dispatch sub-agents" in msg
+    assert "Orchestrator-capable agents here: claude, opencode, codex, devin" in msg
+
+
+def test_validate_warns_not_refuses_for_a_non_orchestrator_role():
+    # Any agent may now fill any non-orchestrator role. An unverified row and an
+    # unknown-prompt_delivery harness both WARN and proceed; neither can block
+    # an otherwise-legal install.
+    plan = _base_plan(
+        coders=[{"id": "kilo", "priority": 1, "model": "kilo/kilo-auto/free"}],
+        reviewer={"id": "cmdcode", "model": "moonshotai/kimi-k3"})
+    issues = m.validate(plan)
+    assert not [msg for level, msg in issues if level == "error"], issues
+    warns = [msg for level, msg in issues if level == "warn"]
+    assert any("UNVERIFIED in this project" in msg and "Kilo Code" in msg
+               for msg in warns), warns
+    assert any("prompt_delivery: unknown" in msg for msg in warns), warns
+
+
+def test_role_options_offer_every_detected_agent_for_every_role():
+    # Removing the whitelist is the point: cmdcode (no `orchestrator` role) must
+    # be offered as orchestrator, and claude (which has every role) as a coder,
+    # for every role in the table.
+    found = {a["id"]: "/bin/" + a["id"] for a in m.REGISTRY["agents"]}
+    for role in ("orchestrator", "coder", "reviewer", "scout", "integrator"):
+        ids = {aid for aid, _, _ in m.role_options(role, found)}
+        assert ids == set(found), (role, ids ^ set(found))
+
+
+def test_emit_questions_offers_every_detected_agent_for_every_role(monkeypatch, capsys):
+    monkeypatch.setattr(m, "scan",
+                        lambda: {"cmdcode": "/bin/cmd-acp", "claude": "/bin/claude"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    for question in q["questions"]:
+        if question.get("type") == "ordered_multi":
+            assert set(question["choices"]) == {"cmdcode", "claude"}, question["key"]
 
 
 def test_validate_errors_when_orchestrator_prompt_not_delivered():
@@ -453,16 +564,21 @@ def test_validate_errors_when_a_backup_orchestrator_never_receives_its_prompt():
 
 
 def test_validate_warns_when_the_orchestrator_is_unverified_for_that_role():
-    # grok/devin clear the gates validate() enforces for orchestrator, so the
-    # role is legal -- but no og run has ever been driven with either as the
-    # brain. The registry records that per role; the caveat must reach a user
-    # choosing one, as a WARN (a weak orchestrator at runtime, not a broken
-    # install), never as an error.
-    for aid in ("grok", "devin"):
-        issues = m.validate(_base_plan(orchestrator=aid))
-        warns = [msg for level, msg in issues if level == "warn"]
-        assert any("UNVERIFIED as orchestrator" in msg for msg in warns), (aid, issues)
-        assert not any(level == "error" for level, _ in issues), (aid, issues)
+    # devin clears the MEASURED dispatch bar (harness devin-native reports
+    # subagents=True) and never receives `none`, so the role is legal -- but no
+    # og run has ever been driven with it as the brain. The registry records that
+    # per role; the caveat must reach a user choosing one, as a WARN (a weak
+    # orchestrator at runtime, not a broken install), never as an error. grok no
+    # longer qualifies -- its harness cannot dispatch -- so it is a separate
+    # refusal, not a warning.
+    issues = m.validate(_base_plan(orchestrator="devin"))
+    warns = [msg for level, msg in issues if level == "warn"]
+    assert any("UNVERIFIED as orchestrator" in msg for msg in warns), issues
+    assert not any(level == "error" for level, _ in issues), issues
+
+    grok = m.validate(_base_plan(orchestrator="grok"))
+    assert any(level == "error" and "cannot dispatch sub-agents" in msg
+               for level, msg in grok), grok
 
 
 def test_validate_no_unverified_warning_for_a_verified_role():
@@ -471,17 +587,31 @@ def test_validate_no_unverified_warning_for_a_verified_role():
     assert not any("UNVERIFIED" in msg for _, msg in issues)
 
 
-def test_role_options_flag_a_role_the_row_marks_unverified():
-    # The per-role marker must reach the pick_one note (the picker's third
-    # per-option field) at SELECTION time -- and must not taint a role the row
-    # is verified for. Same row, two roles, opposite notes.
+def test_role_options_note_capability_without_hiding_an_agent():
+    # The capability caveat rides the pick_one note (the picker's third field) at
+    # SELECTION time; it must not exclude the option, and must not taint a role
+    # where dispatching is irrelevant (a coder is a leaf worker by definition).
     orch = {aid: note for aid, _, note in
-            m.role_options("orchestrator", {"grok": "/bin/grok", "claude": "/bin/claude"})}
-    assert "UNVERIFIED as orchestrator" in orch["grok"]
-    assert orch["claude"] is None
+            m.role_options("orchestrator",
+                           {"grok": "/bin/grok", "claude": "/bin/claude"})}
+    assert set(orch) == {"grok", "claude"}
+    assert "cannot dispatch sub-agents" in orch["grok"]
+    assert "can dispatch sub-agents" in orch["claude"]
     coder = {aid: note for aid, _, note in
-             m.role_options("coder", {"grok": "/bin/grok"})}
-    assert coder["grok"] is None
+             m.role_options("coder",
+                            {"grok": "/bin/grok", "claude": "/bin/claude"})}
+    assert coder["grok"] is None and coder["claude"] is None
+
+
+def test_role_options_carry_the_unverified_roles_caveat():
+    # The per-role UNVERIFIED marker still reaches the picker for an agent that
+    # is legal but unproven in that role (devin as orchestrator).
+    orch = {aid: note for aid, _, note in
+            m.role_options("orchestrator", {"devin": "/bin/devin"})}
+    assert "UNVERIFIED as orchestrator" in orch["devin"]
+    coder = {aid: note for aid, _, note in
+             m.role_options("coder", {"devin": "/bin/devin"})}
+    assert coder["devin"] is None
 
 
 # --------------------------------------------------------------------------
@@ -2969,7 +3099,10 @@ def test_emit_questions_carries_a_fallback_model_question(monkeypatch, capsys):
 def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
     # AGENTS.md Part 1 has an AI installer drive its conversation from
     # --questions and never offer an agent without the warning that applies to
-    # it. The caveat is per role, so it rides the question offering that role.
+    # it. The caveat is per role, so it rides the question offering that role --
+    # and the orchestrator question also carries every agent's measured dispatch
+    # capability (boolean + source), so a dead orchestrator is visible before it
+    # is chosen.
     monkeypatch.setattr(m, "scan", lambda: {"grok": "/bin/grok", "devin": "/bin/devin",
                                             "claude": "/bin/claude"})
     monkeypatch.setattr(m, "load_state", lambda: {})
@@ -2977,15 +3110,18 @@ def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
     out = capsys.readouterr().out
     q = json.loads(out[out.index("{"):])
     orch_q = next(x for x in q["questions"] if x["key"] == "orchestrator")
-    assert "UNVERIFIED as orchestrator" in orch_q["notes"]["grok"]
     assert "UNVERIFIED as orchestrator" in orch_q["notes"]["devin"]
-    assert "claude" not in orch_q["notes"]
+    # grok can no longer orchestrate, so it carries the capability caveat, not
+    # the unverified one; claude is capable and says so, with its source.
+    assert "cannot dispatch sub-agents" in orch_q["notes"]["grok"]
+    assert "can dispatch sub-agents" in orch_q["notes"]["claude"]
+    assert "source:" in orch_q["notes"]["claude"]
     # ...and the coder question carries nothing for them: verified in that role.
     coder_q = next(x for x in q["questions"] if x["key"] == "coders")
     assert "grok" not in coder_q["notes"] and "devin" not in coder_q["notes"]
     # The raw field is in the embedded registry for a consumer that reads it.
-    grok_row = next(r for r in q["registry"] if r["id"] == "grok")
-    assert grok_row["unverified_roles"] == ["orchestrator"]
+    devin_row = next(r for r in q["registry"] if r["id"] == "devin")
+    assert devin_row["unverified_roles"] == ["orchestrator"]
 
 
 # --------------------------------------------------------------------------
@@ -3626,6 +3762,7 @@ PER_ROLE_SITES = {
     "og_install.py": {
         "apply",
         "build_plan_interactive",
+        "dispatch_note",
         "integrator_note",
         "opencode_worker_config_dir",
         "patch_global_config",

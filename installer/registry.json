@@ -16,14 +16,12 @@
     "                Omnigent's slugify(label): lowercase, non-alphanumerics -> '-'.",
     "                A wrong slug does not error — Omnigent silently falls back to",
     "                the FIRST configured acp.agents row, i.e. a different vendor.",
-    "  roles         which slots it may fill. Every coder is also offered as a",
-    "                `scout` and an `integrator`. The scout's requirements (run",
-    "                shell, read files, return a bounded summary) and the",
-    "                integrator's (run shell, write a worktree, run gates) are each",
-    "                a strict subset of a coder's, and neither needs `relay` (they",
-    "                never dispatch) nor cross-vendor independence (neither judges:",
-    "                the integrator never decides a merge, the scout never judges",
-    "                at all), so no extra bar applies to either.",
+    "  roles         the slots this row has historically filled, INFORMATIONAL",
+    "                only: it no longer gates any picker. Every detected agent is",
+    "                offered for every role (orchestrator, coder, reviewer,",
+    "                scout, integrator); whether it can ACTUALLY fill one is",
+    "                decided by the measured dispatch probe (see `relay`) and",
+    "                validate(). Kept so consumers that read it keep working.",
     "  unverified_roles  roles this agent is legal for but has NEVER been driven",
     "                in here, e.g. [\"orchestrator\"] — validate() still passes (the",
     "                row clears the role's gates), but the role is unproven, so",
@@ -48,8 +46,13 @@
     "                  route within, which strands non-Claude workers. Never",
     "                  combine with model.required — validate() refuses the pair,",
     "                  since the worker would never be asked for the pin it needs.",
-    "  relay         false when the agent runs without Omnigent's sys_* tool",
-    "                relay (leaf worker only; cannot orchestrate)",
+    "  relay         FALLBACK ONLY, used when Omnigent cannot be imported from",
+    "                the installer's interpreter: false when the agent runs",
+    "                without Omnigent's sys_* tool relay (leaf worker only;",
+    "                cannot orchestrate). Superseded by the measured",
+    "                `capabilities[<harness>].subagents` probe otherwise -- this",
+    "                flag was wrong for six rows that claimed true while their",
+    "                harness reports subagents=False.",
     "  silent_model_failure  true when a bad model id produces an empty",
     "                        transcript instead of an error",
     "  worker        sub-agent name in the bundle. Defaults to coder_<id>; set it explicitly to keep an established name stable across an id change."
@@ -150,7 +153,7 @@
         "integrator"
       ],
       "vendor": "google",
-      "relay": true,
+      "relay": false,
       "silent_model_failure": false,
       "model": {
         "required": true,
@@ -342,7 +345,7 @@
         "integrator"
       ],
       "vendor": "cursor",
-      "relay": true,
+      "relay": false,
       "silent_model_failure": false,
       "model": {
         "required": true,
@@ -376,7 +379,7 @@
         "integrator"
       ],
       "vendor": "google",
-      "relay": true,
+      "relay": false,
       "silent_model_failure": false,
       "model": {
         "required": false,
@@ -402,7 +405,7 @@
         "integrator"
       ],
       "vendor": "goose",
-      "relay": true,
+      "relay": false,
       "silent_model_failure": false,
       "model": {
         "required": false,
@@ -428,7 +431,7 @@
         "integrator"
       ],
       "vendor": "hermes",
-      "relay": true,
+      "relay": false,
       "silent_model_failure": false,
       "model": {
         "required": false,
@@ -448,17 +451,13 @@
       "binary": "grok",
       "kind": "acp-builtin",
       "roles": [
-        "orchestrator",
         "coder",
         "scout",
         "integrator"
       ],
-      "roles_note": "`orchestrator` added on the only two bars validate() enforces for that role: `relay: true` (the sys_* relay can dispatch) and `prompt_delivery` not `none` — `first_user` prepends the spec prompt to the first user message, so the orchestration contract IS delivered. UNVERIFIED as an orchestrator: no og run has been driven with grok as the brain. Demote to `coder` if the first real dispatch cannot orchestrate.",
-      "unverified_roles": [
-        "orchestrator"
-      ],
+      "kind_note": "NOT an orchestrator: Omnigent reports harness `grok` subagents=False, so it cannot dispatch a sub-agent. The row used to claim `relay: true` AND list `orchestrator`, which would have built a brain that could never delegate.",
       "vendor": "xai",
-      "relay": true,
+      "relay": false,
       "silent_model_failure": false,
       "model": {
         "required": false,
@@ -475,16 +474,16 @@
     {
       "id": "devin",
       "label": "Devin",
-      "harness": "devin",
+      "harness": "devin-native",
       "binary": "devin",
-      "kind": "acp-builtin",
+      "kind": "native",
       "roles": [
         "orchestrator",
         "coder",
         "scout",
         "integrator"
       ],
-      "roles_note": "`orchestrator` added on the only two bars validate() enforces for that role: `relay: true` (the sys_* relay can dispatch) and `prompt_delivery` not `none` — `first_user` prepends the spec prompt to the first user message, so the orchestration contract IS delivered. UNVERIFIED as an orchestrator: no og run has been driven with devin as the brain. Demote to `coder` if the first real dispatch cannot orchestrate.",
+      "roles_note": "`orchestrator` is MEASURED-capable: Omnigent reports harness `devin-native` subagents=True (the native Devin harness mirrors its in-TUI `run_subagent` calls as Omnigent child sessions), and `prompt_delivery` is not `none`, so it clears the orchestrator gates. The row used to point at a harness id `devin` that has no capability entry at all -- the preflight map would have dropped the worker; `devin-native` is the real id. UNVERIFIED as an orchestrator: no og run has been driven with devin as the brain. Demote to `coder` if the first real dispatch cannot orchestrate.",
       "unverified_roles": [
         "orchestrator"
       ],

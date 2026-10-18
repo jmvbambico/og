@@ -141,9 +141,10 @@ Add one row to `installer/registry.json`. No code change should be needed.
   "binary": "newagent",             // what the PATH scan looks for
   "kind": "acp-user",               // native | acp-builtin | acp-user
   "acp_command": "newagent --acp",  // acp-user only
-  "roles": ["coder"],
+  "roles": ["coder"],               // informational only - no longer a picker gate
   "vendor": "somevendor",           // cross-vendor review depends on this
-  "relay": false,                   // false = leaf worker, cannot dispatch
+  "relay": false,                   // FALLBACK dispatch flag, used only when omnigent
+                                    // cannot be imported; otherwise measured
   "silent_model_failure": true,     // true = bad model ⇒ empty transcript
   "prompt_delivery": "unknown",     // argv | per_turn | first_user | none
   "model": {"required": true, "pin_path": "executor.model"},
