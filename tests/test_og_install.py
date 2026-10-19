@@ -1356,7 +1356,7 @@ def test_coder_prompt_carries_the_followups_not_done_rule():
     assert "An empty list is a valid and common answer" in prompt
     assert "say so rather than inventing" in prompt
     assert "observations handed upward" in prompt
-    assert "never work you start" in prompt
+    assert "not work you start" in prompt
     # The rule is IMPLEMENT-only. It does not ride the coder's EXPLORE section
     # (an explorer produces no diff, so there is nothing left "undone" in the
     # implementer's sense, and the existing "State anything that did not fit"
@@ -2138,13 +2138,14 @@ def test_integrator_template_carries_the_bounded_and_never_merge_contract():
     assert "EXACTLY ONE PLACE AT A TIME" in prompt
     assert "another integrator" in prompt
     # The transport deadline: a long gate run in-turn is killed by ACP at ~300s
-    # (measured), so the prompt must force it detached with a pollable handoff --
-    # otherwise the killed dispatch reads as the integrator being broken.
+    # (measured), so the prompt must force it detached and hand the PID plus log
+    # path back for follow-up -- otherwise the killed dispatch produces no
+    # result at all.
     assert "A LONG GATE RUNS DETACHED, NEVER IN-TURN" in prompt
     assert "~300s" in prompt
-    assert "reporting NOTHING" in prompt
+    assert "producing no result" in prompt
     assert "start it DETACHED" in prompt
-    assert "PID and absolute log path to poll" in prompt
+    assert "PID and absolute log path for follow-up" in prompt
     assert "treat it as long" in prompt
     # ...and it is a normal write worker: pinned model, named harness, skills off.
     assert parsed["executor"]["model"] == "moonshotai/kimi-k3"
