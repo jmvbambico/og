@@ -1305,6 +1305,38 @@ def worker_mark(harness: Any, agent: Any) -> str:
     return _vendor_mark(None)
 
 
+def worker_tab_label(harness: Any, agent: Any, title: Any) -> str:
+    """A delegated worker's TAB LABEL: the vendor glyph, then its task.
+
+    herdr labels a delegated worker's tab from the session title, which reads
+    `coder_cmdcode:fix-stale-comments` — the agent name the operator already
+    sees drawn as a glyph in the `og agents` pane, repeated here in full. This
+    is that same substitution, applied to the tab label: the agent name is
+    dropped, the mark takes its place, and the task follows.
+
+    `split_title` does the parse (`coder_zen:task` -> `("zen", "task")`), and
+    `worker_mark` resolves the name to a glyph the same way the pane does —
+    agent name -> harness (via the installed specs) -> vendor -> glyph — so the
+    tab and the row cannot disagree about what brand a worker carries. An
+    unresolvable agent falls back to the ATOM, exactly as the pane does.
+
+    A title with NO `<agent>:` prefix — an older session, or one the server
+    titled plainly — is returned UNCHANGED: there is no agent name to replace,
+    and inventing a glyph for it would be a mark for a session that has none.
+    """
+    _agent, task = split_title(title)
+    if _agent is None:
+        return title if isinstance(title, str) else ""
+    # `worker_mark` returns the mark *slotted* (padded to MARK_SLOT columns):
+    # a Narrow mark already carries its trailing space, a Wide/Fullwidth mark
+    # fills the slot on its own and carries none. Concatenating the slotted
+    # mark straight onto `task` therefore works for today's Narrow marks but
+    # silently drops the separator the day a wide glyph is added. Strip the
+    # slot padding back to the raw glyph and put exactly one space in between,
+    # so the separator is a property of this composition, not of mark width.
+    return worker_mark(harness, agent).rstrip() + " " + task
+
+
 def harness_vendor(harness: Any) -> Optional[str]:
     """The vendor whose brand colour `harness`'s mark carries, or None.
 
