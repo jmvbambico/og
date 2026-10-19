@@ -1327,7 +1327,14 @@ def worker_tab_label(harness: Any, agent: Any, title: Any) -> str:
     _agent, task = split_title(title)
     if _agent is None:
         return title if isinstance(title, str) else ""
-    return worker_mark(harness, agent) + task
+    # `worker_mark` returns the mark *slotted* (padded to MARK_SLOT columns):
+    # a Narrow mark already carries its trailing space, a Wide/Fullwidth mark
+    # fills the slot on its own and carries none. Concatenating the slotted
+    # mark straight onto `task` therefore works for today's Narrow marks but
+    # silently drops the separator the day a wide glyph is added. Strip the
+    # slot padding back to the raw glyph and put exactly one space in between,
+    # so the separator is a property of this composition, not of mark width.
+    return worker_mark(harness, agent).rstrip() + " " + task
 
 
 def harness_vendor(harness: Any) -> Optional[str]:

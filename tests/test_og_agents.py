@@ -2115,6 +2115,14 @@ def test_a_worker_tab_label_is_the_mark_followed_by_its_task(spec_home):
                               "coder_zen:space-per-root") == \
         a._HARNESS_MARKS["opencode-zen"] + " space-per-root"
 
+def test_a_worker_tab_label_keeps_the_separator_for_a_wide_mark(spec_home, monkeypatch):
+    # A Wide/Fullwidth mark fills its slot on its own and carries no padding;
+    # the separator must still come from the composition, not from the slot.
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    monkeypatch.setitem(a._HARNESS_MARKS, "opencode-zen", "\u4e2d")
+    assert a.worker_tab_label("", "zen", "coder_zen:space-per-root") == \
+        "\u4e2d" + " space-per-root"
+
 
 def test_the_tab_label_uses_the_row_harness_when_it_carries_one(spec_home):
     # The row's own harness outranks the spec (see `worker_mark`), so a tab
