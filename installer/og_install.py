@@ -2428,6 +2428,18 @@ def render_coder(plan: dict, c: dict, name: str | None = None) -> str:
         notes.append("# headless worker isn't stuck waiting on someone to click approve. Policies")
         notes.append("# (below) still gate whatever they DO have an opinion on either way.")
         permission_mode_block = "    permission_mode: bypassPermissions"
+    elif a["harness"] == "antigravity-native":
+        # WHY (2026-10-19): a host-spawned agy worker runs in a tmux pane, so the
+        # harness does not see it as headless and leaves agy on its default
+        # `request-review`. The first RunCommand (the gate) then parks an
+        # elicitation nobody answers; the orchestrator cancels the worker after
+        # a minute and the run shows NO TOOL CALLS. agy has no per-tool hook, so
+        # its only control is all-or-nothing `--dangerously-skip-permissions`,
+        # which the harness maps from bypassPermissions.
+        notes.append("# permission_mode: bypassPermissions -- agy's only control is the all-or-")
+        notes.append("# nothing --dangerously-skip-permissions; without it every RunCommand parks")
+        notes.append("# an approval prompt nobody answers and the worker is cancelled.")
+        permission_mode_block = "    permission_mode: bypassPermissions"
     s = tmpl("coder.yaml.tmpl")
     for k, v in {
         "{{NAME}}": name or worker_name(c["id"]),

@@ -1199,6 +1199,14 @@ def test_render_coder_acp_user_gets_permission_mode_or_not(monkeypatch):
     assert isinstance(cline_has, bool)
 
 
+def test_render_coder_agy_bypasses_permissions():
+    # A host-spawned agy worker is not detected as headless, so without the
+    # bypass its first RunCommand parks a prompt nobody answers.
+    plan = _base_plan(coders=[{"id": "agy", "priority": 1, "model": "gemini-3.8-flash-medium"}])
+    cfg = yaml.safe_load(m.render_coder(plan, plan["coders"][0]))
+    assert cfg["executor"]["config"]["permission_mode"] == "bypassPermissions"
+
+
 def test_reviewer_is_valid_yaml():
     plan = _rendering_plan()
     rendered = m.render_reviewer(plan)
