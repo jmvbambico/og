@@ -793,6 +793,10 @@ def choose_model(agent: dict, options: list, current: str | None,
     """The shared numbered model menu: grouped by provider prefix, searchable by
     substring, selectable by number, full id or typed text.
 
+    The full menu caps each provider at MODELS_PER_PROVIDER so a 300-line
+    catalog stays readable; a search lifts that cap and lists every match, so
+    an id the cap hid is reachable by number as well as by a full id.
+
     Extracted from pick_model so the free-fallback picker is the SAME menu over
     a filtered list rather than a second bespoke prompt -- the two exercise one
     code path, so a fix or a rendering change reaches both. Returns a choice:
@@ -809,15 +813,21 @@ def choose_model(agent: dict, options: list, current: str | None,
     pool = options
     while True:
         shown = []
+        # `pool is not options` means a search narrowed the menu. The cap had
+        # already hidden the tail, so re-applying it to the matches would hide
+        # the very ids the user searched for -- a search is the explicit ask to
+        # see past the cap, so a filtered list is shown in full.
+        searching = pool is not options
         for provider, ids in grouped_models(agent, pool):
             if provider:
                 say(f"  {C['dim']}{provider}/{C['x']}")
-            for m in ids[:MODELS_PER_PROVIDER]:
+            cap = len(ids) if searching else MODELS_PER_PROVIDER
+            for m in ids[:cap]:
                 shown.append(m)
                 mark = f" {C['g']}(current){C['x']}" if m == current else ""
                 say(f"  {len(shown):2}. {m}{mark}")
-            if len(ids) > MODELS_PER_PROVIDER:
-                say(f"      {C['dim']}… {len(ids)-MODELS_PER_PROVIDER} more {provider}/ ids; "
+            if len(ids) > cap:
+                say(f"      {C['dim']}… {len(ids)-cap} more {provider}/ ids; "
                     f"type part of a name to search, or a full id{C['x']}")
         got = ask(f"{label} (number, full id, or text to search)", default)
         if got in options:
@@ -986,21 +996,28 @@ class Role(NamedTuple):
     role: str       # the name a registry row lists in its `roles` array
     template: str   # the template that renders it
     multi: bool     # True: many parallel workers; False: one-at-a-time chain
+    chain: bool     # True: an ordered failover chain. False: exactly one entry
     spec: bool      # True: renders a sub-agent dir; False: the root config
     optional: bool  # True: the plan may omit it and the bundle stays correct
     ask: str        # the --questions prompt that offers this role
 
 
 ROLES = [
+    # The orchestrator is the session's brain, and nothing sits above it to
+    # dispatch it: a chain's tail could never launch, so it is a SINGLE entry
+    # (chain=False). Failover belongs on the roles the brain dispatches --
+    # coders, reviewer, scout, integrator -- where the brain picks the next
+    # entry when one is dry. Offering a chain here only ever made an inert
+    # second entry look like real failover.
     Role("orchestrator", "orchestrator", "orchestrator.yaml.tmpl",
-         multi=False, spec=False, optional=False,
-         ask="Which agent plans and delegates (never writes product code), "
-             "in preference order (first is tried first)?"),
+         multi=False, chain=False, spec=False, optional=False,
+         ask="Which agent runs the orchestrator (plans and delegates, never "
+             "writes product code)?"),
     Role("coders", "coder", "coder.yaml.tmpl",
-         multi=True, spec=True, optional=False,
+         multi=True, chain=True, spec=True, optional=False,
          ask="Which agents implement code, in preference order (first is tried first)?"),
     Role("reviewer", "reviewer", "reviewer.yaml.tmpl",
-         multi=False, spec=True, optional=False,
+         multi=False, chain=True, spec=True, optional=False,
          ask="Which agents review the batched diff, in preference order (first "
              "is tried first; the next takes over when one is out of quota)? "
              "Prefer a vendor that differs from every coder."),
@@ -1009,7 +1026,7 @@ ROLES = [
     # across 30 sessions). Optional because it spends prompt bytes; a user who
     # omits it gets a bundle with no scout spec and no dangling reference.
     Role("scout", "scout", "scout.yaml.tmpl",
-         multi=False, spec=True, optional=True,
+         multi=False, chain=True, spec=True, optional=True,
          ask="Which agents answer repo reading, search and git-state questions "
              "as a read-only scout, in preference order (first is tried first)?"),
     # A worker for the orchestrator's own git and gate plumbing — measured at
@@ -1019,7 +1036,7 @@ ROLES = [
     # spends prompt bytes; a user who omits it gets a bundle with no integrator
     # spec and no dangling reference.
     Role("integrator", "integrator", "integrator.yaml.tmpl",
-         multi=False, spec=True, optional=True,
+         multi=False, chain=True, spec=True, optional=True,
          ask="Which agents run git, worktree and gate plumbing for the "
              "orchestrator (they never decide a merge), in preference order "
              "(first is tried first)?"),
@@ -1060,10 +1077,26 @@ def normalize_plan(plan: dict) -> dict:
     correct for either, which is what lets an old state file skip a migration.
     The set of roles comes from ROLES, so a role the table does not declare (a
     hand-added key) is left exactly as it was rather than guessed at.
+
+    A non-chain role (the orchestrator) is truncated to its head: it is a single
+    entry, and a tail there was never launched. That is a lossless fix for a
+    state file written while the installer advertised an orchestrator chain, so
+    it is repaired rather than refused -- `og update` re-applies the saved plan
+    and must not brick on a fixable shape. Warned, not silent: the dropped entry
+    disappears and the user should know why.
     """
     for r in ROLES:
-        if plan.get(r.key) is not None:
-            plan[r.key] = chain_entries(plan[r.key])
+        if plan.get(r.key) is None:
+            continue
+        entries = chain_entries(plan[r.key])
+        if not r.chain and len(entries) > 1:
+            dropped = ", ".join(e["id"] for e in entries[1:])
+            warn(f"the orchestrator cannot fail over — nothing dispatches the "
+                 f"brain, so the extra entry(ies) {dropped} could never launch. "
+                 f"Keeping `{entries[0]['id']}`. To fail over when the brain is "
+                 f"dry, chain the roles it dispatches (coder/reviewer/scout).")
+            entries = entries[:1]
+        plan[r.key] = entries
     return plan
 
 
@@ -1208,14 +1241,21 @@ def build_plan_interactive(state: dict) -> dict:
     if not orch_opts:
         die("no coding CLI found on PATH — install at least one (see README.md) "
             "and re-run.")
-    # A chain, like the coders: the later entries are the failover a launch
-    # takes when the brain above them is out of quota.
-    orchestrator_ids = pick_many_ordered(
+    # ONE agent, not a chain: the brain has no dispatcher above it, so a second
+    # orchestrator could never take over (there is no runtime failover to reach
+    # for). A chain here is offered for the roles the brain dispatches instead.
+    orch_prev = {e["id"]: e.get("model") for e in chain(state, "orchestrator")}
+    orch_current = primary(state, "orchestrator")["id"] if state.get("orchestrator") else None
+    orch_id = pick_one(
         "Which agent runs the ORCHESTRATOR? (plans, delegates, never writes "
-        "product code — preference order, first is tried first)",
-        orch_opts, [e["id"] for e in chain(state, "orchestrator")])
-    orchestrators = [{"id": aid, "priority": i}
-                     for i, aid in enumerate(orchestrator_ids, 1)]
+        "product code)", orch_opts, orch_current)
+    # The orchestrator pins a model exactly like every worker: its spec IS the
+    # bundle's root config, and an unpinned brain is the session's first
+    # conversation — a harness that resolves no model launches on a default it
+    # may not serve, so the very first turn is faulty or empty. A row the
+    # registry marks `pinnable: false` (claude) keeps current/None and is never
+    # asked, so its smart-routing default is preserved.
+    orchestrators = [pin_entry(reg[orch_id], orch_id, 1, orch_prev.get(orch_id), None)]
 
     agent_name = ask("Name for the orchestrator bundle", state.get("agent_name", "dev-lead"))
 
@@ -1335,13 +1375,9 @@ def build_plan_interactive(state: dict) -> dict:
     # silently kept auto-update off. The prompt always reads (Y/n); only an
     # explicit `n` turns it off.
     auto_update = ask_yes("Auto-update og on `og start`?", True)
-    # Asked always even when herdr is absent, like tunnl_ssh_key: the answer is
-    # saved for whenever it is installed, and the prompt says it does not apply
-    # yet. Unlike auto_update above, the default comes from saved state so an
-    # explicit `n` survives a re-run instead of being silently reset on Enter.
-    herdr_agents_pane = ask_yes(
-        "In a herdr session, open `og agents` beside `og chat` as a split pane? "
-        "(ignored if herdr is not installed)", state.get("herdr_agents_pane", True))
+    # The `og agents` split beside `og chat` is mandatory now, so there is no
+    # question: `og_herdr_launch` and the bridge always open it. The old
+    # `herdr_agents_pane` key is ignored, not asked.
     # Asked in the same place as the rest of the runtime knobs, and stored as
     # typed: `og_herdr_launch.projects_dir` expands `~` at read time, so the
     # answer means the same thing whether it came from this prompt or from a
@@ -1366,7 +1402,6 @@ def build_plan_interactive(state: dict) -> dict:
         "bin_dir": bin_dir,
         "default_mode": default_mode,
         "auto_update": auto_update,
-        "herdr_agents_pane": herdr_agents_pane,
         "projects_dir": projects_dir or DEFAULT_PROJECTS_DIR,
     }
 
@@ -1378,8 +1413,10 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     """Return a list of (level, message). level in {'error','warn'}."""
     reg = agents_by_id()
     issues = []
-    # A role may now be a chain; chain() normalizes the old singleton shape so a
-    # saved og-install.json validates exactly as it always did.
+    # A role may be a chain; chain() normalizes the old singleton shape so a
+    # saved og-install.json validates exactly as it always did. The orchestrator
+    # is a single entry (normalize_plan drops any tail), but it is read through
+    # chain() like everything else so a hand-written plan is still checked.
     orchestrators = chain(plan, "orchestrator")
     reviewers = chain(plan, "reviewer")
 
@@ -1406,15 +1443,16 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # `model:` key, and resolved to None at dispatch -- the field failure that
     # started all of this: `model: null`, the harness launched with no model,
     # and every dispatch died with "Runner disconnected unexpectedly". Driven by
-    # SPEC_ROLES -- the roles that render a dispatched sub-agent -- rather than
-    # a hand-written list of four role names, so a role added to ROLES later is
-    # covered without a new branch here. The orchestrator is excluded on
-    # purpose: its spec IS the bundle's root config, it inherits no parent's
-    # model, render_orchestrator writes no model block, and the interactive
-    # path never pins it either. An absent role is legal -- chain() returns []
-    # for a key the plan omits -- so an omitted optional role contributes
-    # nothing rather than crashing.
-    for r in SPEC_ROLES:
+    # ROLES -- every role that can carry a pin -- rather than a hand-written
+    # list, so a role added to the table later is covered without a new branch.
+    # The orchestrator is included: its spec IS the bundle's root config, but a
+    # `required` brain left unpinned (opencode) resolves `model: null` and the
+    # session's FIRST conversation is faulty -- the bug this check now refuses.
+    # A `pinnable: false` row (claude) declares required=false, so it stays
+    # legal unpinned; that is the smart-routing default, not an oversight. An
+    # absent role is legal -- chain() returns [] for a key the plan omits -- so
+    # an omitted optional role contributes nothing rather than crashing.
+    for r in ROLES:
         for e in chain(plan, r.key):
             agent = reg[e["id"]]
             spec = agent.get("model") or {}
@@ -1422,10 +1460,11 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                 continue
             # The consequence is the same dead dispatch for every worker, but a
             # reviewer loses a different thing worth naming -- the batched
-            # diff's independent review -- so it reads its own sentence. The
-            # coder wording is kept verbatim: it is the one already in users'
-            # bug reports, and "worker" still reads correctly for scout and
-            # integrator, which die the same way.
+            # diff's independent review -- so it reads its own sentence, and the
+            # orchestrator's is the session itself. The coder wording is kept
+            # verbatim: it is the one already in users' bug reports, and "worker"
+            # still reads correctly for scout and integrator, which die the same
+            # way.
             #
             # The reviewer sentence names the CONSEQUENCE, not a mechanism, on
             # purpose. "Inherits the orchestrator's model id" is what happens to
@@ -1439,7 +1478,11 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
             # mechanism misdescribes some row. What is true for every shape is
             # that no usable review comes back, and the loss the user must weigh
             # before skipping the pin is the batch's independent review.
-            if r.role == "reviewer":
+            if r.role == "orchestrator":
+                tail = ("An unpinned orchestrator IS the session's brain: with no "
+                        "model the harness launches on a default it may not serve, "
+                        "so the very first conversation is faulty or empty.")
+            elif r.role == "reviewer":
                 tail = ("An unpinned reviewer produces no usable review, so the "
                         "batched diff loses its independent review.")
             elif r.role == "coder":
@@ -1505,9 +1548,10 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            f"{capable}."))
 
         # A harness that never receives the spec prompt cannot orchestrate: the
-        # whole orchestration contract lives in that prompt. Checked for EVERY
-        # entry in the chain -- a `none` BACKUP is exactly as unusable as a
-        # `none` primary, and it is the one reached for when the primary is dry.
+        # whole orchestration contract lives in that prompt. The orchestrator is
+        # a single entry, so this normally fires once; the loop still walks every
+        # entry so a hand-written plan that carries an un-normalized tail is
+        # guarded too (normalize_plan drops that tail before it can install).
         if a.get("prompt_delivery") == "none":
             issues.append(("error",
                            f"{a['label']} never receives a spec prompt "
@@ -1642,21 +1686,20 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                                    "launch fails — declare shim.name == "
                                    f"'{tok}' or fix the token."))
 
-    # The tmux command-string ceiling binds whenever ANY orchestrator in the
-    # chain rides on argv -- NOT just the head. Reading only orchestrators[0]
-    # meant a per_turn primary (OpenCode) hid an argv BACKUP (claude, codex):
-    # the config validated clean, then the backup -- the entry that actually
-    # launches once the primary is dry -- died at launch with 'command too long'
-    # (surfacing as a native terminal that failed to start). Name every argv
-    # entry so a two-orchestrator chain says WHICH one is over the ceiling.
+    # The tmux command-string ceiling binds the orchestrator's own command line,
+    # where the prompt is inlined for an argv harness. The orchestrator is a
+    # single entry now, so normally only one harness can be bound -- but the
+    # walk stays shape-agnostic (`og --show` runs validate on an un-normalized
+    # state), and names every argv entry so a hand-written chain still says
+    # WHICH one is over the ceiling.
     argv_orchestrators = [o for o in orchestrators
                           if reg[o["id"]].get("prompt_delivery") == "argv"]
     if rendered_prompt is not None and argv_orchestrators:
         quoted = len(shlex.quote(rendered_prompt))
         names = ", ".join(reg[o["id"]]["label"] for o in argv_orchestrators)
-        # A two-entry argv chain names two harnesses; "an argv-delivered harness
-        # (A, B)" reads as if only one were over the ceiling. Pluralize both the
-        # noun and the article so WHICH entries are bound is never misread.
+        # More than one argv entry only arises from an un-normalized plan; keep
+        # the noun plural then, so the message never reads as though a single
+        # harness were named twice.
         phrase = ("an argv-delivered harness" if len(argv_orchestrators) == 1
                   else "argv-delivered harnesses")
         if quoted > PROMPT_CEILING:
@@ -2321,6 +2364,11 @@ def render_orchestrator(plan: dict) -> str:
     subs = {
         "{{AGENT_NAME}}": plan["agent_name"],
         "{{ORCHESTRATOR_HARNESS}}": reg[primary(plan, "orchestrator")["id"]]["harness"],
+        # The brain's own pin, at executor.model. This is the session's FIRST
+        # conversation, so an unset model leaves the harness to launch on a
+        # default it may not serve. Empty for a `pinnable: false` row (claude),
+        # which keeps its smart-routing default rather than a stranded family.
+        "{{MODEL_BLOCK}}": model_block(primary(plan, "orchestrator").get("model")),
         "{{ROSTER_BULLETS}}": render_roster(plan),
         "{{VENDOR_MAP}}": render_vendor_map(plan),
         "{{SCOUT_NOTE}}": scout_note(plan),
@@ -2694,9 +2742,9 @@ def opencode_worker_config_dir(plan: dict) -> Path | None:
     `question` for its plan gate.
     """
     is_coder = any(c["id"] == "opencode" for c in plan["coders"])
-    # ANY orchestrator in the chain, not just the primary: the override applies
-    # to every OpenCode session og launches, and a failover to an OpenCode brain
-    # needs `question` for its plan gate too.
+    # The single orchestrator, too: the override applies to every OpenCode
+    # session og launches, and an OpenCode brain needs `question` for its plan
+    # gate -- so the override is skipped whenever OpenCode is the orchestrator.
     if not is_coder or any(o["id"] == "opencode" for o in chain(plan, "orchestrator")):
         return None
     return OMNI / "opencode"
@@ -2892,7 +2940,10 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     STATE.write_text(json.dumps(plan, indent=2) + "\n")
 
     say()
-    ok(f"orchestrator  {plan['agent_name']} ({reg[primary(plan, 'orchestrator')['id']]['label']})")
+    orch0 = primary(plan, "orchestrator")
+    orch_pin = f" → {orch0['model']}" if orch0.get("model") else ""
+    ok(f"orchestrator  {plan['agent_name']} "
+       f"({reg[orch0['id']]['label']}){orch_pin}")
     for c in plan["coders"]:
         pin = f" → {c['model']}" if c.get("model") else ""
         ok(f"coder #{c['priority']}      {worker_name(c['id'])} ({reg[c['id']]['label']}){pin}")
@@ -3206,7 +3257,12 @@ def emit_questions() -> None:
     # parsing the human sentence out of prose.
     role_questions = []
     for r in ROLES:
-        q = {"key": r.key, "type": "ordered_multi",
+        # `ordered_multi` (a chain, answered as an ordered list) only where a
+        # chain is real: a role the brain dispatches. The orchestrator is a
+        # single entry -- `single`, answered with ONE id -- because nothing sits
+        # above the brain to fail it over, so a chain there would be an inert
+        # second entry dressed as failover.
+        q = {"key": r.key, "type": "ordered_multi" if r.chain else "single",
              # An AI driving from --questions must see that a role may be
              # omitted: the interactive path asks yes/no, but this JSON is the
              # only signal AGENTS.md Part 1's installer gets.
@@ -3222,20 +3278,24 @@ def emit_questions() -> None:
         dispatch = role_dispatch(r.role)
         if dispatch:
             q["dispatch"] = dispatch
-        if r.spec:
-            # The same static model list under every role that pins one, so an
-            # AI installer can answer for each entry of the chain. The fallback
-            # has no static choices: its lineup comes from `blink --list-models
-            # --json` at interactive time, so it is a plain string question
-            # (blank = none) and only freebuff actually consumes it.
-            q["per_item"] = {
-                "model": "Model id to pin. REQUIRED for agents where "
-                         "registry.model.required is true.",
-                "choices": model_choices,
-                "fallback_model": "Free fallback model id (blank = none). Only "
-                                  "freebuff uses it; the choice is exported as "
-                                  "BLINK_FALLBACK_MODEL alongside BLINK_MODEL.",
-            }
+        # Every role pins a model -- the orchestrator included, since its spec is
+        # the root config and an unpinned brain is a faulty first conversation --
+        # so the per-item model question rides every role unconditionally. A row
+        # the registry marks `pinnable: false` simply never consumes an answer.
+        #
+        # The same static model list under every role, so an AI installer can
+        # answer for each entry of a chain -- or the one entry of a `single`
+        # role. The fallback has no static choices: its lineup comes from
+        # `blink --list-models --json` at interactive time, so it is a plain
+        # string question (blank = none) and only freebuff actually consumes it.
+        q["per_item"] = {
+            "model": "Model id to pin. REQUIRED for agents where "
+                     "registry.model.required is true.",
+            "choices": model_choices,
+            "fallback_model": "Free fallback model id (blank = none). Only "
+                              "freebuff uses it; the choice is exported as "
+                              "BLINK_FALLBACK_MODEL alongside BLINK_MODEL.",
+        }
         role_questions.append(q)
     say(json.dumps({
         "detected": {k: reg[k]["label"] for k in found},
@@ -3274,10 +3334,7 @@ def emit_questions() -> None:
             # Asked always, like tunnl_ssh_key, with the ask text noting it does
             # not apply on a herdr-less machine -- so the answer is already saved
             # for whenever herdr is installed rather than asked at an awkward time.
-            {"key": "herdr_agents_pane", "type": "bool", "default": True,
-             "ask": "In a herdr session, should `og agents` open beside `og chat` as a "
-                    "split pane? No means the session starts with `og chat` alone. "
-                    "Ignored if herdr is not installed."},
+            # The `og agents` split is mandatory, so there is no question for it.
             # A path with a `~` in it, like the tunnl key question: it is
             # stored as typed and expanded when `og chat --dir` reads it, so
             # changing it does not mean re-running the installer.
@@ -3301,17 +3358,17 @@ def show(state: dict) -> None:
         return
     reg = agents_by_id()
     found = scan()
-    # Both roles render as a chain in order, primary first. The `(primary)`
-    # tag only appears when there IS a chain, so a single-entry install reads
-    # exactly as it always has.
-    orch = chain(state, "orchestrator")
+    # The orchestrator is a single entry, so it prints as one line -- no
+    # "(primary)" tag, no "backup" line: the brain cannot fail over, and a
+    # listed backup here was the misleading half of the old chain feature.
+    # Reviewers and scouts below DO render as chains, in order, primary first.
+    orch = primary(state, "orchestrator")
     revs = chain(state, "reviewer")
     scs = chain(state, "scout")
+    orch_pin = f" → {orch['model']}" if orch.get("model") else ""
+    orch_live = "" if orch["id"] in found else f" {C['r']}(CLI missing){C['x']}"
     say(f"{C['b']}orchestrator{C['x']}  {state['agent_name']} "
-        f"({reg[orch[0]['id']]['label']}){' (primary)' if len(orch) > 1 else ''}")
-    for e in orch[1:]:
-        say(f"{C['b']}  backup #{e['priority']}{C['x']}  {reg[e['id']]['label']} "
-            f"{C['dim']}— failover for the orchestrator{C['x']}")
+        f"({reg[orch['id']]['label']}){orch_pin}{orch_live}")
     for c in state["coders"]:
         live = "" if c["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {c['model']}" if c.get("model") else ""
@@ -3445,10 +3502,6 @@ def main() -> None:
         plan = json.loads(Path(args.plan).read_text())
         plan.setdefault("version", 1)
         plan.setdefault("auto_update", True)
-        # A live og-install.json written before this key existed must still load
-        # and re-apply, getting the default rather than failing validation. This
-        # is the seam `og update` re-applies the saved plan through.
-        plan.setdefault("herdr_agents_pane", True)
         # Same reason, same seam: an og-install.json written before `og chat`
         # grew `--dir` must re-apply without the key, and take the default root
         # rather than refusing. Idempotence is the whole contract here — this

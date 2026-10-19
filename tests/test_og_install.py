@@ -249,6 +249,28 @@ def test_validate_errors_when_required_integrator_model_missing():
     assert any("integrator" in msg and "Antigravity (Google)" in msg for msg in errors), errors
 
 
+def test_validate_errors_when_required_orchestrator_model_missing():
+    # The orchestrator is the session's brain, and an unpinned `required` brain
+    # (opencode) resolves `model: null`: the FIRST conversation is faulty. It is
+    # refused exactly like an unpinned worker, with a brain-specific sentence.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1}])
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert any("orchestrator" in msg and "OpenCode (Zen)" in msg for msg in errors), errors
+    msg = next(msg for msg in errors if "OpenCode (Zen)" in msg)
+    assert "first conversation is faulty" in msg
+    # ...and it clears the moment a model is pinned.
+    ok = _base_plan(orchestrator=[{"id": "opencode", "priority": 1, "model": "opencode/x"}])
+    assert not [msg for level, msg in m.validate(ok) if level == "error"]
+
+
+def test_validate_allows_an_unpinned_pinnable_false_orchestrator():
+    # claude's row is required=false + pinnable=false: leaving the brain unpinned
+    # is the smart-routing default, not an error the installer should refuse.
+    errors = [msg for level, msg in m.validate(_base_plan(orchestrator="claude"))
+              if level == "error"]
+    assert not any("orchestrator" in msg for msg in errors), errors
+
+
 def test_validate_reviewer_object_and_list_shapes_are_both_enforced():
     # The documented plan shape allows "reviewer": {"id": ...} as a single
     # object as well as a list. chain_entries() normalises both, so the
@@ -706,12 +728,22 @@ def test_chain_entries_normalizes_every_old_shape():
 def test_chain_priority_comes_from_array_order():
     # Same rule as coders: position IS preference, so a stale explicit
     # `priority` on an entry keeps its place rather than being renumbered.
-    plan = {"orchestrator": ["claude", "codex"], "reviewer": ["codex", "kiro"],
+    plan = {"reviewer": ["codex", "kiro"], "scout": ["codex", "kiro"],
             "coders": [{"id": "opencode"}, {"id": "cline"}]}
     m.normalize_plan(plan)
-    assert [e["priority"] for e in plan["orchestrator"]] == [1, 2]
     assert [e["priority"] for e in plan["reviewer"]] == [1, 2]
+    assert [e["priority"] for e in plan["scout"]] == [1, 2]
     assert [e["priority"] for e in plan["coders"]] == [1, 2]
+
+
+def test_normalize_drops_an_orchestrator_chain_and_warns(capsys):
+    # The orchestrator is a single entry. A chain written while the installer
+    # advertised an orchestrator failover is truncated to its head -- lossless,
+    # since the tail never launched -- and the repair is not silent.
+    plan = {"orchestrator": ["claude", "opencode"], "coders": [{"id": "opencode"}]}
+    m.normalize_plan(plan)
+    assert plan["orchestrator"] == [{"id": "claude", "priority": 1}]
+    assert "cannot fail over" in capsys.readouterr().out
 
 
 def test_role_table_is_the_single_source_of_truth(monkeypatch):
@@ -738,7 +770,7 @@ def test_role_table_is_the_single_source_of_truth(monkeypatch):
     # A role added to the table is normalized and named with no other change...
     # (a hypothetical role, since every real one now has a row of its own).
     extra = m.Role("fuzzer", "fuzzer", "fuzzer.yaml.tmpl",
-                   multi=False, spec=True, optional=True, ask="x")
+                   multi=False, chain=True, spec=True, optional=True, ask="x")
     monkeypatch.setattr(m, "ROLES", [*m.ROLES, extra])
     moved = {"orchestrator": "claude", "fuzzer": ["codex", "kiro"]}
     m.normalize_plan(moved)
@@ -1018,20 +1050,26 @@ def test_emit_questions_offers_scout_as_an_ordered_chain(monkeypatch, capsys):
     assert "choices" in scout["per_item"]
 
 
-def test_show_renders_both_chains_in_order_with_the_primary_first(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "devin": "/bin/devin",
-                                            "codex": "/bin/codex", "kiro": "/bin/kiro"})
+def test_show_renders_the_orchestrator_as_one_line_and_chains_below_it(tmp_path, monkeypatch, capsys):
+    # The orchestrator is a single entry: one line, no "(primary)" tag and no
+    # "backup" line, because the brain cannot fail over. The reviewer chain
+    # below it still renders in order, primary first, with its backups' pins.
+    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "codex": "/bin/codex",
+                                            "kiro": "/bin/kiro"})
     state = _base_plan(
-        orchestrator=[{"id": "claude", "priority": 1}, {"id": "devin", "priority": 2}],
+        orchestrator={"id": "claude", "priority": 1},
         reviewer=[{"id": "codex", "priority": 1, "model": "gpt-5.5"},
                   {"id": "kiro", "priority": 2, "model": "auto"}],
     )
     m.show(state)
     out = capsys.readouterr().out
-    order = [out.index(x) for x in ("Claude Code", "Devin", "Codex (OpenAI)", "Kiro (AWS)")]
+    order = [out.index(x) for x in ("Claude Code", "Codex (OpenAI)", "Kiro (AWS)")]
     assert order == sorted(order), out
-    assert out.count("(primary)") == 2        # both chains mark their head
-    assert "→ auto" in out                    # the backup's own pin is shown
+    assert out.count("(primary)") == 1        # only the reviewer chain marks its head
+    assert "→ auto" in out                    # the reviewer backup's own pin is shown
+    assert "failover for the orchestrator" not in out
+    orch_line = next(l for l in out.splitlines() if l.lstrip().startswith("orchestrator"))
+    assert "backup" not in orch_line and "(primary)" not in orch_line
 
 
 def test_show_renders_a_configured_fallback(monkeypatch, capsys):
@@ -1054,15 +1092,18 @@ def test_show_renders_unconfigured_fallback_without_an_empty_field(monkeypatch, 
     # the unconfigured case prints an explicit marker, never an empty field
 
 
-def test_emit_questions_offers_orchestrator_and_reviewer_as_ordered_chains(monkeypatch, capsys):
+def test_emit_questions_offers_the_orchestrator_single_and_the_reviewer_as_a_chain(monkeypatch, capsys):
     monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude", "codex": "/bin/codex"})
     monkeypatch.setattr(m, "load_state", lambda: {})
     m.emit_questions()
     out = capsys.readouterr().out
     q = json.loads(out[out.index("{"):])
-    for key in ("orchestrator", "reviewer"):
-        question = next(x for x in q["questions"] if x["key"] == key)
-        assert question["type"] == "ordered_multi", key
+    # A chain is offered only where it is real (a role the brain dispatches).
+    # The orchestrator is a single answer: nothing sits above the brain to fail
+    # it over, so `ordered_multi` there was the misleading CSV entry.
+    orch = next(x for x in q["questions"] if x["key"] == "orchestrator")
+    assert orch["type"] == "single"
+    assert next(x for x in q["questions"] if x["key"] == "reviewer")["type"] == "ordered_multi"
     # The reviewer question carries the same static model list as coders, so an
     # AI installer can pin each entry of the chain.
     assert "choices" in next(x for x in q["questions"]
@@ -1073,6 +1114,21 @@ def test_emit_questions_offers_orchestrator_and_reviewer_as_ordered_chains(monke
     reviewer_model = next(x for x in q["questions"] if x["key"] == "reviewer")["per_item"]["model"]
     assert reviewer_model == coder_model
     assert "REQUIRED" in reviewer_model
+
+
+def test_emit_questions_offers_the_orchestrator_a_model_pin(monkeypatch, capsys):
+    # The orchestrator carries a model pin like every other role, so the JSON
+    # surface an AI installer drives from must offer it -- otherwise the AI
+    # writes a plan with no orchestrator pin and the first conversation is
+    # faulty (the bug this guards).
+    monkeypatch.setattr(m, "scan", lambda: {"opencode": "/bin/opencode"})
+    monkeypatch.setattr(m, "load_state", lambda: {})
+    m.emit_questions()
+    out = capsys.readouterr().out
+    q = json.loads(out[out.index("{"):])
+    orch = next(x for x in q["questions"] if x["key"] == "orchestrator")
+    assert "model" in orch["per_item"]
+    assert "REQUIRED" in orch["per_item"]["model"]
 
 
 # --------------------------------------------------------------------------
@@ -1093,6 +1149,27 @@ def test_render_orchestrator_is_valid_yaml_with_no_leftover_placeholders():
     assert "{{" not in rendered
     parsed = yaml.safe_load(rendered)
     assert parsed["name"] == "test-agent"
+
+
+def test_render_orchestrator_pins_the_brain_model_at_executor_model():
+    # The orchestrator's spec IS the bundle's root config, so its pin goes at
+    # executor.model too -- NOT under executor.config, which the parser ignores.
+    # An unpinned opencode brain is the session's FIRST conversation, and with
+    # no model it launches on a default the harness may not serve.
+    plan = _base_plan(orchestrator=[{"id": "opencode", "priority": 1,
+                                     "model": "opencode/deepseek-v4.1-flash-free"}])
+    parsed = yaml.safe_load(m.render_orchestrator(plan))
+    assert parsed["executor"]["model"] == "opencode/deepseek-v4.1-flash-free"
+    assert "model" not in parsed["executor"]["config"]
+    assert parsed["executor"]["config"]["harness"] == "opencode-native"
+
+
+def test_render_orchestrator_omits_the_model_key_for_an_unpinned_brain():
+    # claude is `pinnable: false`: pinning the brain would pin the routing
+    # family and strand non-Claude workers, so the key must be ABSENT rather
+    # than empty -- a `model:` on its own would be a null pin at launch.
+    parsed = yaml.safe_load(m.render_orchestrator(_base_plan(orchestrator="claude")))
+    assert "model" not in parsed["executor"]
 
 
 def test_render_coder_is_valid_yaml_and_pins_the_model():
@@ -1536,20 +1613,6 @@ def test_check_missing_multiplexer_is_not_an_error(tmp_path):
     assert "herdr" in result.stdout and "not found" in result.stdout
 
 
-def test_emit_questions_lists_the_herdr_agents_pane_default_true(monkeypatch, capsys):
-    monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude"})
-    monkeypatch.setattr(m, "scan_multiplexers", lambda: {})
-    monkeypatch.setattr(m, "load_state", lambda: {})
-    m.emit_questions()
-    out = capsys.readouterr().out
-    q = json.loads(out[out.index("{"):])
-    item = next(x for x in q["questions"] if x["key"] == "herdr_agents_pane")
-    assert item["type"] == "bool"
-    assert item["default"] is True
-    # Asked always, noting it does not apply on a herdr-less machine.
-    assert "Ignored if herdr is not installed" in item["ask"]
-
-
 def test_emit_questions_surfaces_detected_multiplexers(monkeypatch, capsys):
     monkeypatch.setattr(m, "scan", lambda: {"claude": "/bin/claude"})
     monkeypatch.setattr(m, "scan_multiplexers", lambda: {"herdr": "/bin/herdr"})
@@ -1559,30 +1622,6 @@ def test_emit_questions_surfaces_detected_multiplexers(monkeypatch, capsys):
     q = json.loads(out[out.index("{"):])
     assert q["detected_multiplexers"] == {"herdr": "herdr"}
     assert [x["id"] for x in q["multiplexers"]] == ["herdr"]
-
-
-def test_an_old_plan_without_the_key_gets_the_default(tmp_path, monkeypatch):
-    # The idempotence case, real on this machine: a live og-install.json written
-    # before this key existed must load, take the default, and re-apply without
-    # failing validation. `main()`'s --plan path is the seam `og update` uses.
-    old = _chain_plan()
-    assert "herdr_agents_pane" not in old
-    plan_file = tmp_path / "og-install.json"
-    plan_file.write_text(json.dumps(old))
-    captured = {}
-    monkeypatch.setattr(m, "apply", lambda plan, dry_run=False: captured.update(plan))
-    monkeypatch.setattr(sys, "argv", ["og-install", "--plan", str(plan_file)])
-    m.main()
-    assert captured["herdr_agents_pane"] is True
-    assert not any(level == "error" for level, _ in m.validate(captured))
-
-
-def test_the_herdr_agents_pane_key_round_trips_into_state(tmp_path, monkeypatch):
-    # A plan carrying the key lands in og-install.json unchanged, including an
-    # explicit False -- the value bin/og will read later.
-    _apply_into(tmp_path, monkeypatch, _chain_plan(herdr_agents_pane=False))
-    state = json.loads((tmp_path / "og-install.json").read_text())
-    assert state["herdr_agents_pane"] is False
 
 
 # --------------------------------------------------------------------------
@@ -1617,9 +1656,9 @@ def test_the_projects_dir_key_round_trips_into_state(tmp_path, monkeypatch):
 
 
 def test_an_old_plan_without_a_projects_dir_still_loads(tmp_path, monkeypatch):
-    """The idempotence case, the same shape as herdr_agents_pane: a live
-    og-install.json written before `og chat --dir` existed must load, take the
-    default, and re-apply without failing validation."""
+    """The idempotence case: a live og-install.json written before `og chat
+    --dir` existed must load, take the default, and re-apply without failing
+    validation."""
     old = _chain_plan()
     assert "projects_dir" not in old
     plan_file = tmp_path / "og-install.json"
@@ -2559,6 +2598,26 @@ def test_pick_model_search_narrows_then_picks(monkeypatch):
     answers = iter(["claude", "1"])
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
     assert m.pick_model(OPENCODE_AGENT, None) == "opencode/claude-sonnet-5"
+
+
+def test_pick_model_search_shows_matches_beyond_the_cap(monkeypatch, capsys):
+    """A search must list every match, not re-apply the per-provider cap.
+
+    Regression: the initial menu caps a long catalog at MODELS_PER_PROVIDER
+    (twelve) per provider, and the search results were capped the same way -- so
+    an id the cap hid could not be reached by number even after searching for
+    it, only by typing its full (possibly unknown) id.
+    """
+    ids = [f"opencode/model-{i:02d}" for i in range(20)]
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("\n".join(ids) + "\n"))
+    answers = iter(["model", "15"])  # search, then take the 15th match
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
+    assert m.pick_model(OPENCODE_AGENT, None) == "opencode/model-14"
+    out = capsys.readouterr().out
+    assert "20 match(es) for 'model'" in out
+    # The truncation hint belongs to the full list only; the search lifts it.
+    assert out.count("more opencode/ ids") == 1
+
 
 
 def test_pick_model_accepts_a_full_id_the_tool_listed(monkeypatch):

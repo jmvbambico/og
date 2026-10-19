@@ -17,14 +17,18 @@ description: >-
 executor:
   type: omnigent
   context_window: 1000000
-  config:
-    # claude-native is the real Claude Code CLI, not claude-sdk: it inherits
-    # settings.json (and therefore shell hooks) and can be opened or taken
-    # over in a real terminal.
+{{MODEL_BLOCK}}  config:
+    # The vendor's real CLI (claude-native, opencode-native, ...), not a
+    # re-implementation: it inherits the CLI's own settings and can be opened
+    # or taken over in a real terminal.
     harness: {{ORCHESTRATOR_HARNESS}}
     permission_mode: auto
-    # Do not pin a model: pinning the brain also pins the family its workers
-    # are routed within, which would strand the non-Claude workers.
+    # The brain's harness pin also pins the family every sub-agent is routed
+    # within, so hand it to Smart Routing when it is on. A MODEL pin (above) is
+    # written only for agents whose registry row is pinnable: claude leaves it
+    # unset on purpose (a brain pin would pin the routing family and strand
+    # non-Claude workers), while opencode REQUIRES one or its first dispatch
+    # dies with no model.
     smart_routing_harness: auto
 
 prompt: |

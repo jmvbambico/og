@@ -131,8 +131,8 @@ than `og start`, so neither fact selects it. See below.
    result listing omits the latter two, so trust the measurement).
 4. `tab.rename(tab_id, <agent_name>)` — `hivemind`, from `og-install.json`.
 5. `pane.send_text(root_pane, "og chat\n")`.
-6. If `herdr_agents_pane` is on: `pane.split(root_pane, direction=right)` then
-   `pane.send_text(new_pane, "og agents\n")`.
+6. `pane.split(root_pane, direction=right)` then
+   `pane.send_text(new_pane, "og agents\n")` — the `og agents` pane is mandatory.
 7. Record the space (§3) — but the session id is not known yet. See the
    deferred-write note in §3.
 8. Start the bridge if it is not already running.
@@ -244,7 +244,7 @@ launched space, and nothing else:
 
 - write the `pending` record keyed by `$PWD` (§3) **before** exec'ing the chat,
   so the bridge can claim and rename the space when the session appears
-- if `herdr_agents_pane` is on, split and run `og agents`
+- split and run `og agents`
 
 Then `exec omnigent run` as it always did.
 
@@ -284,12 +284,11 @@ from (A)–(D) rather than a copy of it:
     need to be, because the launcher reports its own failure before herdr is
     handed the terminal.
   - `owner: history` / `bridge` is a record a half wrote when it **created** the
-    space and then returned; nobody is coming. A history space whose
-    `herdr_agents_pane` was off when it opened (turned on afterwards — the setting
-    is read once, at creation), a split that failed into a reconcile line nobody
-    read, an agents pane the operator closed: all three leave the record intact
-    and the tab holding one pane, so `og chat --resume` into that space came up
-    with no agents pane at all, silently and permanently. The tab is therefore
+    space and then returned; nobody is coming. A split that failed into a
+    reconcile line nobody read, or an agents pane the operator closed: both leave
+    the record intact and the tab holding one pane, so `og chat --resume` into
+    that space came up with no agents pane at all, silently and permanently. The
+    tab is therefore
     asked whether a pane besides this one is actually there, using the listing the
     split already takes, and the split is made when it is not.
   - **A record with NO `owner`** takes the same path as `history`/`bridge`. The
@@ -558,19 +557,12 @@ import it rather than re-implement any of that.
 
 ## 7. Install question
 
-The question list in `og_install.py` is flat and already has a `bool` type
-(`auto_update`). Following the existing convention — ask always, note when it
-does not apply, the way `tunnl_ssh_key` does:
-
-```python
-{"key": "herdr_agents_pane", "type": "bool", "default": True,
- "ask": "In a herdr session, should `og agents` open beside `og chat` as a "
-        "split pane? No means the session starts with `og chat` alone. "
-        "Ignored if herdr is not installed."},
-```
-
-Lands in `og-install.json`; `bin/og` reads it at launch. It does not touch the
-orchestrator prompt, so the 13.3 KB argv ceiling is not in play.
+There is none: the `og agents` pane is **mandatory**. `og_install.py` used to ask
+a `herdr_agents_pane` bool (`auto_update` is the remaining `bool`), but the split
+is no longer optional — the launcher, the bridge and `og chat` always open it, and
+the old key in `og-install.json` is ignored rather than read. None of this is
+written to `og-install.json`, so the orchestrator prompt is untouched and the
+13.3 KB argv ceiling is not in play.
 
 ---
 

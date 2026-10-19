@@ -755,17 +755,17 @@ def test_main_threads_the_cli_server_into_the_bridge(monkeypatch, tmp_path):
     assert captured["server"] == "https://og.example:8443"
 
 
-def test_main_threads_the_agents_pane_setting_into_the_bridge(
+def test_main_threads_the_space_cap_setting_into_the_bridge(
         monkeypatch, tmp_path):
-    # The install's `herdr_agents_pane` must reach the bridge the same way
-    # `herdr_session_space_cap` does; a bridge that decided its own answer would
-    # ignore the operator's choice for every resumed conversation.
+    # The install's `herdr_session_space_cap` must reach the bridge; a bridge
+    # that decided its own answer would ignore the operator's cap for every
+    # resumed conversation.
     import sys
     import types
 
     monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
     (tmp_path / "og-install.json").write_text(
-        json.dumps({"herdr_agents_pane": False}))
+        json.dumps({"herdr_session_space_cap": 2}))
 
     class StubWatcher:
         def __init__(self, base_url=None, token=None):
@@ -788,7 +788,7 @@ def test_main_threads_the_agents_pane_setting_into_the_bridge(
     monkeypatch.setattr(m, "Bridge", spy)
 
     assert m.main(["--once", "--dry-run"]) == 0
-    assert captured["agents_pane"] is False
+    assert captured["space_cap"] == 2
 
 
 def test_main_returns_zero_when_the_forever_loop_is_interrupted(
@@ -1897,12 +1897,12 @@ def test_a_history_spaces_first_tab_is_labelled_too(seams, tmp_path):
     assert _call(client, "tab_rename")[1] == ("tab1", "New Alignment")
 
 
-def test_a_history_space_opens_the_agents_pane_when_enabled(seams, tmp_path):
+def test_a_history_space_opens_the_agents_pane(seams, tmp_path):
     # THE BUG. Resuming a past conversation from the spaces list did not open
     # the `og agents` pane a fresh `og start` opens, because the history/resume
-    # path never consulted `herdr_agents_pane`. With it on (the default), the
-    # split happens with the SAME command and ratio a fresh launch uses — one
-    # implementation, so the two cannot disagree about either.
+    # path never opened it at all. The split happens with the SAME command and
+    # ratio a fresh launch uses — one implementation, so the two cannot disagree
+    # about either.
     import og_herdr_launch
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
@@ -1920,60 +1920,6 @@ def test_a_history_space_opens_the_agents_pane_when_enabled(seams, tmp_path):
     runs = {c[1][0]: c[1][1] for c in client.calls if c[0] == "pane_run"}
     assert "og agents" in runs.values()
     assert "pane1" not in runs, "og agents must not run in the chat pane"
-
-
-def test_a_history_space_honours_agents_pane_off(seams, tmp_path):
-    # The other half of the pair: `herdr_agents_pane: false` must reach the
-    # history/resume path too. A Bridge with it off opens NO split and starts
-    # nothing — the operator asked for a chat pane only.
-    client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
-                      agents_pane=False)
-    bridge.reconcile([Ev("added", "dead1", root_session(
-        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
-
-    assert "pane.split" not in _names(client)
-    assert "pane_run" not in _names(client)
-    # The resume line is still there, still unsubmitted: turning the split off
-    # must not turn the space's own job off.
-    assert _call(client, "pane_send_text")[1] == ("pane1",
-                                                  "og chat --resume dead1")
-
-
-def test_a_history_space_with_the_agents_pane_off_gets_one_when_it_is_resumed(
-        seams, tmp_path, monkeypatch):
-    # THE WHOLE DEFECT, END TO END, and the only test that can catch it. The
-    # pair above is half the story: the setting is read when the space is
-    # CREATED, and the operator can turn it on at any time afterwards. Nothing
-    # re-runs `_add_history_space` for a space that already exists and
-    # `_split_agents` has exactly one caller, so the record that pass left behind
-    # was the only thing that could ever put the pane back — and `og chat`,
-    # running in that pane on the one keystroke this feature exists for, stood
-    # itself down on it and returned 0.
-    #
-    # Both halves are needed and the bridge's record is not one of them: the tab
-    # is asked whether a second pane is actually there.
-    import og_herdr_launch
-    client = RecordingClient()
-    bridge = m.Bridge(FakeWatcher([]), client, cwd=str(tmp_path),
-                      agents_pane=False)
-    bridge.reconcile([Ev("added", "dead1", root_session(
-        "Fix issue 502", runner_online=False, workspace=str(tmp_path)))])
-    assert "pane.split" not in _names(client)
-
-    # The operator turns the setting on, then presses Enter on the resume line.
-    monkeypatch.chdir(tmp_path)
-    assert og_herdr_launch.chat_pane(
-        client=client,
-        env={"HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "ws1",
-             "HERDR_TAB_ID": "tab1", "HERDR_PANE_ID": "pane1"}) == 0
-
-    assert _names(client).count("pane.split") == 1, _names(client)
-    runs = {c[1][0]: c[1][1] for c in client.calls if c[0] == "pane_run"}
-    assert "og agents" in runs.values()
-    # Not in the pane holding the resume line: that pane is the session, and
-    # `og chat --resume` is what the operator submitted into it.
-    assert "pane1" not in runs, runs
 
 
 def test_the_history_split_is_the_launchers_one_implementation(
@@ -2203,7 +2149,7 @@ def test_a_repaired_history_space_still_leaves_its_resume_line_unsubmitted(
     # The resume line is UNSENT — `pane_send_text`, no newline — and no
     # `pane_run` ever carries it. (A repaired history space also opens the agents
     # pane, whose `og agents` runs in its OWN pane; see
-    # `test_a_history_space_opens_the_agents_pane_when_enabled`.) The pane is read
+    # `test_a_history_space_opens_the_agents_pane`.) The pane is read
     # off the record rather than hardcoded: the agents pane consumes an id, so the
     # repair's create is not the number it would be without a split.
     repair_pane = bridge._recs["dead1"]["pane_id"]

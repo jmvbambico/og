@@ -36,7 +36,8 @@ Ask the user, in this order. Each maps to a key in the plan JSON.
 | Key | Ask |
 |---|---|
 | `agent_name` | Name for the orchestrator bundle. Default `dev-lead`. |
-| `orchestrator` | Which agent plans and delegates, and never writes product code. |
+| `orchestrator` | Which agent plans and delegates, and never writes product code. **One agent, not a chain** — nothing dispatches the brain, so a second orchestrator could never take over. |
+| `orchestrator.model` | Model to pin for the brain. **Required where `registry.model.required` is true** — OpenCode as orchestrator is the common case, and an unpinned brain is a faulty *first* conversation, not just a later dead dispatch. A row marked `pinnable: false` (Claude Code) is never asked: pinning it would pin the routing family. |
 | `coders` | Which agents implement, **in preference order** — first is tried first, later ones absorb overflow. |
 | `coders[].model` | Model to pin per coder. Required where `registry.model.required` is true. For multi-provider CLIs (OpenCode, Kilo) run the registry's `model.list_cmd` (e.g. `opencode models`) and offer everything it prints, grouped by `provider/` prefix — a user with a DeepSeek or Anthropic login there wants `deepseek/…`, not only Zen's `opencode/…-free` ids. |
 | `reviewer` | Which agent reviews the batched diff. |
@@ -81,7 +82,13 @@ Plan shape:
 }
 ```
 
-`priority` is assigned from array order; you may omit it.
+`priority` is assigned from array order; you may omit it. `coders`, `reviewer`,
+`scout` and `integrator` accept an array (failover order, first is tried first).
+The **orchestrator does not**: it is the session's brain and nothing dispatches
+it, so it is a SINGLE agent — a second entry could never take over and is
+dropped with a warning. The orchestrator takes a `model` exactly like a coder —
+required when its registry row is (`opencode`), and omitted for a
+`pinnable: false` row (`claude`), which is why the example above carries none.
 
 ### 4. Verify
 

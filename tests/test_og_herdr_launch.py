@@ -41,7 +41,6 @@ from og_herdr_launch import (  # noqa: E402
     Launch,
     LaunchError,
     _hold_for_problems,
-    agents_pane_enabled,
     agent_name,
     chat_pane,
     install_config,
@@ -380,13 +379,13 @@ def detail_of(sid="s1", workspace=CWD, host_id=None, **extra):
 
 
 def make_ctx(tmp_path, client, watcher, *, inside=False, env=None,
-             agents_pane=True, spawn=None, pane_env=None):
+             spawn=None, pane_env=None):
     environment = {"HOME": str(tmp_path)} if env is None else dict(env)
     if inside:
         environment.setdefault("HERDR_ENV", "1")
         environment.setdefault("HERDR_PANE_ID", "w0:p9")
     return Launch(client=client, watcher=watcher, cwd=CWD, server=SERVER,
-                  agents_pane=agents_pane, env=environment,
+                  env=environment,
                   state_path=tmp_path / "og-herdr.json",
                   pane_env={} if pane_env is None else pane_env,
                   spawn=spawn if spawn is not None else (lambda: None),
@@ -1422,16 +1421,6 @@ def test_case_d_creates_the_space_without_attaching_again(tmp_path):
 # the agents pane
 # ---------------------------------------------------------------------------
 
-def test_agents_pane_off_means_no_split(tmp_path):
-    client = FakeClient()
-    ctx = make_ctx(tmp_path, client, FakeWatcher(), agents_pane=False)
-
-    launch(ctx)
-    assert client.methods == ["ping", "workspace.create", "tab.rename",
-                              "pane.send_text"]
-    assert client.text_typed() == ["og chat"]
-
-
 def test_the_split_leaves_the_agents_pane_room_for_its_footer(tmp_path):
     """`pane.split`'s `ratio` is the share RETAINED by the pane being split, so
     0.7 leaves the agents pane ~30% — enough for its ~52-column footer and the
@@ -1503,21 +1492,12 @@ def test_a_launch_with_no_pane_env_sends_no_browser(tmp_path):
     assert "env" not in client.split_params
 
 
-def test_agents_pane_defaults_on_when_the_install_never_answered():
-    """An install predating the key must still get the split it was configured
-    for by default; defaulting to False would take it away silently."""
-    assert agents_pane_enabled({}) is True
-    assert agents_pane_enabled({"herdr_agents_pane": None}) is True
-    assert agents_pane_enabled({"herdr_agents_pane": True}) is True
-    assert agents_pane_enabled({"herdr_agents_pane": False}) is False
-
-
 def test_session_space_cap_defaults_to_no_limit_and_reads_the_install_key():
     """0 means no limit, and 0 is the default: every non-archived root is listed.
 
-    Same shape as `agents_pane_enabled`: one key in og-install.json, read through
-    one function with a default, so an install that predates the key lists
-    EVERYTHING rather than being handed a cut nobody asked for.
+    One key in og-install.json, read through one function with a default, so an
+    install that predates the key lists EVERYTHING rather than being handed a cut
+    nobody asked for.
     """
     assert DEFAULT_SPACE_CAP == 0
     assert session_space_cap({}) == 0
@@ -2130,9 +2110,8 @@ def test_the_same_pane_id_in_a_different_tab_does_not_suppress_the_split(
 # question about a RECORD — which is written when a space is CREATED, before the
 # split that is supposed to follow it, and says nothing whatever about whether
 # that split happened. `og_herdr._add_history_space` remembers the pane and then
-# splits best-effort: `_split_agents` returns early when `herdr_agents_pane` is
-# off, which the operator can turn on at any time afterwards, and a split that
-# fails becomes a reconcile line nobody reads. The record still claims the pane,
+# splits best-effort, and a split that fails becomes a reconcile line nobody
+# reads. The record still claims the pane,
 # the tab still holds one pane, and so an operator who pressed Enter on a history
 # space's `og chat --resume <id>` got a chat and NO agents pane — for good, since
 # `_split_agents` has one caller and none of them ever looks at a space again.
@@ -2148,8 +2127,8 @@ def test_a_resume_into_a_history_space_with_no_agents_pane_gets_one(tmp_path,
     """THE FAILING INPUT, AND THE BUG. `owner: "history"` in `spaces` is what a
     space opened for a past conversation carries, and it is written whether or
     not the split after it happened. The tab holds ONE pane, so no agents pane is
-    there whatever the record says — most often because the setting was off when
-    the space opened and the operator has since turned it on. A guard that reads
+    there whatever the record says — a split can fail into a reconcile line nobody
+    read, or the operator can close the pane. A guard that reads
     the record alone stands this down, and the operator loses the pane silently
     and permanently."""
     monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
@@ -2484,21 +2463,6 @@ def test_chat_pane_outside_herdr_touches_nothing(tmp_path, monkeypatch, capsys):
     assert client.calls == []
     assert not (tmp_path / "og-herdr.json").exists()
     assert capsys.readouterr() == ("", "")
-
-
-def test_chat_pane_does_not_split_when_the_install_turned_it_off(tmp_path,
-                                                                 monkeypatch):
-    monkeypatch.setenv("OMNIGENT_HOME", str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "og-install.json").write_text('{"herdr_agents_pane": false}')
-    client = FakeClient()
-
-    assert chat_pane(client=client, env=_pane_env()) == 0
-
-    # The RECORD is still written: the agents pane is cosmetic, the pending
-    # record is what stops a second space appearing.
-    assert os.getcwd() in load_state(tmp_path / "og-herdr.json")["pending"]
-    assert client.calls == []
 
 
 def test_chat_pane_never_types_og_agents_into_a_pane_the_operator_already_had(

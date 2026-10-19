@@ -157,9 +157,9 @@ AGENTS_PANE_RATIO = 0.7
 LIVE_STATUSES = frozenset({"running", "idle"})
 
 # og-install.json keys. All have a default, so an install that predates one
-# still launches.
+# still launches. `herdr_agents_pane` is NOT one of them any more: the `og
+# agents` split is mandatory, so the launcher no longer reads a key for it.
 AGENT_NAME_KEY = "agent_name"
-AGENTS_PANE_KEY = "herdr_agents_pane"
 SESSION_SPACE_CAP_KEY = "herdr_session_space_cap"
 PROJECTS_DIR_KEY = "projects_dir"
 DEFAULT_AGENT_NAME = "dev-lead"
@@ -240,17 +240,6 @@ def agent_name(config: dict) -> str:
     return name if isinstance(name, str) and name else DEFAULT_AGENT_NAME
 
 
-def agents_pane_enabled(config: dict) -> bool:
-    """Whether to open `og agents` beside the chat, defaulting to TRUE.
-
-    The key is newer than the install that reads it, and an install that predates
-    it must still get the layout it was configured for by default — defaulting
-    to False would quietly take the split away from everyone who never chose.
-    """
-    value = config.get(AGENTS_PANE_KEY, True)
-    return True if value is None else bool(value)
-
-
 def session_space_cap(config: dict) -> int:
     """How many past-conversation spaces the bridge may keep open.
 
@@ -258,8 +247,8 @@ def session_space_cap(config: dict) -> int:
     one that predates the key) lists every non-archived root — the parity with
     the web sidebar that is the point of the feature. A POSITIVE value is a cap
     the bridge honours, trimming the oldest first (see og_herdr.DEFAULT_SPACE_CAP).
-    Same shape as `agents_pane_enabled`: one key in `~/.omnigent/og-install.json`
-    read through one function with a default.
+    One key in `~/.omnigent/og-install.json`, read through one function with a
+    default.
 
     The reader is here, beside the other config readers, but the CONSUMER is the
     bridge (og_herdr), which counts the history spaces it already has and refuses
@@ -645,7 +634,6 @@ class Launch:
     watcher: Any                     # og_herdr_watch.SessionWatcher
     cwd: str
     server: str
-    agents_pane: bool
     env: dict
     state_path: Path
     # Extra environment for every pane this launch creates, handed to herdr on
@@ -850,7 +838,7 @@ def _attach_there(ctx: Launch, session: dict) -> str:
     gets no agents pane and no explanation, which is indistinguishable at the
     keyboard from case (A)'s split failing, and for the same reason: the launch
     says nothing either way. The likely triggers are a space whose agents pane
-    was closed by hand, and a space opened before `herdr_agents_pane` existed.
+    was closed by hand, and a space opened before og split the pane at all.
 
     It is NOT a small fix, which is why it is written down instead of patched:
     the split needs a tab id and a root pane, and a focused EXISTING space has
@@ -985,8 +973,7 @@ def _open_space(ctx: Launch, attach: bool) -> str:
         _unrecord(ctx.state_path, "pending", ctx.cwd)
         _close_quietly(ctx, ws_id)
         raise
-    if ctx.agents_pane:
-        _split_agents(ctx, ws_id, tab_id, pane_id)
+    _split_agents(ctx, ws_id, tab_id, pane_id)
     info("opened space {0} for {1}".format(ws_id, ctx.cwd))
     return "attach" if attach else "done"
 
@@ -1628,9 +1615,6 @@ def chat_pane(argv=None, client=None, env=None) -> int:
         # is not worth refusing the chat over, but it must never be silent.
         _chat_degrade("could not record this pane for the bridge ({0})".format(exc))
 
-    if not agents_pane_enabled(config):
-        return 0
-
     if owned is not None and owned.get("owner") == OWNER_LAUNCHER:
         # THE LAUNCHER'S OWN RECORD, and the half that must NOT be raced — stood
         # down HERE, above the client construction, so the launcher path opens NO
@@ -1690,10 +1674,9 @@ def chat_pane(argv=None, client=None, env=None) -> int:
             # CREATED, by a half that has since finished, and says nothing about
             # whether the split that was supposed to follow it ever happened:
             # `og_herdr._add_history_space` remembers the pane and then splits
-            # best-effort (`_split_agents` returns early when `herdr_agents_pane`
-            # is off, which the operator can turn on afterwards), a split can fail
-            # into a reconcile line nobody read, and the operator can close the
-            # pane. NOBODY is coming to split again, so the tab is asked and only
+            # best-effort, a split can fail into a reconcile line nobody read, and
+            # the operator can close the pane. NOBODY is coming to split again, so
+            # the tab is asked and only
             # a pane that is demonstrably there counts — otherwise `og chat
             # --resume` into a past conversation comes back with no agents pane at
             # all — no error, nothing degraded, nothing to notice.
@@ -2714,7 +2697,6 @@ def build_launch(args: argparse.Namespace) -> Launch:
     from og_herdr_client import HerdrClient
     from og_herdr_watch import SessionWatcher
 
-    config = install_config()
     client = HerdrClient(socket_path=args.socket)
     watcher = SessionWatcher(base_url=args.server,
                              token=SessionWatcher.discover_token(args.server))
@@ -2723,8 +2705,7 @@ def build_launch(args: argparse.Namespace) -> Launch:
                      or Path.home() / ".omnigent") / "logs"
                 / "herdr-server.log")
     return Launch(client=client, watcher=watcher, cwd=os.getcwd(),
-                  server=args.server,
-                  agents_pane=agents_pane_enabled(config), env=dict(os.environ),
+                  server=args.server, env=dict(os.environ),
                   state_path=default_state_path(),
                   pane_env=pane_env_for(dict(os.environ)),
                   spawn=spawn_herdr_server(binary, log_path),

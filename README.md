@@ -100,11 +100,16 @@ repo carries its own `AGENTS.md` (the constitution) and optionally
 | `scout` | **never** | optional | repo reading, search and git-state questions, read-only |
 | `integrator` | no product code | optional | git, worktree and gate plumbing; **never decides a merge** |
 
-Every role but `orchestrator` renders its own sub-agent spec and so takes its
-own model pin. `validate()` refuses a config that leaves a `required` pin unset
-on **any** of them — an unpinned worker either inherits the orchestrator's model
-id or resolves to none at all, and both are a dead dispatch rather than a slow
-one.
+Every role takes its own model pin, the `orchestrator` included: its spec *is*
+the bundle's root config, so its pin goes at `executor.model` there, and an
+unpinned brain is the session's very first conversation — a harness that
+resolves no model launches on a default it may not serve. `validate()` refuses a
+config that leaves a `required` pin unset on **any** role — an unpinned worker
+either inherits the orchestrator's model id or resolves to none at all, and both
+are a dead dispatch rather than a slow one. A row the registry marks
+`pinnable: false` (Claude Code) is the exception: pinning that brain would pin
+the family every worker is routed within and strand non-Claude workers, so it is
+left to the harness's own default.
 
 ---
 
@@ -168,7 +173,7 @@ tested distro). Native Windows — PowerShell, cmd, Git Bash — is not supporte
 
 | Agent | Harness | Roles | Model pin | Notes |
 |---|---|---|---|---|
-| Claude Code | `claude-native` | orch / coder / reviewer | optional |  |
+| Claude Code | `claude-native` | orch / coder / reviewer | optional | as the **orchestrator** the brain is deliberately left unpinned: pinning it would pin the family its workers route within, stranding non-Claude workers. As a worker it is pinnable like any other |
 | OpenCode (Zen) | `opencode-native` | orch / coder | **required** | lists every provider you've added with `opencode auth login` (Zen, DeepSeek, Anthropic, …); Zen's free `-free` lineup rotates and is day-capped |
 | Codex | `codex-native` | orch / coder / reviewer | optional — 4 static choices | the CLI does not enumerate models, so the picker offers a static list and accepts a hand-typed newer id |
 | Cline | `acp:cline` | coder | **required** | leaf worker; **fails silently on a bad model**; runs with `--auto-approve true` (see below) |
@@ -244,7 +249,8 @@ becomes same-vendor with Cline for cross-vendor review. The row ships pinned to
 **Model pin location.** A pin goes at `executor.model`. `executor.config` is a
 free-form dict, so a `model:` placed there is accepted without complaint and
 then silently ignored — the worker inherits the *orchestrator's* model id and
-the dispatch fails. The installer always writes it to the right place.
+the dispatch fails. The installer always writes it to the right place, the
+orchestrator's own pin included (its spec is the bundle's root `config.yaml`).
 
 **Prompt delivery.** Omnigent reports, per harness, whether a spec prompt
 actually reaches the CLI:

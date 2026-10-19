@@ -470,7 +470,7 @@ attaching to the agent's terminal; `og agents` does the same.
 ### The layout, and the one rule that keeps it
 
 The conversation's **main pane stays `og chat`** (the Omnigent CLI), with the
-`og agents` pane beside it when `herdr_agents_pane` is on. Nothing in this
+`og agents` pane always beside it. Nothing in this
 feature retypes, repurposes or retargets it. Each agent's own CLI is a **tab of
 its own**:
 
