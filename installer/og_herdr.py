@@ -860,7 +860,7 @@ class Bridge:
 
     def __init__(self, watcher, client, dry_run=False, source=DEFAULT_SOURCE,
                  cwd=None, server=DEFAULT_SERVER, state_path=None, filer=None,
-                 space_cap=DEFAULT_SPACE_CAP, pane_env=None, agents_pane=True):
+                 space_cap=DEFAULT_SPACE_CAP, pane_env=None):
         self.watcher = watcher
         self.client = client
         self.dry_run = dry_run
@@ -879,14 +879,6 @@ class Bridge:
         # How many history spaces (past conversations) this bridge may keep on
         # screen; see DEFAULT_SPACE_CAP. A live session is never subject to it.
         self.space_cap = space_cap
-        # Whether a history/resume space gets the `og agents` split its sibling
-        # `og start` opens for a fresh conversation. TRUE by default, matching
-        # `og_herdr_launch.agents_pane_enabled`'s default for an install that
-        # predates the key — a history space must read the install's
-        # `herdr_agents_pane` exactly as a fresh start does, and a Bridge built
-        # by anything at all gets the configured layout unless told otherwise.
-        # `main` reads the key and passes it here; see `_split_agents`.
-        self.agents_pane = agents_pane
         # The pane-shell environment installed into every pane this bridge asks
         # herdr to create, so none of them can open a browser (see
         # `pane_env_for`). DERIVED from this process when not given, rather than
@@ -1760,8 +1752,8 @@ The rule itself is `_memory_decides`, which is where the distinction
         runs `og chat --resume`, which opens a browser. Nothing about the day it
         goes wrong looks like anything on screen; see `pane_env_for`.
 
-        A history space also gets the `og agents` split a fresh launch opens,
-        gated on `agents_pane` — see `_split_agents`. It runs in its OWN pane,
+        A history space also gets the `og agents` split a fresh launch opens —
+        see `_split_agents`. It runs in its OWN pane,
         so it neither submits the resume line above nor starts a runner for the
         dead session.
         """
@@ -1797,15 +1789,15 @@ The rule itself is `_memory_decides`, which is where the distinction
 
     def _split_agents(self, ws_id: str, tab_id: str, root_pane: str,
                       cwd: str) -> list:
-        """Open `og agents` beside a history space's chat pane, when enabled.
+        """Open `og agents` beside a history space's chat pane.
 
-        A history/resume space must honour `herdr_agents_pane` exactly as a
-        fresh `og start` does — same command, same ratio, same degradation — or
-        a past conversation resumed from the spaces list comes up without the
-        pane its sibling launch opens. The split is the SAME implementation the
-        launcher calls (`og_herdr_launch.split_agents_pane`), imported HERE
-        rather than at module load because the launcher imports this module and
-        this module must import without it (see `main`).
+        A history/resume space must open the split exactly as a fresh `og start`
+        does — same command, same ratio, same degradation — or a past
+        conversation resumed from the spaces list comes up without the pane its
+        sibling launch opens. The split is the SAME implementation the launcher
+        calls (`og_herdr_launch.split_agents_pane`), imported HERE rather than at
+        module load because the launcher imports this module and this module must
+        import without it (see `main`).
 
         It runs NOTHING on the chat pane: `og agents` goes into its own pane, so
         the resume line stays typed-but-unsubmitted and no runner starts for the
@@ -1818,8 +1810,6 @@ The rule itself is `_memory_decides`, which is where the distinction
         `reconcile` to report, never an exception — a cosmetic pane must not take
         the space, and the visible conversation in it, down with it.
         """
-        if not self.agents_pane:
-            return []
         from og_herdr_launch import split_agents_pane
 
         return split_agents_pane(self.client, ws_id, tab_id, root_pane, cwd,
@@ -3838,20 +3828,15 @@ def main(argv=None) -> int:
 
     from og_herdr_watch import SessionWatcher
 
-    # The two install keys this daemon honours — how many past-conversation
-    # spaces to keep open (`herdr_session_space_cap`) and whether a history space
-    # opens the `og agents` split (`herdr_agents_pane`) — both from the same
+    # The one install key this daemon honours — how many past-conversation
+    # spaces to keep open (`herdr_session_space_cap`) — from the same
     # og-install.json the launcher reads. Imported HERE, not at module load: this
     # module must import without the launcher — the launcher imports THIS one —
-    # and the readers live beside the other config readers in og_herdr_launch.
-    # ONE `install_config()` read feeds both, so the two cannot see different
-    # files.
-    from og_herdr_launch import (agents_pane_enabled, install_config,
-                                 session_space_cap)
+    # and the reader lives beside the other config readers in og_herdr_launch.
+    from og_herdr_launch import install_config, session_space_cap
 
     config = install_config()
     space_cap = session_space_cap(config)
-    agents_pane = agents_pane_enabled(config)
 
     # Read once and shared: the filer below files against the same server and
     # token the watcher polls, so `_load_token` must not be called twice.
@@ -3875,8 +3860,7 @@ def main(argv=None) -> int:
                     # The same URL the watcher polls, and the one the pane's
                     # `omnigent attach --server` has to name: the pane cannot
                     # discover it (see attach_command).
-                    server=args.server, filer=filer, space_cap=space_cap,
-                    agents_pane=agents_pane)
+                    server=args.server, filer=filer, space_cap=space_cap)
 
     if args.once:
         for line in bridge.run_once():

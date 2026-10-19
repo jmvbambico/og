@@ -646,8 +646,25 @@ def call(path, method="GET", body=None):
         return json.load(r) if r.status != 204 else {}
 
 try:
-    agents = call("/v1/agents").get("data", [])
-    dev = next((a for a in agents if a.get("name") == agent_name), None)
+    # /v1/agents is cursor-paginated (default limit 20). A single GET saw only
+    # the first page, so an installed agent whose name sorted past it read as
+    # "not registered" -- `og start` then skipped the pin and the workspace
+    # refresh, and `og status` cried "not pinned" while the project demonstrably
+    # was. Walk the cursor so the lookup does not depend on the page the agent
+    # happens to land on.
+    def all_agents():
+        out, after = [], None
+        while True:
+            page = call("/v1/agents?limit=200" + (f"&after={after}" if after else ""))
+            out.extend(page.get("data", []))
+            if not page.get("has_more"):
+                break
+            after = page.get("last_id")
+            if not after:
+                break
+        return out
+
+    dev = next((a for a in all_agents() if a.get("name") == agent_name), None)
     if dev is None:
         print(f"{agent_name} is not registered on the server", file=sys.stderr); sys.exit(1)
 

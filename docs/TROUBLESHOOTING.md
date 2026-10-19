@@ -451,6 +451,56 @@ unnoticed.
 
 ---
 
+## "Models unavailable" with an OpenCode (or other non-Claude/Codex) orchestrator
+
+The web composer's *New Chat* model dropdown is empty and reads **"Models
+unavailable"** when the pinned agent's harness is `opencode-native` — or any
+harness other than Claude Code, Codex, Pi and Devin.
+
+**Cause.** The dropdown asks the host for a pre-launch catalog:
+
+```
+GET /v1/hosts/<host_id>/harnesses/opencode-native/model-options
+```
+
+Omnigent implements that endpoint for `codex-native`, `claude-native`,
+`claude-sdk`, `pi` and `devin-native` only. For everything else the host answers
+
+```
+HTTP 502 {"detail": "model options are unsupported for harness 'opencode-native'"}
+```
+
+and the dialog renders the empty result as "Models unavailable". This is an
+upstream gap, **not** an og one, and it is still present in upstream's newest
+build — `brew upgrade omnigent` does not change it.
+
+**It is cosmetic.** og pins the brain's model in the orchestrator spec
+(`executor.model`, e.g. `commandcode/claude-sonnet-5-5`), so the runner launches
+the harness and sessions start normally; only the picker's label is blank.
+
+Confirm it on your own machine — `PORT` is the one `og status` prints:
+
+```bash
+PORT=6768
+URL="http://127.0.0.1:$PORT"
+TOK=$(python3 -c "import json;print(json.load(open('$HOME/.omnigent/auth_tokens.json'))['$URL']['token'])")
+HOST=$(curl -s -H "Authorization: Bearer $TOK" "$URL/v1/hosts" \
+  | python3 -c "import sys,json;print(next(h['host_id'] for h in json.load(sys.stdin)['hosts'] if h.get('status')=='online'))")
+curl -s -H "Authorization: Bearer $TOK" \
+  "$URL/v1/hosts/$HOST/harnesses/opencode-native/model-options"
+```
+
+A `"model options are unsupported …"` detail is this issue, and nothing needs
+fixing: the session launches on the pinned model regardless.
+
+**If you want a populated picker.** Make the orchestrator (or at least the
+composer's pinned agent) a harness Omnigent can enumerate — Claude Code
+(`claude-native`) or Codex (`codex-native`). The OpenCode — and any non-Claude
+vendor — model pin still works as a coder; only the pre-launch dropdown is
+affected.
+
+---
+
 ## New sessions open in `~` or `~/projects`, not the directory `og start` ran from
 
 The composer's default workspace is the pinned project's `workspace`, which

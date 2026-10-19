@@ -756,3 +756,91 @@ def test_the_needs_setup_open_browser_is_gated_by_the_suppression():
     text = OG.read_text()
     assert re.search(r'^\s*if og_browser_suppressed; then$', text, re.M)
     assert re.search(r'^\s*open_in_browser "\$OG_PUBLIC_URL"$', text, re.M)
+
+
+# --------------------------------------------------------------------------
+# ensure_project -- the agent lookup must page past /v1/agents' first page
+# --------------------------------------------------------------------------
+def test_ensure_project_finds_an_agent_beyond_the_first_agents_page(tmp_path):
+    """`/v1/agents` is cursor-paginated (default limit 20). A single GET saw
+    only page one, so an installed agent whose name sorted past it read as
+    "not registered": `og start` then skipped the project pin and the workspace
+    refresh, and `og status` reported "not pinned" while the project was, in
+    fact, pinned. The stub caps every page at 20 rows (ignoring `limit`), so the
+    lookup can only pass by walking the `after` cursor — exactly what a real
+    server with more agents than one page forces."""
+    import http.server
+    import json
+    import threading
+    import urllib.parse
+
+    home = tmp_path / "home"
+    (home / ".omnigent").mkdir(parents=True)
+    omni = home / ".omnigent"
+
+    agents = [{"id": f"a{i:02d}", "name": f"decoy-{i}"} for i in range(24)]
+    agents.append({"id": "zz-hivemind", "name": "hivemind"})
+
+    class Stub(http.server.BaseHTTPRequestHandler):
+        patched = {}
+
+        def _json(self, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            if parsed.path == "/v1/agents":
+                after = (query.get("after") or [None])[0]
+                limit = int((query.get("limit") or ["20"])[0])
+                start = 0
+                if after is not None:
+                    ids = [a["id"] for a in agents]
+                    start = ids.index(after) + 1 if after in ids else len(agents)
+                page = agents[start:start + min(limit, 20)]  # page size is the server's, not ours
+                self._json({
+                    "object": "list", "data": page,
+                    "first_id": page[0]["id"] if page else None,
+                    "last_id": page[-1]["id"] if page else None,
+                    "has_more": start + len(page) < len(agents),
+                })
+            elif parsed.path == "/v1/projects":
+                self._json({"object": "list", "data": [
+                    {"id": "p1", "object": "project", "name": "hivemind",
+                     "config": {"agent_id": "stale-id"}}]})
+            elif parsed.path == "/v1/hosts":
+                self._json({"hosts": [{"host_id": "h1", "status": "online"}]})
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_PATCH(self):
+            n = int(self.headers.get("Content-Length", 0))
+            Stub.patched = json.loads(self.rfile.read(n))
+            self._json({})
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        (omni / "auth_tokens.json").write_text(
+            json.dumps({f"http://127.0.0.1:{port}": {"token": "t"}}))
+        result = _run_sourced(home, "ensure_project", env={
+            "OG_AGENT": "hivemind", "OG_PORT": str(port),
+            "OG_WORKSPACE": str(tmp_path / "ws")})
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "hivemind"
+        # The pin really moved to the agent found on the later page, and picked
+        # up the online host the stub served.
+        assert Stub.patched.get("config", {}).get("agent_id") == "zz-hivemind"
+        assert Stub.patched["config"]["host_id"] == "h1"
+    finally:
+        srv.shutdown()
