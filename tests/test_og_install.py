@@ -948,6 +948,28 @@ def test_scout_template_carries_the_read_only_contract():
     assert parsed["skills"] == "none"
 
 
+def test_scout_template_names_provenance_and_keeps_it_bounded():
+    """A scout answers WHY as well as WHERE. The git history and the comments are
+    the evidence -- and this repo's AGENTS.md says most comments record a failure
+    that actually happened. The bounded-summary rule is the one a history
+    question most tempts a scout to break, so it is pinned here too: a provenance
+    answer is still paths and line ranges, never a pasted log or a dumped file."""
+    plan = _base_plan(scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+    prompt = " ".join(yaml.safe_load(m.render_scout(plan))["prompt"].split())
+    assert "PROVENANCE" in prompt
+    # The read-only tools that answer "why". Naming only reads keeps the
+    # read-only contract above intact.
+    assert "git log -S" in prompt
+    assert "git log --follow" in prompt
+    assert "git blame" in prompt
+    assert "the comments around the line" in prompt
+    # A comment is evidence about the past here, not decoration.
+    assert "records a real failure" in prompt
+    assert "quote it with its file:line" in prompt
+    # ...and a history answer stays bounded: no pasted log, no dumped file.
+    assert "NEVER a pasted `git log`" in prompt
+
+
 def test_scout_read_only_is_stated_as_trusted_not_sandboxed():
     """The read-only rule is a CONTRACT the scout honours, not a policy that
     stops it: blast_radius only denies force-push/rm -rf/hard-reset, gate_pushes
