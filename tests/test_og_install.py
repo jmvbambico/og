@@ -3106,6 +3106,9 @@ def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
     monkeypatch.setattr(m, "scan", lambda: {"grok": "/bin/grok", "devin": "/bin/devin",
                                             "claude": "/bin/claude"})
     monkeypatch.setattr(m, "load_state", lambda: {})
+    # Pin the probe so the boolean AND the source are asserted, not left to
+    # whether Omnigent happens to be importable from the test interpreter.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", {"claude-native": True, "grok": False})
     m.emit_questions()
     out = capsys.readouterr().out
     q = json.loads(out[out.index("{"):])
@@ -3116,9 +3119,18 @@ def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
     assert "cannot dispatch sub-agents" in orch_q["notes"]["grok"]
     assert "can dispatch sub-agents" in orch_q["notes"]["claude"]
     assert "source:" in orch_q["notes"]["claude"]
+    # The STRUCTURED sibling, machine-readable: id -> {can, source}. A capable
+    # agent is true/measured, an incapable one false/measured -- and the prose
+    # note still rides alongside it for the human reading the picker.
+    assert orch_q["dispatch"]["claude"] == {"can": True, "source": "measured"}
+    assert orch_q["dispatch"]["grok"] == {"can": False, "source": "measured"}
+    assert orch_q["dispatch"]["devin"]["source"] in ("measured", "registry-flag")
     # ...and the coder question carries nothing for them: verified in that role.
     coder_q = next(x for x in q["questions"] if x["key"] == "coders")
     assert "grok" not in coder_q["notes"] and "devin" not in coder_q["notes"]
+    # Dispatch capability only gates the brain, so the structured map rides the
+    # orchestrator question alone -- not every role question.
+    assert "dispatch" not in coder_q
     # The raw field is in the embedded registry for a consumer that reads it.
     devin_row = next(r for r in q["registry"] if r["id"] == "devin")
     assert devin_row["unverified_roles"] == ["orchestrator"]
@@ -3774,6 +3786,7 @@ PER_ROLE_SITES = {
         "render_scout",
         "render_vendor_map",
         "reviewer_names",
+        "role_dispatch",
         "role_options",
         "scout_note",
         "show",

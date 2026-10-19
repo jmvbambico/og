@@ -1131,15 +1131,16 @@ def role_options(role: str, found: dict | None = None) -> list:
 
 
 def role_notes(role: str) -> dict:
-    """agent id -> per-role caveat, for the `--questions` surface.
+    """agent id -> per-role caveat PROSE, for the `--questions` surface.
 
     AGENTS.md Part 1 has an AI installer drive its conversation from that
     output, and it must never offer an agent without the warning that applies to
     it. The caveat is per role -- an agent can be a verified coder and an
     unverified orchestrator -- so it is keyed by id under the question that
-    offers them. The orchestrator question also carries the measured dispatch
-    capability of every agent (boolean + source), so the owner can see which
-    agents can orchestrate without reading the probe code.
+    offers them. This is what a HUMAN reads at selection time; the machine
+    readable dispatch answer lives in the sibling `dispatch` map (`role_dispatch`),
+    so a program never has to parse a sentence to learn whether an agent can
+    orchestrate.
     """
     out = {}
     for a in REGISTRY["agents"]:
@@ -1152,6 +1153,26 @@ def role_notes(role: str) -> dict:
             notes.append(caveat)
         if notes:
             out[a["id"]] = " ".join(notes)
+    return out
+
+
+def role_dispatch(role: str) -> dict:
+    """agent id -> {can, source} dispatch capability, or {} for a leaf role.
+
+    The ORCHESTRATOR question alone carries this: dispatch capability is the one
+    bar that gates a brain -- every other role is a leaf worker by definition --
+    so the field rides exactly the question where it can change the answer. It is
+    a sibling of `notes` on the same question: keyed by id, each value a
+    machine-readable {can: bool, source: str} that an AI installer reads directly
+    instead of parsing the human sentence in `notes`. Reuses `dispatch_capability`
+    so the boolean and source are the same ones validate() enforces.
+    """
+    if role != "orchestrator":
+        return {}
+    out = {}
+    for a in REGISTRY["agents"]:
+        cap = dispatch_capability(a)
+        out[a["id"]] = {"can": cap.can, "source": cap.source}
     return out
 
 
@@ -3179,7 +3200,10 @@ def emit_questions() -> None:
     # conversation from this output, and it must never offer a role without the
     # warning that applies to it. The `roles` array no longer restricts the
     # choices: every detected agent is offered for every role, and the notes
-    # carry the capability caveat where one applies.
+    # carry the capability caveat where one applies. The orchestrator question
+    # also carries a structured `dispatch` map (id -> {can, source}) next to
+    # `notes`, so an AI installer reads the answer as a boolean rather than
+    # parsing the human sentence out of prose.
     role_questions = []
     for r in ROLES:
         q = {"key": r.key, "type": "ordered_multi",
@@ -3191,6 +3215,13 @@ def emit_questions() -> None:
                          if a["id"] in found],
              "notes": role_notes(r.role),
              "ask": r.ask}
+        # The machine-readable dispatch answer, a sibling of `notes`, rides the
+        # orchestrator question only: can a harness dispatch is the bar that
+        # gates a brain, while every other role is a leaf worker that the bar
+        # does not touch. Empty for those roles, so it is not emitted there.
+        dispatch = role_dispatch(r.role)
+        if dispatch:
+            q["dispatch"] = dispatch
         if r.spec:
             # The same static model list under every role that pins one, so an
             # AI installer can answer for each entry of the chain. The fallback
