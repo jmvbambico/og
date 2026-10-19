@@ -99,6 +99,113 @@ def scan() -> dict:
     return found
 
 
+# --------------------------------------------------------------------------
+# sub-agent dispatch capability -- MEASURED from Omnigent, not the registry
+# --------------------------------------------------------------------------
+# Whether a harness can dispatch sub-agents is a capability Omnigent reports on
+# its own harness object as `capabilities[<harness>].subagents`. The registry's
+# `relay` flag is a hand-maintained guess that was demonstrably WRONG for six
+# rows (agy, cursor, gemini, goose, hermes and grok each claimed `relay: true`
+# while their harness reports subagents=False). grok was even offered as an
+# orchestrator, so the installer would happily build a brain that could never
+# delegate. Measure when Omnigent is importable; fall back to the flag when it
+# is not -- Omnigent is a separate homebrew install
+# (/opt/homebrew/Cellar/omnigent/<ver>/libexec) and is usually NOT importable
+# from the interpreter running this installer.
+_UNSET = object()
+_SUBAGENT_CAPS: object = _UNSET
+
+
+def measured_subagent_caps() -> dict | None:
+    """{harness_id: bool} from Omnigent's capabilities, or None if unavailable.
+
+    Cached for the process -- the probe is asked once, never once per picker
+    row. Any failure (Omnigent absent, a capability shape change, anything) is
+    swallowed into None: a measurement that cannot be taken must never fail
+    setup. Callers then fall back to the registry's `relay` flag and say so.
+    """
+    global _SUBAGENT_CAPS
+    if _SUBAGENT_CAPS is not _UNSET:
+        return _SUBAGENT_CAPS
+    caps = None
+    try:
+        from omnigent.harness_plugins import plugin_state
+        raw = plugin_state().contributions[0].capabilities
+        caps = {hid: bool(getattr(c, "subagents", False)) for hid, c in raw.items()}
+    except Exception:
+        caps = None
+    _SUBAGENT_CAPS = caps
+    return caps
+
+
+class DispatchCapability(NamedTuple):
+    can: bool
+    source: str              # 'measured' | 'registry-flag'
+    harness: str
+    shared_key: str | None   # the shared 'acp' key, when measured through it
+
+
+def dispatch_capability(agent: dict) -> DispatchCapability:
+    """Whether `agent` can dispatch sub-agents, and where that answer came from.
+
+    An `acp:<slug>` row has no capability key of its own -- Omnigent exposes ONE
+    shared `acp` entry for the whole ACP transport, exactly as
+    `configured_harnesses` does (see `preflight_key`) -- so the shared key is
+    consulted before the registry flag. Every other harness keeps its own id.
+    """
+    harness = agent.get("harness") or ""
+    caps = measured_subagent_caps()
+    if caps is not None:
+        if harness in caps:
+            return DispatchCapability(caps[harness], "measured", harness, None)
+        if harness.startswith("acp:") and "acp" in caps:
+            return DispatchCapability(caps["acp"], "measured", harness, "acp")
+    return DispatchCapability(agent.get("relay") is not False, "registry-flag",
+                              harness, None)
+
+
+def capability_reason(cap: DispatchCapability) -> str:
+    """Why `cap` says an agent cannot dispatch, naming the source of the answer."""
+    if cap.source == "measured":
+        via = f" (via shared key '{cap.shared_key}')" if cap.shared_key else ""
+        return (f"omnigent reports harness '{cap.harness}'{via} cannot "
+                "dispatch sub-agents")
+    return ("the registry `relay` flag (Omnigent not importable from this "
+            "interpreter) says it cannot dispatch sub-agents: relay: false means "
+            "this row runs without Omnigent's sys_* tool relay")
+
+
+def orchestrator_capable_ids() -> list:
+    """Registry ids the probe says can actually orchestrate, in registry order.
+
+    A capable harness that never receives its spec prompt cannot orchestrate
+    either, so `prompt_delivery: none` is excluded alongside the dispatch gate
+    -- otherwise the refusal would advertise a second dead end.
+    """
+    return [a["id"] for a in REGISTRY["agents"]
+            if dispatch_capability(a).can
+            and a.get("prompt_delivery") != "none"]
+
+
+def dispatch_note(agent: dict, role: str) -> str | None:
+    """The can/cannot-orchestrate caveat for `agent` in `role`, or None.
+
+    Only the orchestrator role is killed by an inability to dispatch; every
+    other role is a leaf worker by definition, so only it emits a note. The note
+    carries the BOOLEAN and the SOURCE (measured via Omnigent, or the registry
+    flag when it is not importable), so an AI installer driving its conversation
+    from --questions can see which agents can orchestrate without reading the
+    probe code -- and the picker shows the same caveat at selection time.
+    """
+    if role != "orchestrator":
+        return None
+    cap = dispatch_capability(agent)
+    if cap.can:
+        return f"can dispatch sub-agents (source: {cap.source})."
+    return (f"cannot dispatch sub-agents ({capability_reason(cap)}); "
+            f"source: {cap.source}.")
+
+
 def multiplexers_by_id() -> dict:
     return {x["id"]: x for x in REGISTRY.get("multiplexers", [])}
 
@@ -977,8 +1084,8 @@ def role_caveat(agent: dict, role: str) -> str | None:
     """The UNVERIFIED-in-this-role caveat for `agent`, or None.
 
     A row records the roles it has never been driven in as a structured list
-    rather than free text: grok and devin are verified coders but unverified
-    ORCHESTRATORS, so the whole-row `unverified` flag (which condemns a row in
+    rather than free text: a row can be a verified coder but an unverified
+    ORCHESTRATOR, so the whole-row `unverified` flag (which condemns a row in
     the detected-CLI list) would be wrong here. This is the field CODE reads,
     so the caveat reaches the picker, validate() and --questions instead of
     sitting in the registry unread the way a `roles_note` did.
@@ -992,22 +1099,30 @@ def role_caveat(agent: dict, role: str) -> str | None:
 
 
 def role_options(role: str, found: dict | None = None) -> list:
-    """(id, label, note) for every detected agent that may fill `role`.
+    """(id, label, note) for every DETECTED agent, for any `role`.
 
-    Extracted from build_plan_interactive so the per-role caveat can be asserted
-    without a terminal: `pick_one` renders the third field under the option, so
-    a caveat that only lived in the registry was invisible at exactly the moment
-    the user chose.
+    The registry's `roles` array no longer GATES this picker: every detected
+    agent is offered for every role (orchestrator, coder, reviewer, scout,
+    integrator). The whitelist used to hide, e.g., cmdcode from the
+    orchestrator question even though the only real bar is whether its harness
+    can dispatch -- which is a measured fact, not a catalog opinion. What a role
+    cannot actually do now shows as a note instead of hiding the option:
+    dispatch capability for the orchestrator, the per-role UNVERIFIED caveat
+    anywhere. `pick_one` renders the third field under the option, so a caveat
+    is visible at exactly the moment the user chooses rather than after.
     """
     if found is None:
         found = scan()
     out = []
     for a in REGISTRY["agents"]:
-        if a["id"] not in found or role not in a["roles"]:
+        if a["id"] not in found:
             continue
         notes = []
         if role == "reviewer" and a.get("reviewer_warning"):
             notes.append(a["reviewer_warning"])
+        capability = dispatch_note(a, role)
+        if capability:
+            notes.append(capability)
         caveat = role_caveat(a, role)
         if caveat:
             notes.append(caveat)
@@ -1016,18 +1131,48 @@ def role_options(role: str, found: dict | None = None) -> list:
 
 
 def role_notes(role: str) -> dict:
-    """agent id -> per-role caveat, for the `--questions` surface.
+    """agent id -> per-role caveat PROSE, for the `--questions` surface.
 
     AGENTS.md Part 1 has an AI installer drive its conversation from that
     output, and it must never offer an agent without the warning that applies to
-    it. The caveat is per role -- grok/devin are verified coders and unverified
-    orchestrators -- so it is keyed by id under the question that offers them.
+    it. The caveat is per role -- an agent can be a verified coder and an
+    unverified orchestrator -- so it is keyed by id under the question that
+    offers them. This is what a HUMAN reads at selection time; the machine
+    readable dispatch answer lives in the sibling `dispatch` map (`role_dispatch`),
+    so a program never has to parse a sentence to learn whether an agent can
+    orchestrate.
     """
     out = {}
     for a in REGISTRY["agents"]:
+        notes = []
+        capability = dispatch_note(a, role)
+        if capability:
+            notes.append(capability)
         caveat = role_caveat(a, role)
         if caveat:
-            out[a["id"]] = caveat
+            notes.append(caveat)
+        if notes:
+            out[a["id"]] = " ".join(notes)
+    return out
+
+
+def role_dispatch(role: str) -> dict:
+    """agent id -> {can, source} dispatch capability, or {} for a leaf role.
+
+    The ORCHESTRATOR question alone carries this: dispatch capability is the one
+    bar that gates a brain -- every other role is a leaf worker by definition --
+    so the field rides exactly the question where it can change the answer. It is
+    a sibling of `notes` on the same question: keyed by id, each value a
+    machine-readable {can: bool, source: str} that an AI installer reads directly
+    instead of parsing the human sentence in `notes`. Reuses `dispatch_capability`
+    so the boolean and source are the same ones validate() enforces.
+    """
+    if role != "orchestrator":
+        return {}
+    out = {}
+    for a in REGISTRY["agents"]:
+        cap = dispatch_capability(a)
+        out[a["id"]] = {"can": cap.can, "source": cap.source}
     return out
 
 
@@ -1054,10 +1199,15 @@ def build_plan_interactive(state: dict) -> dict:
         return role_options(role, found)
 
     # --- orchestrator ---
+    # Every detected agent is offered, whatever its `roles` array says: the
+    # capability that actually matters (can it dispatch sub-agents?) is measured
+    # and enforced in validate(), and a dead choice is refused there with the
+    # capable list named. This branch is therefore unreachable once any CLI is
+    # found, but kept as the honest guard for the no-CLI case.
     orch_opts = opts("orchestrator")
     if not orch_opts:
-        die("none of the detected CLIs can act as an orchestrator "
-            "(needs Omnigent's sys_* tool relay).")
+        die("no coding CLI found on PATH — install at least one (see README.md) "
+            "and re-run.")
     # A chain, like the coders: the later entries are the failover a launch
     # takes when the brain above them is out of quota.
     orchestrator_ids = pick_many_ordered(
@@ -1339,11 +1489,20 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
 
     for o in orchestrators:
         a = reg[o["id"]]
-        if a.get("relay") is False:
+        # The authoritative bar: can this harness dispatch at all? Measured from
+        # Omnigent's own capabilities when importable, falling back to the
+        # registry `relay` flag otherwise -- and the message says WHICH source
+        # answered, so a stale registry flag reads as a registry problem rather
+        # than a verdict. The refusal also names every agent that CAN orchestrate
+        # here, so the fix is in the same sentence as the fault.
+        capability = dispatch_capability(a)
+        if not capability.can:
+            capable = ", ".join(orchestrator_capable_ids()) or "(none detected)"
             issues.append(("error",
-                           f"{a['label']} runs without Omnigent's sys_* tool "
-                           "relay, so it cannot dispatch sub-agents. Pick a different "
-                           "orchestrator."))
+                           f"{o['id']} cannot be the orchestrator: "
+                           f"{capability_reason(capability)}, so it could never "
+                           f"delegate. Orchestrator-capable agents here: "
+                           f"{capable}."))
 
         # A harness that never receives the spec prompt cannot orchestrate: the
         # whole orchestration contract lives in that prompt. Checked for EVERY
@@ -1426,7 +1585,7 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "generated `roster` skill tells the orchestrator to do exactly that."))
 
     # A role a row marks `unverified_roles` clears validate()'s gates but has
-    # never been driven here -- grok/devin as orchestrator. The registry used to
+    # never been driven here -- devin as orchestrator. The registry used to
     # record that only in a free-text `roles_note` nothing read, so a user
     # selecting one as the brain was never shown the caveat. The config is legal
     # (a weak orchestrator at runtime, not a broken install), so this WARNs
@@ -1436,6 +1595,34 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
             caveat = role_caveat(reg[e["id"]], r.role)
             if caveat:
                 issues.append(("warn", caveat))
+
+    # Removing the registry `roles` whitelist means ANY detected agent can now
+    # be chosen for ANY role. Two former refusals become warnings so a legal but
+    # unproven choice still proceeds: a row never exercised in this project
+    # (`unverified`), and a harness whose prompt delivery Omnigent does not
+    # declare (`unknown`). Neither is a broken install -- the first real
+    # dispatch is the proof -- so neither may block one. Deduplicated by id: a
+    # worker pinned in two roles deserves one caveat, not one per role.
+    seen_unverified: set = set()
+    seen_unknown: set = set()
+    for r in ROLES:
+        for e in chain(plan, r.key):
+            a = reg[e["id"]]
+            if a.get("unverified") and e["id"] not in seen_unverified:
+                seen_unverified.add(e["id"])
+                issues.append(("warn",
+                               f"{a['label']} is UNVERIFIED in this project: no og run "
+                               "has been driven with it, so its first real dispatch is the "
+                               "only proof it works here. It clears validation; watch that "
+                               "dispatch before trusting a completion report."))
+            if (a.get("prompt_delivery") == "unknown"
+                    and e["id"] not in seen_unknown):
+                seen_unknown.add(e["id"])
+                issues.append(("warn",
+                               f"{a['label']} does not declare how it receives its spec "
+                               "prompt (prompt_delivery: unknown). Assume the prompt may "
+                               "not arrive: inline its operating rules into every dispatch "
+                               "and verify the first one."))
 
     # A `{shim:<name>}` token with no matching shim block renders a path to
     # a file nothing ever writes. The launch then fails with an exec error
@@ -3011,7 +3198,12 @@ def emit_questions() -> None:
     # answers with one value does not have to change. The per-role UNVERIFIED
     # caveat rides the question: AGENTS.md Part 1 has the AI installer drive its
     # conversation from this output, and it must never offer a role without the
-    # warning that applies to it.
+    # warning that applies to it. The `roles` array no longer restricts the
+    # choices: every detected agent is offered for every role, and the notes
+    # carry the capability caveat where one applies. The orchestrator question
+    # also carries a structured `dispatch` map (id -> {can, source}) next to
+    # `notes`, so an AI installer reads the answer as a boolean rather than
+    # parsing the human sentence out of prose.
     role_questions = []
     for r in ROLES:
         q = {"key": r.key, "type": "ordered_multi",
@@ -3020,9 +3212,16 @@ def emit_questions() -> None:
              # only signal AGENTS.md Part 1's installer gets.
              "optional": r.optional,
              "choices": [a["id"] for a in REGISTRY["agents"]
-                         if a["id"] in found and r.role in a["roles"]],
+                         if a["id"] in found],
              "notes": role_notes(r.role),
              "ask": r.ask}
+        # The machine-readable dispatch answer, a sibling of `notes`, rides the
+        # orchestrator question only: can a harness dispatch is the bar that
+        # gates a brain, while every other role is a leaf worker that the bar
+        # does not touch. Empty for those roles, so it is not emitted there.
+        dispatch = role_dispatch(r.role)
+        if dispatch:
+            q["dispatch"] = dispatch
         if r.spec:
             # The same static model list under every role that pins one, so an
             # AI installer can answer for each entry of the chain. The fallback
@@ -3208,6 +3407,23 @@ def main() -> None:
             ok(f"{reg[aid]['label']:22} {C['dim']}{path}{C['x']}")
         if not found:
             err("none found — install at least one (see README.md)")
+        # Which detected agents can actually orchestrate, so the owner can see
+        # the answer without reading the probe code. Measured from Omnigent's
+        # harness capabilities when importable; the label says which source
+        # answered, because a stale registry flag has been wrong before.
+        say()
+        caps = measured_subagent_caps()
+        source = "omnigent (measured)" if caps is not None \
+            else "registry flag; omnigent not importable"
+        say(f"{C['b']}Orchestrator capability{C['x']} "
+            f"{C['dim']}(source: {source}){C['x']}")
+        for aid in sorted(found):
+            capability = dispatch_capability(reg[aid])
+            if capability.can:
+                ok(f"{reg[aid]['label']:22} can dispatch sub-agents")
+            else:
+                warn(f"{reg[aid]['label']:22} cannot dispatch sub-agents — "
+                     f"not an orchestrator")
         # Optional, reported like the per-workflow prereqs above: a multiplexer
         # is a convenience, so a missing one is a warn, never an err, and it
         # must NOT reach the exit code on the next line. og runs without one.
