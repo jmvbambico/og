@@ -2097,6 +2097,71 @@ def test_an_absent_pyyaml_degrades_without_raising(spec_home, monkeypatch):
     assert a.worker_mark("", "zen") == a.ATOM + " "
 
 
+# ---------------------------------------------------------------------------
+# 8d. the TAB LABEL: the same mark, the task, no agent name
+#
+# `og agents` drops the agent name from a worker's row and draws the mark in its
+# place. herdr's tab for that worker used to keep the raw title
+# (`coder_cmdcode:fix-stale-comments`), repeating the name the operator already
+# sees as a glyph. `worker_tab_label` is that substitution, applied to the tab
+# label — one resolution chain, shared with the pane.
+# ---------------------------------------------------------------------------
+
+def test_a_worker_tab_label_is_the_mark_followed_by_its_task(spec_home):
+    # The title is `<role>_<agent>:<task>`; the role and the agent name are
+    # dropped, the mark takes their place, and the task follows.
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    assert a.worker_tab_label("", "zen",
+                              "coder_zen:space-per-root") == \
+        a._HARNESS_MARKS["opencode-zen"] + " space-per-root"
+
+
+def test_the_tab_label_uses_the_row_harness_when_it_carries_one(spec_home):
+    # The row's own harness outranks the spec (see `worker_mark`), so a tab
+    # whose session ran on a different harness than its agent's spec declares
+    # carries THAT harness's mark.
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    assert a.worker_tab_label("claude-native", "zen",
+                              "coder_zen:fix") == \
+        a._HARNESS_MARKS["anthropic"] + " fix"
+
+
+def test_an_unresolvable_agent_in_a_title_draws_the_atom(spec_home):
+    # The agent IS named, so there is something to mark; we just cannot find a
+    # harness for it. The atom, never a blank — the failure would be a missing
+    # mark, not a missing agent.
+    assert a.worker_tab_label("", "brandnew",
+                              "coder_brandnew:something") == \
+        a.ATOM + " something"
+
+
+def test_a_title_with_no_agent_prefix_passes_through_unchanged():
+    # An older session, or one the server titled plainly, has no `<agent>:` to
+    # substitute. It keeps its label exactly — no glyph, no mangling.
+    assert a.worker_tab_label("", None, "Fix the bridge") == "Fix the bridge"
+    assert a.worker_tab_label("", None, "") == ""
+    assert a.worker_tab_label("", None, None) == ""
+
+
+def test_a_tab_label_never_raises_when_the_spec_scan_is_broken(
+        spec_home, monkeypatch):
+    # The same degrade-as-the-pane rule: a missing home, no PyYAML or a
+    # malformed spec must not stop a tab from being labelled.
+    monkeypatch.setattr(h, "_yaml", None)
+    monkeypatch.setattr(h, "_REGISTRY_AGENT_HARNESSES", None)
+    assert a.worker_tab_label("", "zen",
+                              "coder_zen:task") == a.ATOM + " task"
+
+
+def test_a_tab_label_never_raises_on_a_non_string_title(spec_home):
+    # A title that is not a string has no `<agent>:` prefix to parse, so the
+    # label is the degraded passthrough — an empty string, never a raised
+    # exception and never a glyph for a session that has no title.
+    _write_spec(spec_home, "Hivemind", "coder_zen", "opencode-native")
+    assert a.worker_tab_label("", "zen", 7) == ""
+    assert a.worker_tab_label("", "zen", None) == ""
+
+
 def test_the_spec_scan_runs_once_and_is_cached(spec_home, monkeypatch):
     # The pane polls every few seconds; the scan must not walk the filesystem per
     # call. One scan, then the cached table is served.

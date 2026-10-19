@@ -21,6 +21,7 @@ import pytest
 
 import og_herdr as m
 import og_herdr_launch
+import og_agents as a
 
 
 class FakeHerdrError(Exception):
@@ -989,7 +990,15 @@ def test_a_root_opens_a_space_labelled_with_its_title(seams):
     assert _names(client).count("tab_create") == 0
 
 
-def test_a_sub_agent_opens_a_tab_in_its_parents_space(seams):
+def test_a_sub_agent_opens_a_tab_in_its_parents_space(
+        seams, isolated_omnigent_home, monkeypatch):
+    # The worker's tab label comes from the SAME resolution `og agents` uses,
+    # so the test writes a real spec and resets the cached scan rather than
+    # asserting against a table this file does not own.
+    _write_spec(isolated_omnigent_home, "Hivemind", "coder_zen",
+                "opencode-native")
+    monkeypatch.setattr(m, "_REGISTRY_AGENT_HARNESSES", None)
+
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
     bridge.reconcile([Ev("added", "root", root_session("New Alignment"))])
@@ -1000,11 +1009,28 @@ def test_a_sub_agent_opens_a_tab_in_its_parents_space(seams):
 
     tc = _call(client, "tab_create")
     assert tc[1] == ("ws1",), "the tab went somewhere other than the root's space"
-    assert tc[2]["label"] == "coder_zen:space-per-root"
+    # The tab's LABEL is the worker's brand glyph followed by its task — the
+    # agent name `coder_zen` is dropped, exactly as `og agents` drops it from
+    # the row and draws the mark instead (see og_agents.worker_tab_label).
+    assert tc[2]["label"] == a._HARNESS_MARKS["opencode-zen"] + \
+        " space-per-root", tc[2]["label"]
     assert tc[2]["cwd"] == "/repo/og"
     # ...and no second workspace: the whole point of the layout.
     assert _names(client).count("workspace_create") == 0
     assert _names(client).count("tab_create") == 1
+
+
+def _write_spec(home, bundle, name, harness):
+    """Write `<home>/agents/<bundle>/agents/<name>/config.yaml`.
+
+    Mirrors the fixture of the same name in tests/test_og_agents.py so the
+    resolution is exercised against a known spec here too.
+    """
+    spec_dir = Path(home) / "agents" / bundle / "agents" / name
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    (spec_dir / "config.yaml").write_text(
+        f"spec_version: 1\nname: {name}\nexecutor:\n  type: omnigent\n"
+        f"  config:\n    harness: {harness}\n")
 
 
 def test_a_worker_emitted_before_its_root_still_lands_in_its_space(seams):
@@ -4027,7 +4053,8 @@ def test_a_batch_of_title_changes_lists_the_workspaces_once(seams):
         [("ws1", "First"), ("ws2", "Second")]
 
 
-def test_a_workers_title_change_never_renames_the_space_or_tab_it_sits_in(seams):
+def test_a_workers_title_change_never_renames_the_space_or_tab_it_sits_in(
+        seams, isolated_omnigent_home, monkeypatch):
     # A sub-agent gets a TAB in its parent's space, and its record names the
     # PARENT's workspace. Renaming that to the worker's title would rename the
     # operator's whole conversation to `fix-space-rename` every time a worker
@@ -4035,13 +4062,19 @@ def test_a_workers_title_change_never_renames_the_space_or_tab_it_sits_in(seams)
     # one level down. The positive control — the ROOT's own title DOES rename the
     # space AND its first tab — is in the same test, because the negative alone
     # is satisfied by a module that renames nothing at all.
+    _write_spec(isolated_omnigent_home, "Hivemind", "coder_zen",
+                "opencode-native")
+    monkeypatch.setattr(m, "_REGISTRY_AGENT_HARNESSES", None)
+
     client = RecordingClient()
     bridge = m.Bridge(FakeWatcher([]), client, cwd="/repo/og")
     bridge.reconcile([Ev("added", "root", root_session("Old name"))])
     bridge.reconcile([Ev("added", "w1", sub_session("root", "coder_zen:fix"))])
 
-    # The worker's tab was created WITH its own title, and is never the root's.
-    assert _call(client, "tab_create")[2]["label"] == "coder_zen:fix"
+    # The worker's tab was created WITH its own label — the brand glyph followed
+    # by the task, the agent name dropped — and is never the root's.
+    assert _call(client, "tab_create")[2]["label"] == \
+        a._HARNESS_MARKS["opencode-zen"] + " fix"
 
     # The ROOT's title arriving renames its own space AND its first tab...
     bridge.reconcile([Ev("changed", "root", root_session("New name"),
