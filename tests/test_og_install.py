@@ -1318,6 +1318,39 @@ def test_coder_prompt_carries_the_unattended_and_orientation_rules():
     assert "do not build one" in prompt
 
 
+def test_coder_prompt_carries_the_followups_not_done_rule():
+    # A worker's "do not refactor or wander" prohibition had no mechanism behind
+    # it until the coder prompt asked for the follow-ups it deliberately did
+    # NOT do. The rule must survive a rewrite of the surrounding prose, so it
+    # is pinned by content rather than by shape.
+    plan = _rendering_plan()
+    prompt = " ".join(yaml.safe_load(m.render_coder(plan, plan["coders"][0]))["prompt"].split())
+    assert "follow-ups you deliberately did NOT do" in prompt
+    # The three points the rule has to carry: omission is correct, an empty
+    # list is valid and common, and these are observations not new work.
+    assert "Not doing them is correct" in prompt
+    assert "hiding them is not" in prompt
+    assert "not an invitation to do more work" in prompt
+    assert "An empty list is a valid and common answer" in prompt
+    assert "say so rather than inventing" in prompt
+    assert "observations handed upward" in prompt
+    assert "never work you start" in prompt
+    # The rule is IMPLEMENT-only. It does not ride the coder's EXPLORE section
+    # (an explorer produces no diff, so there is nothing left "undone" in the
+    # implementer's sense, and the existing "State anything that did not fit"
+    # sentence already carries observations upward), and it must not leak into
+    # the other read-only contracts in the same family. Both need a chain entry
+    # to render: _rendering_plan() has no scout, so build one.
+    scout_plan = _base_plan(
+        coders=_rendering_plan()["coders"],
+        scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}],
+    )
+    assert "follow-ups you deliberately did NOT do" not in \
+        " ".join(yaml.safe_load(m.render_scout(scout_plan))["prompt"].split())
+    assert "follow-ups you deliberately did NOT do" not in \
+        " ".join(yaml.safe_load(m.render_reviewer(plan))["prompt"].split())
+
+
 # --------------------------------------------------------------------------
 # CLI smoke tests -- run the real script as a subprocess
 # --------------------------------------------------------------------------
