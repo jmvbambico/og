@@ -948,6 +948,28 @@ def test_scout_template_carries_the_read_only_contract():
     assert parsed["skills"] == "none"
 
 
+def test_scout_template_names_provenance_and_keeps_it_bounded():
+    """A scout answers WHY as well as WHERE. The git history and the comments are
+    the evidence -- and this repo's AGENTS.md says most comments record a failure
+    that actually happened. The bounded-summary rule is the one a history
+    question most tempts a scout to break, so it is pinned here too: a provenance
+    answer is still paths and line ranges, never a pasted log or a dumped file."""
+    plan = _base_plan(scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}])
+    prompt = " ".join(yaml.safe_load(m.render_scout(plan))["prompt"].split())
+    assert "PROVENANCE" in prompt
+    # The read-only tools that answer "why". Naming only reads keeps the
+    # read-only contract above intact.
+    assert "git log -S" in prompt
+    assert "git log --follow" in prompt
+    assert "git blame" in prompt
+    assert "the comments around the line" in prompt
+    # A comment is evidence about the past here, not decoration.
+    assert "records a real failure" in prompt
+    assert "quote it with its file:line" in prompt
+    # ...and a history answer stays bounded: no pasted log, no dumped file.
+    assert "NEVER a pasted `git log`" in prompt
+
+
 def test_scout_read_only_is_stated_as_trusted_not_sandboxed():
     """The read-only rule is a CONTRACT the scout honours, not a policy that
     stops it: blast_radius only denies force-push/rm -rf/hard-reset, gate_pushes
@@ -1316,6 +1338,39 @@ def test_coder_prompt_carries_the_unattended_and_orientation_rules():
     assert "do not install anything" in prompt
     # Workers never index a worktree themselves (the orchestrator seeds it).
     assert "do not build one" in prompt
+
+
+def test_coder_prompt_carries_the_followups_not_done_rule():
+    # A worker's "do not refactor or wander" prohibition had no mechanism behind
+    # it until the coder prompt asked for the follow-ups it deliberately did
+    # NOT do. The rule must survive a rewrite of the surrounding prose, so it
+    # is pinned by content rather than by shape.
+    plan = _rendering_plan()
+    prompt = " ".join(yaml.safe_load(m.render_coder(plan, plan["coders"][0]))["prompt"].split())
+    assert "follow-ups you deliberately did NOT do" in prompt
+    # The three points the rule has to carry: omission is correct, an empty
+    # list is valid and common, and these are observations not new work.
+    assert "Not doing them is correct" in prompt
+    assert "hiding them is not" in prompt
+    assert "not an invitation to do more work" in prompt
+    assert "An empty list is a valid and common answer" in prompt
+    assert "say so rather than inventing" in prompt
+    assert "observations handed upward" in prompt
+    assert "not work you start" in prompt
+    # The rule is IMPLEMENT-only. It does not ride the coder's EXPLORE section
+    # (an explorer produces no diff, so there is nothing left "undone" in the
+    # implementer's sense, and the existing "State anything that did not fit"
+    # sentence already carries observations upward), and it must not leak into
+    # the other read-only contracts in the same family. Both need a chain entry
+    # to render: _rendering_plan() has no scout, so build one.
+    scout_plan = _base_plan(
+        coders=_rendering_plan()["coders"],
+        scout=[{"id": "cmdcode", "model": "moonshotai/kimi-k3"}],
+    )
+    assert "follow-ups you deliberately did NOT do" not in \
+        " ".join(yaml.safe_load(m.render_scout(scout_plan))["prompt"].split())
+    assert "follow-ups you deliberately did NOT do" not in \
+        " ".join(yaml.safe_load(m.render_reviewer(plan))["prompt"].split())
 
 
 # --------------------------------------------------------------------------
@@ -2082,6 +2137,16 @@ def test_integrator_template_carries_the_bounded_and_never_merge_contract():
     # The concurrency hazard: the integration suite runs in exactly one place.
     assert "EXACTLY ONE PLACE AT A TIME" in prompt
     assert "another integrator" in prompt
+    # The transport deadline: a long gate run in-turn is killed by ACP at ~300s
+    # (measured), so the prompt must force it detached and hand the PID plus log
+    # path back for follow-up -- otherwise the killed dispatch produces no
+    # result at all.
+    assert "A LONG GATE RUNS DETACHED, NEVER IN-TURN" in prompt
+    assert "~300s" in prompt
+    assert "producing no result" in prompt
+    assert "start it DETACHED" in prompt
+    assert "PID and absolute log path for follow-up" in prompt
+    assert "treat it as long" in prompt
     # ...and it is a normal write worker: pinned model, named harness, skills off.
     assert parsed["executor"]["model"] == "moonshotai/kimi-k3"
     assert parsed["skills"] == "none"

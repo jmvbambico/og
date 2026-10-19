@@ -53,6 +53,13 @@ prompt: |
     it. The orchestrator will not dispatch two integrators against one repo
     concurrently; your job is to make sure you are not the second one.
 
+  A LONG GATE RUNS DETACHED, NEVER IN-TURN:
+  - ACP kills any turn that does not answer in ~300s; a full gate suite takes
+    8-10 minutes: run one in-turn and it dies mid-run, producing no result.
+  - NEVER run a long suite in-turn: start it DETACHED, output to a file, and
+    return IMMEDIATELY with the PID and absolute log path for follow-up.
+  - A short command still runs in-turn; if you cannot tell, treat it as long.
+
   Report the SHAs, the branch state and the gate verdicts — bounded, with
   file:line evidence where it matters. Keep it short.
 
