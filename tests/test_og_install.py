@@ -2082,6 +2082,15 @@ def test_integrator_template_carries_the_bounded_and_never_merge_contract():
     # The concurrency hazard: the integration suite runs in exactly one place.
     assert "EXACTLY ONE PLACE AT A TIME" in prompt
     assert "another integrator" in prompt
+    # The transport deadline: a long gate run in-turn is killed by ACP at ~300s
+    # (measured), so the prompt must force it detached with a pollable handoff --
+    # otherwise the killed dispatch reads as the integrator being broken.
+    assert "A LONG GATE RUNS DETACHED, NEVER IN-TURN" in prompt
+    assert "~300s" in prompt
+    assert "reporting NOTHING" in prompt
+    assert "start it DETACHED" in prompt
+    assert "PID and absolute log path to poll" in prompt
+    assert "treat it as long" in prompt
     # ...and it is a normal write worker: pinned model, named harness, skills off.
     assert parsed["executor"]["model"] == "moonshotai/kimi-k3"
     assert parsed["skills"] == "none"
