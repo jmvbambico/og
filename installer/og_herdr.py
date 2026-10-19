@@ -2669,9 +2669,16 @@ The rule itself is `_memory_decides`, which is where the distinction
         map through all three of its own creates and this one threaded nothing,
         which is how a fan-out of workers put panes on the screen that would
         open a browser.
+
+        The tab's LABEL carries the worker's brand: `og agents` draws the same
+        vendor glyph for this agent, and a tab reading `coder_cmdcode:fix`
+        repeats the name the operator already sees as a mark. The resolution is
+        `og_agents.worker_tab_label` — one chain, shared, never guessed.
         """
+        from og_agents import worker_tab_label
+        label = worker_tab_label(harness, agent, title) or sid[:8]
         result = self.client.tab_create(space, cwd=cwd,
-                                        label=title or sid[:8], focus=False,
+                                        label=label, focus=False,
                                         env=self.pane_env)
         tab_id = _id_of(result.get("tab"), "tab_id")
         pane_id = _id_of(result.get("root_pane"), "pane_id")
