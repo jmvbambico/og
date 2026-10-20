@@ -694,35 +694,44 @@ def is_free_tier_pin(agent: dict, model: str | None) -> bool:
     return str(model).strip() in {str(m).strip() for m in free} or is_zen_free(model)
 
 
-def long_running_tag(agent: dict, entry: dict) -> str:
-    """The terse roster-line form of `long_running_note` (prompt bytes)."""
-    if not entry.get("model"):
-        return "no (no pin)"
-    if is_free_tier_pin(agent, entry.get("model")):
-        return "no (free-tier; rate-limited)"
-    if is_acp_transport(agent):
-        return "no (ACP; long steps time out)"
-    return "yes"
+def long_running_facts(agent: dict, entry: dict) -> tuple[str, str, str]:
+    """`(tag, short_reason, full_note)` for one worker's long-running trait.
 
-
-def long_running_note(agent: dict, entry: dict) -> str:
-    """One-line long-running trait for a worker's roster bullet.
-
-    Derived from transport + pin, never from the vendor name: a native harness
-    on a paid (non-free-tier) pin can hold a long foreground step, while an ACP
-    worker hits Omnigent's ~300s transport deadline ("Timeout waiting for ACP
+    The single derivation behind both the orchestrator roster bullet and the
+    generated roster skill, so the two can never drift. Derived from transport
+    + pin, never from the vendor name: a native harness on a paid
+    (non-free-tier) pin can hold a long foreground step, while an ACP worker
+    hits Omnigent's ~300s transport deadline ("Timeout waiting for ACP
     response") and a free-tier pin is rate-limited. Those two must not be
     routed long work, so the reason is stated rather than a bare `no`.
     """
     model = entry.get("model")
     if not model:
-        return "no — no model pin, so capacity is unknown"
+        return ("no (no pin)",
+                "no pin",
+                "no — no model pin, so capacity is unknown")
     if is_free_tier_pin(agent, model):
-        return "no — free-tier pin is rate-limited; split long work into bounded steps"
+        return ("no (free-tier; rate-limited)",
+                "free-tier; rate-limited",
+                "no — free-tier pin is rate-limited; split long work into bounded steps")
     if is_acp_transport(agent):
-        return ("no — ACP kills a long single step ('Timeout waiting for ACP "
+        return ("no (ACP; long steps time out)",
+                "ACP; long steps time out",
+                "no — ACP kills a long single step ('Timeout waiting for ACP "
                 "response'); run long commands detached")
-    return "yes — native harness on a paid pin; this is the worker for long-running work"
+    return ("yes",
+            "native paid pin",
+            "yes — native harness on a paid pin; this is the worker for long-running work")
+
+
+def long_running_tag(agent: dict, entry: dict) -> str:
+    """The terse roster-line form: `yes` or `no (<short reason>)`."""
+    return long_running_facts(agent, entry)[0]
+
+
+def long_running_note(agent: dict, entry: dict) -> str:
+    """The full one-line trait used by the generated roster skill."""
+    return long_running_facts(agent, entry)[2]
 
 
 # --------------------------------------------------------------------------
@@ -1914,7 +1923,7 @@ def render_roster(plan: dict) -> str:
     for i, c in enumerate(plan["coders"]):
         a = reg[c["id"]]
         pin = f", pinned `{c['model']}`" if c.get("model") else ""
-        tags = []
+        tags = [f"long-running: {long_running_tag(a, c)}"]
         if a.get("relay") is False:
             tags.append("leaf worker, cannot dispatch")
         if a.get("silent_model_failure"):
@@ -1929,14 +1938,16 @@ def render_roster(plan: dict) -> str:
         rv = reg[e["id"]]
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{rv['label']} "
-                     f"(`{rv['harness']}`){pin}. Reviews only; never edits.")
+                     f"(`{rv['harness']}`){pin}. long-running: "
+                     f"{long_running_tag(rv, e)}. Reviews only; never edits.")
     # The scout's read-only contract is a fact the orchestrator must know BEFORE
     # it dispatches one, so it stays inline rather than behind the roster skill.
     for name, e in zip(sc_names, chain(plan, "scout")):
         sc = reg[e["id"]]
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{sc['label']} "
-                     f"(`{sc['harness']}`){pin}. Read-only; never edits, commits "
+                     f"(`{sc['harness']}`){pin}. long-running: "
+                     f"{long_running_tag(sc, e)}. Read-only; never edits, commits "
                      "or mutates. Bounded summary only.")
     # The integrator's two hard rules change a decision made BEFORE anything is
     # read: that its answer is bounded (so delegating is worth the round trip),
@@ -1946,7 +1957,8 @@ def render_roster(plan: dict) -> str:
         ig = reg[e["id"]]
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{ig['label']} "
-                     f"(`{ig['harness']}`){pin}. Git/gate plumbing; bounded "
+                     f"(`{ig['harness']}`){pin}. long-running: "
+                     f"{long_running_tag(ig, e)}. Git/gate plumbing; bounded "
                      "result; never decides a merge.")
     return "\n".join(lines)
 

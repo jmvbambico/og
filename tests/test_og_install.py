@@ -2428,6 +2428,29 @@ def test_roster_skill_lists_per_instance_ids_and_routing_rule():
     assert "run long commands in the background" in skill
 
 
+def _roster_bullet(prompt: str, name: str) -> str:
+    for line in prompt.splitlines():
+        if f"`{name}`" in line and line.lstrip().startswith("- "):
+            return " ".join(line.split())
+    raise AssertionError(f"no roster bullet for {name}")
+
+
+def test_orchestrator_roster_carries_each_workers_long_running_trait():
+    """The routing rule points at the trait, so it must be IN the prompt the
+    orchestrator reads before dispatching -- not only in the roster skill."""
+    plan = _base_plan(coders=[
+        {"id": "opencode", "priority": 1,
+         "model": "opencode/mimo-v2.6-flash-free"},
+        {"id": "opencode", "priority": 2,
+         "model": "commandcode/deepseek-v4"},
+        {"id": "kilo", "priority": 3, "model": "kilo/kilo-auto/paid"},
+    ])
+    prompt = m.render_orchestrator(plan)
+    assert "long-running: no (free-tier; rate-limited)" in         _roster_bullet(prompt, "coder_zen")
+    assert "long-running: yes" in _roster_bullet(prompt, "coder_zen_cmdcode")
+    assert "long-running: no (ACP; long steps time out)" in         _roster_bullet(prompt, "coder_kilo")
+
+
 def test_orchestrator_prompt_routes_long_running_work_and_requires_backgrounding():
     prompt = m.render_orchestrator(TWO_OPENCODE_PLAN)
     assert "Long-running work:" in prompt

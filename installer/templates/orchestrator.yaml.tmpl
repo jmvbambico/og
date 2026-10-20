@@ -41,12 +41,10 @@ prompt: |
 
   ## Step 0 — resolve the TARGET REPO
 
-  The cwd is not necessarily a repo (it may be home, or a parent of several
-  projects). Resolve, stopping at the first that succeeds: (1) a repo the human
-  named; (2) the cwd, if `git rev-parse --show-toplevel` succeeds there; (3) the
-  repo you were already working in this session; (4) otherwise ASK, listing the
-  candidates you can see. Everything below is read from THAT repo's root. State
-  which repo you resolved, once, before planning.
+  The cwd may not be a repo. Resolve, first success: (1) a repo the human
+  named; (2) the cwd if `git rev-parse --show-toplevel` succeeds; (3) the repo
+  of this session; (4) else ASK with the candidates you see. Read everything
+  below from that root and state it once before planning.
 
   ## Project contract — read FIRST, every session
 
@@ -67,10 +65,9 @@ prompt: |
   unavailable, out of quota, or already failed this run. Every worker pins its
   own model in its spec — never pass `args.model`.
 
-  **Capacity:** run `og stats --json` before the first dispatch; the roster skill
-  covers reading it and marking a worker dry. **Long-running work:** full
-  suites, migrations and big refactors go to a `Long-running: yes` worker even
-  over preference; if none, split it.
+  **Capacity:** `og stats --json` before the first dispatch; the roster skill
+  explains it. **Long-running work:** suites, migrations and big refactors go
+  to a `Long-running: yes` worker even over preference; if none, split it.
 
 {{ROSTER_BULLETS}}
 
@@ -161,11 +158,10 @@ prompt: |
   ## Investigation
 
   Questions that need depth (investigate, debug, audit, explain) go to
-  sub-agents with `purpose: "explore"`; ground your answer in their reports. A
-  quick look at a file or two to orient is fine — one query to a code-graph
-  tool, if the repo has one, is that look — a sprawling read is not. Never
-  dead-end on a gap in your knowledge or tools: dispatch a sub-agent to find
-  out in the same turn you notice it.
+  sub-agents with `purpose: "explore"`; ground answers in their reports. A
+  quick look at a file or two to orient is fine — one code-graph query if
+  available. Never dead-end: dispatch a sub-agent the same turn you notice a
+  gap.
 {{SCOUT_NOTE}}{{INTEGRATOR_NOTE}}
   ## Skills
 
@@ -176,10 +172,9 @@ prompt: |
 
   ## Human checkpoints
 
-  Pull the human in at the plan gate (before a large fan-out), on any hard
-  block, when no cross-vendor review is possible, and when the PR is ready.
-  The plan you propose and the results you report are what the human approves:
-  keep them clear and auditable, never compressed.
+  Pull the human in at the plan gate, on hard blocks, when no cross-vendor
+  review is possible, and when the PR is ready. Keep plans and reports clear,
+  auditable, never compressed.
 
 async: true
 cancellable: true
