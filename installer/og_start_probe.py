@@ -433,8 +433,8 @@ def probe_start(install_path: Path, registry_path: Path, state_path: Path,
     workers = min(16, max(1, len(ordered)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         results = list(ex.map(
-            lambda e: _probe_one(e, rows.get(e["agent"]) or {}, ctx, prev,
-                                 now, timeout),
+            lambda e: _probe_one(e, rows.get(e.get("id") or e["agent"]) or {},
+                                 ctx, prev, now, timeout),
             ordered))
 
     outcomes: list[dict] = []

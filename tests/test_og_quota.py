@@ -1182,6 +1182,43 @@ def _agy_registry(path: Path):
                 "quota": {"probe": "antigravity"}}}}))
 
 
+def test_lineup_gives_each_instance_of_one_harness_its_own_id(tmp_path):
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    inst.write_text(json.dumps({
+        "coders": [
+            {"id": "opencode", "priority": 1,
+             "model": "opencode/mimo-v2.6-flash-free"},
+            {"id": "opencode", "priority": 2,
+             "model": "commandcode/deepseek-v4"},
+        ],
+    }))
+    _write_registry(reg)
+    rows = st.lineup(inst, reg)
+    assert [(r["agent"], r["id"]) for r in rows] == [
+        ("opencode", "opencode"), ("opencode@cmdcode", "opencode")]
+
+
+def test_a_mark_on_one_instance_does_not_dry_the_other(tmp_path):
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    state = tmp_path / "og-quota.json"
+    inst.write_text(json.dumps({
+        "coders": [
+            {"id": "opencode", "priority": 1,
+             "model": "opencode/mimo-v2.6-flash-free"},
+            {"id": "opencode", "priority": 2,
+             "model": "commandcode/deepseek-v4"},
+        ],
+    }))
+    _write_registry(reg)
+    st.do_mark("opencode@cmdcode", "+2h", "paid instance exhausted", state)
+    rows = st.build_rows(st.lineup(inst, reg), state, no_probe=True, only=None)
+    by_agent = {r["agent"]: r["rec"]["state"] for r in rows}
+    assert by_agent["opencode@cmdcode"] == "dry"
+    assert by_agent["opencode"] != "dry"
+
+
 def test_lineup_threads_the_pinned_model_into_the_probe_params(tmp_path):
     """The probe cannot report the right quota family unless the pin reaches
     it: the pinned model travels in the request params, per role and chain."""

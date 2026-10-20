@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import og_quota as q  # noqa: E402
+from og_instances import instance_ids  # noqa: E402
 
 OMNI = Path(os.environ.get("OMNIGENT_HOME", Path.home() / ".omnigent"))
 INSTALL = OMNI / "og-install.json"
@@ -84,7 +85,8 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
         sys.exit(f"{registry_path} is not valid JSON: {e}")
 
     def entry(agent_id, role: str, priority: int | None,
-              model: str | None = None) -> dict | None:
+              model: str | None = None,
+              instance: str | None = None) -> dict | None:
         # A malformed entry -- a bare number, a null, an object with no id --
         # names no agent, and a row for it would carry agent=None and crash the
         # table render. og stats runs interactively before a dispatch decision,
@@ -103,8 +105,11 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
             # worker `dry` (see og_quota._agy_family). params is the established
             # channel -- agent_id already arrives this way.
             params["model"] = model
-        return {"role": role, "agent": agent_id, "priority": priority,
-                "probe": probe, "params": params,
+        # `agent` is the INSTANCE key: everything persisted and marked is keyed
+        # by it, so two installs of one harness get separate records. `id` is
+        # the registry row the probe/table looks up.
+        return {"role": role, "agent": instance or agent_id, "id": agent_id,
+                "priority": priority, "probe": probe, "params": params,
                 "note": quota.get("note") or ""}
 
     def _role_entries(value) -> list[dict]:
@@ -136,37 +141,40 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
     entries: list[dict] = []
 
     def add(agent_id, role: str, priority: int | None,
-            model: str | None = None) -> None:
-        e = entry(agent_id, role, priority, model)
+            model: str | None = None, instance: str | None = None) -> None:
+        e = entry(agent_id, role, priority, model, instance)
         if e is not None:
             entries.append(e)
 
-    for e in _role_entries(inst.get("orchestrator")):
-        add(e["id"], "orchestrator", None, e.get("model"))
+    def add_chain(value, role: str) -> None:
+        items = _role_entries(value)
+        for iid, e in zip(instance_ids(items), items):
+            add(e["id"], role, None, e.get("model"), iid)
+
+    add_chain(inst.get("orchestrator"), "orchestrator")
     coders = inst.get("coders")
     if not isinstance(coders, list):
         # A hand-edited "coders": 5 is not iterable and used to raise
         # TypeError: 'int' object is not iterable. `og stats` runs interactively
         # right before a dispatch decision, so it must skip what it cannot read.
         coders = []
-    for c in sorted((c for c in coders if isinstance(c, dict)),
-                    key=lambda c: _priority_key(c.get("priority", 999))):
-        add(c.get("id"), "coder", c.get("priority"), c.get("model"))
+    coder_items = sorted((c for c in coders
+                          if isinstance(c, dict) and isinstance(c.get("id"), str)),
+                         key=lambda c: _priority_key(c.get("priority", 999)))
+    for iid, c in zip(instance_ids(coder_items), coder_items):
+        add(c.get("id"), "coder", c.get("priority"), c.get("model"), iid)
     # One row per reviewer, in chain order: this is the probe surface the
     # orchestrator reads to pick the earliest entry with capacity, so a backup
     # that is absent here cannot be failed over to on evidence.
-    for e in _role_entries(inst.get("reviewer")):
-        add(e["id"], "reviewer", None, e.get("model"))
+    add_chain(inst.get("reviewer"), "reviewer")
     # Same rule for the scout chain, appended after the reviewers: the earliest
     # scout WITH CAPACITY is the one dispatched, so an absent entry cannot be
     # chosen on evidence and the failover the roster skill promises is lost.
-    for e in _role_entries(inst.get("scout")):
-        add(e["id"], "scout", None, e.get("model"))
+    add_chain(inst.get("scout"), "scout")
     # Same rule again for the integrator chain, appended after the scouts: the
     # earliest integrator with capacity is the one dispatched, so a backup
     # missing here cannot be failed over to on evidence.
-    for e in _role_entries(inst.get("integrator")):
-        add(e["id"], "integrator", None, e.get("model"))
+    add_chain(inst.get("integrator"), "integrator")
     return entries
 
 
