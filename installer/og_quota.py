@@ -451,11 +451,15 @@ def _kilo_free_pin(model_id: str | None) -> bool:
     list of tier names, so a future `kilo/<router>/free` maps without a code
     change -- the same reasoning as _agy_family. `params["model"]` is the
     established channel (og_stats.lineup already passes the pin down).
+
+    A concrete free model is `kilo/<vendor>/<model>:free` (OpenRouter-style
+    suffix, e.g. `kilo/poolside/laguna-s-2.1:free`): it draws on the paid
+    balance no more than the router does, so the suffix counts too.
     """
     if not model_id:
         return False
     segs = [s for s in str(model_id).strip().lower().split("/") if s]
-    return bool(segs) and segs[-1] == "free"
+    return bool(segs) and (segs[-1] == "free" or segs[-1].endswith(":free"))
 
 
 def _probe_kilo_profile(params: dict, ctx: Ctx) -> dict:

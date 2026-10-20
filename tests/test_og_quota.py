@@ -466,6 +466,14 @@ def test_kilo_free_pin_positive_balance_still_not_measured(tmp_path, monkeypatch
     assert "12.5" in rec["detail"]
 
 
+def test_kilo_colon_free_pin_not_dry_on_zero_paid_balance(tmp_path, monkeypatch):
+    rec = _kilo_probe(tmp_path, monkeypatch, {"balance": 0},
+                      model="kilo/poolside/laguna-s-2.1:free")
+    assert rec["state"] == "ok"
+    assert rec["tier"] == "assumed"
+    assert rec["remaining"] is None
+
+
 def test_kilo_free_pin_shape_maps_any_free_route(tmp_path, monkeypatch):
     # shape-derived, so a future `kilo/<router>/free` maps without a code change
     assert q._kilo_free_pin("kilo/kilo-auto/free") is True
@@ -473,6 +481,12 @@ def test_kilo_free_pin_shape_maps_any_free_route(tmp_path, monkeypatch):
     assert q._kilo_free_pin("KILO/Kilo-Auto/Free") is True
     assert q._kilo_free_pin("kilo/kilo-auto/frontier") is False
     assert q._kilo_free_pin("kilo/freebeats/balanced") is False
+    # a concrete model with the `:free` suffix is free too (field bug: a
+    # `kilo/poolside/laguna-s-2.1:free` pin read `dry` on a 0 paid balance)
+    assert q._kilo_free_pin("kilo/poolside/laguna-s-2.1:free") is True
+    assert q._kilo_free_pin("kilo/nvidia/nemotron-3-ultra-550b-a55b:free") is True
+    assert q._kilo_free_pin("kilo/poolside/laguna-s-2.1") is False
+    assert q._kilo_free_pin("kilo/acme/freestyle:fast") is False
     assert q._kilo_free_pin(None) is False
     assert q._kilo_free_pin("") is False
 
