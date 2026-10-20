@@ -38,8 +38,8 @@ Ask the user, in this order. Each maps to a key in the plan JSON.
 | `agent_name` | Name for the orchestrator bundle. Default `dev-lead`. |
 | `orchestrator` | Which agent plans and delegates, and never writes product code. **One agent, not a chain** — nothing dispatches the brain, so a second orchestrator could never take over. |
 | `orchestrator.model` | Model to pin for the brain. **Required where `registry.model.required` is true** — OpenCode as orchestrator is the common case, and an unpinned brain is a faulty *first* conversation, not just a later dead dispatch. A row marked `pinnable: false` (Claude Code) is never asked: pinning it would pin the routing family. |
-| `coders` | Which agents implement, **in preference order** — first is tried first, later ones absorb overflow. |
-| `coders[].model` | Model to pin per coder. Required where `registry.model.required` is true. For multi-provider CLIs (OpenCode, Kilo) run the registry's `model.list_cmd` (e.g. `opencode models`) and offer everything it prints, grouped by `provider/` prefix — a user with a DeepSeek or Anthropic login there wants `deepseek/…`, not only Zen's `opencode/…-free` ids. |
+| `coders` | Which agents implement, **in preference order** — first is tried first, later ones absorb overflow. The same harness may appear more than once with different model pins; each occurrence keeps its own worker name (`coder_zen`, `coder_zen_cmdcode`) and stats id (`opencode`, `opencode@cmdcode`). |
+| `coders[].model` | Model to pin per coder **instance**. Required where `registry.model.required` is true. For multi-provider CLIs (OpenCode, Kilo) run the registry's `model.list_cmd` (e.g. `opencode models`) and offer everything it prints, grouped by `provider/` prefix — a user with a DeepSeek or Anthropic login there wants `deepseek/…`, not only Zen's `opencode/…-free` ids. Two instances on the same pin are warned about: they buy no extra quota. |
 | `reviewer` | Which agent reviews the batched diff. |
 | `port`, `ngrok_domain`, `max_dispatches` | Runtime knobs; defaults are fine. |
 

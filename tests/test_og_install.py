@@ -21,6 +21,7 @@ import pytest
 import yaml
 
 import og_install as m
+import og_instances as oi
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -2337,6 +2338,120 @@ def test_roster_skill_stats_id_map_names_every_chain_role():
 
 
 # --------------------------------------------------------------------------
+# multiple instances of one harness
+# --------------------------------------------------------------------------
+TWO_OPENCODE_PLAN = _base_plan(coders=[
+    {"id": "opencode", "priority": 1, "model": "opencode/mimo-v2.6-flash-free"},
+    {"id": "opencode", "priority": 2, "model": "commandcode/deepseek-v4"},
+])
+
+
+def test_coder_instance_ids_and_worker_names_are_per_pin():
+    assert m.coder_instance_ids(TWO_OPENCODE_PLAN) == [
+        "opencode", "opencode@cmdcode"]
+    assert m.coder_names(TWO_OPENCODE_PLAN) == [
+        "coder_zen", "coder_zen_cmdcode"]
+
+
+def test_second_instance_without_a_provider_pin_gets_the_ordinal():
+    plan = _base_plan(coders=[
+        {"id": "opencode", "priority": 1, "model": None},
+        {"id": "opencode", "priority": 2, "model": None},
+    ])
+    assert oi.instance_ids(plan["coders"]) == ["opencode", "opencode-2"]
+    assert m.coder_names(plan) == ["coder_zen", "coder_zen_2"]
+
+
+def test_single_instance_plan_keeps_every_existing_identity():
+    plan = _base_plan()
+    assert m.coder_names(plan) == ["coder_zen"]
+    assert m.coder_instance_ids(plan) == ["opencode"]
+
+
+def test_commandcode_pin_resolves_to_the_pinned_vendor():
+    reg = m.agents_by_id()
+    assert m.vendor_of(reg["opencode"],
+                       {"model": "commandcode/deepseek-v4"}) == "deepseek"
+
+
+def test_picker_keeps_a_repeated_harness_in_order(monkeypatch):
+    options = [("opencode", "OpenCode", ""), ("cmdcode", "Command Code", ""),
+               ("kilo", "Kilo", ""), ("cline", "Cline", "")]
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "2,2,4,1")
+    assert m.pick_many_ordered("coders", options, allow_repeats=True) == [
+        "cmdcode", "cmdcode", "cline", "opencode"]
+
+
+def test_picker_reloads_a_saved_repeated_order(monkeypatch):
+    options = [("opencode", "OpenCode", ""), ("cmdcode", "Command Code", ""),
+               ("kilo", "Kilo", "")]
+    seen = {}
+
+    def fake_ask(prompt, default=None):
+        seen["default"] = default
+        return default
+
+    monkeypatch.setattr(m, "ask", fake_ask)
+    saved = ["opencode", "cmdcode", "cmdcode", "kilo"]
+    assert m.pick_many_ordered("coders", options, saved,
+                               allow_repeats=True) == saved
+    assert seen["default"] == "1,2,2,3"
+
+
+def test_validate_warns_only_when_two_instances_reuse_one_model():
+    # Different pins add capacity; the same pin does not.
+    assert not any("reuses" in msg
+                   for _, msg in m.validate(TWO_OPENCODE_PLAN))
+    same = _base_plan(coders=[
+        {"id": "opencode", "priority": 1,
+         "model": "opencode/mimo-v2.6-flash-free"},
+        {"id": "opencode", "priority": 2,
+         "model": "opencode/mimo-v2.6-flash-free"},
+    ])
+    assert any(level == "warn" and "reuses" in msg
+               for level, msg in m.validate(same))
+
+
+def test_roster_names_each_instance_and_tags_long_running_work():
+    roster = m.render_roster(TWO_OPENCODE_PLAN)
+    assert "`coder_zen`" in roster and "`coder_zen_cmdcode`" in roster
+    skill = m.render_roster_skill(TWO_OPENCODE_PLAN)
+    assert "Long-running: no — free-tier pin" in skill
+    assert "Long-running: yes — native harness on a paid pin" in skill
+
+
+def test_roster_skill_lists_per_instance_ids_and_routing_rule():
+    skill = m.render_roster_skill(TWO_OPENCODE_PLAN)
+    assert "`coder_zen` -> `opencode`" in skill
+    assert "`coder_zen_cmdcode` -> `opencode@cmdcode`" in skill
+    assert "Long-running: yes" in skill
+    assert "run long commands in the background" in skill
+
+
+def test_orchestrator_prompt_routes_long_running_work_and_requires_backgrounding():
+    prompt = m.render_orchestrator(TWO_OPENCODE_PLAN)
+    assert "Long-running work:" in prompt
+    assert "`Long-running: yes`" in prompt
+    assert "run long commands in the background" in prompt
+
+
+def test_render_coder_defaults_to_the_second_instances_unique_name():
+    cfg = yaml.safe_load(m.render_coder(TWO_OPENCODE_PLAN,
+                                        TWO_OPENCODE_PLAN["coders"][1]))
+    assert cfg["name"] == "coder_zen_cmdcode"
+
+
+def test_long_running_note_is_derived_from_the_pin_and_transport():
+    reg = m.agents_by_id()
+    paid = {"model": "commandcode/deepseek-v4"}
+    free = {"model": "opencode/mimo-v2.6-flash-free"}
+    assert m.long_running_tag(reg["opencode"], paid) == "yes"
+    assert m.long_running_tag(reg["opencode"], free).startswith("no")
+    assert "free-tier" in m.long_running_note(reg["opencode"], free)
+    assert "ACP" in m.long_running_note(reg["kilo"], paid)
+
+
+# --------------------------------------------------------------------------
 # prompt diet: guidance moved out of the argv prompt into the roster skill
 #
 # The orchestrator prompt is inlined into the harness command line and capped
@@ -3833,8 +3948,8 @@ def _run_interactive(monkeypatch, state=None):
     monkeypatch.setattr(m, "ask_yes", fake_ask_yes)
     monkeypatch.setattr(m, "pick_one", fake_pick_one)
     monkeypatch.setattr(m, "pick_many_ordered",
-                        lambda prompt, options, current=None: [options[0][0]])
-    monkeypatch.setattr(m, "pick_model", lambda agent, current=None: None)
+                        lambda prompt, options, current=None, allow_repeats=False: [options[0][0]])
+    monkeypatch.setattr(m, "pick_model", lambda agent, current=None, label=None: None)
     return m.build_plan_interactive(state), events
 
 
@@ -3906,10 +4021,13 @@ PER_ROLE_SITES = {
     "og_install.py": {
         "apply",
         "build_plan_interactive",
+        "coder_instance_ids",
+        "coder_names",
         "dispatch_note",
         "integrator_note",
         "opencode_worker_config_dir",
         "patch_global_config",
+        "render_coder",
         "render_integrator",
         "render_orchestrator",
         "render_reviewer",

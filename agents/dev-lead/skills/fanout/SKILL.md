@@ -14,12 +14,20 @@ FIRST task and who absorbs overflow — it does not mean queueing everything ont
 the first worker. With N independent tasks and N available workers, spread
 them so they run concurrently.
 
+**Long-running work overrides preference order.** A task projected to run long
+(full test suites, backfills/migrations, many sequential LLM calls, a large
+refactor) goes to a worker whose roster line says `long-running: yes`, even if
+an earlier-preference worker is free. If none says yes, split it into bounded
+steps or tell the human.
+
 ## 0. Check capacity
 
 Before decomposing, run `og stats --json` (og is on PATH; if it is missing or
-errors, proceed and say so once). Map `coder_<id>` -> `<id>` and `reviewer` ->
-the reviewer's id. A worker whose state is `dry` with `reset_at` in the future
-is out of capacity: skip it and take the next worker in preference order.
+errors, proceed and say so once). Map each worker to its own stats id (the
+generated `roster` skill lists them; a harness installed twice gets a
+provider-derived id such as `opencode@cmdcode`). A worker whose state is `dry`
+with `reset_at` in the future is out of capacity: skip it and take the next
+worker in preference order. A mark on one instance does not touch the other.
 Preference order still wins — only when two candidates are otherwise equal does
 `ok` outrank `unknown`. The roster skill's Capacity section says the rest,
 including how to mark a worker dry on a quota failure and re-admit it after
@@ -69,7 +77,7 @@ your turn. Each `sys_session_send` sets `title` (the WORK, not the vendor),
 contract, and its worktree path. Never pass `args.model`: every worker pins
 its own, and the only exception is the model preflight in your prompt.
 
-Two lines belong in EVERY `args.input`, because some harnesses never see
+Three lines belong in EVERY `args.input`, because some harnesses never see
 their spec prompt and only read what you send:
 
 - **Unattended.** "Nobody is watching: never call a question / ask-user tool
@@ -81,6 +89,9 @@ their spec prompt and only read what you send:
   or CLI that queries an indexed code graph — use it before grepping; read
   each file once and do not re-read whole files after edits." Name no
   specific tool: the worker checks what is actually present.
+- **Long commands.** "Run long commands in the background with a log and poll
+  in short steps; never block on one long foreground command." A full suite or
+  migration run in one foreground call can outlive the turn or the transport.
 
 Respect the per-turn dispatch cap. If you have more tasks than the cap, run
 them in waves rather than trying to exceed it.
