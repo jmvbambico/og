@@ -47,7 +47,8 @@ def _install(path: Path, model: str | None = "opencode/mimo-v2.6-flash-free",
 def _registry(path: Path, patterns: list[str] | None = None, *,
               probe: str | None = None, argv: list[str] | None = None,
               model_prefer: str | None = "opencode/mimo-v2.6-flash-free",
-              agent: str = "opencode", free: bool | None = None):
+              agent: str = "opencode",
+              free_models: list[str] | None = None):
     model: dict = {"required": True}
     if model_prefer:
         model["prefer"] = model_prefer
@@ -56,8 +57,8 @@ def _registry(path: Path, patterns: list[str] | None = None, *,
                          "Reply with exactly: ok. Do not use tools."],
         "failure_patterns": patterns or ["Rate limit exceeded"],
     }
-    if free is not None:
-        liveness["free"] = free
+    if free_models is not None:
+        liveness["free_models"] = free_models
     path.write_text(json.dumps({"agents": [{
         "id": agent,
         "label": agent,
@@ -92,15 +93,19 @@ def _ctx(bin_dir: Path, now: datetime = NOW,
 
 def _run(tmp_path, bin_dir, *, timeout=5.0, ctx=None, patterns=None,
          probe=None, argv=None, agent="opencode",
-         model="opencode/mimo-v2.6-flash-free", prefer=None, free=None,
-         system=False):
+         model="opencode/mimo-v2.6-flash-free", prefer=None,
+         free_models=None, system=False):
     inst = tmp_path / "og-install.json"
     reg = tmp_path / "registry.json"
     state = tmp_path / "og-quota.json"
     _install(inst, model, agent)
+    if free_models is None:
+        # Default for the success-path tests: the installed pin is listed.
+        # Billing tests pass [] or an explicit list on purpose.
+        free_models = [model] if model else []
     _registry(reg, patterns, probe=probe, argv=argv, agent=agent,
               model_prefer=prefer if prefer is not None else model,
-              free=free)
+              free_models=free_models)
     return sp.probe_start(inst, reg, state, timeout=timeout,
                           ctx=ctx or _ctx(bin_dir, system=system)), state
 
@@ -298,13 +303,14 @@ def test_a_paid_pin_is_skipped_without_running_the_cli(tmp_path):
 
     outcomes, state = _run(
         tmp_path, bin_dir, agent="cmdcode", model="moonshotai/kimi-k3",
-        prefer="moonshotai/kimi-k3",
+        prefer="moonshotai/kimi-k3", free_models=[],
         argv=["cmd", "-p", "Reply with exactly: ok. Do not use tools.",
               "--model", "{model}", "--skip-onboarding"],
         patterns=["Rate limit exceeded"])
 
     assert outcomes[0]["state"] == "skipped"
-    assert "paid model moonshotai/kimi-k3" in outcomes[0]["detail"]
+    assert "model not verified free: moonshotai/kimi-k3" in \
+        outcomes[0]["detail"]
     assert not marker.exists(), "a paid probe was actually executed"
     assert q.load_state(state)["marks"] == {}
 
@@ -315,31 +321,54 @@ def test_unpinned_falls_back_to_a_paid_prefer_and_is_skipped(tmp_path):
     _fake_cli(bin_dir, "opencode", f'touch "{marker}"\necho ok\n')
 
     outcomes, state = _run(tmp_path, bin_dir, model=None,
-                           prefer="anthropic/claude-opus-5")
+                           prefer="anthropic/claude-opus-5", free_models=[])
 
     assert outcomes[0]["state"] == "skipped"
-    assert "paid model anthropic/claude-opus-5" in outcomes[0]["detail"]
+    assert "model not verified free: anthropic/claude-opus-5" in \
+        outcomes[0]["detail"]
     assert not marker.exists()
     assert q.load_state(state)["marks"] == {}
 
 
-def test_explicit_free_registry_truth_allows_a_paid_looking_id(tmp_path):
+def test_a_free_looking_suffix_alone_is_not_authoritative(tmp_path):
+    """(a) A paid model can be NAMED `...-free`; only the registry allow-list
+    may authorise spending. The CLI must not run."""
+    marker = tmp_path / "ran"
     bin_dir = tmp_path / "bin"
-    _fake_cli(bin_dir, "opencode", "echo ok\n")
+    _fake_cli(bin_dir, "opencode", f'touch "{marker}"\necho ok\n')
 
-    outcomes, _ = _run(tmp_path, bin_dir, model="somevendor/paid-looking",
-                       prefer="somevendor/paid-looking", free=True)
+    outcomes, state = _run(tmp_path, bin_dir, model="opencode/paid-model-free",
+                           free_models=[])
+
+    assert outcomes[0]["state"] == "skipped"
+    assert "model not verified free: opencode/paid-model-free" in \
+        outcomes[0]["detail"]
+    assert not marker.exists()
+    assert q.load_state(state)["marks"] == {}
+
+
+def test_an_allow_listed_id_is_probed(tmp_path):
+    """(b) The only way a liveness request runs is an exact allow-list hit."""
+    marker = tmp_path / "ran"
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "opencode", f'touch "{marker}"\necho ok\n')
+
+    outcomes, _ = _run(tmp_path, bin_dir, model="opencode/listed-free",
+                       free_models=["opencode/listed-free"], system=True)
 
     assert outcomes[0]["state"] == "ok"
+    assert marker.exists()
 
 
-def test_free_model_shapes():
-    assert sp._is_free_model({}, "opencode/mimo-v2.6-flash-free")
-    assert sp._is_free_model({}, "kilo/kilo-auto/free")
-    assert sp._is_free_model({}, "vendor/model:free")
-    assert not sp._is_free_model({}, "moonshotai/kimi-k3")
-    assert sp._is_free_model({"quota": {"liveness": {"free": True}}},
-                             "moonshotai/kimi-k3")
+def test_free_models_is_an_exact_allow_list():
+    row = {"quota": {"liveness": {"free_models": ["opencode/listed-free"]}}}
+    assert sp._is_free_model(row, "opencode/listed-free")
+    # no shape rule: any other id, however free-looking, is not authorised
+    assert not sp._is_free_model(row, "opencode/other-free")
+    assert not sp._is_free_model(row, "opencode/listed-free:free")
+    assert not sp._is_free_model({}, "kilo/kilo-auto/free")
+    assert not sp._is_free_model({"quota": {"liveness": {"free": True}}},
+                                 "opencode/listed-free")
 
 
 def test_a_model_template_without_any_model_is_skipped(tmp_path):
@@ -354,7 +383,7 @@ def test_a_model_template_without_any_model_is_skipped(tmp_path):
                                             "priority": 1}]}))
     # the registry's prefer is the installer's default pin, so to test the
     # empty case remove it from the row too
-    _registry(reg, model_prefer=None)
+    _registry(reg, model_prefer=None, free_models=[])
 
     outcomes = sp.probe_start(inst, reg, state, ctx=_ctx(bin_dir))
     assert outcomes[0]["state"] == "skipped"
@@ -372,6 +401,36 @@ def test_registry_liveness_has_no_action_enabling_flags():
         assert "--tools-all" not in argv, row["id"]
         if argv:
             assert any("Do not use tools" in str(a) for a in argv), row["id"]
+
+
+def test_registry_free_models_belong_to_their_agent_row():
+    """(c) Every allow-listed id is an exact id owned by its own row: listed
+    only there, prefixed by that agent's provider, and including the row's
+    preferred pin whenever the row has an allow-list at all."""
+    reg = json.loads((REPO / "installer" / "registry.json").read_text())
+    claimed: dict[str, str] = {}
+    allow_lists = 0
+    for row in reg["agents"]:
+        live = (row.get("quota") or {}).get("liveness") or {}
+        ids = live.get("free_models") or []
+        assert isinstance(ids, list), row["id"]
+        if ids:
+            allow_lists += 1
+            assert row["model"]["prefer"] in ids, row["id"]
+        for mid in ids:
+            assert isinstance(mid, str) and mid == mid.strip() and mid
+            assert mid.split("/")[0] == row["id"], (row["id"], mid)
+            assert mid not in claimed, (mid, row["id"], claimed[mid])
+            claimed[mid] = row["id"]
+    # the two unmeasured-tier rows that document a free path have one;
+    # Command Code/Kiro have none, so their paid pins stay skipped.
+    assert allow_lists == 2
+    assert claimed == {
+        "opencode/mimo-v2.6-flash-free": "opencode",
+        "opencode/deepseek-v4.1-flash-free": "opencode",
+        "opencode/mimo-v2.5-free": "opencode",
+        "kilo/kilo-auto/free": "kilo",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +534,7 @@ def test_probe_merge_keeps_a_mark_written_while_probing(tmp_path):
     reg = tmp_path / "registry.json"
     state = tmp_path / "og-quota.json"
     _install(inst)
-    _registry(reg)
+    _registry(reg, free_models=["opencode/mimo-v2.6-flash-free"])
     q.save_state({"version": 1, "agents": {}, "marks": {}}, state)
 
     result = {}

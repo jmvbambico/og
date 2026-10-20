@@ -142,7 +142,12 @@
         "liveness": {
           "argv": ["opencode", "run", "-m", "{model}", "Reply with exactly: ok. Do not use tools."],
           "failure_patterns": ["Rate limit exceeded"],
-          "note": "No action-enabling flags and a prompt that forbids tools: the probe is a capability check, not a dispatch."
+          "free_models": [
+            "opencode/mimo-v2.6-flash-free",
+            "opencode/deepseek-v4.1-flash-free",
+            "opencode/mimo-v2.5-free"
+          ],
+          "note": "No action-enabling flags and a prompt that forbids tools: the probe is a capability check, not a dispatch. free_models is an exact-id allow-list of documented Zen free pins; a -free suffix alone is not evidence of a free model."
         }
       }
     },
@@ -297,7 +302,8 @@
         "liveness": {
           "argv": ["kilo", "run", "-m", "{model}", "Reply with exactly: ok. Do not use tools."],
           "failure_patterns": ["Rate limit exceeded", "Add credits to continue", "usage limit"],
-          "note": "Runs only for the free router (kilo/.../free); a paid pin is measured by kilo-profile and never liveness-probed."
+          "free_models": ["kilo/kilo-auto/free"],
+          "note": "Runs only for the registry-listed free router; a paid pin is measured by kilo-profile and never liveness-probed."
         }
       }
     },

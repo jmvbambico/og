@@ -17,11 +17,12 @@ Two kinds of evidence:
   (`quota.liveness.argv`), the pin comes from `og-install.json`, and nothing
   user-specific is hardcoded here.
 
-A liveness probe must never bill. It runs only when the model is verifiably
-free (an explicit `free: true`, or an id whose last segment is `free` /
-ends in `-free` / ends in `:free`); a paid pin is reported `skipped: paid
-model` and the mark is left alone. The request runs in a fresh empty temporary
-directory, with stdin closed and its own session/process group, so it can
+A liveness probe must never bill. It runs only when the model appears in the
+registry's authoritative allow-list (`quota.liveness.free_models`, exact ids
+documented as free tier); an id's SHAPE is never evidence -- a paid model can
+carry a `-free` suffix. An unlisted pin is reported `skipped: model not
+verified free` and the mark is left alone. The request runs in a fresh empty
+temporary directory, with stdin closed and its own session/process group, so it can
 neither touch the caller's tree nor survive a timeout. No action-enabling
 flags (`--yolo`, `--tools-all`, ...) are passed, and the prompt explicitly
 forbids tools: the probe is a capability check, not a dispatch.
@@ -179,27 +180,27 @@ def _resolve_model(row: dict, entry: dict) -> str | None:
     return str(model) if model else None
 
 
-def _is_free_model(row: dict, model: str | None) -> bool:
-    """True only when the pin is verifiably free -- a probe must never bill.
+def _free_models(row: dict) -> set[str]:
+    """The agent row's authoritative free-tier allow-list, exact ids only."""
+    live = ((row.get("quota") or {}).get("liveness") or {})
+    ids = live.get("free_models") or []
+    if isinstance(ids, str):
+        ids = [ids]
+    return {str(i).strip() for i in ids
+            if isinstance(i, str) and str(i).strip()}
 
-    Explicit registry truth (`quota.liveness.free` or `quota.free`) wins;
-    otherwise the id's SHAPE decides, never a list of model names, so a new
-    free id maps without a code change. Shapes seen in practice:
-    `opencode/mimo-v2.6-flash-free`, `kilo/kilo-auto/free`,
-    OpenRouter's `vendor/model:free`.
+
+def _is_free_model(row: dict, model: str | None) -> bool:
+    """True only when the exact pin is allow-listed by the registry.
+
+    WHY no id-shape rule: a paid model can end in `-free` (or `:free`), so
+    suffix inference is not authority to spend money. `quota.liveness.
+    free_models` is populated only with ids the registry/docs document as the
+    free tier, and a pin absent from it is skipped.
     """
-    quota = row.get("quota") or {}
-    liveness = quota.get("liveness") or {}
-    if liveness.get("free") is True or quota.get("free") is True:
-        return True
     if not model:
         return False
-    m = str(model).strip().lower()
-    if m.endswith(":free"):
-        return True
-    segs = [s for s in m.split("/") if s]
-    last = segs[-1] if segs else m
-    return last == "free" or last.endswith("-free")
+    return str(model).strip() in _free_models(row)
 
 
 def _liveness_plan(row: dict, entry: dict) -> tuple[list[str] | None, str]:
@@ -211,7 +212,7 @@ def _liveness_plan(row: dict, entry: dict) -> tuple[list[str] | None, str]:
     model = _resolve_model(row, entry)
     if not _is_free_model(row, model):
         if model:
-            return None, f"skipped: paid model {model}"
+            return None, f"skipped: model not verified free: {model}"
         return None, "skipped: no model to verify as free"
     return [str(a).replace("{model}", model or "") for a in template], ""
 

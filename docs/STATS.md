@@ -88,11 +88,12 @@ exit status is ignored.
   from the registry row's `quota.liveness.argv` (`{model}` is replaced by the
   pin in `og-install.json`, falling back to the registry's `model.prefer`);
   nothing user-specific is hardcoded.
-- **A liveness probe never bills.** It runs only when the pin is verifiably
-  free: an explicit `quota.liveness.free: true` (or `quota.free: true`), or an
-  id whose last segment is `free`, ends in `-free`, or ends in `:free`. A paid
-  pin (Command Code's credits, Kiro's `auto`) reports `skipped: paid model`
-  and the mark is left alone.
+- **A liveness probe never bills.** It runs only when the exact pin appears in
+  the registry row's `quota.liveness.free_models` allow-list — ids the registry
+  and docs document as free tier (OpenCode Zen's free pins, Kilo's
+  `kilo/kilo-auto/free`). An id's shape is never evidence: a paid model can be
+  named `…-free`. An unlisted pin (Command Code's credits, Kiro's `auto`)
+  reports `skipped: model not verified free` and the mark is left alone.
 - The request runs with stdin closed and its own session/process group, in a
   fresh empty temporary directory, never the caller's cwd. On timeout the
   whole group gets SIGTERM, then SIGKILL after a short grace, so a grandchild
