@@ -12,6 +12,7 @@ refreshes OAuth tokens — a refresh would rotate the user's real session.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -22,6 +23,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+
+try:  # POSIX; the fallback keeps import on a platform without fcntl
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no bin/og either
+    fcntl = None  # type: ignore[assignment]
 
 # Network probes must fail fast: og stats is run interactively before a
 # dispatch decision, and an 8 s ceiling bounds the worst-case wall clock.
@@ -963,11 +969,15 @@ def load_state(path: Path | None = None) -> dict:
         return {"version": STATE_VERSION, "agents": {}, "marks": {}}
 
 
-def save_state(state: dict, path: Path | None = None) -> None:
+def save_state(state: dict, path: Path | None = None,
+               now: datetime | None = None) -> None:
     p = path or OMNI_STATE
     p.parent.mkdir(parents=True, exist_ok=True)
-    # prune expired marks on write (schema pin) and dead agent entries
-    now = datetime.now().astimezone()
+    # prune expired marks on write (schema pin) and dead agent entries.
+    # `now` is injectable so a caller running on a fixed clock (the start probe
+    # in tests, or a replayed state) does not have its fresh marks pruned by
+    # the wall clock.
+    now = now or datetime.now().astimezone()
     marks = {k: v for k, v in (state.get("marks") or {}).items() if _mark_active(v, now)}
     state = {"version": STATE_VERSION, "agents": state.get("agents") or {},
              "marks": marks}
@@ -983,6 +993,44 @@ def save_state(state: dict, path: Path | None = None) -> None:
             os.unlink(tmp)
         except OSError:
             raise
+
+
+@contextlib.contextmanager
+def state_lock(path: Path | None = None):
+    """Exclusive inter-process lock on `$path.lock`.
+
+    WHY: `og start`'s probe and an interactive `og stats --mark`/`--clear` are
+    independent processes writing the same small JSON file. Without a lock,
+    either one's read-modify-write can drop the other's update -- a mark
+    written while a probe was running would silently vanish. The lock file is
+    a sidecar (never the state itself, which is replaced atomically).
+    """
+    p = Path(str(path or OMNI_STATE) + ".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a+") as fh:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def update_state(path: Path | None, mutate: Callable[[dict], Any],
+                 now: datetime | None = None):
+    """Locked load -> mutate -> save, returning `mutate`'s result.
+
+    Every writer of the state file goes through this, so concurrent writers
+    serialise instead of overwriting each other. `mutate` receives the freshest
+    state and edits it in place; per-agent edits keep unrelated agents' marks
+    and records intact.
+    """
+    with state_lock(path):
+        state = load_state(path)
+        result = mutate(state)
+        save_state(state, path, now=now)
+        return result
 
 
 def _mark_active(mark: dict, now: datetime) -> bool:

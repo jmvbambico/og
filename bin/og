@@ -12,7 +12,8 @@
 #                       A flag alongside the multiplexer goes to the launcher, which
 #                       execs the multiplexer TUI: --once does the work, prints it and
 #                       does NOT attach — the diagnostic for a space or pane that did
-#                       not come up.
+#                       not come up. Every start also probes installed agents' capacity;
+#                       --no-probe (or OG_START_PROBE=0) skips that for offline use.
 #   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
 #   og restart [mode]   og stop, then og start with the same arguments
@@ -1270,10 +1271,13 @@ parse_start_args() {
   # og has no flag parser anywhere else, but --use consumes a value so it cannot
   # be one more positional case arm (see docs/TUNNEL-PROVIDERS.md): collect
   # positionals and flags in one pass.
-  local use="" provider mux="" mode="" domain="" ids a
+  local use="" provider mux="" mode="" domain="" ids a no_probe=0
   local -a pos=() rest=() mux_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      # og's own flag, never the launcher's: the start capacity probe makes a
+      # real request per unmeasured agent, which is wrong on a metered link.
+      --no-probe) no_probe=1; shift ;;
       --use)
         [[ -n "${2:-}" ]] || die "--use needs a provider: ngrok or tunnl"
         use="$2"; shift 2 ;;
@@ -1345,6 +1349,10 @@ parse_start_args() {
   esac
   OG_START_MODE="$mode" OG_START_DOMAIN="$domain"
   OG_START_PROVIDER="$provider" OG_START_MUX="$mux"
+  # Env wins only in the "off" direction: a probe is on by default, and an
+  # explicit --no-probe always disables it.
+  OG_START_PROBE="${OG_START_PROBE:-1}"
+  if [[ "$no_probe" -eq 1 ]]; then OG_START_PROBE=0; fi
   # A launcher flag with no multiplexer has nothing to be forwarded to, and
   # accepting it silently would be the same defect this forwarding exists to fix
   # (a flag the operator typed that nothing acts on). The mux id is known here;
@@ -1472,6 +1480,36 @@ og_browser_suppressed() {
   [[ "${OG_SUPPRESS_BROWSER:-}" == "1" ]]
 }
 
+# Refresh the quota state from the installed lineup before any session opens.
+#
+# WHY (2026-10-13): `og stats --mark` used to default to no expiry, and an
+# agent whose quota cannot be measured (OpenCode Zen free tier, Command Code)
+# has no other probe to override the mark -- one "rate limit exceeded" mark
+# kept two workers out of the roster for a week. A start is a fresh moment, so
+# it gets fresh evidence: a healthy liveness reply clears the mark, a quota
+# string re-marks it WITH the reset time as its expiry.
+#
+# Bounded and best-effort by construction: the Python side runs one thread per
+# agent, each with its own timeout, and its exit status is ignored. `og start`
+# must never hang or fail because a coding CLI is slow, logged out, or absent.
+#
+# `python3 -` (stdin), not `python3 <script>`: the probe is an inline helper
+# like the other heredocs in this file, so the exec tests' argv recorder does
+# not mistake it for the launcher handoff.
+run_start_probe() {
+  local repo="$1" py
+  [[ -n "$repo" ]] || return 0
+  [[ -f "$repo/installer/og_start_probe.py" ]] || return 0
+  py="$(command -v python3 2>/dev/null || true)"
+  [[ -n "$py" ]] || return 0
+  OG_REPO="$repo" OMNIGENT_HOME="$OMNI_HOME" "$py" - <<'PYEOF' || true
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["OG_REPO"], "installer"))
+import og_start_probe
+raise SystemExit(og_start_probe.main())
+PYEOF
+}
+
 cmd_start() {
   # `og start`            -> local  (LAN only; the safe default)
   # `og start local`      -> same, explicit
@@ -1569,6 +1607,13 @@ cmd_start() {
       die "port $PORT is already in use by $holder.
     Set OG_PORT=<free port> in $CONF_FILE, or stop that process first."
     fi
+  fi
+
+  # Before the server and tunnel, so the roster opens on current evidence and
+  # a probe cannot be mistaken for a startup failure. Skipped by --no-probe /
+  # OG_START_PROBE=0 (parse_start_args).
+  if [[ "${OG_START_PROBE:-1}" != "0" ]]; then
+    run_start_probe "$(og_repo_dir 2>/dev/null || true)"
   fi
 
   local url=""
@@ -2555,11 +2600,11 @@ case "${1:-}" in
   ""|-h|--help|help)
     # The usage block is the comment header, so the RANGE has to track it: every
     # command added above without widening this quietly drops off the end of
-    # `og help`, which is how `og version` went missing once already. 2,41 is the
+    # `og help`, which is how `og version` went missing once already. 2,42 is the
     # last line of the command list (the prose below it is not help).
     # tests/test_og_start_mux.py::test_help_block_lists_every_dispatched_command
     # is the guard that cannot rot the way a number does.
-    sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac

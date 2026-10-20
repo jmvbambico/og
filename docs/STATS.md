@@ -57,22 +57,80 @@ og stats --clear kilo
 | cursor-dashboard | cursor | token from `state.vscdb` → current-period usage |
 | deepseek-balance | cline | `GET user/balance`, needs `$DEEPSEEK_API_KEY` |
 | launch-budget | freebuff | last balance freebuff itself printed (chat.db transcripts + newest runner logs); `unknown` when nothing reported since the daily reset — og never subtracts a per-launch cost. The observation is taken only from freebuff worker sessions' own error output, and anything else — including og's own reports — is ignored by design |
-| (none) | opencode, kiro | known limit, not measurable: row shows the registry `quota.note` |
+| (none) | opencode, kiro, cmdcode | known limit, not measurable: `og stats` shows the registry `quota.note`; `og start` runs the row's `quota.liveness` probe instead |
 
 ## Marks
 
 `--mark <id> dry [--until ISO8601|+2h|+30m|+1d] [--reason ...]` forces an
-agent `dry` until the expiry (default: no expiry); `--clear <id>` removes it.
+agent `dry` until the expiry (**default: +1h**); `--clear <id>` removes it.
 An expired mark is ignored and pruned on the next state write. The
 orchestrator treats a marked agent as unavailable and dispatches around it —
 use marks to hold quota back for a planned run. A probe result of `dry`
 (measured exhaustion) behaves the same way without any mark.
 
+The default used to be "no expiry", which is how one `Rate limit exceeded`
+mark kept an agent out of the roster for a week: nothing ever overrode it for
+a quota model with no queryable balance. Every mark now has a deadline, and
+`og start` refreshes the evidence (below).
+
+## Startup probe (`og start` / `og restart`)
+
+Before any session opens, `og start` probes every agent in the installed
+lineup once, concurrently, with a per-agent timeout (20s for liveness, the
+probe's own 8s otherwise). The probe can never abort or hang a start; its
+exit status is ignored.
+
+- **Measurable quota** (`quota.probe` in the registry): run exactly as
+  `og stats` runs it.
+- **No queryable quota** (`probe: null`), or an `assumed` reading such as
+  Kilo's free router: run a **liveness** probe — one tiny real request through
+  the agent's own CLI on the model the install pinned. The command shape comes
+  from the registry row's `quota.liveness.argv` (`{model}` is replaced by the
+  pin in `og-install.json`, falling back to the registry's `model.prefer`);
+  nothing user-specific is hardcoded.
+- **A liveness probe never bills.** It runs only when the exact pin appears in
+  the registry row's `quota.liveness.free_models` allow-list — ids the registry
+  and docs document as free tier (OpenCode Zen's free pins, Kilo's
+  `kilo/kilo-auto/free`). An id's shape is never evidence: a paid model can be
+  named `…-free`. An unlisted pin (Command Code's credits, Kiro's `auto`)
+  reports `skipped: model not verified free` and the mark is left alone.
+- The request runs with stdin closed and its own session/process group, in a
+  fresh empty temporary directory, never the caller's cwd. On timeout the
+  whole group gets SIGTERM, then SIGKILL after a short grace, so a grandchild
+  the CLI spawned cannot survive. No action-enabling flags (`--yolo`,
+  `--tools-all`) are passed, and the prompt forbids tools.
+- A known quota string from `quota.liveness.failure_patterns` means `dry`, but
+  ONLY when the request failed (non-zero exit, or no reply). A successful
+  reply that merely mentions a quota phrase is `ok`. The reset clause supports
+  `2d`, `1d 3h`, `2h 41m`, `45m` and `30s`; a zero or unparsable reset falls
+  back to +1h.
+- A missing binary reports `unavailable`, an auth error or timeout reports
+  `error`, and a paid pin reports `skipped`, with the first error line or the
+  reason. None of them is `dry`: a broken or unaffordable probe is not evidence
+  of exhaustion, and none writes or clears a mark. They persist as `unknown` in
+  `og-quota.json` (the record schema has no error/skip state), so
+  `og stats --no-probe` renders them as `unknown`, not as a capacity claim.
+- An `ok` result clears any existing dry mark and records the probe time.
+
+One compact line per agent is printed, e.g.:
+
+```
+  opencode     ok           ok (reply received)
+  cmdcode      dry          dry: You've reached your 5-hour usage limit. Resets in 2h 41m (until 10-13 14:12)
+```
+
+Skip the probe with `og start --no-probe` or `OG_START_PROBE=0` (offline or
+metered use). `og restart` runs it too, because restart is stop + start.
+
 ## Files and overrides
 
 - State: `$OMNIGENT_HOME/og-quota.json` (last-good records + marks, versioned,
-  written atomically). A 429 or probe failure reuses the last-good record if
-  it is under 30 minutes old, flagged as `<probe> (cached)`.
+  written atomically). Writers serialise on a sidecar `og-quota.json.lock`
+  (`flock`): `og stats --mark`/`--clear`, `og stats`'s own probe save, and the
+  start probe each lock around load→merge→save, and probe saves merge per
+  agent — so a mark set while a probe ran is not lost. A 429 or probe failure
+  reuses the last-good record if it is under 30 minutes old, flagged as
+  `<probe> (cached)`.
 - `OG_REGISTRY=/path/to/registry.json` points at an alternate catalog
   (default: the repo's `installer/registry.json`).
 

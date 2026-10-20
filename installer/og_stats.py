@@ -175,7 +175,12 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _parse_until(s: str | None, now: datetime) -> str | None:
-    """ISO8601, or +2h/+30m/+1d style relative offsets. Returns local ISO."""
+    """ISO8601, or +2h/+30m/+1d style relative offsets. Returns local ISO.
+
+    An absent value is no longer "no expiry": do_mark substitutes +1h, because
+    a mark without an expiry can outlive its cause indefinitely for an agent
+    nothing else probes (see og_start_probe.py).
+    """
     if not s:
         return None
     m = re.fullmatch(r"\+(\d+)([smhd])", s.strip(), re.I)
@@ -195,22 +200,30 @@ def _parse_until(s: str | None, now: datetime) -> str | None:
 
 def do_mark(agent_id: str, until: str | None, reason: str,
             state_path: Path) -> None:
-    state = q.load_state(state_path)
     now = _now()
-    marks = state.setdefault("marks", {})
-    mark = {"state": "dry", "until": _parse_until(until, now),
+    # Default +1h, not "no expiry": an unexpiring mark outlived its cause for
+    # a week on an agent with no queryable quota (2026-10-13). A caller that
+    # wants longer says so with --until; the start probe refreshes the rest.
+    expiry = _parse_until(until, now) or (now + timedelta(hours=1)).isoformat()
+    mark = {"state": "dry", "until": expiry,
             "reason": reason, "at": now.isoformat()}
-    if mark["until"] and _q_parse(mark["until"]) <= now:
-        # an already-expired mark is equivalent to clearing; store nothing
-        marks.pop(agent_id, None)
-    else:
-        marks[agent_id] = mark
-    state.setdefault("agents", {}).setdefault(agent_id, {
-        **q.unknown_record("marked without a probe result"),
-        "tier": "unknown"})
-    q.save_state(state, state_path)
-    u = mark["until"] or "no expiry"
-    print(f"mark {agent_id}: dry until {u}" + (f" ({reason})" if reason else ""))
+
+    def mutate(state: dict) -> None:
+        # Locked read-modify-write (see q.update_state): a probe finishing at
+        # the same moment must not drop this mark, or this run drop its probe.
+        marks = state.setdefault("marks", {})
+        if _q_parse(mark["until"]) <= now:
+            # an already-expired mark is equivalent to clearing; store nothing
+            marks.pop(agent_id, None)
+        else:
+            marks[agent_id] = mark
+        state.setdefault("agents", {}).setdefault(agent_id, {
+            **q.unknown_record("marked without a probe result"),
+            "tier": "unknown"})
+
+    q.update_state(state_path, mutate)
+    print(f"mark {agent_id}: dry until {expiry}"
+          + (f" ({reason})" if reason else ""))
 
 
 def _q_parse(s: str) -> datetime:
@@ -218,9 +231,10 @@ def _q_parse(s: str) -> datetime:
 
 
 def do_clear(agent_id: str, state_path: Path) -> None:
-    state = q.load_state(state_path)
-    removed = (state.get("marks") or {}).pop(agent_id, None)
-    q.save_state(state, state_path)
+    def mutate(state: dict) -> dict | None:
+        return (state.get("marks") or {}).pop(agent_id, None)
+
+    removed = q.update_state(state_path, mutate)
     print(f"clear {agent_id}: {'removed' if removed else 'no active mark'}")
 
 
@@ -348,7 +362,17 @@ def build_rows(entries: list[dict], state_path: Path, *, no_probe: bool,
         # for the view, and stashes the UNMARKED probe records in
         # state["agents"]; save persists those, never a mark overlay.
         recs.update(q.run_probes(requests, _ctx_from(now), state))
-        q.save_state(state, state_path)
+        raw = {aid: (state.get("agents") or {}).get(aid) for aid in requests}
+
+        def merge(fresh: dict) -> None:
+            # Locked, per-agent: a mark written while the probes ran survives
+            # instead of being clobbered by this run's whole-file save.
+            fresh.setdefault("agents", {}).update(
+                {a: r for a, r in raw.items() if r is not None})
+
+        q.update_state(state_path, merge, now=now)
+        # Re-read marks so the table below reflects a concurrent --mark/--clear.
+        state["marks"] = q.load_state(state_path).get("marks") or {}
     # merged view: re-apply marks over everything shown
     merged = q.merge_view({"agents": recs, "marks": state.get("marks") or {}},
                           _ctx_from(now))
@@ -377,7 +401,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--mark", nargs="+", metavar="AGENT_ID",
                     help="mark an agent dry: --mark AGENT_ID [dry] (dry-run: prints, writes state)")
     ap.add_argument("--until", metavar="WHEN",
-                    help="with --mark: ISO8601 or +2h/+30m/+1d (default: no expiry)")
+                    help="with --mark: ISO8601 or +2h/+30m/+1d (default: +1h)")
     ap.add_argument("--reason", default="", help="with --mark: why it is dry")
     ap.add_argument("--clear", metavar="AGENT_ID", help="remove an agent's mark")
     ap.add_argument("--no-probe", action="store_true",
