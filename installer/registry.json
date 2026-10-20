@@ -140,8 +140,9 @@
         "probe": null,
         "note": "Zen free tier is enforced server-side with no queryable balance; failures show as 'Rate limit exceeded' in the opencode log (see og audit).",
         "liveness": {
-          "argv": ["opencode", "run", "-m", "{model}", "reply ok"],
-          "failure_patterns": ["Rate limit exceeded"]
+          "argv": ["opencode", "run", "-m", "{model}", "Reply with exactly: ok. Do not use tools."],
+          "failure_patterns": ["Rate limit exceeded"],
+          "note": "No action-enabling flags and a prompt that forbids tools: the probe is a capability check, not a dispatch."
         }
       }
     },
@@ -294,8 +295,9 @@
       "quota": {
         "probe": "kilo-profile",
         "liveness": {
-          "argv": ["kilo", "run", "-m", "{model}", "reply ok"],
-          "failure_patterns": ["Rate limit exceeded", "Add credits to continue", "usage limit"]
+          "argv": ["kilo", "run", "-m", "{model}", "Reply with exactly: ok. Do not use tools."],
+          "failure_patterns": ["Rate limit exceeded", "Add credits to continue", "usage limit"],
+          "note": "Runs only for the free router (kilo/.../free); a paid pin is measured by kilo-profile and never liveness-probed."
         }
       }
     },
@@ -340,8 +342,9 @@
         "probe": null,
         "note": "50 credits/month on the free plan; no public remaining-credit endpoint found.",
         "liveness": {
-          "argv": ["kiro-cli", "chat", "--no-interactive", "reply ok"],
-          "failure_patterns": ["rate limit", "usage limit", "out of credits"]
+          "argv": ["kiro-cli", "chat", "--no-interactive", "Reply with exactly: ok. Do not use tools."],
+          "failure_patterns": ["rate limit", "usage limit", "out of credits"],
+          "note": "Probe only runs on a verifiably free pin; Kiro's `auto` default is not marked free, so it reports skipped."
         }
       }
     },
@@ -613,8 +616,9 @@
         "probe": null,
         "note": "Command Code enforces a rolling 5-hour AND a rolling weekly credit window, both rolling from first use, on top of the monthly credit pool (Go $1/$10, GOAT $10/$70, Pro $20/$80, Max 10x $100/$150, Max 20x $200/$300; Pro's windows are $16 per 5h and $40 per week). No queryable quota API. Exhaustion prints `You've reached your 5-hour usage limit. Resets in 2h 41m` — match that string to mark the worker dry and take --until from it.",
         "liveness": {
-          "argv": ["cmd", "-p", "reply ok", "--model", "{model}", "--yolo", "--skip-onboarding"],
-          "failure_patterns": ["You've reached your .*usage limit", "Rate limit exceeded"]
+          "argv": ["cmd", "-p", "Reply with exactly: ok. Do not use tools.", "--model", "{model}", "--skip-onboarding"],
+          "failure_patterns": ["You've reached your .*usage limit", "Rate limit exceeded"],
+          "note": "No --yolo/--tools-all: a text-only probe needs no permissions, and the strict prompt is the guard against file writes. Paid pins are skipped, so this argv only runs on a future verified-free Command Code model."
         }
       }
     }

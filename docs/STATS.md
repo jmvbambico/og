@@ -88,13 +88,26 @@ exit status is ignored.
   from the registry row's `quota.liveness.argv` (`{model}` is replaced by the
   pin in `og-install.json`, falling back to the registry's `model.prefer`);
   nothing user-specific is hardcoded.
-- A known quota string from `quota.liveness.failure_patterns` means `dry`.
-  `Resets in 2h 41m` in the output becomes the mark's expiry; with no reset
-  clause the mark lasts +1h.
-- A missing binary reports `unavailable`, and an auth error or timeout reports
-  `error`, with the first error line. Neither is `dry`: a broken probe is not
-  evidence of exhaustion, and it neither writes nor clears a mark. Both persist
-  as `unknown` in `og-quota.json` (the record schema has no error state), so
+- **A liveness probe never bills.** It runs only when the pin is verifiably
+  free: an explicit `quota.liveness.free: true` (or `quota.free: true`), or an
+  id whose last segment is `free`, ends in `-free`, or ends in `:free`. A paid
+  pin (Command Code's credits, Kiro's `auto`) reports `skipped: paid model`
+  and the mark is left alone.
+- The request runs with stdin closed and its own session/process group, in a
+  fresh empty temporary directory, never the caller's cwd. On timeout the
+  whole group gets SIGTERM, then SIGKILL after a short grace, so a grandchild
+  the CLI spawned cannot survive. No action-enabling flags (`--yolo`,
+  `--tools-all`) are passed, and the prompt forbids tools.
+- A known quota string from `quota.liveness.failure_patterns` means `dry`, but
+  ONLY when the request failed (non-zero exit, or no reply). A successful
+  reply that merely mentions a quota phrase is `ok`. The reset clause supports
+  `2d`, `1d 3h`, `2h 41m`, `45m` and `30s`; a zero or unparsable reset falls
+  back to +1h.
+- A missing binary reports `unavailable`, an auth error or timeout reports
+  `error`, and a paid pin reports `skipped`, with the first error line or the
+  reason. None of them is `dry`: a broken or unaffordable probe is not evidence
+  of exhaustion, and none writes or clears a mark. They persist as `unknown` in
+  `og-quota.json` (the record schema has no error/skip state), so
   `og stats --no-probe` renders them as `unknown`, not as a capacity claim.
 - An `ok` result clears any existing dry mark and records the probe time.
 
@@ -111,8 +124,12 @@ metered use). `og restart` runs it too, because restart is stop + start.
 ## Files and overrides
 
 - State: `$OMNIGENT_HOME/og-quota.json` (last-good records + marks, versioned,
-  written atomically). A 429 or probe failure reuses the last-good record if
-  it is under 30 minutes old, flagged as `<probe> (cached)`.
+  written atomically). Writers serialise on a sidecar `og-quota.json.lock`
+  (`flock`): `og stats --mark`/`--clear`, `og stats`'s own probe save, and the
+  start probe each lock around load→merge→save, and probe saves merge per
+  agent — so a mark set while a probe ran is not lost. A 429 or probe failure
+  reuses the last-good record if it is under 30 minutes old, flagged as
+  `<probe> (cached)`.
 - `OG_REGISTRY=/path/to/registry.json` points at an alternate catalog
   (default: the repo's `installer/registry.json`).
 

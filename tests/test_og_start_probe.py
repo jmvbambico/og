@@ -7,7 +7,11 @@ an explicit tmp_path argument, so nothing touches the real install.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +25,7 @@ import og_stats as st  # noqa: E402
 # Real wall clock: save_state prunes marks against the actual clock, so a
 # fixed past date would be pruned before the assertion could read it.
 NOW = datetime.now().astimezone()
+REPO = Path(__file__).resolve().parent.parent
 
 
 def _fake_cli(bin_dir: Path, name: str, body: str) -> Path:
@@ -31,28 +36,37 @@ def _fake_cli(bin_dir: Path, name: str, body: str) -> Path:
     return p
 
 
-def _install(path: Path, model: str = "opencode/mimo-v2.6-flash-free"):
-    path.write_text(json.dumps({
-        "coders": [{"id": "opencode", "priority": 1, "model": model}],
-    }))
+def _install(path: Path, model: str | None = "opencode/mimo-v2.6-flash-free",
+             agent: str = "opencode"):
+    entry = {"id": agent, "priority": 1}
+    if model:
+        entry["model"] = model
+    path.write_text(json.dumps({"coders": [entry]}))
 
 
 def _registry(path: Path, patterns: list[str] | None = None, *,
               probe: str | None = None, argv: list[str] | None = None,
-              model_prefer: str = "opencode/mimo-v2.6-flash-free"):
+              model_prefer: str | None = "opencode/mimo-v2.6-flash-free",
+              agent: str = "opencode", free: bool | None = None):
+    model: dict = {"required": True}
+    if model_prefer:
+        model["prefer"] = model_prefer
+    liveness: dict = {
+        "argv": argv or ["opencode", "run", "-m", "{model}",
+                         "Reply with exactly: ok. Do not use tools."],
+        "failure_patterns": patterns or ["Rate limit exceeded"],
+    }
+    if free is not None:
+        liveness["free"] = free
     path.write_text(json.dumps({"agents": [{
-        "id": "opencode",
-        "label": "OpenCode",
+        "id": agent,
+        "label": agent,
         "roles": ["coder"],
-        "model": {"required": True, "prefer": model_prefer},
+        "model": model,
         "quota": {
             "probe": probe,
             "note": "no queryable balance",
-            "liveness": {
-                "argv": argv or ["opencode", "run", "-m", "{model}",
-                                 "reply ok"],
-                "failure_patterns": patterns or ["Rate limit exceeded"],
-            },
+            "liveness": liveness,
         },
     }]}))
 
@@ -64,25 +78,47 @@ def _mark(state_path: Path, agent: str = "opencode", until=None):
                  state_path)
 
 
-def _ctx(bin_dir: Path, now: datetime = NOW) -> q.Ctx:
-    # Only the fake bin dir on PATH: a missing binary must be genuinely
-    # missing, not found later in the machine's real PATH.
-    return q.Ctx(env={"PATH": str(bin_dir)}, now=lambda: now)
+def _ctx(bin_dir: Path, now: datetime = NOW,
+         extra_env: dict | None = None, system: bool = False) -> q.Ctx:
+    # By default only the fake bin dir is on PATH: a missing binary must be
+    # genuinely missing, not found later in the machine's real PATH. Tests
+    # whose fake CLI calls shell utilities (sleep, ps, touch) opt into the
+    # system directories explicitly.
+    path = str(bin_dir) + (":/usr/bin:/bin" if system else "")
+    env = {"PATH": path}
+    env.update(extra_env or {})
+    return q.Ctx(env=env, now=lambda: now)
 
 
 def _run(tmp_path, bin_dir, *, timeout=5.0, ctx=None, patterns=None,
-         probe=None, argv=None):
+         probe=None, argv=None, agent="opencode",
+         model="opencode/mimo-v2.6-flash-free", prefer=None, free=None,
+         system=False):
     inst = tmp_path / "og-install.json"
     reg = tmp_path / "registry.json"
     state = tmp_path / "og-quota.json"
-    _install(inst)
-    _registry(reg, patterns, probe=probe, argv=argv)
+    _install(inst, model, agent)
+    _registry(reg, patterns, probe=probe, argv=argv, agent=agent,
+              model_prefer=prefer if prefer is not None else model,
+              free=free)
     return sp.probe_start(inst, reg, state, timeout=timeout,
-                          ctx=ctx or _ctx(bin_dir)), state
+                          ctx=ctx or _ctx(bin_dir, system=system)), state
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    out = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                         capture_output=True, text=True).stdout.strip()
+    return bool(out) and not out.startswith("Z")
 
 
 # ---------------------------------------------------------------------------
-# liveness: the three outcomes that matter
+# liveness: the outcomes that matter
 # ---------------------------------------------------------------------------
 
 def test_ok_liveness_clears_an_unexpiring_mark(tmp_path):
@@ -105,7 +141,8 @@ def test_ok_liveness_clears_an_unexpiring_mark(tmp_path):
     assert rec["last_probe_at"]
     # the pin from the install (not a hardcoded id) reached the CLI
     assert args_file.read_text().splitlines() == [
-        "run", "-m", "opencode/mimo-v2.6-flash-free", "reply ok"]
+        "run", "-m", "opencode/mimo-v2.6-flash-free",
+        "Reply with exactly: ok. Do not use tools."]
 
 
 def test_quota_string_marks_dry_with_the_parsed_expiry(tmp_path):
@@ -130,6 +167,33 @@ def test_quota_string_marks_dry_with_the_parsed_expiry(tmp_path):
     assert saved["agents"]["opencode"]["state"] == "unknown"
 
 
+def test_successful_reply_with_a_quota_phrase_is_ok(tmp_path):
+    """#5: a successful reply mentioning a quota phrase is NOT exhaustion.
+    Only a FAILED request (non-zero or no reply) may be classified dry."""
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "opencode",
+              "echo ok\necho 'Rate limit exceeded' >&2\nexit 0\n")
+    state = tmp_path / "og-quota.json"
+    _mark(state)
+
+    outcomes, state = _run(tmp_path, bin_dir)
+
+    assert outcomes[0]["state"] == "ok"
+    assert "opencode" not in q.load_state(state)["marks"]
+
+
+def test_exit_zero_with_no_reply_and_a_quota_phrase_is_dry(tmp_path):
+    """No successful reply + a quota string is still evidence of exhaustion."""
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "opencode", "echo 'Rate limit exceeded' >&2\nexit 0\n")
+    state = tmp_path / "og-quota.json"
+
+    outcomes, state = _run(tmp_path, bin_dir)
+
+    assert outcomes[0]["state"] == "dry"
+    assert "opencode" in q.load_state(state)["marks"]
+
+
 def test_missing_binary_is_unavailable_not_dry(tmp_path):
     """A broken install says nothing about capacity: never dry."""
     bin_dir = tmp_path / "empty"
@@ -151,11 +215,51 @@ def test_timeout_is_error_not_dry(tmp_path):
     _fake_cli(bin_dir, "opencode", "sleep 5\n")
     state = tmp_path / "og-quota.json"
 
-    outcomes, state = _run(tmp_path, bin_dir, timeout=0.3)
+    outcomes, state = _run(tmp_path, bin_dir, timeout=0.3, system=True)
 
     assert outcomes[0]["state"] == "error"
     assert "timed out" in outcomes[0]["detail"]
     assert q.load_state(state)["marks"] == {}
+
+
+def test_timeout_kills_the_whole_process_group(tmp_path):
+    """#1: a grandchild the CLI spawned must not survive the timeout."""
+    bin_dir = tmp_path / "bin"
+    pidfile = tmp_path / "grandchild.pid"
+    _fake_cli(bin_dir, "opencode",
+              f'sleep 60 &\necho $! > "{pidfile}"\nwait\n')
+    ctx = _ctx(bin_dir, extra_env={"OG_PROBE_PID": str(pidfile)},
+               system=True)
+
+    # 1.5s: enough for the shell to start and background its grandchild even
+    # on a loaded machine, short enough to keep the suite quick.
+    outcomes, _ = _run(tmp_path, bin_dir, timeout=1.5, ctx=ctx)
+
+    assert outcomes[0]["state"] == "error" and "timed out" in outcomes[0][
+        "detail"]
+    assert pidfile.exists(), "the fake CLI never started its grandchild"
+    pid = int(pidfile.read_text().strip())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and _running(pid):
+        time.sleep(0.05)
+    assert not _running(pid), f"grandchild {pid} survived the probe timeout"
+
+
+def test_probe_runs_in_a_fresh_empty_temporary_directory(tmp_path):
+    """#1: never the caller's cwd, and the directory is gone afterwards."""
+    bin_dir = tmp_path / "bin"
+    pwd_file = tmp_path / "pwd"
+    _fake_cli(bin_dir, "opencode", f'pwd > "{pwd_file}"\necho ok\n')
+    ctx = _ctx(bin_dir, extra_env={"OG_PROBE_PWD": str(pwd_file)},
+               system=True)
+
+    outcomes, _ = _run(tmp_path, bin_dir, ctx=ctx)
+
+    assert outcomes[0]["state"] == "ok"
+    probed_cwd = Path(pwd_file.read_text().strip())
+    assert probed_cwd != Path.cwd()
+    assert probed_cwd != tmp_path
+    assert not probed_cwd.exists(), "TemporaryDirectory was not cleaned up"
 
 
 def test_auth_error_is_reported_without_drying(tmp_path):
@@ -183,9 +287,64 @@ def test_default_expiry_is_one_hour_when_no_reset_is_printed(tmp_path):
     assert timedelta(minutes=59) <= until - NOW <= timedelta(minutes=61)
 
 
-def test_a_model_template_without_a_pin_is_unavailable(tmp_path):
-    """Nothing user-specific is invented: an unpinned install cannot run a
-    model-pinned liveness probe."""
+# ---------------------------------------------------------------------------
+# #2: a probe must never bill
+# ---------------------------------------------------------------------------
+
+def test_a_paid_pin_is_skipped_without_running_the_cli(tmp_path):
+    marker = tmp_path / "ran"
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "cmd", f'touch "{marker}"\necho ok\n')
+
+    outcomes, state = _run(
+        tmp_path, bin_dir, agent="cmdcode", model="moonshotai/kimi-k3",
+        prefer="moonshotai/kimi-k3",
+        argv=["cmd", "-p", "Reply with exactly: ok. Do not use tools.",
+              "--model", "{model}", "--skip-onboarding"],
+        patterns=["Rate limit exceeded"])
+
+    assert outcomes[0]["state"] == "skipped"
+    assert "paid model moonshotai/kimi-k3" in outcomes[0]["detail"]
+    assert not marker.exists(), "a paid probe was actually executed"
+    assert q.load_state(state)["marks"] == {}
+
+
+def test_unpinned_falls_back_to_a_paid_prefer_and_is_skipped(tmp_path):
+    marker = tmp_path / "ran"
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "opencode", f'touch "{marker}"\necho ok\n')
+
+    outcomes, state = _run(tmp_path, bin_dir, model=None,
+                           prefer="anthropic/claude-opus-5")
+
+    assert outcomes[0]["state"] == "skipped"
+    assert "paid model anthropic/claude-opus-5" in outcomes[0]["detail"]
+    assert not marker.exists()
+    assert q.load_state(state)["marks"] == {}
+
+
+def test_explicit_free_registry_truth_allows_a_paid_looking_id(tmp_path):
+    bin_dir = tmp_path / "bin"
+    _fake_cli(bin_dir, "opencode", "echo ok\n")
+
+    outcomes, _ = _run(tmp_path, bin_dir, model="somevendor/paid-looking",
+                       prefer="somevendor/paid-looking", free=True)
+
+    assert outcomes[0]["state"] == "ok"
+
+
+def test_free_model_shapes():
+    assert sp._is_free_model({}, "opencode/mimo-v2.6-flash-free")
+    assert sp._is_free_model({}, "kilo/kilo-auto/free")
+    assert sp._is_free_model({}, "vendor/model:free")
+    assert not sp._is_free_model({}, "moonshotai/kimi-k3")
+    assert sp._is_free_model({"quota": {"liveness": {"free": True}}},
+                             "moonshotai/kimi-k3")
+
+
+def test_a_model_template_without_any_model_is_skipped(tmp_path):
+    """Nothing user-specific is invented: no pin and no prefer means no
+    probe (and certainly not a billed one)."""
     bin_dir = tmp_path / "bin"
     _fake_cli(bin_dir, "opencode", "echo ok\n")
     inst = tmp_path / "og-install.json"
@@ -195,14 +354,49 @@ def test_a_model_template_without_a_pin_is_unavailable(tmp_path):
                                             "priority": 1}]}))
     # the registry's prefer is the installer's default pin, so to test the
     # empty case remove it from the row too
-    _registry(reg)
-    data = json.loads(reg.read_text())
-    data["agents"][0]["model"].pop("prefer")
-    reg.write_text(json.dumps(data))
+    _registry(reg, model_prefer=None)
 
     outcomes = sp.probe_start(inst, reg, state, ctx=_ctx(bin_dir))
-    assert outcomes[0]["state"] == "unavailable"
-    assert "no pinned model" in outcomes[0]["detail"]
+    assert outcomes[0]["state"] == "skipped"
+    assert "no model to verify as free" in outcomes[0]["detail"]
+
+
+def test_registry_liveness_has_no_action_enabling_flags():
+    """#1: probes are capability checks. No --yolo/--tools-all in any row, and
+    every prompt forbids tools."""
+    reg = json.loads((REPO / "installer" / "registry.json").read_text())
+    for row in reg["agents"]:
+        live = (row.get("quota") or {}).get("liveness") or {}
+        argv = live.get("argv") or []
+        assert "--yolo" not in argv, row["id"]
+        assert "--tools-all" not in argv, row["id"]
+        if argv:
+            assert any("Do not use tools" in str(a) for a in argv), row["id"]
+
+
+# ---------------------------------------------------------------------------
+# #3: reset parsing (days, combos, zero is not a match)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,delta", [
+    ("Resets in 2d", timedelta(days=2)),
+    ("Resets in 1d 3h", timedelta(days=1, hours=3)),
+    ("Resets in 2h 41m", timedelta(hours=2, minutes=41)),
+    ("Resets in 45m", timedelta(minutes=45)),
+    ("Resets in 30s", timedelta(seconds=30)),
+    ("You've reached your limit. Resets in 2 days 3 hours.", timedelta(
+        days=2, hours=3)),
+])
+def test_reset_parsing_supports_days_and_combos(text, delta):
+    assert sp._reset_from_text(text, NOW) == NOW + delta
+
+
+@pytest.mark.parametrize("text", [
+    "Resets in 0m", "Resets in 0d 0h", "Resets in", "soon",
+    "Resets in soon",
+])
+def test_zero_or_empty_reset_is_not_a_match(text):
+    assert sp._reset_from_text(text, NOW) is None
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +430,75 @@ def test_measured_ok_clears_a_mark_and_measured_dry_writes_one(tmp_path,
     assert outcomes[0]["state"] == "dry"
     until = q._parse_iso(q.load_state(state)["marks"]["opencode"]["until"])
     assert until == NOW + timedelta(minutes=30)
+
+
+# ---------------------------------------------------------------------------
+# #4: concurrent writers serialise and merge per agent
+# ---------------------------------------------------------------------------
+
+def test_update_state_serializes_two_writers(tmp_path):
+    path = tmp_path / "og-quota.json"
+    q.save_state({"version": 1, "agents": {}, "marks": {}}, path)
+    entered, release = threading.Event(), threading.Event()
+
+    def first(state):
+        entered.set()
+        assert release.wait(5)
+        state.setdefault("marks", {})["a"] = {
+            "state": "dry", "until": None, "reason": "a", "at": q._iso(NOW)}
+
+    def second(state):
+        state.setdefault("marks", {})["b"] = {
+            "state": "dry", "until": None, "reason": "b", "at": q._iso(NOW)}
+
+    t1 = threading.Thread(target=lambda: q.update_state(path, first))
+    t1.start()
+    assert entered.wait(5), "first writer never entered its mutation"
+    t2 = threading.Thread(target=lambda: q.update_state(path, second))
+    t2.start()
+    time.sleep(0.2)
+    assert t2.is_alive(), "second writer did not wait for the lock"
+    release.set()
+    t1.join(5)
+    t2.join(5)
+    assert set(q.load_state(path)["marks"]) == {"a", "b"}
+
+
+def test_probe_merge_keeps_a_mark_written_while_probing(tmp_path):
+    """A mark written by `og stats --mark` during the probe must survive: the
+    final step reloads under the lock and merges per agent."""
+    bin_dir = tmp_path / "bin"
+    started = tmp_path / "started"
+    _fake_cli(bin_dir, "opencode",
+              f'touch "{started}"\nsleep 1\necho ok\n')
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    state = tmp_path / "og-quota.json"
+    _install(inst)
+    _registry(reg)
+    q.save_state({"version": 1, "agents": {}, "marks": {}}, state)
+
+    result = {}
+
+    def run_probe():
+        result["outcomes"] = sp.probe_start(
+            inst, reg, state, timeout=5, ctx=_ctx(bin_dir, system=True))
+
+    t = threading.Thread(target=run_probe)
+    t.start()
+    deadline = time.monotonic() + 5
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert started.exists(), "probe CLI did not start"
+    q.update_state(state, lambda s: s.setdefault("marks", {}).__setitem__(
+        "claude", {"state": "dry", "until": None, "reason": "concurrent",
+                   "at": q._iso(NOW)}))
+    t.join(10)
+
+    assert result["outcomes"][0]["state"] == "ok"
+    marks = q.load_state(state)["marks"]
+    assert "claude" in marks and marks["claude"]["reason"] == "concurrent"
+    assert "opencode" not in marks  # the probe's ok still cleared its own
 
 
 # ---------------------------------------------------------------------------

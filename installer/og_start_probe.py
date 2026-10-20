@@ -17,11 +17,21 @@ Two kinds of evidence:
   (`quota.liveness.argv`), the pin comes from `og-install.json`, and nothing
   user-specific is hardcoded here.
 
+A liveness probe must never bill. It runs only when the model is verifiably
+free (an explicit `free: true`, or an id whose last segment is `free` /
+ends in `-free` / ends in `:free`); a paid pin is reported `skipped: paid
+model` and the mark is left alone. The request runs in a fresh empty temporary
+directory, with stdin closed and its own session/process group, so it can
+neither touch the caller's tree nor survive a timeout. No action-enabling
+flags (`--yolo`, `--tools-all`, ...) are passed, and the prompt explicitly
+forbids tools: the probe is a capability check, not a dispatch.
+
 Results are bounded (one thread and one timeout per agent) and can never abort
 a start: the caller ignores this process's exit status, and main() catches
 everything. A missing binary, an auth error or a timeout is reported as
-`unavailable`/`error`, never `dry` -- only a quota string is evidence of
-exhaustion, because a broken probe says nothing about capacity.
+`unavailable`/`error`, never `dry` -- only a failed request carrying a known
+quota string is evidence of exhaustion, because a broken probe says nothing
+about capacity.
 """
 from __future__ import annotations
 
@@ -29,8 +39,11 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -41,13 +54,18 @@ import og_stats as st  # noqa: E402
 
 DEFAULT_TIMEOUT_S = 20.0
 DEFAULT_MARK_TTL = timedelta(hours=1)
+# Grace between SIGTERM and SIGKILL when a probe overruns. Short: `og start`
+# is already waiting on this, and an agent CLI that ignores TERM for 2s is not
+# going to become responsive in the next 10.
+KILL_GRACE_S = 2.0
 
-# "Resets in 2h 41m", "resets in 45m", "Resets in 2 hours 41 minutes".
-_RESET_RX = re.compile(
-    r"resets?\s+in\s+"
-    r"(?:(\d+)\s*h(?:ours?|rs?)?)?\s*"
-    r"(?:(\d+)\s*m(?:in(?:utes?)?)?)?",
+# "Resets in 2d", "1d 3h", "2h 41m", "45m", "30s", "2 hours 41 minutes".
+_RESET_CLAUSE_RX = re.compile(r"resets?\s+in\s+([^.;\n]+)", re.IGNORECASE)
+_RESET_PART_RX = re.compile(
+    r"(\d+)\s*(d(?:ays?)?|h(?:ours?|rs?)?|m(?:in(?:utes?)?)?"
+    r"|s(?:ec(?:onds?)?)?)\b",
     re.IGNORECASE)
+_UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
 
 def _iso(dt: datetime) -> str:
@@ -89,80 +107,166 @@ def _expiry(reset_at: str | None, now: datetime) -> datetime:
 
 
 def _reset_from_text(text: str, now: datetime) -> datetime | None:
-    m = _RESET_RX.search(text or "")
+    """Parse every duration in a "Resets in ..." clause into an expiry.
+
+    Supports days as well as the compact hour/minute/second forms and their
+    combinations ("2d", "1d 3h", "2h 41m", "45m", "30s"). A zero total, or a
+    clause with no parsable part, is NOT a match: the caller then falls back
+    to +1h rather than writing an already-expired mark.
+    """
+    m = _RESET_CLAUSE_RX.search(text or "")
     if not m:
         return None
-    h, mi = int(m.group(1) or 0), int(m.group(2) or 0)
-    if h == 0 and mi == 0:
+    seconds = 0
+    for num, unit in _RESET_PART_RX.findall(m.group(1)):
+        seconds += int(num) * _UNIT_SECONDS[unit[0].lower()]
+    if seconds <= 0:
         return None
-    return now + timedelta(hours=h, minutes=mi)
+    return now + timedelta(seconds=seconds)
 
 
-def _liveness_argv(row: dict, entry: dict) -> tuple[list[str] | None, str]:
-    """The registry's liveness argv with the install's pin substituted.
+def _kill_tree(p: subprocess.Popen, sig: int) -> None:
+    """Signal the probe's whole process group (it is a session leader).
 
-    Returns (argv, reason). argv is None when the probe cannot be formed --
-    no liveness block, or a `{model}` template with nothing pinned.
+    `start_new_session=True` makes the child's pid its pgid, so killpg reaches
+    a grandchild the CLI spawned. After SIGTERM the caller gives a short
+    grace, then this is called again with SIGKILL -- unconditionally, even if
+    the leader already exited, so a TERM-ignoring grandchild still dies.
     """
-    conf = ((row.get("quota") or {}).get("liveness") or {})
-    template = conf.get("argv") or []
-    if not template:
-        return None, "no liveness probe configured"
+    try:
+        os.killpg(p.pid, sig)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        p.send_signal(sig)
+    except OSError:
+        pass
+
+
+def _run_bounded(argv: list[str], env: dict[str, str], timeout: float,
+                 cwd: str) -> tuple[int | None, str, str, bool]:
+    """Run a probe with stdin closed, in `cwd`, killing its tree on timeout."""
+    try:
+        p = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env, cwd=cwd,
+            start_new_session=True)
+    except OSError as e:
+        return None, "", str(e), False
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out, err, False
+    except subprocess.TimeoutExpired:
+        _kill_tree(p, signal.SIGTERM)
+        deadline = time.monotonic() + KILL_GRACE_S
+        while time.monotonic() < deadline and p.poll() is None:
+            time.sleep(0.05)
+        _kill_tree(p, signal.SIGKILL)
+        try:
+            out, err = p.communicate(timeout=KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        return None, out, err, True
+
+
+def _resolve_model(row: dict, entry: dict) -> str | None:
     model = (entry.get("params") or {}).get("model")
     if not model:
         # Registry `prefer` is the installer's own default pin; using it keeps
         # an unpinned install probeable without inventing a model here.
-        model = ((row.get("model") or {}).get("prefer"))
-    if any("{model}" in str(a) for a in template) and not model:
-        return None, "no pinned model for the liveness probe"
-    return [str(a).replace("{model}", str(model or "")) for a in template], ""
+        model = (row.get("model") or {}).get("prefer")
+    return str(model) if model else None
+
+
+def _is_free_model(row: dict, model: str | None) -> bool:
+    """True only when the pin is verifiably free -- a probe must never bill.
+
+    Explicit registry truth (`quota.liveness.free` or `quota.free`) wins;
+    otherwise the id's SHAPE decides, never a list of model names, so a new
+    free id maps without a code change. Shapes seen in practice:
+    `opencode/mimo-v2.6-flash-free`, `kilo/kilo-auto/free`,
+    OpenRouter's `vendor/model:free`.
+    """
+    quota = row.get("quota") or {}
+    liveness = quota.get("liveness") or {}
+    if liveness.get("free") is True or quota.get("free") is True:
+        return True
+    if not model:
+        return False
+    m = str(model).strip().lower()
+    if m.endswith(":free"):
+        return True
+    segs = [s for s in m.split("/") if s]
+    last = segs[-1] if segs else m
+    return last == "free" or last.endswith("-free")
+
+
+def _liveness_plan(row: dict, entry: dict) -> tuple[list[str] | None, str]:
+    """(argv, reason). argv is None when the probe must not run."""
+    conf = ((row.get("quota") or {}).get("liveness") or {})
+    template = conf.get("argv") or []
+    if not template:
+        return None, "no liveness probe configured"
+    model = _resolve_model(row, entry)
+    if not _is_free_model(row, model):
+        if model:
+            return None, f"skipped: paid model {model}"
+        return None, "skipped: no model to verify as free"
+    return [str(a).replace("{model}", model or "") for a in template], ""
 
 
 def _probe_liveness(row: dict, entry: dict, ctx: q.Ctx,
                     now: datetime, timeout: float) -> dict:
     """One tiny real request through the agent's own CLI.
 
-    Returns a small outcome dict: state is ok | dry | error | unavailable.
-    (The persisted record keeps the schema's ok/dry/unknown states; this word
-    is what the start line shows.)
+    Returns a small outcome dict: state is ok | dry | error | unavailable |
+    skipped. (The persisted record keeps the schema's ok/dry/unknown states;
+    this word is what the start line shows.)
     """
-    argv, why = _liveness_argv(row, entry)
+    argv, why = _liveness_plan(row, entry)
     if argv is None:
-        return {"state": "unavailable", "detail": why}
+        return {"state": "unavailable" if why.startswith("no ") else "skipped",
+                "detail": why}
     exe = _which(argv[0], ctx.env.get("PATH"))
     if exe is None:
         return {"state": "unavailable",
                 "detail": f"unavailable: {argv[0]} not found on PATH"}
     argv[0] = exe
-    try:
-        r = ctx.run(argv, capture_output=True, text=True, timeout=timeout,
-                    stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
+    with tempfile.TemporaryDirectory(prefix="og-probe-") as cwd:
+        rc, out, err, timed_out = _run_bounded(argv, ctx.env, timeout, cwd)
+    if timed_out:
         return {"state": "error",
                 "detail": f"error: timed out after {timeout:g}s"}
-    except OSError as e:
-        return {"state": "error", "detail": f"error: {e}"}
-    out = f"{getattr(r, 'stdout', '') or ''}\n{getattr(r, 'stderr', '') or ''}"
+    if rc is None and not out and not err:
+        return {"state": "error", "detail": "error: could not start the probe"}
+    text = f"{out or ''}\n{err or ''}"
     patterns = ((row.get("quota") or {}).get("liveness") or {}).get(
         "failure_patterns") or []
+    matched = None
     for pat in patterns:
         try:
-            m = re.search(pat, out, re.IGNORECASE | re.DOTALL)
+            matched = re.search(pat, text, re.IGNORECASE | re.DOTALL)
         except re.error:
             continue
-        if m:
-            # The reset clause normally sits on the same line as the matched
-            # quota string ("... usage limit. Resets in 2h 41m") but not
-            # inside the match itself, so parse the whole output.
-            msg = next((ln.strip() for ln in out.splitlines()
-                        if m.group(0) in ln), "") or _first_line(m.group(0))
-            return {"state": "dry", "detail": "dry: " + (msg or "quota failure"),
-                    "expires_at": _reset_from_text(out, now)}
-    if getattr(r, "returncode", 1) == 0:
+        if matched:
+            break
+    # A request SUCCEEDED when it exited 0 and printed something. Only a
+    # failed request (non-zero, or no reply) carrying a quota string is
+    # evidence of exhaustion: a successful reply that merely mentions a quota
+    # phrase must clear a mark, not set one.
+    succeeded = rc == 0 and bool((out or "").strip())
+    if matched and not succeeded:
+        msg = next((ln.strip() for ln in text.splitlines()
+                    if matched.group(0) in ln), "") or _first_line(
+                        matched.group(0))
+        return {"state": "dry", "detail": "dry: " + (msg or "quota failure"),
+                "expires_at": _reset_from_text(text, now)}
+    if succeeded:
         return {"state": "ok", "detail": "ok (reply received)"}
     return {"state": "error",
-            "detail": "error: " + (_first_line(out) or
-                                   f"exit {getattr(r, 'returncode', '?')}")}
+            "detail": "error: " + (_first_line(text) or
+                                   f"exit {rc if rc is not None else '?'}")}
 
 
 def _outcome_expiry(outcome: dict, now: datetime) -> datetime:
@@ -183,8 +287,8 @@ def _apply(agent_id: str, outcome: dict, now: datetime,
            state: dict) -> dict:
     """Persist one outcome: ok clears a mark, dry writes one with an expiry.
 
-    error/unavailable changes nothing: no evidence is not a licence to keep a
-    stale mark, nor to clear one.
+    error/unavailable/skipped changes nothing: no evidence is not a licence to
+    keep a stale mark, nor to clear one.
     """
     marks = state.setdefault("marks", {})
     if outcome["state"] == "ok":
@@ -207,7 +311,7 @@ def _probe_one(entry: dict, row: dict, ctx: q.Ctx, prev: dict,
     shared state: the callers run concurrently, and a probe's cache fallback
     iterates the previous records -- inserting into that dict mid-iteration
     would raise "dictionary changed size". Records are applied sequentially
-    in probe_start.
+    under the state lock in probe_start.
     """
     agent_id = entry["agent"]
     probe = entry.get("probe")
@@ -238,7 +342,8 @@ def _probe_one(entry: dict, row: dict, ctx: q.Ctx, prev: dict,
                                  f"{raw.get('detail', '')}"}
         # `assumed` means the probe identified the binding pool but measured
         # nothing (Kilo's free router). If the registry knows how to make a
-        # real request, verify it -- otherwise "ok, assumed" stays a guess.
+        # real request AND the pin is verifiably free, verify it -- otherwise
+        # "ok, assumed" stays a guess and a paid pin is never billed.
         if raw.get("tier") == "assumed":
             live = _probe_liveness(row, entry, ctx, now, timeout)
             if live["state"] in ("ok", "dry"):
@@ -250,6 +355,11 @@ def _probe_one(entry: dict, row: dict, ctx: q.Ctx, prev: dict,
                     rec = _record("unknown", "unknown",
                                   _iso(_outcome_expiry(live, now)), now,
                                   live["detail"])
+                outcome = live
+            elif live["state"] == "skipped":
+                # Keep the assumed quota record; the skip is only a statement
+                # about our willingness to spend money, not about capacity.
+                live["detail"] = f"{outcome.get('detail', '')}; {live['detail']}"
                 outcome = live
             else:
                 # The quota probe could not measure and the liveness request
@@ -301,7 +411,6 @@ def probe_start(install_path: Path, registry_path: Path, state_path: Path,
     except (OSError, ValueError):
         reg = {}
     rows = st._agents_map(reg)
-    state = q.load_state(state_path)
 
     # One line per agent, in lineup order: the same agent can hold two roles
     # (coder + integrator), and a caller wants one verdict, not two probes
@@ -315,23 +424,32 @@ def probe_start(install_path: Path, registry_path: Path, state_path: Path,
         ordered.append(e)
 
     ctx = ctx or q.Ctx(now=lambda: now)
-    # Snapshot for the probes' 30-minute cache fallback; the shared dict is
-    # only written in the sequential pass below.
-    prev = dict(state.get("agents") or {})
+    # Snapshot for the probes' 30-minute cache fallback. Probing happens with
+    # NO lock held -- a 20s network call must not block a concurrent
+    # `og stats --mark`; the locked merge below is what prevents lost updates.
+    snapshot = q.load_state(state_path)
+    prev = dict(snapshot.get("agents") or {})
     workers = min(16, max(1, len(ordered)))
-    outcomes: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         results = list(ex.map(
             lambda e: _probe_one(e, rows.get(e["agent"]) or {}, ctx, prev,
                                  now, timeout),
             ordered))
-    for agent_id, (o, rec) in zip((e["agent"] for e in ordered), results):
-        if rec is not None:
-            state.setdefault("agents", {})[agent_id] = rec
-        _apply(agent_id, o, now, state)
-        o["agent"] = agent_id
-        outcomes.append(o)
-    q.save_state(state, state_path, now=now)
+
+    outcomes: list[dict] = []
+
+    def merge(fresh: dict) -> None:
+        """Per-agent merge into the state read under the lock."""
+        for agent_id, (o, rec) in zip((e["agent"] for e in ordered), results):
+            if rec is not None:
+                fresh.setdefault("agents", {})[agent_id] = rec
+            _apply(agent_id, o, now, fresh)
+            o["agent"] = agent_id
+            outcomes.append(o)
+
+    # Locked load->merge->save: a mark written by `og stats` while the probes
+    # ran survives, and our own per-agent verdict is applied on top.
+    q.update_state(state_path, merge, now=now)
     return outcomes
 
 
