@@ -198,13 +198,63 @@ def test_a_launcher_flag_is_forwarded_and_everything_else_is_not(
                                 "forwarded": " ".join(forwarded)}
 
 
-def _source_and_forward(home, argv):
+def _source_and_forward(home, argv, extra_env=None):
+    env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "OG_REPO": str(REPO)}
+    env.update(extra_env or {})
     return subprocess.run(
         ["bash", "-c", _FORWARD_DRIVER, str(OG), *argv],
-        capture_output=True, text=True, timeout=30,
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin",
-             "OG_REPO": str(REPO)},
+        capture_output=True, text=True, timeout=30, env=env,
     )
+
+
+# `og start --no-probe` / OG_START_PROBE=0: the startup capacity probe is on by
+# default but must be switchable off, and the flag is og's own -- it must not
+# leak into the launcher's forwarded argv.
+_PROBE_DRIVER = r'''
+src="$0"; args=("$@")
+set --
+source "$src" >/dev/null 2>&1
+parse_start_args ${args[@]+"${args[@]}"} || exit 1
+printf 'probe=%s\nforwarded=%s\n' "${OG_START_PROBE-}" "${OG_START_MUX_ARGS[*]-}"
+'''
+
+
+def _source_and_probe(home, argv, extra_env=None):
+    env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "OG_REPO": str(REPO)}
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", "-c", _PROBE_DRIVER, str(OG), *argv],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+
+
+def _probe_vars(result):
+    got = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("probe", "forwarded"):
+            got[key] = value
+    return got
+
+
+def test_start_probe_is_on_by_default_and_switchable_off(tmp_path):
+    default = _source_and_probe(tmp_path, ["local"])
+    assert default.returncode == 0, default.stderr
+    assert _probe_vars(default) == {"probe": "1", "forwarded": ""}
+
+    flagged = _source_and_probe(tmp_path, ["--no-probe", "local"])
+    assert flagged.returncode == 0, flagged.stderr
+    assert _probe_vars(flagged) == {"probe": "0", "forwarded": ""}
+
+    offline = _source_and_probe(tmp_path, ["local"],
+                                {"OG_START_PROBE": "0"})
+    assert offline.returncode == 0, offline.stderr
+    assert _probe_vars(offline) == {"probe": "0", "forwarded": ""}
+
+    # with a multiplexer the flag is consumed by og, never forwarded
+    muxed = _source_and_probe(tmp_path, ["herdr", "--no-probe"])
+    assert muxed.returncode == 0, muxed.stderr
+    assert _probe_vars(muxed) == {"probe": "0", "forwarded": ""}
 
 
 def test_a_launcher_flag_with_no_multiplexer_is_refused_not_swallowed(tmp_path):

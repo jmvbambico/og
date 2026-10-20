@@ -959,11 +959,15 @@ def load_state(path: Path | None = None) -> dict:
         return {"version": STATE_VERSION, "agents": {}, "marks": {}}
 
 
-def save_state(state: dict, path: Path | None = None) -> None:
+def save_state(state: dict, path: Path | None = None,
+               now: datetime | None = None) -> None:
     p = path or OMNI_STATE
     p.parent.mkdir(parents=True, exist_ok=True)
-    # prune expired marks on write (schema pin) and dead agent entries
-    now = datetime.now().astimezone()
+    # prune expired marks on write (schema pin) and dead agent entries.
+    # `now` is injectable so a caller running on a fixed clock (the start probe
+    # in tests, or a replayed state) does not have its fresh marks pruned by
+    # the wall clock.
+    now = now or datetime.now().astimezone()
     marks = {k: v for k, v in (state.get("marks") or {}).items() if _mark_active(v, now)}
     state = {"version": STATE_VERSION, "agents": state.get("agents") or {},
              "marks": marks}

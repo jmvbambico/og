@@ -175,7 +175,12 @@ def lineup(install_path: Path, registry_path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _parse_until(s: str | None, now: datetime) -> str | None:
-    """ISO8601, or +2h/+30m/+1d style relative offsets. Returns local ISO."""
+    """ISO8601, or +2h/+30m/+1d style relative offsets. Returns local ISO.
+
+    An absent value is no longer "no expiry": do_mark substitutes +1h, because
+    a mark without an expiry can outlive its cause indefinitely for an agent
+    nothing else probes (see og_start_probe.py).
+    """
     if not s:
         return None
     m = re.fullmatch(r"\+(\d+)([smhd])", s.strip(), re.I)
@@ -198,7 +203,11 @@ def do_mark(agent_id: str, until: str | None, reason: str,
     state = q.load_state(state_path)
     now = _now()
     marks = state.setdefault("marks", {})
-    mark = {"state": "dry", "until": _parse_until(until, now),
+    # Default +1h, not "no expiry": an unexpiring mark outlived its cause for
+    # a week on an agent with no queryable quota (2026-10-13). A caller that
+    # wants longer says so with --until; the start probe refreshes the rest.
+    expiry = _parse_until(until, now) or (now + timedelta(hours=1)).isoformat()
+    mark = {"state": "dry", "until": expiry,
             "reason": reason, "at": now.isoformat()}
     if mark["until"] and _q_parse(mark["until"]) <= now:
         # an already-expired mark is equivalent to clearing; store nothing
@@ -377,7 +386,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--mark", nargs="+", metavar="AGENT_ID",
                     help="mark an agent dry: --mark AGENT_ID [dry] (dry-run: prints, writes state)")
     ap.add_argument("--until", metavar="WHEN",
-                    help="with --mark: ISO8601 or +2h/+30m/+1d (default: no expiry)")
+                    help="with --mark: ISO8601 or +2h/+30m/+1d (default: +1h)")
     ap.add_argument("--reason", default="", help="with --mark: why it is dry")
     ap.add_argument("--clear", metavar="AGENT_ID", help="remove an agent's mark")
     ap.add_argument("--no-probe", action="store_true",

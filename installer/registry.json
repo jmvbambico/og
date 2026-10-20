@@ -138,7 +138,11 @@
       "worker": "coder_zen",
       "quota": {
         "probe": null,
-        "note": "Zen free tier is enforced server-side with no queryable balance; failures show as 'Rate limit exceeded' in the opencode log (see og audit)."
+        "note": "Zen free tier is enforced server-side with no queryable balance; failures show as 'Rate limit exceeded' in the opencode log (see og audit).",
+        "liveness": {
+          "argv": ["opencode", "run", "-m", "{model}", "reply ok"],
+          "failure_patterns": ["Rate limit exceeded"]
+        }
       }
     },
     {
@@ -288,7 +292,11 @@
       "unverified": true,
       "prompt_delivery": "unknown",
       "quota": {
-        "probe": "kilo-profile"
+        "probe": "kilo-profile",
+        "liveness": {
+          "argv": ["kilo", "run", "-m", "{model}", "reply ok"],
+          "failure_patterns": ["Rate limit exceeded", "Add credits to continue", "usage limit"]
+        }
       }
     },
     {
@@ -330,7 +338,11 @@
       "prompt_delivery": "unknown",
       "quota": {
         "probe": null,
-        "note": "50 credits/month on the free plan; no public remaining-credit endpoint found."
+        "note": "50 credits/month on the free plan; no public remaining-credit endpoint found.",
+        "liveness": {
+          "argv": ["kiro-cli", "chat", "--no-interactive", "reply ok"],
+          "failure_patterns": ["rate limit", "usage limit", "out of credits"]
+        }
       }
     },
     {
@@ -599,7 +611,11 @@
       "prompt_delivery": "unknown",
       "quota": {
         "probe": null,
-        "note": "Command Code enforces a rolling 5-hour AND a rolling weekly credit window, both rolling from first use, on top of the monthly credit pool (Go $1/$10, GOAT $10/$70, Pro $20/$80, Max 10x $100/$150, Max 20x $200/$300; Pro's windows are $16 per 5h and $40 per week). No queryable quota API. Exhaustion prints `You've reached your 5-hour usage limit. Resets in 2h 41m` — match that string to mark the worker dry and take --until from it."
+        "note": "Command Code enforces a rolling 5-hour AND a rolling weekly credit window, both rolling from first use, on top of the monthly credit pool (Go $1/$10, GOAT $10/$70, Pro $20/$80, Max 10x $100/$150, Max 20x $200/$300; Pro's windows are $16 per 5h and $40 per week). No queryable quota API. Exhaustion prints `You've reached your 5-hour usage limit. Resets in 2h 41m` — match that string to mark the worker dry and take --until from it.",
+        "liveness": {
+          "argv": ["cmd", "-p", "reply ok", "--model", "{model}", "--yolo", "--skip-onboarding"],
+          "failure_patterns": ["You've reached your .*usage limit", "Rate limit exceeded"]
+        }
       }
     }
   ],
