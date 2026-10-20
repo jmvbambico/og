@@ -2446,15 +2446,19 @@ def test_orchestrator_roster_carries_each_workers_long_running_trait():
         {"id": "kilo", "priority": 3, "model": "kilo/kilo-auto/paid"},
     ])
     prompt = m.render_orchestrator(plan)
-    assert "long-running: no (free-tier; rate-limited)" in         _roster_bullet(prompt, "coder_zen")
+    assert "`long-running: yes`" in prompt
+    assert "`Long-running: yes`" not in prompt
+    assert "long-running: no (free-tier; rate-limited)" in \
+        _roster_bullet(prompt, "coder_zen")
     assert "long-running: yes" in _roster_bullet(prompt, "coder_zen_cmdcode")
-    assert "long-running: no (ACP; long steps time out)" in         _roster_bullet(prompt, "coder_kilo")
+    assert "long-running: no (ACP; long steps time out)" in \
+        _roster_bullet(prompt, "coder_kilo")
 
 
 def test_orchestrator_prompt_routes_long_running_work_and_requires_backgrounding():
     prompt = m.render_orchestrator(TWO_OPENCODE_PLAN)
     assert "Long-running work:" in prompt
-    assert "`Long-running: yes`" in prompt
+    assert "`long-running: yes`" in prompt
     assert "run long commands in the background" in prompt
 
 
