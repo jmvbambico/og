@@ -462,6 +462,33 @@ def test_zero_or_empty_reset_is_not_a_match(text):
 # measurable probes: the same mark lifecycle, using the existing probe
 # ---------------------------------------------------------------------------
 
+def test_probe_runs_once_per_instance_and_keys_state_by_instance(tmp_path,
+                                                                monkeypatch):
+    inst = tmp_path / "og-install.json"
+    reg = tmp_path / "registry.json"
+    state = tmp_path / "og-quota.json"
+    inst.write_text(json.dumps({"coders": [
+        {"id": "opencode", "priority": 1,
+         "model": "opencode/mimo-v2.6-flash-free"},
+        {"id": "opencode", "priority": 2,
+         "model": "commandcode/deepseek-v4"},
+    ]}))
+    _registry(reg, probe="stub", free_models=[])
+    seen = []
+
+    def probe(params, ctx):
+        seen.append(params.get("agent_id"))
+        return q.make_record("ok", "measured", 1, 1, "percent", [],
+                             None, "stub", q._iso(NOW), "fine")
+
+    monkeypatch.setitem(q.PROBES, "stub", probe)
+    outcomes = sp.probe_start(inst, reg, state)
+    assert [o["agent"] for o in outcomes] == ["opencode", "opencode@cmdcode"]
+    assert seen == ["opencode", "opencode@cmdcode"]
+    stored = q.load_state(state)["agents"]
+    assert set(stored) == {"opencode", "opencode@cmdcode"}
+
+
 def test_measured_ok_clears_a_mark_and_measured_dry_writes_one(tmp_path,
                                                                monkeypatch):
     bin_dir = tmp_path / "bin"

@@ -3,7 +3,10 @@
 `og stats` answers one question before a dispatch: **which coder has room to
 run?** It builds the lineup from `og-install.json` (orchestrator, coders by
 priority, reviewer last), finds each agent's quota probe in its registry row's
-`quota` block, runs the probes concurrently, and prints one row per agent.
+`quota` block, runs the probes concurrently, and prints one row per **agent
+instance**. A harness installed twice gets two rows and two independent
+records: the first keeps the registry id (`opencode`), later ones get a
+pin-derived id (`opencode@cmdcode`, or `opencode-2` without a provider pin).
 
 ```bash
 og stats                        # installed lineup, live probes
@@ -20,7 +23,7 @@ og stats --clear kilo
 | Column    | Meaning |
 |-----------|---------|
 | role      | orchestrator / coder / reviewer (from the install state) |
-| agent     | agent id |
+| agent     | agent instance id (`opencode`, `opencode@cmdcode`, …) |
 | state     | `ok`, `dry`, or `unknown` |
 | remaining | quota left, e.g. `60/100%`, `12.5 credits`, `0 Freebucks` |
 | reset     | next window reset, local time with a relative hint (`in 45m`) |
@@ -62,7 +65,9 @@ og stats --clear kilo
 ## Marks
 
 `--mark <id> dry [--until ISO8601|+2h|+30m|+1d] [--reason ...]` forces an
-agent `dry` until the expiry (**default: +1h**); `--clear <id>` removes it.
+agent **instance** `dry` until the expiry (**default: +1h**); `--clear <id>`
+removes it. Use the id the table prints: marking `opencode@cmdcode` leaves the
+other OpenCode instance untouched.
 An expired mark is ignored and pruned on the next state write. The
 orchestrator treats a marked agent as unavailable and dispatches around it —
 use marks to hold quota back for a planned run. A probe result of `dry`

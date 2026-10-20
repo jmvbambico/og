@@ -27,6 +27,8 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+from og_instances import instance_ids, worker_names
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - install.sh resolves this first
@@ -620,7 +622,7 @@ def search_models(models: list, needle: str) -> list:
 # nothing about who trained the model, which is what the cross-vendor review
 # rule is about. `opencode/claude-sonnet-5` reviewed by Claude Code is
 # same-vendor review however the invoice reads.
-AGGREGATOR_PROVIDERS = {"opencode", "openrouter", "kilo"}
+AGGREGATOR_PROVIDERS = {"opencode", "openrouter", "kilo", "commandcode"}
 MODEL_FAMILIES = [
     (r"claude", "anthropic"),
     (r"gpt|codex|^o[1-9]\b", "openai"),
@@ -669,6 +671,69 @@ def is_zen_free(model_id: str | None) -> bool:
     return is_zen(model_id) and model_id.endswith("-free")
 
 
+def is_acp_transport(agent: dict) -> bool:
+    """True for an ACP harness (acp-builtin or acp-user, `kind` or id)."""
+    return (agent.get("kind") in ("acp-builtin", "acp-user")
+            or str(agent.get("harness", "")).startswith("acp:"))
+
+
+def is_free_tier_pin(agent: dict, model: str | None) -> bool:
+    """Whether the pin is a documented free-tier id for THIS row.
+
+    The registry's `quota.liveness.free_models` is the exact allow-list the
+    start probe trusts, so the same evidence drives the roster note. Zen's
+    `-free` suffix is kept as a second signal because those ids are also the
+    documented free lineup. Never inferred from an id merely LOOKING free.
+    """
+    if not model:
+        return False
+    free = (((agent.get("quota") or {}).get("liveness") or {})
+            .get("free_models") or [])
+    if isinstance(free, str):
+        free = [free]
+    return str(model).strip() in {str(m).strip() for m in free} or is_zen_free(model)
+
+
+def long_running_facts(agent: dict, entry: dict) -> tuple[str, str, str]:
+    """`(tag, short_reason, full_note)` for one worker's long-running trait.
+
+    The single derivation behind both the orchestrator roster bullet and the
+    generated roster skill, so the two can never drift. Derived from transport
+    + pin, never from the vendor name: a native harness on a paid
+    (non-free-tier) pin can hold a long foreground step, while an ACP worker
+    hits Omnigent's ~300s transport deadline ("Timeout waiting for ACP
+    response") and a free-tier pin is rate-limited. Those two must not be
+    routed long work, so the reason is stated rather than a bare `no`.
+    """
+    model = entry.get("model")
+    if not model:
+        return ("no (no pin)",
+                "no pin",
+                "no — no model pin, so capacity is unknown")
+    if is_free_tier_pin(agent, model):
+        return ("no (free-tier; rate-limited)",
+                "free-tier; rate-limited",
+                "no — free-tier pin is rate-limited; split long work into bounded steps")
+    if is_acp_transport(agent):
+        return ("no (ACP; long steps time out)",
+                "ACP; long steps time out",
+                "no — ACP kills a long single step ('Timeout waiting for ACP "
+                "response'); run long commands detached")
+    return ("yes",
+            "native paid pin",
+            "yes — native harness on a paid pin; this is the worker for long-running work")
+
+
+def long_running_tag(agent: dict, entry: dict) -> str:
+    """The terse roster-line form: `yes` or `no (<short reason>)`."""
+    return long_running_facts(agent, entry)[0]
+
+
+def long_running_note(agent: dict, entry: dict) -> str:
+    """The full one-line trait used by the generated roster skill."""
+    return long_running_facts(agent, entry)[2]
+
+
 # --------------------------------------------------------------------------
 # interactive helpers
 # --------------------------------------------------------------------------
@@ -706,22 +771,39 @@ def pick_one(prompt: str, options: list, current: str | None = None) -> str:
         err("pick a number from the list")
 
 
-def pick_many_ordered(prompt: str, options: list, current: list | None = None) -> list:
-    """Select several, in priority order. Returns values in the order given."""
+def pick_many_ordered(prompt: str, options: list, current: list | None = None,
+                      allow_repeats: bool = False) -> list:
+    """Select several, in priority order. Returns values in the order given.
+
+    `allow_repeats` is the coder picker's "another instance of this harness"
+    affordance: entering the same number twice appends that agent again, and
+    the model step then asks once per instance. Roles that identify a worker
+    by agent id alone keep the old dedupe.
+    """
     say()
     say(f"{C['b']}{prompt}{C['x']}")
+    hint = ("a repeated number means another instance of that harness" if allow_repeats
+            else "duplicate numbers are ignored")
     say(f"{C['dim']}  Enter numbers in PREFERENCE ORDER, comma separated (e.g. 2,1,3).{C['x']}")
-    say(f"{C['dim']}  The first is tried first; later ones absorb overflow.{C['x']}")
+    say(f"{C['dim']}  The first is tried first; later ones absorb overflow; {hint}.{C['x']}")
     for i, (val, label, note) in enumerate(options, 1):
         say(f"  {i}. {label}")
         if note:
             say(f"     {C['dim']}{note}{C['x']}")
     cur = current or []
-    default = ",".join(str(i) for i, (v, _, _) in enumerate(options, 1) if v in cur) or "1"
-    # Preserve the saved order rather than the menu order.
-    if cur:
+    if allow_repeats:
+        # The saved order may already name the same agent twice. Walk it and
+        # spend each menu index once per saved occurrence, so `2,2` reloads as
+        # `2,2` rather than collapsing to `2`.
         idx = {v: i for i, (v, _, _) in enumerate(options, 1)}
-        default = ",".join(str(idx[v]) for v in cur if v in idx) or default
+        default = ",".join(str(idx[v]) for v in cur if v in idx) or "1"
+    else:
+        default = ",".join(str(i) for i, (v, _, _) in enumerate(options, 1)
+                           if v in cur) or "1"
+        # Preserve the saved order rather than the menu order.
+        if cur:
+            idx = {v: i for i, (v, _, _) in enumerate(options, 1)}
+            default = ",".join(str(idx[v]) for v in cur if v in idx) or default
     while True:
         got = ask("choose (ordered)", default)
         parts = [p.strip() for p in got.split(",") if p.strip()]
@@ -729,15 +811,17 @@ def pick_many_ordered(prompt: str, options: list, current: list | None = None) -
             seen, out = set(), []
             for p in parts:
                 v = options[int(p) - 1][0]
-                if v not in seen:
+                if allow_repeats:
+                    out.append(v)
+                elif v not in seen:
                     seen.add(v)
                     out.append(v)
             return out
         err("enter one or more numbers from the list, comma separated")
 
 
-def pick_model(agent: dict, current: str | None) -> str | None:
-    """Resolve the model pin for one agent."""
+def pick_model(agent: dict, current: str | None, label: str | None = None) -> str | None:
+    """Resolve the model pin for one agent (or one instance of it)."""
     spec = agent.get("model") or {}
     required = spec.get("required", False)
     # Unpinnable is DECLARED (model.pinnable: false), not inferred from missing
@@ -754,7 +838,7 @@ def pick_model(agent: dict, current: str | None) -> str | None:
         return current
 
     say()
-    say(f"{C['b']}Model for {agent['label']}{C['x']}")
+    say(f"{C['b']}Model for {label or agent['label']}{C['x']}")
     if spec.get("note"):
         say(f"  {C['dim']}{spec['note']}{C['x']}")
 
@@ -886,14 +970,20 @@ def pick_fallback_model(agent: dict, current: str | None = None) -> str | None:
 
 
 def pin_entry(agent: dict, agent_id: str, priority: int,
-              prev_model: str | None, prev_fallback: str | None) -> dict:
+              prev_model: str | None, prev_fallback: str | None,
+              label: str | None = None) -> dict:
     """One plan entry: the model pin, then -- for a row that declares one -- the
     free fallback chosen AFTER the pin. The `fallback_model` key is written only
     when the row supports it AND the user said yes, so declining, skipping or a
     failed probe leaves the key absent, BLINK_FALLBACK_MODEL unset, and the
-    rendered command exactly as it was before this feature."""
+    rendered command exactly as it was before this feature.
+
+    `label` names the INSTANCE in the model prompt (an OpenCode coder installed
+    twice must show which slot is being pinned), while the registry row is
+    still what supplies the model list.
+    """
     entry = {"id": agent_id, "priority": priority,
-             "model": pick_model(agent, prev_model)}
+             "model": pick_model(agent, prev_model, label)}
     fallback = pick_fallback_model(agent, prev_fallback)
     if fallback:
         entry["fallback_model"] = fallback
@@ -1065,8 +1155,23 @@ def role_names(plan: dict, key: str) -> list:
     r = role_of(key)
     entries = chain(plan, key)
     if r.multi:
-        return [worker_name(e["id"]) for e in entries]
+        return worker_names([worker_name(e["id"]) for e in entries], entries)
     return [key if i == 1 else f"{key}_{i}" for i in range(1, len(entries) + 1)]
+
+
+def coder_names(plan: dict) -> list:
+    """Spec names for the coder chain, in preference order."""
+    return role_names(plan, "coders")
+
+
+def coder_instance_ids(plan: dict) -> list:
+    """The state key for each coder: the first instance keeps its id.
+
+    Kept here so the installer (roster skill, validate) and `og stats` derive
+    the same key from the same plan. `og_stats` mirrors it through
+    `og_instances` because it must stay stdlib-only.
+    """
+    return instance_ids(chain(plan, "coders"))
 
 
 def normalize_plan(plan: dict) -> dict:
@@ -1264,13 +1369,42 @@ def build_plan_interactive(state: dict) -> dict:
     if not coder_opts:
         die("no detected CLI can act as a coder.")
     coder_ids = pick_many_ordered(
-        "Which agents IMPLEMENT code? (preference order — first is tried first)",
-        coder_opts, [c["id"] for c in state.get("coders", [])])
+        "Which agents IMPLEMENT code? (preference order — first is tried first; "
+        "enter a number twice for a second instance of that harness)",
+        coder_opts, [c["id"] for c in state.get("coders", [])],
+        allow_repeats=True)
 
-    prev_models = {c["id"]: c.get("model") for c in state.get("coders", [])}
-    prev_fallbacks = {c["id"]: c.get("fallback_model") for c in state.get("coders", [])}
-    coders = [pin_entry(reg[cid], cid, i, prev_models.get(cid), prev_fallbacks.get(cid))
-              for i, cid in enumerate(coder_ids, 1)]
+    # Match saved entries by (agent id, occurrence) rather than by id alone: a
+    # roster with two OpenCode coders has two models to restore, and the first
+    # instance's pin must not leak into the second.
+    prev_by_id: dict[str, list] = {}
+    for e in chain(state, "coders"):
+        prev_by_id.setdefault(e["id"], []).append(e)
+    occurrences: dict[str, int] = {}
+    pinned: dict[str, set] = {}
+    coders = []
+    for i, cid in enumerate(coder_ids, 1):
+        occurrences[cid] = occurrences.get(cid, 0) + 1
+        occ = occurrences[cid]
+        saved = prev_by_id.get(cid) or []
+        prev = saved[occ - 1] if len(saved) >= occ else {}
+        label = reg[cid]["label"]
+        if occ > 1:
+            label = f"{label} — instance #{occ}"
+        entry = pin_entry(reg[cid], cid, i, prev.get("model"),
+                          prev.get("fallback_model"), label)
+        if entry.get("model") and entry["model"] in pinned.get(cid, set()):
+            # Two instances of one harness on ONE pin buy nothing — they draw
+            # on the same quota and rate limit — so say so while the user can
+            # still change the second answer. Warned, not refused: a user may
+            # deliberately want a second worker on the same model.
+            warn(f"{reg[cid]['label']} instance #{occ} reuses "
+                 f"`{entry['model']}`, already pinned for instance #1. Both "
+                 "instances draw on the same quota; pin a different model if "
+                 "the second was meant to add capacity.")
+        if entry.get("model"):
+            pinned.setdefault(cid, set()).add(entry["model"])
+        coders.append(entry)
 
     # --- reviewer ---
     rev_opts = opts("reviewer")
@@ -1506,6 +1640,25 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            "erroring. Verify the first dispatch produced a real commit — an "
                            "empty transcript means the pin is wrong, not that it refused."))
 
+    # Two instances of one harness on one pin add no capacity: they share the
+    # same quota and rate limit. The picker warns at answer time; a hand-written
+    # plan gets the same warning here. Not an error -- a user may deliberately
+    # want a second worker on the same model.
+    seen_pins: dict[str, dict[str, str]] = {}
+    for name, c in zip(coder_names(plan), plan["coders"]):
+        model = c.get("model")
+        if not model:
+            continue
+        pinned_by_agent = seen_pins.setdefault(c["id"], {})
+        if model in pinned_by_agent:
+            issues.append(("warn",
+                           f"`{name}` reuses `{model}`, already pinned for "
+                           f"`{pinned_by_agent[model]}`. Two instances of "
+                           f"{reg[c['id']]['label']} on one model share a quota, "
+                           "so the second adds no capacity."))
+        else:
+            pinned_by_agent[model] = name
+
     # Cross-vendor review is the point of the reviewer role: an agent must never
     # review code its own vendor wrote, and vendor follows the model pin, not
     # the registry row. This WARNs rather than refuses -- refusing would block a
@@ -1513,10 +1666,11 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     # telling them plainly what they are getting. Checked for EVERY entry in the
     # chain: the one that gets used is the one the orchestrator reaches for when
     # the primary is dry.
+    coder_pins = list(zip(coder_names(plan), plan["coders"]))
     for i, (name, r) in enumerate(zip(reviewer_names(plan), reviewers)):
         rv = vendor_of(reg[r["id"]], r)
-        colliding = [f"`{worker_name(c['id'])}` ({reg[c['id']]['label']})"
-                     for c in plan["coders"] if vendor_of(reg[c["id"]], c) == rv]
+        colliding = [f"`{cname}` ({reg[c['id']]['label']})"
+                     for cname, c in coder_pins if vendor_of(reg[c["id"]], c) == rv]
         if colliding:
             # The PRIMARY collides immediately -- you never fail over TO the
             # primary -- so the failover wording is right only for a backup.
@@ -1759,17 +1913,17 @@ def render_roster(plan: dict) -> str:
     """
     reg = agents_by_id()
     ordinals = ["FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH", "SIXTH"]
+    cod_names = coder_names(plan)
     rev_names = role_names(plan, "reviewer")
     sc_names = role_names(plan, "scout")
     ig_names = role_names(plan, "integrator")
-    names = [f"`{worker_name(c['id'])}`" for c in plan["coders"]] \
-        + [f"`{n}`" for n in rev_names + sc_names + ig_names]
+    names = [f"`{n}`" for n in cod_names + rev_names + sc_names + ig_names]
     width = max(len(n) for n in names) + 1
     lines = []
     for i, c in enumerate(plan["coders"]):
         a = reg[c["id"]]
         pin = f", pinned `{c['model']}`" if c.get("model") else ""
-        tags = []
+        tags = [f"long-running: {long_running_tag(a, c)}"]
         if a.get("relay") is False:
             tags.append("leaf worker, cannot dispatch")
         if a.get("silent_model_failure"):
@@ -1784,14 +1938,16 @@ def render_roster(plan: dict) -> str:
         rv = reg[e["id"]]
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{rv['label']} "
-                     f"(`{rv['harness']}`){pin}. Reviews only; never edits.")
+                     f"(`{rv['harness']}`){pin}. long-running: "
+                     f"{long_running_tag(rv, e)}. Reviews only; never edits.")
     # The scout's read-only contract is a fact the orchestrator must know BEFORE
     # it dispatches one, so it stays inline rather than behind the roster skill.
     for name, e in zip(sc_names, chain(plan, "scout")):
         sc = reg[e["id"]]
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{sc['label']} "
-                     f"(`{sc['harness']}`){pin}. Read-only; never edits, commits "
+                     f"(`{sc['harness']}`){pin}. long-running: "
+                     f"{long_running_tag(sc, e)}. Read-only; never edits, commits "
                      "or mutates. Bounded summary only.")
     # The integrator's two hard rules change a decision made BEFORE anything is
     # read: that its answer is bounded (so delegating is worth the round trip),
@@ -1801,7 +1957,8 @@ def render_roster(plan: dict) -> str:
         ig = reg[e["id"]]
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         lines.append(f"  - {f'`{name}`'.ljust(width)}{ig['label']} "
-                     f"(`{ig['harness']}`){pin}. Git/gate plumbing; bounded "
+                     f"(`{ig['harness']}`){pin}. long-running: "
+                     f"{long_running_tag(ig, e)}. Git/gate plumbing; bounded "
                      "result; never decides a merge.")
     return "\n".join(lines)
 
@@ -1814,16 +1971,17 @@ def render_vendor_map(plan: dict) -> str:
     vendors that drift the moment the roster is reconfigured) would.
     """
     reg = agents_by_id()
+    coder_pins = list(zip(coder_names(plan), plan["coders"]))
     lines = []
-    for c in plan["coders"]:
-        lines.append(f"  - `{worker_name(c['id'])}` is {vendor_of(reg[c['id']], c)}.")
+    for name, c in coder_pins:
+        lines.append(f"  - `{name}` is {vendor_of(reg[c['id']], c)}.")
     # The collision note sits on the REVIEWER line now: with a chain, the same
     # coder can be same-vendor with one reviewer and cross-vendor with the next,
     # so the pairing belongs to the reviewer being named (and matches the
     # `degraded-review` warning validate() raises for that entry).
     for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
         rv = vendor_of(reg[e["id"]], e)
-        same = [f"`{worker_name(c['id'])}`" for c in plan["coders"]
+        same = [f"`{cname}`" for cname, c in coder_pins
                 if vendor_of(reg[c["id"]], c) == rv]
         note = (f" — same vendor as {', '.join(same)}; that pairing is "
                 "degraded-review" if same else "")
@@ -1901,9 +2059,16 @@ def render_roster_skill(plan: dict) -> str:
     # table so a new one cannot leave this sentence stale the way it read
     # `reviewer`/`scout` after integrator landed.
     stats_chain_roles = "/".join(f"`{r.key}`" for r in SPEC_ROLES if not r.multi)
-    oc = next((c for c in plan["coders"] if c["id"] == "opencode"), None)
-    zen = ([zen_preflight_note(worker_name("opencode")), ""]
-           if oc and is_zen_free(oc.get("model")) else [])
+    cod_names = coder_names(plan)
+    cod_ids = coder_instance_ids(plan)
+    zen = []
+    for name, c in zip(cod_names, plan["coders"]):
+        if c["id"] == "opencode" and is_zen_free(c.get("model")):
+            zen += [zen_preflight_note(name), ""]
+    stats_map = ", ".join(f"`{name}` -> `{iid}`"
+                          for name, iid in zip(cod_names, cod_ids))
+    if stats_map:
+        stats_map += "; "
     out = [
         "---", "name: roster",
         "description: What each worker in this orchestrator's roster actually is — "
@@ -1939,18 +2104,23 @@ def render_roster_skill(plan: dict) -> str:
         "`max_dispatches_per_turn` — a schema typo can burn a whole turn's budget:", "",
         "    sys_session_send({agent: \"coder_kilo\", title: \"fix-sse-retry\",",
         "        args: {input: \"<the task text>\", purpose: \"implement\"}})", "",
+        "Every brief must also say: run long commands in the background with a log",
+        "and poll in short steps; never block on one long foreground command.", "",
         *zen,
         "## Capacity", "",
         "Run `og stats --json` (og is on PATH) before the FIRST dispatch of this run,",
         "and `og stats --agent <id> --json` before every later one. If `og` is missing",
         "or errors, proceed as today and say so once — do not stall the run on it.",
-        "Map the stats output's agent ids back to workers by id: `coder_<id>` maps",
-        f"to `<id>`, and {stats_chain_roles} map to their chain's agent ids. A worker",
+        "Each worker has its own stats id; a mark on one instance does NOT affect",
+        f"the other: {stats_map}{stats_chain_roles} map to their chain's agent ids. The old",
+        "`coder_<id>` shortcut only holds for the first instance. A worker",
         "whose state is `dry` while `reset_at` is in the future is out of capacity —",
         "skip it and take the next worker. Preference order still wins: only when two",
         "candidates are otherwise equal does `ok` outrank `unknown`. `og stats` reports",
         "a measured `ok` only when the probe actually answered; an inferred or unknown",
-        "state is not a clean bill of health.",
+        "state is not a clean bill of health. Long-running work: send a",
+        "projected-long task to a worker whose section says `Long-running: yes`,",
+        "even over preference; if none does, split it.",
         "",
         "On a QUOTA failure — rate limit, usage cap, out of credits, Kilo's",
         "`Add credits to continue, or switch to a free model`, freebuff's",
@@ -1973,9 +2143,12 @@ def render_roster_skill(plan: dict) -> str:
     ]
     for i, c in enumerate(plan["coders"], 1):
         a = reg[c["id"]]
-        out += [f"## {i}. `{worker_name(c['id'])}` — {a['label']}", "",
+        out += [f"## {i}. `{cod_names[i-1]}` — {a['label']}", "",
                 f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
                 f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}",
+                f"- stats id: `{cod_ids[i-1]}` — use this exact id for `og stats --agent`, "
+                "`--mark` and `--clear`; the first instance keeps the bare agent id",
+                f"- **Long-running: {long_running_note(a, c)}.**",
                 quota_line(a)]
         out += agy_completion_lines(a)
         out += quota_failure_lines(a)
@@ -2039,12 +2212,13 @@ def render_roster_skill(plan: dict) -> str:
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         out += [f"## `{name}` — {rv['label']}{pin}", "",
                 f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, e)}`",
+                f"- **Long-running: {long_running_note(rv, e)}.**",
                 quota_line(rv), *quota_failure_lines(rv)]
         out += agy_completion_lines(rv)
         # The same collision validate() warns about at install time, carried
         # here so the orchestrator knows it at DISPATCH time too -- the moment
         # it is deciding which entry to use, long after the install scrolled by.
-        colliding = [f"`{worker_name(c['id'])}`" for c in plan["coders"]
+        colliding = [f"`{cname}`" for cname, c in zip(cod_names, plan["coders"])
                      if vendor_of(reg[c["id"]], c) == vendor_of(rv, e)]
         if colliding:
             out.append(f"- **Same-vendor review (`{vendor_of(rv, e)}`).** This reviewer shares "
@@ -2108,6 +2282,7 @@ def render_roster_skill(plan: dict) -> str:
             pin = f", pinned `{e['model']}`" if e.get("model") else ""
             out += [f"## `{name}` — {sc['label']}{pin}", "",
                     f"- harness `{sc['harness']}`, vendor `{vendor_of(sc, e)}`",
+                    f"- **Long-running: {long_running_note(sc, e)}.**",
                     quota_line(sc), *quota_failure_lines(sc),
                     "- **Read-only.** Never edits, creates or deletes a file, never",
                     "  commits, never runs a command that mutates the repo or the working",
@@ -2186,6 +2361,7 @@ def render_roster_skill(plan: dict) -> str:
             pin = f", pinned `{e['model']}`" if e.get("model") else ""
             out += [f"## `{name}` — {ig['label']}{pin}", "",
                     f"- harness `{ig['harness']}`, vendor `{vendor_of(ig, e)}`",
+                    f"- **Long-running: {long_running_note(ig, e)}.**",
                     quota_line(ig), *quota_failure_lines(ig),
                     "- **Bounded result.** The verdict, the SHAs and branch names, and",
                     "  only the FAILING gate output — never a full diff, log or passing",
@@ -2441,8 +2617,12 @@ def render_coder(plan: dict, c: dict, name: str | None = None) -> str:
         notes.append("# an approval prompt nobody answers and the worker is cancelled.")
         permission_mode_block = "    permission_mode: bypassPermissions"
     s = tmpl("coder.yaml.tmpl")
+    if name is None:
+        names = coder_names(plan)
+        name = next((n for n, entry in zip(names, plan["coders"])
+                     if entry is c), worker_name(c["id"]))
     for k, v in {
-        "{{NAME}}": name or worker_name(c["id"]),
+        "{{NAME}}": name,
         "{{LABEL}}": a["label"],
         "{{PRIORITY}}": str(c["priority"]),
         "{{HARNESS}}": a["harness"],
@@ -2956,9 +3136,9 @@ def apply(plan: dict, dry_run: bool = False) -> None:
     orch_pin = f" → {orch0['model']}" if orch0.get("model") else ""
     ok(f"orchestrator  {plan['agent_name']} "
        f"({reg[orch0['id']]['label']}){orch_pin}")
-    for c in plan["coders"]:
+    for name, c in zip(coder_names(plan), plan["coders"]):
         pin = f" → {c['model']}" if c.get("model") else ""
-        ok(f"coder #{c['priority']}      {worker_name(c['id'])} ({reg[c['id']]['label']}){pin}")
+        ok(f"coder #{c['priority']}      {name} ({reg[c['id']]['label']}){pin}")
     for i, (name, e) in enumerate(zip(reviewer_names(plan), chain(plan, "reviewer"))):
         pin = f" → {e['model']}" if e.get("model") else ""
         if i == 0:
@@ -3381,13 +3561,13 @@ def show(state: dict) -> None:
     orch_live = "" if orch["id"] in found else f" {C['r']}(CLI missing){C['x']}"
     say(f"{C['b']}orchestrator{C['x']}  {state['agent_name']} "
         f"({reg[orch['id']]['label']}){orch_pin}{orch_live}")
-    for c in state["coders"]:
+    for name, c in zip(coder_names(state), state["coders"]):
         live = "" if c["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {c['model']}" if c.get("model") else ""
         fb = f" (fallback: {c['fallback_model']})" if c.get("fallback_model") \
             else " (fallback: none)"
         say(f"{C['b']}coder #{c['priority']}{C['x']}      "
-            f"{worker_name(c['id'])} ({reg[c['id']]['label']}){pin}{fb}{live}")
+            f"{name} ({reg[c['id']]['label']}){pin}{fb}{live}")
     for i, e in enumerate(revs):
         live = "" if e["id"] in found else f" {C['r']}(CLI missing){C['x']}"
         pin = f" → {e['model']}" if e.get("model") else ""

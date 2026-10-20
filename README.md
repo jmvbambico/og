@@ -36,6 +36,9 @@ Omnigent gives you the runtime. This repo is the *opinionated setup on top*:
   DENY, not a sentence in a system prompt a model can reason past.
 - **Your order, your models.** Workers run in the preference order you set,
   and each pins any model its CLI offers — free tier or subscription alike.
+  Enter the same harness twice to run two instances with different pins (for
+  example OpenCode on a free tier and again on a paid endpoint); each keeps its
+  own worker name and quota state.
 - **Reproducible.** Every choice lives in one JSON file. Re-running the
   installer on another machine reproduces the setup.
 
@@ -356,7 +359,11 @@ The installer will ask you to:
 1. name the orchestrator bundle (default `dev-lead`)
 2. pick which agent **orchestrates**
 3. pick which agents **implement**, *in preference order* — the first is tried
-   first, later ones absorb overflow
+   first, later ones absorb overflow. Repeat a number (`2,2,4`) to add another
+   instance of that harness; you are asked for a model once per instance. The
+   first instance keeps the established worker name (`coder_zen`), later ones
+   get a pin-derived name (`coder_zen_cmdcode`) and state id (`opencode@cmdcode`),
+   so marking one dry never affects the other
 4. pin a **model** per worker — the installer runs the CLI's own listing
    (`opencode models`, `kilo models`, `cursor-agent models`,
    `cmd --list-models`), grouped by
