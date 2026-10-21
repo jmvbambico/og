@@ -14,6 +14,9 @@
 #                       does NOT attach — the diagnostic for a space or pane that did
 #                       not come up. Every start also probes installed agents' capacity;
 #                       --no-probe (or OG_START_PROBE=0) skips that for offline use.
+#                       Every start also checks this repo's orchestration contract
+#                       (.agents/orchestration.yaml) and warns when it is missing
+#                       or broken; --no-contract-check silences that warning.
 #   og init [path]      scaffold this repo's orchestration contract
 #   og stop             stop the server, host daemons, and the tunnel
 #   og restart [mode]   og stop, then og start with the same arguments
@@ -128,6 +131,10 @@ OG_ARGV=("$@")
 die() { printf '\033[0;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[0;36m→\033[0m %s\n' "$*"; }
 ok() { printf '\033[0;32m✓\033[0m %s\n' "$*"; }
+# The `!` prefix the multiplexer warning already uses. Always stderr: a warning
+# that shares stdout with the URL, QR and status lines gets piped away or
+# mistaken for success, and a non-interactive start has nowhere else to say it.
+warn() { printf '\033[0;33m!\033[0m %s\n' "$*" >&2; }
 
 # Render the public URL as a scannable QR block. Optional by design: a missing
 # qrencode must never fail a start, and neither may a code too wide to fit — in
@@ -1305,12 +1312,17 @@ parse_start_args() {
   # be one more positional case arm (see docs/TUNNEL-PROVIDERS.md): collect
   # positionals and flags in one pass.
   local use="" provider mux="" mode="" domain="" ids a no_probe=0
+  local no_contract_check=0
   local -a pos=() rest=() mux_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       # og's own flag, never the launcher's: the start capacity probe makes a
       # real request per unmeasured agent, which is wrong on a metered link.
       --no-probe) no_probe=1; shift ;;
+      # Silences the contract warning below. An operator who deliberately runs
+      # a repo without a contract (a scratch directory, a demo) should not be
+      # nagged on every start.
+      --no-contract-check) no_contract_check=1; shift ;;
       --use)
         [[ -n "${2:-}" ]] || die "--use needs a provider: ngrok or tunnl"
         use="$2"; shift 2 ;;
@@ -1386,6 +1398,8 @@ parse_start_args() {
   # explicit --no-probe always disables it.
   OG_START_PROBE="${OG_START_PROBE:-1}"
   if [[ "$no_probe" -eq 1 ]]; then OG_START_PROBE=0; fi
+  OG_START_CONTRACT_CHECK="${OG_START_CONTRACT_CHECK:-1}"
+  if [[ "$no_contract_check" -eq 1 ]]; then OG_START_CONTRACT_CHECK=0; fi
   # A launcher flag with no multiplexer has nothing to be forwarded to, and
   # accepting it silently would be the same defect this forwarding exists to fix
   # (a flag the operator typed that nothing acts on). The mux id is known here;
@@ -1543,6 +1557,141 @@ raise SystemExit(og_start_probe.main())
 PYEOF
 }
 
+# Say when the orchestration contract `.agents/orchestration.yaml` is missing or
+# cannot load. This WARNS and always continues: `og start` starts a server, and
+# a missing contract is a merge-policy concern, not a reason to refuse or stall.
+#
+# The failure this exists to make visible: with no contract, `og start` serves
+# fine and the merge policy fails closed, so nothing unguarded is merged — but
+# the orchestrator plans and delegates without gates, protected branches or an
+# integration base, and THAT looks like it is working. A silently absent
+# contract is indistinguishable from a healthy one until a run goes wrong.
+#
+# Resolution mirrors policies/omnigent_local_policies.py:_load_contract EXACTLY:
+# walk up from the directory the server is told to use as its workspace, stop
+# at the FIRST `.agents/orchestration.yaml`, and treat an unreadable or
+# unparseable file there as final rather than continuing upward. A check that
+# disagreed with the policy would be worse than no check: it would teach the
+# operator to distrust the warning. The directory is OG_LAUNCH_DIR, the same
+# value pinned as the project's default workspace (and handed to sessions), so
+# this is the tree the policy is actually given. An OG_WORKSPACE override is
+# therefore honoured for free.
+#
+# The YAML parse runs under the interpreter omnigent itself runs under, because
+# that is where the policy's `import yaml` happens. On a machine without PyYAML
+# the policy loads no contract no matter what is on disk, and that deserves its
+# own message rather than looking like a broken repo.
+check_orchestration_contract() {
+  [[ "${OG_START_CONTRACT_CHECK:-1}" == "1" ]] || return 0
+
+  local start="${OG_LAUNCH_DIR:-$PWD}" dir found="" py status detail answer
+  dir="$(cd "$start" 2>/dev/null && pwd -P)" || dir="$start"
+  while :; do
+    if [[ -f "$dir/.agents/orchestration.yaml" ]]; then
+      found="$dir/.agents/orchestration.yaml"
+      break
+    fi
+    [[ "$dir" == "/" || -z "$dir" ]] && break
+    dir="$(dirname "$dir")"
+  done
+
+  if [[ -z "$found" ]]; then
+    warn "no orchestration contract above $start — no gates, no protected branches, no integration base."
+    warn "  the merge policy fails closed, so nothing unguarded merges; the orchestrator just plans without them, which looks like it is working."
+    _offer_contract_init "$start" ""
+    return 0
+  fi
+
+  # The policy's interpreter, not necessarily the one running this script. A
+  # launcher with a non-python shebang (a shell wrapper) is rejected by the
+  # `-c` probe rather than misreported as a missing PyYAML.
+  py="$(omnigent_python 2>/dev/null || true)"
+  if [[ -z "$py" ]] || ! "$py" -c 'import sys' >/dev/null 2>&1; then
+    py="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [[ -z "$py" ]]; then
+    warn "cannot check the orchestration contract at $found: no python3 found."
+    return 0
+  fi
+
+  # A literal tab, held in a variable: bash 3.2's parser does not accept
+  # `$'\t'` nested inside `${...}` and reads the quote as an unterminated
+  # string, which takes the WHOLE script down at load time.
+  local out tab; tab=$'\t'
+  out="$("$py" - "$found" <<'PYEOF' 2>/dev/null
+import sys
+try:
+    import yaml
+except ImportError:
+    print("noyaml\t")
+    raise SystemExit(0)
+try:
+    data = yaml.safe_load(open(sys.argv[1], encoding="utf-8").read())
+except Exception as exc:
+    # One line: the YAML parser emits a small essay with a caret diagram, and a
+    # warning that scrolls the terminal buries the consequence.
+    print("bad\t%s: %s" % (type(exc).__name__, " ".join(str(exc).split())[:300]))
+    raise SystemExit(0)
+print(("ok" if isinstance(data, dict) else "notmap") + "\t")
+PYEOF
+)" || true
+  status="${out%%"$tab"*}"
+  detail="${out#*"$tab"}"
+
+  case "$status" in
+    "")
+      # The probe itself failed. Do not dress that up as a broken contract —
+      # and, above all, do not let it stop the start.
+      warn "could not check the orchestration contract at $found ($(basename "$py") produced no verdict)."
+      ;;
+    ok)
+      # The common case says nothing: a start that is already correct has no
+      # reason to grow a line.
+      ;;
+    noyaml)
+      warn "orchestration contract at $found cannot be loaded: $(basename "$py") has no PyYAML."
+      warn "  this is a machine/install problem, not a repo one — the policy silently loads no contract even though the file exists. Re-run: og setup"
+      ;;
+    notmap)
+      warn "orchestration contract at $found is valid YAML but not a mapping."
+      warn "  the policy ignores it: no gates, no protected branches, no integration base."
+      _offer_contract_init "$start" "--force"
+      ;;
+    *)
+      warn "orchestration contract at $found does not parse: $detail"
+      warn "  the policy falls back to its defaults: no gates, no protected branches beyond the always-protected set, no integration base."
+      _offer_contract_init "$start" "--force"
+      ;;
+  esac
+  return 0
+}
+
+# Ask once, only where someone can answer. A piped or CI start must never sit
+# waiting on a read that no human will type into, so without a terminal the
+# warning above is the whole interaction. `--force` for a contract that exists
+# but does not load: `og init` refuses an existing file, and that file is
+# exactly the one in the way. A subshell because cmd_init `exec`s python —
+# called directly it would replace this process and the start would never
+# happen.
+_offer_contract_init() {
+  local start="$1" force="${2:-}" answer
+  [[ -t 0 ]] || return 0
+  local -a args=()
+  [[ -n "$force" ]] && args=("$force")
+  read -r -p "Run 'og init${force:+ $force}' in $start now? [y/N] " answer || answer=""
+  case "$answer" in
+    [yY]|[yY][eE][sS])
+      info "running og init in $start"
+      # A failed scaffold must not abort the start: the offer was a kindness,
+      # and `set -e` is inherited from this script, so the subshell's status is
+      # caught here rather than propagating.
+      ( cmd_init "${args[@]+"${args[@]}"}" "$start" ) \
+        || warn "og init did not finish; starting anyway."
+      ;;
+  esac
+  return 0
+}
+
 cmd_start() {
   # `og start`            -> local  (LAN only; the safe default)
   # `og start local`      -> same, explicit
@@ -1562,6 +1711,12 @@ cmd_start() {
   # is "unbound" under set -u on bash 3.2, which is the oldest shell this
   # script claims to work.
   local -a mux_args=("${OG_START_MUX_ARGS[@]+"${OG_START_MUX_ARGS[@]}"}")
+
+  # Before the multiplexer check, and long before auto-update or a server
+  # launch: this is a filesystem walk and one parse, and a warning about the
+  # directory the operator is starting in is most useful before anything slow
+  # happens. Never fatal — see check_orchestration_contract.
+  check_orchestration_contract
 
   # A missing multiplexer is never an error: og is fully usable without one.
   # Checked HERE, before anything is started, rather than at the launcher call
@@ -2662,11 +2817,11 @@ case "${1:-}" in
   ""|-h|--help|help)
     # The usage block is the comment header, so the RANGE has to track it: every
     # command added above without widening this quietly drops off the end of
-    # `og help`, which is how `og version` went missing once already. 2,42 is the
+    # `og help`, which is how `og version` went missing once already. 2,45 is the
     # last line of the command list (the prose below it is not help).
     # tests/test_og_start_mux.py::test_help_block_lists_every_dispatched_command
     # is the guard that cannot rot the way a number does.
-    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *) die "unknown command: $1  (try: og help)" ;;
 esac
