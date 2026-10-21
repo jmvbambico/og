@@ -1312,6 +1312,9 @@ def test_a_pasted_fenced_copy_is_left_byte_identical():
     out = og_init.upsert_agents_block(doc, NEW)
 
     assert out.count(og_init.BLOCK_BEGIN) == 2
+    # A fenced example never competes for selection, so it must not be
+    # reported as a stale copy: the user wrote it deliberately.
+    assert og_init.block_ambiguity(doc) == ""
     assert "TAIL" in out
     assert "integration base `stage`" in out.split(og_init.BLOCK_BEGIN)[1]
     assert "integration base `dev`" in out.split(og_init.BLOCK_BEGIN)[2]
@@ -1473,10 +1476,17 @@ def test_no_arrangement_loses_text_or_duplicates_the_block(combo):
             assert line in out, f"{combo} lost {line}"
     # Exactly one live block: the one og wrote.
     assert out.count("integration base `stage`") == 1, f"{combo} has no live block"
-    # At most one piece was rewritten, and the rest are byte-identical.
-    rewritten = [c for c, m in _PIECE_MARKERS.items()
-                 if out.count(m) < doc.count(m)]
-    assert len(rewritten) <= 1, f"{combo} rewrote {rewritten}"
+    # OCCURRENCES, not piece types: two copies of the same piece that both
+    # changed is still one label, and would slip past a type count.
+    drops = {c: doc.count(t) - out.count(t) for c, t in _DOC_PIECES.items()}
+    lost = {c: d for c, d in drops.items() if d > 0}
+    assert len(lost) <= 1, f"{combo} rewrote {lost}"
+    for c, d in lost.items():
+        assert d == 1, f"{combo} rewrote {d} occurrences of {c}"
+    # The warning and the resolution must never disagree: the warning
+    # fires exactly when more than one block competed for selection.
+    pool, _ = og_init._block_candidates(og_init._split_lines(doc))
+    assert bool(og_init.block_ambiguity(doc)) == (len(pool) > 1), f"{combo}"
     assert og_init.upsert_agents_block(out, NEW) == out, f"{combo} is not idempotent"
 
 
@@ -1487,3 +1497,28 @@ def test_a_document_with_two_signed_blocks_rewrites_the_first():
 
     assert out.split(og_init.BLOCK_BEGIN)[1].count("integration base `stage`") == 1
     assert out.split(og_init.BLOCK_BEGIN)[2].count("integration base `dev`") == 1
+
+
+def test_the_warning_fires_only_when_the_choice_was_ambiguous():
+    """The four measured cases: a fenced example is not an ambiguity."""
+    real = og_init.upsert_agents_block("# Mine\n", REAL)
+    cases = {
+        "real only": (real, False),
+        "real + FENCED example": (real + "\nExample:\n\n```\n" + COPY + "```\n", False),
+        "real + UNFENCED copy": (real + "\n" + COPY, True),
+        "signature quoted inline": (real + "\nI mention " + og_init.BLOCK_SIGNATURE
+                                    + " here.\n", False),
+    }
+    for name, (doc, warns) in cases.items():
+        assert bool(og_init.block_ambiguity(doc)) is warns, name
+
+
+def test_several_signatures_inside_one_span_are_one_block():
+    """A signature quoted inside og's own block is not a second candidate."""
+    doc = REAL.replace(og_init.BLOCK_SIGNATURE + "\n",
+                       og_init.BLOCK_SIGNATURE + "\n" + og_init.BLOCK_SIGNATURE + "\n", 1)
+    assert doc.count(og_init.BLOCK_SIGNATURE) == 2
+
+    out = og_init.upsert_agents_block(doc, NEW)
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+    assert og_init.block_ambiguity(doc) == "", "one block, not two"

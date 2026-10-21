@@ -850,6 +850,10 @@ def _signed_blocks(lines: list) -> list:
     says WHICH of them is og's. A signature with no begin marker is a
     QUOTATION — somebody pasted the line — and is not a block at all.
 
+    A block is a MARKER SPAN that contains a signature, so several
+    signatures inside one span are one block, and a signature quoted
+    inside a block's own span does not make a second one.
+
     Each entry is (begin index, end index, inside a code fence). An end
     index of None means the block was truncated: the end marker is gone,
     and everything from the begin marker on was og's.
@@ -870,26 +874,47 @@ def _signed_blocks(lines: list) -> list:
             continue
         ends = [i for i in range(s + 1, len(lines))
                 if lines[i][0].strip() == BLOCK_END]
-        blocks.append((begins[-1], ends[0] if ends else None, s in inside))
+        begin, end = begins[-1], (ends[0] if ends else None)
+        # A signature that falls inside a span already found belongs to
+        # that block: it is quoted inside it, not a block of its own.
+        if any(b <= s <= (e if e is not None else len(lines))
+               for b, e, _ in blocks):
+            continue
+        blocks.append((begin, end, s in inside))
     return blocks
 
 
-def _find_block(lines: list):
-    """Locate og's own block: (begin index, end index) or None.
+def _block_candidates(lines: list) -> tuple:
+    """(the blocks that COMPETE for selection, the one that wins).
 
-    Two signed blocks in one document cannot be told apart — they are the
-    same text — so the choice is made by a rule and the ambiguity is
-    reported by the caller. The rule: the FIRST signed block that is not
-    inside a code fence (a block in a fence is a copy somebody pasted as an
-    example), and if every one of them is fenced, the first signed block.
+    The rule: the FIRST signed block that is not inside a code fence; if
+    every one of them is fenced, the first signed block. Among several
+    unfenced blocks, the first is og's: a copy is made FROM a block that
+    already existed, so the original comes first in the file.
 
-    Among several unfenced blocks, the first is og's: a copy is made FROM a
-    block that already existed, so the original comes first in the file.
+    The COMPETING blocks are the ones the rule ranks against each other.
+    A fenced copy never competes with an unfenced block — it is an
+    example somebody wrote, and og leaves it byte-identical — so it is not
+    a candidate when an unfenced block exists.
+
+    The warning and the resolution read THIS set, and only this set: a
+    warning that fires when nothing is wrong teaches people to ignore
+    warnings, and one that says "remove the copy" about a documentation
+    example og deliberately preserved is worse than no warning at all.
     """
     blocks = _signed_blocks(lines)
-    if blocks:
-        unfenced = [b for b in blocks if not b[2]]
-        return (unfenced or blocks)[0][:2]
+    if not blocks:
+        return [], None
+    unfenced = [b for b in blocks if not b[2]]
+    pool = unfenced or blocks
+    return pool, pool[0]
+
+
+def _find_block(lines: list):
+    """Locate og's own block: (begin index, end index) or None."""
+    _, chosen = _block_candidates(lines)
+    if chosen:
+        return chosen[:2]
     return _legacy_block(lines)
 
 
@@ -981,18 +1006,23 @@ def block_ambiguity(text: str) -> str:
     live one. It updates one of them — deterministically — and says so: a
     stale block that LOOKS current is the exact failure this whole feature
     exists to end, and the user is the only one who can remove a copy.
+
+    The warning fires only when the choice was genuinely ambiguous: when
+    more than one block COMPETED for selection. A fenced example never
+    competes with an unfenced block, so a document with a real block and a
+    documentation example is silent — telling the user to remove their own
+    example would be worse than saying nothing.
     """
     lines = _split_lines(text)
-    blocks = _signed_blocks(lines)
-    if len(blocks) < 2:
+    pool, chosen = _block_candidates(lines)
+    if len(pool) < 2:
         return ""
-    chosen = _find_block(lines)
-    where = f"the first one (line {chosen[0] + 1})" if chosen else "the first one"
-    others = len(blocks) - 1
+    where = f"the first one (line {chosen[0] + 1})"
+    others = len(pool) - 1
     stale = ("the other is a copy that is now stale" if others == 1
              else f"the other {others} are copies that are now stale")
-    return (f"AGENTS.md holds {len(blocks)} og blocks — og's signature appears "
-            f"{len(blocks)} times, and og cannot tell which one is the live one. "
+    return (f"AGENTS.md holds {len(pool)} og blocks — og's signature appears "
+            f"{len(pool)} times, and og cannot tell which one is the live one. "
             f"og updated {where}; {stale}. Remove the "
             f"{'copy' if others == 1 else 'copies'}, or the directives the "
             f"orchestrator reads may be the stale one.")
