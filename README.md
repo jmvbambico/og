@@ -446,10 +446,14 @@ what to ask the user, the constraints to respect, and how to verify the result.
 
 ```
 og start            serve on your LAN — QR points at this machine's network IP
+                    warns when this repo's orchestration contract is missing or
+                    broken; --no-contract-check silences that warning
 og start tunneled   start the tunnel first, then serve behind that public origin
                     --use ngrok|tunnl.gg overrides the configured provider
 og init [path]      scaffold a repo's orchestration contract
                     run once per repo, before the first og start
+og init --questions emit the decision schema as JSON (for an AI)
+                    reads the repo, writes nothing
 og stop             stop server, host daemons, tunnel
 og restart [mode]   og stop, then og start — same arguments as start
 og setup            re-run the installer: agents, models, reviewer
@@ -610,6 +614,15 @@ everything the contract supplies: the gates workers run before reporting, the
 protected branches a merge is refused against, the integration base, the paths
 implementers must not touch. The orchestrator will plan and delegate without
 them, which looks like it is working.
+
+So `og start` warns (to stderr) when it cannot load the contract — missing,
+unparseable, not a mapping, or unreadable because PyYAML is absent. On a
+terminal it offers to run `og init` (which then asks a few questions); for a
+broken contract the offer names the file and says `--force` will overwrite it.
+Ctrl-C at the offer abandons the scaffold and the start continues. Everywhere
+else it warns and starts normally, never waiting for an answer.
+`--no-contract-check` silences the warning for a directory you know is not
+meant to be orchestrated.
 
 Run `og init` inside a repo to scaffold both files:
 
