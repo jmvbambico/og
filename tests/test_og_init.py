@@ -742,3 +742,178 @@ def test_questions_warn_when_a_cross_vendor_review_is_impossible(tmp_path, monke
 
     assert payload["roster"]["cross_vendor_review_possible"] is False
     assert any("cross_vendor_review" in w for w in payload["warnings"])
+
+
+# --- round 2: the marker boundary is a promise about someone else's file ---
+#
+# Two ways to break that promise, both real:
+#
+#   1. `Path.read_text()` translates CRLF to LF, so a CRLF-authored
+#      AGENTS.md came back with every line ending rewritten — a whole-file
+#      diff in a file og was only asked to add a block to.
+#   2. A marker pair inside a fenced code block is an EXAMPLE of this
+#      feature, not og's block. Replacing it ate the example and left the
+#      fence unterminated.
+
+
+BLOCK = og_init.orchestration_block({"integration_base": "main", "protected": []})
+
+
+def test_crlf_file_keeps_its_line_endings(tmp_path):
+    p = tmp_path / "AGENTS.md"
+    p.write_bytes(b"# Mine\r\n\r\nUser text here.\r\n")
+
+    og_init.write_agents_block(p, BLOCK)
+    after = p.read_bytes()
+
+    assert b"\r\n" in after
+    assert b"User text here.\r\n" in after
+    assert b"\n\n" not in after.replace(b"\r\n", b"~"), "no bare LF was introduced"
+
+
+def test_crlf_user_bytes_are_byte_identical_after_one_and_two_runs(tmp_path):
+    original = b"# Mine\r\n\r\nUser text here.\r\n\r\nMore prose.\r\n"
+    p = tmp_path / "AGENTS.md"
+    p.write_bytes(original)
+
+    og_init.write_agents_block(p, BLOCK)
+    once = p.read_bytes()
+    og_init.write_agents_block(p, BLOCK)
+    twice = p.read_bytes()
+
+    assert once == twice, "a rerun must be a no-op"
+    # Every byte the user wrote, unchanged.
+    for line in original.split(b"\r\n"):
+        if line:
+            assert line + b"\r\n" in once
+    # The block went in with the file's own ending.
+    assert b"og:orchestration:begin -->\r\n" in once
+    assert b"og:orchestration:end -->\r\n" in once
+
+
+def test_mixed_line_endings_are_not_normalised(tmp_path):
+    """og must not "fix" a user's mixed file."""
+    original = b"# Mine\r\n\nUser text here.\n\r\nMore prose.\n"
+    p = tmp_path / "AGENTS.md"
+    p.write_bytes(original)
+
+    og_init.write_agents_block(p, BLOCK)
+    after = p.read_bytes()
+
+    assert after.startswith(b"# Mine\r\n\nUser text here.\n\r\nMore prose.\n")
+    # The inserted block follows the DOMINANT ending, which here is LF.
+    assert b"og:orchestration:begin -->\n" in after
+
+
+def test_fenced_example_is_left_byte_identical():
+    doc = ("# Mine\n\n```\n" + og_init.BLOCK_BEGIN + "\nexample content\n"
+           + og_init.BLOCK_END + "\n```\n\nMORE USER TEXT\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "example content" in out
+    assert out.count("```") == 2, "the fence must not be left dangling"
+    assert "MORE USER TEXT" in out
+    # og's own block was appended, and it is the block that carries the
+    # signature.
+    assert og_init.BLOCK_SIGNATURE in out
+    assert out.count(og_init.BLOCK_BEGIN) == 2, "the example and og's block"
+
+
+def test_fenced_example_survives_a_rerun():
+    doc = ("# Mine\n\n```\n" + og_init.BLOCK_BEGIN + "\nexample content\n"
+           + og_init.BLOCK_END + "\n```\n\nMORE USER TEXT\n")
+    once = og_init.upsert_agents_block(doc, BLOCK)
+    twice = og_init.upsert_agents_block(once, BLOCK)
+
+    assert twice == once
+    assert "example content" in twice
+    assert twice.count("```") == 2
+
+
+def test_two_marker_pairs_in_one_file():
+    """A quoted pair AND og's own block: only og's is replaced."""
+    quoted = ("# Mine\n\n```\n" + og_init.BLOCK_BEGIN + "\nexample content\n"
+              + og_init.BLOCK_END + "\n```\n")
+    with_block = og_init.upsert_agents_block(quoted, BLOCK)
+    # A second, unfenced, quoted pair AFTER og's block.
+    doc = (with_block + "\nUNFENCED QUOTE\n" + og_init.BLOCK_BEGIN + "\n"
+           + "user text\n" + og_init.BLOCK_END + "\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "user text" in out, "an unsigned pair is not og's block"
+    assert "example content" in out
+    assert out.count(og_init.BLOCK_SIGNATURE) == 1
+
+
+def test_orphan_begin_marker_without_a_signature_is_not_repaired():
+    """A user's half-written marker pair must not lose their text."""
+    doc = ("# Mine\n\n" + og_init.BLOCK_BEGIN + "\nuser text\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "user text" in out
+    assert og_init.BLOCK_SIGNATURE in out, "og's block is appended alongside"
+
+
+def test_orphan_begin_marker_with_the_signature_is_repaired():
+    """og's own truncated block is replaced, not duplicated."""
+    doc = ("# Mine\n\n" + og_init.BLOCK_BEGIN + "\n" + og_init.BLOCK_SIGNATURE
+           + "\n\n## Orchestration\n\nhalf a block\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "half a block" not in out
+    assert out.count(og_init.BLOCK_SIGNATURE) == 1
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_indented_marker_is_not_og_s_block():
+    """An indented marker is an example, not a block to rewrite."""
+    doc = "# Mine\n\n    " + og_init.BLOCK_BEGIN + "\n    user text\n"
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "user text" in out
+    assert og_init.BLOCK_SIGNATURE in out
+
+
+def test_crlf_run_through_main(tmp_path, monkeypatch):
+    """The end-to-end path must not normalise the file either."""
+    repo = _git_repo(tmp_path / "crlf")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    (repo / "AGENTS.md").write_bytes(b"# Mine\r\n\r\nUser text here.\r\n")
+    _no_prompt(monkeypatch)
+
+    _run_init(monkeypatch, str(repo))
+
+    after = (repo / "AGENTS.md").read_bytes()
+    assert b"User text here.\r\n" in after
+    assert og_init.BLOCK_SIGNATURE.encode() in after
+    assert b"og:orchestration:end -->\r\n" in after
+
+
+# --- the gate confirmation default ------------------------------------------
+#
+# "Default to fewer" applies where the uncertainty actually is: a gate og
+# detected and can vouch for is kept, a gate og flagged as probably wrong
+# is removed unless the user says otherwise.
+
+
+def test_a_legacy_block_without_the_signature_is_still_replaced():
+    """A block written by an og from before the signature existed."""
+    legacy = ("# Mine\n\n" + og_init.BLOCK_BEGIN + "\n\n## Orchestration\n\n"
+              "old body\n" + og_init.BLOCK_END + "\n")
+    out = og_init.upsert_agents_block(legacy, BLOCK)
+
+    assert "old body" not in out
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+    assert og_init.BLOCK_SIGNATURE in out
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_an_unfenced_unsigned_pair_is_not_replaced():
+    """A quoted pair in prose is the user's text, not og's block."""
+    doc = ("# Mine\n\n" + og_init.BLOCK_BEGIN + "\nthe user's own note\n"
+           + og_init.BLOCK_END + "\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "the user's own note" in out
+    assert og_init.BLOCK_SIGNATURE in out, "og's block is appended, not merged"
+    assert out.count(og_init.BLOCK_BEGIN) == 2

@@ -359,12 +359,13 @@ def build_gates(repo: Path, stacks: list) -> tuple:
                 continue
         for name, cmd, scope in st["gates"]:
             cmd = cmd.format(**subs) if subs else cmd
+            gname = gate_name(name, slug)
             if st["id"] == "node" and name in ("build", "unit"):
                 key = "build" if name == "build" else "test"
                 if key not in scripts:
                     notes.append(f"package.json has no `{key}` script — "
                                  f"`{prefix}{cmd}` will fail")
-            gates.append((gate_name(name, slug), prefix + cmd, scope))
+            gates.append((gname, prefix + cmd, scope))
         for name, cmd, scope, binary in st["optional"]:
             cmd = cmd.format(**subs) if subs else cmd
             if binary and not _which(binary):
@@ -647,6 +648,11 @@ def branches_for_model(model: str, base: dict, names: set) -> dict:
 # it — a rerun replaces the block, it does not append a second one.
 BLOCK_BEGIN = "<!-- og:orchestration:begin -->"
 BLOCK_END = "<!-- og:orchestration:end -->"
+# The markers alone do not identify og's block: they are documented, so a
+# user may well quote them in their own AGENTS.md. This signature, inside
+# the block, is what makes og's own block machine-identifiable — a quoted
+# example carries the markers but not the signature.
+BLOCK_SIGNATURE = "<!-- og:orchestration:signature:v1 -->"
 
 
 def orchestration_block(branches: dict) -> str:
@@ -659,6 +665,7 @@ def orchestration_block(branches: dict) -> str:
     integ = branches.get("integration_base") or "TODO"
     protected = ", ".join(branches.get("protected") or []) or "none"
     return f"""{BLOCK_BEGIN}
+{BLOCK_SIGNATURE}
 
 ## Orchestration
 
@@ -681,37 +688,216 @@ same time corrupt each other.
 """
 
 
-def upsert_agents_block(text: str, block: str) -> str:
-    """Return `text` with the marked block replaced, or the block appended.
+# --- reading and writing somebody else's document --------------------------
+#
+# The marker boundary is a PROMISE about another person's file: og rewrites
+# one span and leaves every other byte alone. Two ways to break that promise
+# are handled here, and both were real bugs:
+#
+#   1. `Path.read_text()` translates CRLF to LF on the way in, so a
+#      CRLF-authored AGENTS.md came back with every line ending rewritten —
+#      a whole-file diff in a file the user never asked og to touch. The
+#      file is therefore read and written as BYTES.
+#   2. A marker pair inside a fenced code block is an EXAMPLE of this
+#      feature, not og's block. Replacing it ate the example and left the
+#      fence unterminated.
+
+
+def _split_lines(text: str) -> list:
+    """Split text into [content, ending] pairs, preserving the endings.
+
+    `str.splitlines()` normalises CRLF away, which is exactly the loss this
+    function exists to prevent: the ending is carried alongside the content
+    so it can be written back unchanged.
+    """
+    lines = []
+    i = 0
+    n = len(text)
+    while i < n:
+        j = text.find("\n", i)
+        if j == -1:
+            lines.append([text[i:], ""])
+            break
+        content = text[i:j]
+        if content.endswith("\r"):
+            lines.append([content[:-1], "\r\n"])
+        else:
+            lines.append([content, "\n"])
+        i = j + 1
+    return lines
+
+
+def _join_lines(lines: list) -> str:
+    return "".join(c + e for c, e in lines)
+
+
+def _dominant_newline(text: str) -> str:
+    """The line ending this document mostly uses.
+
+    A MIXED file stays mixed: this decides what the INSERTED block looks
+    like, never what the user's own lines look like. og does not "fix" a
+    user's line endings.
+    """
+    crlf = text.count("\r\n")
+    lone = text.count("\n") - crlf
+    return "\r\n" if crlf > lone else "\n"
+
+
+# A markdown fence: three or more backticks or tildes, indented by at most
+# three spaces. Anything deeper is an indented code block, not a fence.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _fenced_lines(lines: list) -> set:
+    """The indices of the lines that sit inside a fenced code block.
+
+    A fence is how a user quotes a marker pair when they document this very
+    feature — og's own README does it. A marker inside a fence is an
+    EXAMPLE, and replacing it would eat the example and leave the fence
+    unterminated, which is corruption, not an update.
+    """
+    inside = set()
+    fence = None
+    for i, (content, _) in enumerate(lines):
+        m = _FENCE_RE.match(content)
+        if fence is None:
+            if m:
+                marker = m.group(1)
+                fence = (marker[0], len(marker))
+                inside.add(i)
+        else:
+            inside.add(i)
+            if m:
+                marker = m.group(1)
+                # A closing fence repeats the same character, is at least as
+                # long as the opening one, and carries no info string.
+                if (marker[0] == fence[0] and len(marker) >= fence[1]
+                        and not m.group(2).strip()):
+                    fence = None
+    return inside
+
+
+def _is_marker(content: str, marker: str) -> bool:
+    """True for a line that is exactly the marker, at the start of the line.
+
+    The marker must be at column 0: an indented marker is not og's block,
+    and og does not guess which of several an author meant.
+    """
+    return content.startswith(marker) and not content[len(marker):].strip()
+
+
+def _is_ours(lines: list, begin: int, end) -> bool:
+    """Does this span look like og's own orchestration block?
+
+    Two ways to say yes: the signature is inside it, or its first non-empty
+    line is the block's heading — which is how a block written by an og
+    BEFORE the signature existed is still recognised and updated rather than
+    duplicated.
+
+    A quoted example — a marker pair around the user's own prose — fails
+    both, so og appends its own block and leaves the example alone.
+    """
+    body = range(begin + 1, end if end is not None else len(lines))
+    for i in body:
+        if BLOCK_SIGNATURE in lines[i][0]:
+            return True
+    for i in body:
+        if lines[i][0].strip():
+            return "## Orchestration" in lines[i][0]
+    return False
+
+
+def _find_block(lines: list):
+    """Locate og's own block: (begin index, end index) or None.
+
+    An end index of None means the block was truncated — a begin marker
+    with no end.
+
+    A marker pair alone does not prove the block is og's: the markers are
+    documented, so a user may quote them — in a fenced example, or in
+    prose. Candidates are therefore the pairs that sit OUTSIDE a code
+    fence and look like og's own block (see `_is_ours`), and the last of
+    those is the one that gets replaced. If nothing qualifies, og appends
+    its block instead of overwriting somebody else's text.
+    """
+    fenced = _fenced_lines(lines)
+    begins = [i for i, (c, _) in enumerate(lines)
+              if i not in fenced and _is_marker(c, BLOCK_BEGIN)]
+    ends = [i for i, (c, _) in enumerate(lines)
+            if i not in fenced and _is_marker(c, BLOCK_END)]
+    pairs = []
+    for b in begins:
+        e = next((x for x in ends if x > b), None)
+        if e is not None and _is_ours(lines, b, e):
+            pairs.append((b, e))
+    if pairs:
+        return pairs[-1]
+    # No complete block. A begin marker with no end is a truncated block —
+    # but only og's own, which the heading/signature test recognises. An
+    # unsigned orphan is the user's text, and eating it would be exactly
+    # the kind of damage the marker boundary exists to prevent.
+    orphans = [b for b in begins if not any(e > b for e in ends)]
+    ours = [b for b in orphans if _is_ours(lines, b, None)]
+    if ours:
+        return (ours[-1], None)
+    return None
+
+
+def upsert_agents_block(text: str, block: str, newline: str = None) -> str:
+    """Return `text` with og's block replaced, or the block appended.
 
     The markers are the entire contract for what og may rewrite, so the
     replacement is a single span: the bytes before it and the bytes after it
-    are copied through untouched. This is what makes the operation
-    idempotent — the rerunnable rule in AGENTS.md. A second `og init` finds
-    the markers and replaces the block in place instead of appending another.
+    are copied through untouched, ending for ending. This is what makes the
+    operation idempotent — the rerunnable rule in AGENTS.md. A second
+    `og init` finds og's own block and replaces it in place instead of
+    appending another.
     """
-    # The trailing newline is part of the matched span, so a replacement
-    # reproduces the file byte for byte instead of growing one newline per
-    # run.
-    pattern = re.compile(re.escape(BLOCK_BEGIN) + r".*?" + re.escape(BLOCK_END)
-                         + r"\r?\n?", re.DOTALL)
-    m = pattern.search(text)
-    if m:
-        return text[:m.start()] + block + text[m.end():]
-    # A begin marker with no end marker means the block was truncated by
-    # something else. Replacing to the end of the file repairs it instead of
-    # leaving a half-block behind a second one.
-    m = re.search(re.escape(BLOCK_BEGIN), text)
-    if m:
-        return text[:m.start()] + block
-    if not text:
-        return block
-    if not text.endswith("\n"):
-        text += "\n"
-    # No blank line is inserted before the block: every byte outside the
-    # markers has to survive the write untouched, and a separator would be a
-    # byte og added to the user's document.
-    return text + block
+    if newline is None:
+        newline = _dominant_newline(text)
+    lines = _split_lines(text)
+    # The block's own text is written with the document's line ending, so a
+    # CRLF document does not gain a block with LF endings in the middle of
+    # it.
+    body = [c for c, _ in _split_lines(block.rstrip("\n"))]
+    found = _find_block(lines)
+
+    if found:
+        begin, end = found
+        if end is None:
+            # A truncated block: everything from the begin marker to the end
+            # of the file was og's, and is replaced as a unit.
+            region_end = len(lines)
+            last_ending = lines[-1][1] or newline
+        else:
+            region_end = end + 1
+            # The block's last line keeps the ending the replaced one had.
+            last_ending = lines[end][1] or newline
+        new_lines = [[c, newline] for c in body[:-1]] + [[body[-1], last_ending]]
+        return _join_lines(lines[:begin] + new_lines + lines[region_end:])
+
+    # Append. The block goes at the end, and the user's last line keeps its
+    # own ending — a line without a terminator gets one, because otherwise
+    # the block would be glued onto the user's prose.
+    out = [list(l) for l in lines]
+    if out and out[-1][1] == "":
+        out[-1][1] = newline
+    return _join_lines(out + [[c, newline] for c in body])
+
+
+def write_agents_block(path: Path, block: str) -> str:
+    """Update the marked block in an AGENTS.md without touching other bytes.
+
+    The file is read and written as bytes with no newline translation: a
+    CRLF document that came back with LF endings is a whole-file diff in
+    somebody else's file, and the marker boundary promised that og would
+    not touch a single byte outside it.
+    """
+    raw = path.read_bytes()
+    text = raw.decode("utf-8", "surrogateescape")
+    updated = upsert_agents_block(text, block)
+    path.write_bytes(updated.encode("utf-8", "surrogateescape"))
+    return updated
 
 
 # --- the installed roster, for the cross-vendor review note ----------------
@@ -1146,9 +1332,12 @@ def main() -> None:
             # meant it found nothing about orchestration at all. The markers
             # are the whole contract for what og may rewrite, so the rerun
             # replaces the block in place.
-            before = am.read_text()
-            block = orchestration_block(branches)
-            am.write_text(upsert_agents_block(before, block))
+            #
+            # The write goes through the byte-preserving path: a CRLF
+            # AGENTS.md must come back with its line endings intact, or the
+            # user gets a whole-file diff in a file og was only asked to
+            # add a block to.
+            write_agents_block(am, orchestration_block(branches))
             ok("updated the orchestration block in AGENTS.md")
         else:
             am.write_text(AGENTS_STUB.format(
