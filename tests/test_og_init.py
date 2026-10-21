@@ -8,11 +8,16 @@ Two failure modes are covered here, because both were silent:
   2. Stack detection used to look at the repo root only, so a nested project
      detected nothing at all — which is what emptied `never_write` and
      triggered (1). The two compound, so they are tested together.
+
+The later sections cover the decision surface (`--questions`), the marked
+AGENTS.md block, and the interactive question flow.
 """
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -319,3 +324,123 @@ def test_control_characters_do_not_reach_a_comment(tmp_path):
     assert "\x01" not in body
     data = yaml.safe_load(body)
     assert "gates" in data
+
+
+# --- the decision surface: `og init --questions` ---------------------------
+#
+# `install.sh --questions` hands an AI a schema instead of a transcript of
+# interactive prompts. `og init` had no such surface, so an AI driving it had
+# to scrape a terminal dialogue to learn the same facts.
+
+
+GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+
+def _git_repo(path: Path, extra_branches=()) -> Path:
+    """A real git repo — `og init` refuses to run outside one."""
+    path.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, **GIT_ENV}
+    subprocess.run(["git", "init", "-q", str(path)], check=True,
+                   capture_output=True, env=env)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                   cwd=path, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "x"],
+                   cwd=path, check=True, env=env)
+    for b in extra_branches:
+        subprocess.run(["git", "branch", b], cwd=path, check=False,
+                       capture_output=True, env=env)
+    return path
+
+
+def _run_init(monkeypatch, *args):
+    monkeypatch.setattr(sys, "argv", ["og init", *args])
+    og_init.main()
+
+
+def _no_prompt(monkeypatch):
+    """Make any prompt a hard failure."""
+    def boom(*a, **k):
+        raise AssertionError("og init prompted, but this path must not ask")
+    monkeypatch.setattr("builtins.input", boom)
+
+
+def test_questions_emits_parseable_json_without_a_contract(tmp_path, monkeypatch, capsys):
+    repo = _git_repo(tmp_path / "fresh")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    _no_prompt(monkeypatch)
+
+    _run_init(monkeypatch, "--questions", str(repo))
+
+    payload = json.loads(capsys.readouterr().out)
+    for key in ("detected", "current", "questions", "apply_with"):
+        assert key in payload, payload.keys()
+    assert payload["current"] is None
+    assert payload["detected"]["stacks"][0]["id"] == "python"
+    assert payload["detected"]["gates"], "the detected gates must be reported"
+    assert payload["apply_with"].startswith("og init ")
+
+
+def test_questions_reports_an_existing_contract_as_current(tmp_path, monkeypatch, capsys):
+    repo = _git_repo(tmp_path / "existing")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    _run_init(monkeypatch, str(repo))
+    capsys.readouterr()
+
+    _run_init(monkeypatch, "--questions", str(repo))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["current"] is not None
+    assert payload["current"]["parses"] is True
+    assert payload["current"]["contract"]["branches"]["integration_base"] == "main"
+
+
+def test_questions_reports_a_contract_that_does_not_parse(tmp_path, monkeypatch, capsys):
+    """A contract the loader cannot read is silently IGNORED, so say so."""
+    repo = _git_repo(tmp_path / "broken")
+    _write(repo / ".agents" / "orchestration.yaml", "branches: [oops\n")
+
+    _run_init(monkeypatch, "--questions", str(repo))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["current"]["parses"] is False
+    assert payload["current"]["contract"] is None
+    assert payload["current"]["error"]
+
+
+def test_questions_writes_nothing(tmp_path, monkeypatch, capsys):
+    repo = _git_repo(tmp_path / "readonly")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    before = sorted(p.name for p in repo.iterdir())
+
+    _run_init(monkeypatch, "--questions", str(repo))
+    capsys.readouterr()
+
+    assert sorted(p.name for p in repo.iterdir()) == before
+    assert not (repo / ".agents").exists()
+
+
+def test_questions_offers_exactly_the_three_questions(tmp_path, monkeypatch, capsys):
+    repo = _git_repo(tmp_path / "q")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    _run_init(monkeypatch, "--questions", str(repo))
+
+    payload = json.loads(capsys.readouterr().out)
+    keys = [q["key"] for q in payload["questions"]]
+    assert keys == ["branching_model", "gate_scopes", "gates"]
+    for q in payload["questions"]:
+        assert q["ask"], q
+
+
+def test_questions_states_what_it_decided_itself(tmp_path, monkeypatch, capsys):
+    """The values og must NOT ask about are reported, with the reason."""
+    repo = _git_repo(tmp_path / "d")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    _run_init(monkeypatch, "--questions", str(repo))
+
+    payload = json.loads(capsys.readouterr().out)
+    decided = {d["key"]: d for d in payload["not_asked"]}
+    assert decided["merge_policy.enabled"]["value"] is False
+    assert "branches.task_prefix" in decided
+
+

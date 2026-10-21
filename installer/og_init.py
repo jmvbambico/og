@@ -254,16 +254,31 @@ def node_scripts(repo: Path) -> set:
         return set()
 
 
+def detect_branch_names(repo: Path) -> set:
+    """Every branch name in the repo, local and remote-tracking.
+
+    Kept separate from `detect_branches` because the branching MODEL is a
+    different question from the branch layout: the layout is what the contract
+    needs, the model is what the user has to confirm when the layout does not
+    answer it.
+    """
+    listing = run(["git", "for-each-ref", "--format=%(refname:short)",
+                   "refs/heads", "refs/remotes/origin"], repo) or ""
+    names = set()
+    for b in listing.splitlines():
+        b = b.strip()
+        if not b:
+            continue
+        names.add(b.split("/", 1)[-1] if b.startswith("origin/") else b)
+    return names
+
+
 def detect_branches(repo: Path) -> dict:
     """Read the real branch layout instead of assuming gitflow."""
     out = {"integration_base": None, "protected": [], "task_prefix": "feature/"}
     head = run(["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], repo)
     default = head.rsplit("/", 1)[-1] if head else None
-    branches = set()
-    listing = run(["git", "for-each-ref", "--format=%(refname:short)",
-                   "refs/heads", "refs/remotes/origin"], repo) or ""
-    for b in listing.splitlines():
-        branches.add(b.split("/", 1)[-1] if b.startswith("origin/") else b)
+    branches = detect_branch_names(repo)
     if not default:
         default = "main" if "main" in branches else ("master" if "master" in branches else None)
 
@@ -557,6 +572,251 @@ release), and anything touching money or customer data.
 """
 
 
+# --------------------------------------------------------------------------
+# The decision schema (`--questions`) and the interactive flow.
+#
+# `install.sh --questions` hands an AI a machine-readable schema instead of a
+# transcript of interactive prompts. `og init` had no such surface, so an AI
+# driving it had to scrape a terminal dialogue to learn the same facts — the
+# asymmetry that made this whole feature undrivable by anything but a human
+# at a keyboard. `--questions` closes it: the same shape, measured from THIS
+# repo.
+#
+# The rule the flow follows is og's own: measure first, ask only what is
+# genuinely the user's to answer. Everything og can detect, og decides and
+# says so out loud; only the three questions below are asked, and only the
+# ones the answer to which changes what is written.
+# --------------------------------------------------------------------------
+
+BRANCHING_MODELS = ["gitflow", "github-flow", "trunk-release", "custom"]
+
+BRANCHING_LABELS = {
+    "gitflow": "GitFlow — integration on develop, releases cut from main",
+    "github-flow": "GitHub Flow — short-lived branches merged into main",
+    "trunk-release": "Trunk + release branches — main plus release/*",
+    "custom": "Custom — I will set the branches by hand",
+}
+
+
+def detect_branching_model(names: set):
+    """The branching model the branch layout implies, or None if it is unclear.
+
+    A `dev`/`develop` branch is a gitflow repo; a repo whose only branch is
+    `main` is github flow. Anything in between — several unrelated branches,
+    no default branch at all — is genuinely ambiguous, and that is the only
+    case where the question is worth asking.
+    """
+    if names & {"dev", "develop"}:
+        return "gitflow"
+    if names and names <= {"main", "master"}:
+        return "github-flow"
+    return None
+
+
+# --- the installed roster, for the cross-vendor review note ----------------
+#
+# `require_cross_vendor_review` is true in every generated contract, but the
+# gate can only see a cross-vendor review in the PR body. Whether one is
+# POSSIBLE depends on the installed roster, which lives in the installer's
+# state file, not in the repo. Reporting it here is the difference between
+# the user learning it at review time and learning it now.
+MODEL_FAMILIES = (("claude", "anthropic"), ("sonnet", "anthropic"),
+                  ("opus", "anthropic"), ("haiku", "anthropic"),
+                  ("gpt", "openai"), ("o1", "openai"), ("o3", "openai"),
+                  ("gemini", "google"), ("deepseek", "deepseek"),
+                  ("qwen", "alibaba"), ("llama", "meta"),
+                  ("mistral", "mistral"), ("kimi", "moonshot"),
+                  ("grok", "xai"))
+
+
+def _model_vendor(model):
+    if not model:
+        return None
+    low = str(model).lower()
+    for needle, vendor in MODEL_FAMILIES:
+        if needle in low:
+            return vendor
+    return None
+
+
+def read_roster():
+    """The installed agents and their vendors, or None if there is no install.
+
+    Cheap by construction: one JSON file the installer already wrote, plus
+    the registry next to this script. The model-family heuristic is
+    deliberately conservative — when it cannot place a model, the registry
+    vendor is used.
+    """
+    state_path = Path(os.environ.get("OMNIGENT_HOME", Path.home() / ".omnigent")) \
+        / "og-install.json"
+    try:
+        state = json.loads(state_path.read_text())
+    except Exception:
+        return None
+    try:
+        registry = {a["id"]: a for a in
+                    (json.loads((Path(__file__).resolve().parent / "registry.json")
+                                .read_text()).get("agents") or [])}
+    except Exception:
+        registry = {}
+    entries = []
+    # The state file's own key names, mapped to the role they mean: the
+    # installer writes `coders`, not `coder`.
+    for state_key, role in (("coders", "coder"), ("reviewer", "reviewer")):
+        for e in (state.get(state_key) or []):
+            if not isinstance(e, dict):
+                continue
+            reg = registry.get(e.get("id")) or {}
+            vendor = _model_vendor(e.get("model")) or reg.get("vendor")
+            entries.append({"role": role, "id": e.get("id"),
+                            "model": e.get("model"), "vendor": vendor})
+    coder_vendors = {e["vendor"] for e in entries
+                     if e["role"] == "coder" and e["vendor"]}
+    reviewer_vendors = {e["vendor"] for e in entries
+                        if e["role"] == "reviewer" and e["vendor"]}
+    return {
+        "state_file": str(state_path),
+        "agents": entries,
+        "vendors": sorted({e["vendor"] for e in entries if e["vendor"]}),
+        "cross_vendor_review_possible": bool(coder_vendors)
+        and bool(reviewer_vendors - coder_vendors),
+    }
+
+
+def read_current(repo: Path):
+    """The contract that already exists in this repo, if any.
+
+    `parses: false` is reported rather than raised: a contract that does not
+    parse is silently ignored by the policy loader, so every gate and every
+    protected branch in it is dead. A caller that sees this can say so.
+    """
+    path = repo / ".agents" / "orchestration.yaml"
+    if not path.exists():
+        return None
+    rel = str(path.relative_to(repo))
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as e:
+        return {"path": rel, "parses": False, "error": str(e), "contract": None}
+    return {"path": rel, "parses": True, "error": None, "contract": data}
+
+
+def _q_gates(gates):
+    return [{"name": n, "run": c, "scope": s} for n, c, s in gates]
+
+
+def build_questions(gates, names) -> list:
+    """The decision schema, mirroring `install.sh --questions`.
+
+    Mirrored: `key`, `type`, `default`, `ask`, `choices`. Dropped from the
+    installer: `prompt_ceiling_bytes` and the agent `registry` (installer
+    concerns, not repo concerns), `detected_multiplexers` and `multiplexers`
+    (a machine concern), and the per-question `current` field (the saved
+    state is a top-level `current` here too, because the contract is the state
+    this command has).
+    """
+    detected_model = detect_branching_model(names)
+    return [
+        {
+            "key": "branching_model",
+            "type": "choice",
+            "choices": list(BRANCHING_MODELS),
+            "default": detected_model or ("github-flow" if names & {"main", "master"}
+                                          else "gitflow"),
+            # `detected: true` means the layout answered it — say so and move
+            # on rather than asking a question with a known answer.
+            "detected": bool(detected_model),
+            "ask": "Which branching model does this repo use? It sets `protected`, "
+                   "which is what the merge gate DENYS on. A `dev`/`develop` "
+                   "branch means GitFlow; a repo whose only branch is `main` "
+                   "means GitHub Flow.",
+        },
+        {
+            "key": "gate_scopes",
+            "type": "per_gate",
+            "choices": ["worker", "integration"],
+            "gates": _q_gates(gates),
+            "ask": "For each gate: does it touch a shared database, a fixed port, "
+                   "or the network? If it does, it must be integration-only — "
+                   "parallel workers running it at the same time corrupt each "
+                   "other. This is the question og cannot answer by looking.",
+        },
+        {
+            "key": "gates",
+            "type": "gate_list",
+            "default": [n for n, _, _ in gates],
+            "gates": _q_gates(gates),
+            "ask": "Confirm the detected gates. A wrong gate command is worse "
+                   "than a missing one, because the orchestrator quotes the "
+                   "contract back and runs exactly what it says. Delete any "
+                   "that are wrong; og proposes nothing that was not detected.",
+        },
+    ]
+
+
+def emit_questions(repo: Path, stacks, branches, gates, high_risk, never_write,
+                   notes, names) -> None:
+    """Print the decision schema as JSON. Read-only: nothing is written."""
+    detected_model = detect_branching_model(names)
+    roster = read_roster()
+    warnings = []
+    if roster is not None and not roster["cross_vendor_review_possible"]:
+        warnings.append(
+            "the installed roster holds one vendor, so `require_cross_vendor_review: "
+            "true` cannot be satisfied — a review will be same-vendor and the PR "
+            "must be labelled `degraded-review`")
+    payload = {
+        "repo": {"path": str(repo), "name": repo.name},
+        "detected": {
+            "stacks": [{"id": s["id"], "label": s["label"], "dir": s.get("dir", "")}
+                       for s in stacks],
+            "gates": _q_gates(gates),
+            "branches": {
+                "integration_base": branches.get("integration_base"),
+                "protected": branches.get("protected", []),
+                "task_prefix": branches.get("task_prefix"),
+                "all": sorted(names),
+                "branching_model": detected_model,
+            },
+            "high_risk_paths": list(dict.fromkeys(high_risk)),
+            "never_write": list(dict.fromkeys(never_write)),
+            "notes": notes,
+        },
+        "current": read_current(repo),
+        "questions": build_questions(gates, names),
+        # The things og decided rather than asked about, with the reason, so
+        # a caller driving from this schema does not go and ask them either.
+        "not_asked": [
+            {"key": "merge_policy.enabled", "value": False,
+             "why": "every merge stays a human's decision until the gates have "
+                    "been watched on real PRs"},
+            {"key": "merge_policy.max_diff_lines", "value": 400,
+             "why": "a starting point; recalibrate from real PR history"},
+            {"key": "merge_policy.max_diff_files", "value": 15,
+             "why": "a starting point; recalibrate from real PR history"},
+            {"key": "branches.task_prefix", "value": branches.get("task_prefix"),
+             "why": "derived from the branch names already in the repo"},
+            {"key": "merge_policy.high_risk_paths",
+             "value": "stack files plus .github/workflows",
+             "why": "derived from the detected stack and the CI definition"},
+        ],
+        "roster": roster,
+        "warnings": warnings,
+        "plan": {
+            "branching_model": "one of " + ", ".join(BRANCHING_MODELS),
+            "gates": "list of {name, run, scope} — scope null means "
+                     "integration-only; omit to keep the detected gates",
+            "gate_scopes": "map of gate name -> 'worker' | 'integration', if the "
+                           "scopes are answered without replacing the gate list",
+            "branches": {"integration_base": "main", "protected": [],
+                         "task_prefix": "feature/"},
+            "note": "either `gates` or `gate_scopes` (or both) may be given",
+        },
+        "apply_with": "og init --plan answers.json",
+    }
+    print(json.dumps(payload, indent=2, default=str))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="og init", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -564,6 +824,8 @@ def main() -> None:
     ap.add_argument("--force", action="store_true", help="overwrite an existing contract")
     ap.add_argument("--print", dest="show", action="store_true",
                     help="print the contract instead of writing it")
+    ap.add_argument("--questions", action="store_true",
+                    help="emit the decision schema as JSON (for an AI)")
     ap.add_argument("--no-agents-md", action="store_true", help="skip the AGENTS.md stub")
     args = ap.parse_args()
 
@@ -577,6 +839,16 @@ def main() -> None:
     stacks = detect_stacks(repo)
     branches = detect_branches(repo)
     gates, high_risk, never_write, notes = build_gates(repo, stacks)
+    names = detect_branch_names(repo)
+
+    # `--questions` is a query, exactly like `--print`: it measures and
+    # reports, and writes nothing. It runs before the summary lines so its
+    # stdout is JSON and nothing else — a caller piping it into a JSON parser
+    # must not have to strip prose first.
+    if args.questions:
+        emit_questions(repo, stacks, branches, gates, high_risk, never_write,
+                       notes, names)
+        return
 
     info(f"repo        {repo}")
     info(f"stack       {', '.join(_stack_label(s) for s in stacks) or 'none detected'}")
@@ -587,8 +859,8 @@ def main() -> None:
     for n in notes:
         warn(n)
 
-    body = render(repo, branches, gates, high_risk, never_write, stacks, notes)
     if args.show:
+        body = render(repo, branches, gates, high_risk, never_write, stacks, notes)
         print()
         print(body)
         return
@@ -597,6 +869,8 @@ def main() -> None:
     if target.exists() and not args.force:
         die(f"{target.relative_to(repo)} already exists. Re-run with --force to replace it, "
             "or --print to see what would be generated.")
+
+    body = render(repo, branches, gates, high_risk, never_write, stacks, notes)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body)
     ok(f"wrote {target.relative_to(repo)}")
