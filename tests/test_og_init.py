@@ -14,6 +14,7 @@ AGENTS.md block, and the interactive question flow.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shlex
@@ -1268,3 +1269,108 @@ def test_a_signed_block_inside_a_fence_is_og_s_own():
 
     assert out.count(og_init.BLOCK_BEGIN) == 1
     assert out.count(og_init.BLOCK_SIGNATURE) == 1
+
+
+# --- round 5: a signature alone is a quotation, not a block -----------------
+#
+# The signature identifies WHICH block is og's; it does not say that a
+# block exists. Only a begin marker says og wrote this — without one, a
+# pasted signature line must not take the rest of the file with it.
+
+
+def test_a_bare_signature_line_is_not_og_s_block():
+    doc = "# Mine\n" + og_init.BLOCK_SIGNATURE + "\nIMPORTANT USER TEXT\n"
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "IMPORTANT USER TEXT" in out
+    assert out.count(og_init.BLOCK_BEGIN) == 1, "og's block is appended beside it"
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_a_bare_signature_line_before_the_user_text_is_not_og_s_block():
+    doc = "# Mine\nIMPORTANT USER TEXT\n" + og_init.BLOCK_SIGNATURE + "\n"
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "IMPORTANT USER TEXT" in out
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+
+
+def test_three_runs_over_a_bare_signature_leave_one_block():
+    doc = "# Mine\n" + og_init.BLOCK_SIGNATURE + "\nIMPORTANT USER TEXT\n"
+    for _ in range(3):
+        doc = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert doc.count(og_init.BLOCK_BEGIN) == 1
+    assert doc.count(og_init.BLOCK_SIGNATURE) == 2, "the quotation and og's block"
+    assert "IMPORTANT USER TEXT" in doc
+
+
+def test_a_signature_quoted_inline_is_not_og_s_block():
+    doc = ("# Mine\n\nI use " + og_init.BLOCK_SIGNATURE + " in my docs.\n\n"
+           "IMPORTANT USER TEXT\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "IMPORTANT USER TEXT" in out
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+
+
+def test_a_bare_signature_after_og_s_own_block_does_not_hijack_it():
+    """The block's own signature wins; the pasted one is left alone."""
+    doc = _with_block("\n" + og_init.BLOCK_SIGNATURE + "\nIMPORTANT USER TEXT\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "IMPORTANT USER TEXT" in out
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_a_truncated_signed_block_is_still_repaired():
+    """The no-regression case: the begin marker is present, so it is og's."""
+    truncated = og_init.upsert_agents_block("# Mine\n", BLOCK).replace(
+        og_init.BLOCK_END + "\n", "")
+    out = og_init.upsert_agents_block(truncated, BLOCK)
+
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+    assert out.count(og_init.BLOCK_SIGNATURE) == 1
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_a_bare_signature_before_og_s_own_block_does_not_hide_it():
+    """The quotation must not make the real block invisible."""
+    doc = og_init.BLOCK_SIGNATURE + "\n```\n" + BLOCK
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert out.count(BLOCK) == 1, "og's block is updated in place, not duplicated"
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+# A property test over the arrangements that matter: whatever the document
+# is made of, the user's text survives, og's block is never duplicated, and
+# a second run changes nothing.
+_DOC_PIECES = {
+    "pre": "# Mine\nSENTINEL PRE\n",
+    "signed_block": BLOCK,
+    "legacy_block": BLOCK.replace(og_init.BLOCK_SIGNATURE + "\n", "", 1),
+    "bare_signature": og_init.BLOCK_SIGNATURE + "\n",
+    "quoted_pair": (og_init.BLOCK_BEGIN + "\nSENTINEL QUOTED\n"
+                    + og_init.BLOCK_END + "\n"),
+    "fingerprint_pair": (og_init.BLOCK_BEGIN + "\n\n## Orchestration\n\n"
+                         + og_init.BLOCK_FINGERPRINT + " and more\n"
+                         + og_init.BLOCK_END + "\n"),
+    "open_fence": "```\n",
+    "post": "SENTINEL POST\n",
+}
+
+
+@pytest.mark.parametrize("combo", sorted(
+    itertools.permutations(_DOC_PIECES, 3),
+    key=lambda c: (len(c), c)))
+def test_no_arrangement_loses_text_or_duplicates_the_block(combo):
+    doc = "".join(_DOC_PIECES[c] for c in combo)
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    for line in ("SENTINEL PRE", "SENTINEL POST", "SENTINEL QUOTED"):
+        if line in doc:
+            assert line in out, f"{combo} lost {line}"
+    assert out.count(BLOCK) <= 1, f"{combo} duplicated og's block"
+    assert og_init.upsert_agents_block(out, BLOCK) == out, f"{combo} is not idempotent"

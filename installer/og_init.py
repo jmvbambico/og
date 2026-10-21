@@ -864,14 +864,35 @@ def _signed_block(lines: list):
     # them is inside a fence (the document ends inside an open one), the
     # last is taken.
     unfenced = [s for s in sigs if s not in inside]
-    s = (unfenced or sigs)[-1]
-    begins = [i for i in range(s) if lines[i][0].strip() == BLOCK_BEGIN]
-    ends = [i for i in range(s + 1, len(lines)) if lines[i][0].strip() == BLOCK_END]
-    if ends:
-        return (begins[-1] if begins else s, ends[0])
-    # Truncated: the end marker is gone, so the block runs to the end of
-    # the file.
-    return (begins[-1] if begins else s, None)
+    # A signature outside any fence is og's own first, but a signature that
+    # turns out to have no begin marker of its own must not hide a real
+    # block that happens to sit inside one — the document ending inside an
+    # open fence puts og's own block inside it.
+    for s in (list(reversed(unfenced))
+              + list(reversed([x for x in sigs if x in inside]))):
+        # The begin marker must belong to the SAME block. A begin marker
+        # that sits before an already-closed block's end marker belongs to
+        # that block, not to this signature.
+        last_end = max((i for i in range(s)
+                        if lines[i][0].strip() == BLOCK_END), default=-1)
+        begins = [i for i in range(s)
+                  if lines[i][0].strip() == BLOCK_BEGIN and i > last_end]
+        if not begins:
+            # A signature with no begin marker of its own is a QUOTATION,
+            # not a block: somebody pasted the line. Only a begin marker
+            # says og wrote this — without one, og appends its own block
+            # beside the quotation instead of replacing everything from
+            # that line to the end of the file, which would delete text
+            # og does not own.
+            continue
+        ends = [i for i in range(s + 1, len(lines))
+                if lines[i][0].strip() == BLOCK_END]
+        if ends:
+            return (begins[-1], ends[0])
+        # Truncated: the end marker is gone, so the block runs to the end
+        # of the file.
+        return (begins[-1], None)
+    return None
 
 
 def _legacy_block(lines: list):
