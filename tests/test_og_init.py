@@ -984,15 +984,29 @@ def test_a_shared_state_suite_flags_the_unit_gate(tmp_path):
 
 
 def test_a_legacy_block_without_the_signature_is_still_replaced():
-    """A block written by an og from before the signature existed."""
-    legacy = ("# Mine\n\n" + og_init.BLOCK_BEGIN + "\n\n## Orchestration\n\n"
-              "old body\n" + og_init.BLOCK_END + "\n")
+    """A block written by an og from before the signature existed.
+
+    The legacy shape is today's block minus its signature line, which is
+    exactly what the og of round 1 wrote.
+    """
+    legacy = "# Mine\n\n" + BLOCK.replace(og_init.BLOCK_SIGNATURE + "\n", "", 1)
     out = og_init.upsert_agents_block(legacy, BLOCK)
 
-    assert "old body" not in out
     assert out.count(og_init.BLOCK_BEGIN) == 1
     assert og_init.BLOCK_SIGNATURE in out
     assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_a_users_own_orchestration_section_is_not_taken_over():
+    """A heading called "## Orchestration" is not og's block."""
+    doc = ("# Mine\n\n" + og_init.BLOCK_BEGIN + "\n\n## Orchestration\n\n"
+           "the user's own words about how this repo works\n"
+           + og_init.BLOCK_END + "\n")
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "the user's own words" in out
+    assert og_init.BLOCK_SIGNATURE in out, "og's block is appended beside it"
+    assert out.count(og_init.BLOCK_BEGIN) == 2
 
 
 def test_an_unfenced_unsigned_pair_is_not_replaced():
@@ -1128,3 +1142,129 @@ def test_prompt_does_not_substitute_a_default_on_eof(monkeypatch):
     monkeypatch.setattr("builtins.input", boom)
     with pytest.raises(EOFError):
         og_init._prompt("question: ", "default")
+
+
+# --- round 4: identity comes from the signature, not from the fences --------
+#
+# The fence rule was added to protect a quoted example, and it ended up
+# able to duplicate the block forever and to delete the user's text past
+# it. The signature is what identifies og's block; fence-awareness is only
+# how a block written before the signature existed is recognised.
+
+
+def _with_block(text=""):
+    """A document with og's block already in it."""
+    return "# Mine\n\n" + BLOCK + text
+
+
+FENCE_ARRANGEMENTS = {
+    # An unterminated fence BEFORE the block: the block lands inside it.
+    "fence_before": "# Mine\n```\n",
+    # An unterminated fence AFTER the block.
+    "fence_after": _with_block("\n```\nuser text after\n"),
+    # An unterminated fence INSIDE the block, with the user's text after.
+    "fence_inside": _with_block("\nUSER TAIL TEXT\n").replace(
+        "## Orchestration", "## Orchestration\n```", 1),
+    # A tilde fence.
+    "tilde_fence": "# Mine\n~~~\n",
+    # A fence with an info string.
+    "info_string": "# Mine\n```python\ncode()\n```\n",
+    # Three spaces of indent is still a fence.
+    "indent3": "# Mine\n   ```\n",
+    # Four spaces of indent is an indented code block, NOT a fence.
+    "indent4": "# Mine\n    ```\n",
+    # A proper, closed fence around a quoted example.
+    "quoted_example": ("# Mine\n\n```\n" + og_init.BLOCK_BEGIN + "\n"
+                       "example content\n" + og_init.BLOCK_END + "\n```\n"),
+}
+
+
+# A quoted example legitimately contains the marker text; what must never
+# happen is a second og BLOCK.
+EXPECTED_MARKERS = {"quoted_example": 2}
+
+
+@pytest.mark.parametrize("case", sorted(FENCE_ARRANGEMENTS))
+def test_the_block_count_is_one_under_every_fence_arrangement(case):
+    doc = FENCE_ARRANGEMENTS[case]
+    for _ in range(3):
+        doc = og_init.upsert_agents_block(doc, BLOCK)
+        assert doc.count(og_init.BLOCK_SIGNATURE) == 1, case
+        assert doc.count(og_init.BLOCK_BEGIN) == \
+            EXPECTED_MARKERS.get(case, 1), case
+
+
+@pytest.mark.parametrize("case", sorted(FENCE_ARRANGEMENTS))
+def test_the_result_stops_changing_after_the_first_run(case):
+    doc = FENCE_ARRANGEMENTS[case]
+    once = og_init.upsert_agents_block(doc, BLOCK)
+    twice = og_init.upsert_agents_block(once, BLOCK)
+    assert twice == once, case
+
+
+def test_user_text_past_an_unterminated_fence_survives():
+    """The block-2 regression: the tail must not be deleted."""
+    doc = _with_block("\nUSER TAIL TEXT\n").replace(
+        "## Orchestration", "## Orchestration\n```", 1)
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "USER TAIL TEXT" in out
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+
+
+def test_user_text_past_an_unterminated_fence_before_the_block_survives():
+    doc = "# Mine\n```\n" + "USER TEXT\n" + BLOCK
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "USER TEXT" in out
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+
+
+def test_a_quoted_example_is_still_left_alone():
+    """The round-2 behaviour survives the new identity rule."""
+    doc = FENCE_ARRANGEMENTS["quoted_example"]
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert "example content" in out
+    assert out.count("```") == 2
+    assert out.count(og_init.BLOCK_BEGIN) == 2, "the example and og's block"
+
+
+def test_cr_only_endings_update_in_place():
+    """A classic-Mac document is a document, not one long line."""
+    cr = og_init.upsert_agents_block("# Mine\n", BLOCK).replace("\n", "\r")
+    out = og_init.upsert_agents_block(cr, BLOCK)
+
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+    assert "\r" in out
+    assert "\n" not in out, "the CR endings must survive"
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_a_cr_only_document_keeps_its_endings_when_the_block_is_added():
+    doc = "# Mine\r"
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+    assert "\n" not in out
+    assert out.endswith("og:orchestration:end -->\r")
+
+
+def test_the_block_is_never_appended_inside_an_open_fence():
+    """og's block must be readable, not swallowed by the user's code block."""
+    doc = "# Mine\n```\nsome code\n"
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    # The fence is closed, so the block is outside it.
+    assert out.count("```") == 2
+    assert out.index("og:orchestration:begin") > out.rindex("```")
+    assert og_init.upsert_agents_block(out, BLOCK) == out
+
+
+def test_a_signed_block_inside_a_fence_is_og_s_own():
+    """A signed block is og's block wherever it sits."""
+    doc = "# Mine\n\n```\n" + BLOCK + "```\n"
+    out = og_init.upsert_agents_block(doc, BLOCK)
+
+    assert out.count(og_init.BLOCK_BEGIN) == 1
+    assert out.count(og_init.BLOCK_SIGNATURE) == 1

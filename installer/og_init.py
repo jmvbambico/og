@@ -682,6 +682,11 @@ BLOCK_END = "<!-- og:orchestration:end -->"
 # the block, is what makes og's own block machine-identifiable — a quoted
 # example carries the markers but not the signature.
 BLOCK_SIGNATURE = "<!-- og:orchestration:signature:v1 -->"
+# The first sentence of og's own block. It is the FINGERPRINT: it is what
+# tells a block written by a pre-signature og apart from a section a user
+# wrote themselves under the same heading, and it is why the two must not be
+# edited apart.
+BLOCK_FINGERPRINT = "`.agents/orchestration.yaml` is the machine-readable contract:"
 
 
 def orchestration_block(branches: dict) -> str:
@@ -698,7 +703,7 @@ def orchestration_block(branches: dict) -> str:
 
 ## Orchestration
 
-`.agents/orchestration.yaml` is the machine-readable contract: the gates and
+{BLOCK_FINGERPRINT} the gates and
 their scope, the protected branches, the integration base, and the paths an
 implementer must not touch. Read it before planning, and run exactly the
 commands it names — a gate that looks wrong is fixed there, not improvised.
@@ -737,22 +742,29 @@ def _split_lines(text: str) -> list:
 
     `str.splitlines()` normalises CRLF away, which is exactly the loss this
     function exists to prevent: the ending is carried alongside the content
-    so it can be written back unchanged.
+    so it can be written back unchanged. A lone CR is a line ending too —
+    classic-Mac files are still classic-Mac files, and a document whose
+    endings are not recognised is a document whose markers cannot be found.
     """
     lines = []
     i = 0
     n = len(text)
     while i < n:
-        j = text.find("\n", i)
-        if j == -1:
+        lf = text.find("\n", i)
+        cr = text.find("\r", i)
+        if lf == -1 and cr == -1:
             lines.append([text[i:], ""])
             break
-        content = text[i:j]
-        if content.endswith("\r"):
-            lines.append([content[:-1], "\r\n"])
+        if cr != -1 and (lf == -1 or cr < lf):
+            if text.startswith("\r\n", cr):
+                lines.append([text[i:cr], "\r\n"])
+                i = cr + 2
+            else:
+                lines.append([text[i:cr], "\r"])
+                i = cr + 1
         else:
-            lines.append([content, "\n"])
-        i = j + 1
+            lines.append([text[i:lf], "\n"])
+            i = lf + 1
     return lines
 
 
@@ -768,8 +780,13 @@ def _dominant_newline(text: str) -> str:
     user's line endings.
     """
     crlf = text.count("\r\n")
-    lone = text.count("\n") - crlf
-    return "\r\n" if crlf > lone else "\n"
+    lf = text.count("\n") - crlf
+    cr = text.count("\r") - crlf
+    if crlf >= lf and crlf >= cr and crlf:
+        return "\r\n"
+    if cr > lf:
+        return "\r"
+    return "\n"
 
 
 # A markdown fence: three or more backticks or tildes, indented by at most
@@ -777,13 +794,13 @@ def _dominant_newline(text: str) -> str:
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
-def _fenced_lines(lines: list) -> set:
-    """The indices of the lines that sit inside a fenced code block.
+def _fence_state(lines: list) -> tuple:
+    """(the lines inside a fence, the fence still open at the end or None).
 
     A fence is how a user quotes a marker pair when they document this very
-    feature — og's own README does it. A marker inside a fence is an
-    EXAMPLE, and replacing it would eat the example and leave the fence
-    unterminated, which is corruption, not an update.
+    feature — og's own README does it. The open fence matters too: a
+    document that ends inside one is a document og must not write its block
+    into.
     """
     inside = set()
     fence = None
@@ -803,73 +820,102 @@ def _fenced_lines(lines: list) -> set:
                 if (marker[0] == fence[0] and len(marker) >= fence[1]
                         and not m.group(2).strip()):
                     fence = None
-    return inside
+    return inside, fence
 
 
 def _is_marker(content: str, marker: str) -> bool:
-    """True for a line that is exactly the marker, at the start of the line.
+    """True for a line that is exactly the marker, whatever its indentation.
 
-    The marker must be at column 0: an indented marker is not og's block,
-    and og does not guess which of several an author meant.
+    Used for the SIGNED path, where the signature has already proved the
+    block is og's: the markers around it are then only anchors, and an
+    indented one still delimits og's block.
+    """
+    return content.strip() == marker
+
+
+def _is_column0_marker(content: str, marker: str) -> bool:
+    """True for a marker at the very start of the line.
+
+    Used for the LEGACY path, where the markers are the only evidence: an
+    indented marker is somebody's quoted text, not a block to rewrite.
     """
     return content.startswith(marker) and not content[len(marker):].strip()
 
 
-def _is_ours(lines: list, begin: int, end) -> bool:
-    """Does this span look like og's own orchestration block?
+def _signed_block(lines: list):
+    """og's own block, found by its signature: (begin, end) or None.
 
-    Two ways to say yes: the signature is inside it, or its first non-empty
-    line is the block's heading — which is how a block written by an og
-    BEFORE the signature existed is still recognised and updated rather than
-    duplicated.
+    The signature is AUTHORITATIVE. It is not something a user types by
+    accident, so a block that carries it is og's block, wherever it sits —
+    inside a code fence, indented, at the end of the file. Fence-awareness
+    is deliberately NOT applied here: a fence that is never closed would
+    otherwise hide og's own block from og, and every run would append
+    another one.
 
-    A quoted example — a marker pair around the user's own prose — fails
-    both, so og appends its own block and leaves the example alone.
+    An end index of None means the block was truncated — the end marker is
+    gone — and everything from the begin marker on was og's.
     """
-    body = range(begin + 1, end if end is not None else len(lines))
-    for i in body:
-        if BLOCK_SIGNATURE in lines[i][0]:
-            return True
-    for i in body:
-        if lines[i][0].strip():
-            return "## Orchestration" in lines[i][0]
-    return False
+    sigs = [i for i, (c, _) in enumerate(lines) if c.strip() == BLOCK_SIGNATURE]
+    if not sigs:
+        return None
+    inside, _ = _fence_state(lines)
+    # A document can hold two signed blocks only if the user pasted one
+    # somewhere. og's own is the one outside any fence; if every one of
+    # them is inside a fence (the document ends inside an open one), the
+    # last is taken.
+    unfenced = [s for s in sigs if s not in inside]
+    s = (unfenced or sigs)[-1]
+    begins = [i for i in range(s) if lines[i][0].strip() == BLOCK_BEGIN]
+    ends = [i for i in range(s + 1, len(lines)) if lines[i][0].strip() == BLOCK_END]
+    if ends:
+        return (begins[-1] if begins else s, ends[0])
+    # Truncated: the end marker is gone, so the block runs to the end of
+    # the file.
+    return (begins[-1] if begins else s, None)
+
+
+def _legacy_block(lines: list):
+    """A block written by an og from before the signature existed.
+
+    Narrow on purpose. This path is the ONLY one where a pair of markers
+    can be mistaken for og's block, so it demands three things: no signed
+    block anywhere in the document, the pair outside any code fence, and
+    og's OWN paragraph inside it — not merely a heading called
+    "## Orchestration", which a user may well have written themselves.
+    """
+    inside, _ = _fence_state(lines)
+    begins = [i for i, (c, _) in enumerate(lines)
+              if i not in inside and _is_column0_marker(c, BLOCK_BEGIN)]
+    ends = [i for i, (c, _) in enumerate(lines)
+            if i not in inside and _is_column0_marker(c, BLOCK_END)]
+    pairs = []
+    for b in begins:
+        e = next((x for x in ends if x > b), None)
+        if e is not None:
+            pairs.append((b, e))
+    if not pairs:
+        return None
+    # The LAST pair that carries og's own paragraph is og's: og appends its
+    # block at the end of the document, and a user's own section under the
+    # same heading does not carry the paragraph.
+    for b, e in reversed(pairs):
+        body = " ".join(lines[i][0] for i in range(b + 1, e))
+        if BLOCK_FINGERPRINT in body:
+            return (b, e)
+    return None
 
 
 def _find_block(lines: list):
     """Locate og's own block: (begin index, end index) or None.
 
-    An end index of None means the block was truncated — a begin marker
-    with no end.
-
-    A marker pair alone does not prove the block is og's: the markers are
-    documented, so a user may quote them — in a fenced example, or in
-    prose. Candidates are therefore the pairs that sit OUTSIDE a code
-    fence and look like og's own block (see `_is_ours`), and the last of
-    those is the one that gets replaced. If nothing qualifies, og appends
-    its block instead of overwriting somebody else's text.
+    The signature decides. Fence-awareness is only how a block written by a
+    pre-signature og is recognised, because that is the one case where the
+    markers are the only evidence there is.
     """
-    fenced = _fenced_lines(lines)
-    begins = [i for i, (c, _) in enumerate(lines)
-              if i not in fenced and _is_marker(c, BLOCK_BEGIN)]
-    ends = [i for i, (c, _) in enumerate(lines)
-            if i not in fenced and _is_marker(c, BLOCK_END)]
-    pairs = []
-    for b in begins:
-        e = next((x for x in ends if x > b), None)
-        if e is not None and _is_ours(lines, b, e):
-            pairs.append((b, e))
-    if pairs:
-        return pairs[-1]
-    # No complete block. A begin marker with no end is a truncated block —
-    # but only og's own, which the heading/signature test recognises. An
-    # unsigned orphan is the user's text, and eating it would be exactly
-    # the kind of damage the marker boundary exists to prevent.
-    orphans = [b for b in begins if not any(e > b for e in ends)]
-    ours = [b for b in orphans if _is_ours(lines, b, None)]
-    if ours:
-        return (ours[-1], None)
-    return None
+    signed = _signed_block(lines)
+    if signed:
+        return signed
+    return _legacy_block(lines)
 
 
 def upsert_agents_block(text: str, block: str, newline: str = None) -> str:
@@ -897,7 +943,7 @@ def upsert_agents_block(text: str, block: str, newline: str = None) -> str:
             # A truncated block: everything from the begin marker to the end
             # of the file was og's, and is replaced as a unit.
             region_end = len(lines)
-            last_ending = lines[-1][1] or newline
+            last_ending = (lines[-1][1] or newline) if lines else newline
         else:
             region_end = end + 1
             # The block's last line keeps the ending the replaced one had.
@@ -911,6 +957,14 @@ def upsert_agents_block(text: str, block: str, newline: str = None) -> str:
     out = [list(l) for l in lines]
     if out and out[-1][1] == "":
         out[-1][1] = newline
+    # Never append INSIDE an open fence. A block written into a code block
+    # is a block nobody can read — and, worse, one the next run cannot see,
+    # because the fence that hides it is never closed. So the fence is
+    # closed first: the user's own text stays inside it, exactly as it was,
+    # and og's block lands outside.
+    _, open_fence = _fence_state(out)
+    if open_fence:
+        out.append([open_fence[0] * open_fence[1], newline])
     return _join_lines(out + [[c, newline] for c in body])
 
 
