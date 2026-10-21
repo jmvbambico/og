@@ -894,3 +894,58 @@ def test_ensure_project_finds_an_agent_beyond_the_first_agents_page(tmp_path):
         assert Stub.patched["config"]["host_id"] == "h1"
     finally:
         srv.shutdown()
+
+
+# wait_host_online / restart_host_daemon -- og start recovers by itself
+# --------------------------------------------------------------------------
+def test_wait_host_online_returns_as_soon_as_the_host_registers(tmp_path):
+    """start_host_daemon exits 0 when the daemon is RUNNING but has not
+    registered, so a start could reach the pin with no online host. The wait is
+    what turns that into og doing the waiting rather than the operator."""
+    home = tmp_path / "home"
+    (home / ".omnigent").mkdir(parents=True)
+    ticker = tmp_path / "ticks"
+    ticker.write_text("0")
+    body = f'''
+    host_online() {{
+      n=$(cat {ticker}); n=$((n + 1)); echo "$n" > {ticker}
+      [ "$n" -ge 3 ]
+    }}
+    wait_host_online 5 && echo WAITED-OK
+    '''
+    result = _run_sourced(home, body)
+    assert result.returncode == 0, result.stderr
+    assert "WAITED-OK" in result.stdout
+    # Polled until it saw an online host rather than giving up on the first no.
+    assert int(ticker.read_text()) == 3
+
+
+def test_wait_host_online_gives_up_inside_its_budget(tmp_path):
+    """A bounded wait: a host that never registers must not hang `og start`."""
+    home = tmp_path / "home"
+    (home / ".omnigent").mkdir(parents=True)
+    body = 'host_online() { return 1; }; wait_host_online 1 || echo GAVE-UP'
+    result = _run_sourced(home, body, timeout=30)
+    assert "GAVE-UP" in result.stdout, result.stderr
+
+
+def test_restart_host_daemon_kills_only_our_own_pid(tmp_path):
+    """The wedged-daemon case: alive, so start_host_daemon's loop is happy, but
+    never registering. Restarting is the only thing that clears it -- and it
+    must kill the pid in OUR pidfile, never a second og's."""
+    home = tmp_path / "home"
+    omni = home / ".omnigent"
+    omni.mkdir(parents=True)
+    victim = subprocess.Popen(["sleep", "60"])
+    bystander = subprocess.Popen(["sleep", "60"])
+    try:
+        (omni / "og-host.pid").write_text(str(victim.pid))
+        body = 'start_host_daemon() { echo RESTARTED; }; restart_host_daemon'
+        result = _run_sourced(home, body)
+        assert "RESTARTED" in result.stdout, result.stderr
+        victim.wait(timeout=10)                      # ours was killed
+        assert bystander.poll() is None              # the other og was not
+        assert not (omni / "og-host.pid").exists()   # stale pidfile cleared
+    finally:
+        _kill(victim.pid)
+        _kill(bystander.pid)
