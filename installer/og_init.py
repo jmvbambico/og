@@ -17,8 +17,10 @@ contract back and would confidently run the wrong thing.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import yaml
@@ -174,6 +176,53 @@ def _stack_label(st: dict) -> str:
     return f'{st["label"]} ({d})' if d else st["label"]
 
 
+# A directory name read from the filesystem is now an untrusted input channel
+# into the contract: it ends up in a shell command, in a path glob, and in a
+# gate name. Any of those can carry characters that break YAML or the shell.
+# The helpers below are the two places where that input is made safe.
+#
+# YAML plain scalars are only safe for a narrow character set, so anything
+# outside it is emitted as a JSON double-quoted string: JSON strings are a
+# strict subset of YAML's double-quoted scalar syntax (same escapes, same
+# quoting), and `json.dumps` is stdlib, so this costs no dependency.
+_PLAIN_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/@+=~-]*\Z")
+
+
+def _yaml_scalar(value: str) -> str:
+    """Render a string as a YAML scalar, quoted only when it has to be.
+
+    Values that are safe as plain scalars come out byte-for-byte unchanged,
+    so the common case keeps the readable `run: cargo test` style; anything
+    else is escaped instead of being trusted.
+    """
+    if _PLAIN_SAFE.match(value) and value == value.strip():
+        return value
+    return json.dumps(value)
+
+
+def _yaml_quoted(value: str) -> str:
+    """Render a string as a YAML double-quoted scalar, always quoted."""
+    return json.dumps(value)
+
+
+def _gate_slug(rel: str) -> str:
+    """Turn a repo-relative directory into a readable name suffix.
+
+    `console/src-tauri` -> `console-src-tauri`; `console app` -> `console-app`.
+    """
+    return re.sub(r"[^A-Za-z0-9]+", "-", rel).strip("-")
+
+
+def _one_line(value) -> str:
+    """Flatten a value so it cannot break out of a YAML comment.
+
+    A directory named `x\\nnever_write:` would otherwise inject a line of
+    YAML into the middle of the generated comment block. Comments are the one
+    place in the file with no quoting, so the value is flattened instead.
+    """
+    return " ".join(str(value).splitlines()).strip()
+
+
 def node_pm(repo: Path) -> tuple:
     for lock, pm in (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"),
                      ("bun.lockb", "bun"), ("package-lock.json", "npm")):
@@ -221,6 +270,26 @@ def detect_branches(repo: Path) -> dict:
 
 def build_gates(repo: Path, stacks: list) -> tuple:
     gates, high_risk, never_write, notes = [], [], [], []
+    used_names = set()
+
+    def gate_name(base: str, slug: str) -> str:
+        """A gate name that identifies exactly one command.
+
+        A nested gate is named after its directory (`unit-console`), because
+        the orchestrator quotes gates back by name and two `unit` gates are
+        ambiguous. A root-level gate keeps its original name.
+        """
+        if not slug:
+            used_names.add(base)
+            return base
+        candidate = f"{base}-{slug}"
+        n = 2
+        while candidate in used_names:
+            candidate = f"{base}-{slug}-{n}"
+            n += 1
+        used_names.add(candidate)
+        return candidate
+
     for st in stacks:
         # A stack found in a subdirectory runs its commands THERE, so the
         # emitted command is prefixed with a `cd` into that directory. A
@@ -228,7 +297,21 @@ def build_gates(repo: Path, stacks: list) -> tuple:
         # `cd ./ &&` prefix.
         rel = st.get("dir") or ""
         base = st.get("root") or repo
-        prefix = f"cd {rel} && " if rel else ""
+        # The directory name comes from the filesystem, so it is quoted for the
+        # shell: `cd console app && ...` would be parsed as `cd` with two
+        # arguments and fail at gate-run time — silently, because the
+        # contract itself still parses.
+        prefix = f"cd {shlex.quote(rel)} && " if rel else ""
+        # A gate name must identify ONE command, because the orchestrator
+        # quotes gates back by name. Two directories each with a `unit` gate
+        # would be ambiguous, so a nested gate is named after its directory.
+        # A root-level gate keeps its original name (`unit` stays `unit`).
+        slug = _gate_slug(rel) if rel else ""
+        if rel and not slug:
+            # A directory made only of characters the slug drops (`!!!`)
+            # still needs a suffix, or its gate would collide with the
+            # root-level one.
+            slug = "dir"
         subs = {}
         if st["id"] == "node":
             pm, lock = node_pm(base)
@@ -247,8 +330,9 @@ def build_gates(repo: Path, stacks: list) -> tuple:
             if st["id"] == "node" and name in ("build", "unit"):
                 key = "build" if name == "build" else "test"
                 if key not in scripts:
-                    notes.append(f"package.json has no `{key}` script — `{cmd}` will fail")
-            gates.append((name, prefix + cmd, scope))
+                    notes.append(f"package.json has no `{key}` script — "
+                                 f"`{prefix}{cmd}` will fail")
+            gates.append((gate_name(name, slug), prefix + cmd, scope))
         for name, cmd, scope, binary in st["optional"]:
             cmd = cmd.format(**subs) if subs else cmd
             if binary and not _which(binary):
@@ -256,7 +340,7 @@ def build_gates(repo: Path, stacks: list) -> tuple:
                 continue
             if st["id"] == "node" and name in ("lint", "typecheck") and name not in scripts:
                 continue
-            gates.append((name, prefix + cmd, scope))
+            gates.append((gate_name(name, slug), prefix + cmd, scope))
         for h in st["high_risk"]:
             h = h.format(**subs) if subs else h
             high_risk.append(f"{rel}/{h}" if rel else h)
@@ -284,6 +368,10 @@ def build_gates(repo: Path, stacks: list) -> tuple:
             continue
         seen.add(g)
         deduped.append(g)
+    # Nested gate names are uniquified where they are built (below), so that
+    # a name identifies exactly one command — the orchestrator quotes gates
+    # back by name. Root-level names are left exactly as they have always
+    # been.
     return deduped, list(dict.fromkeys(high_risk)), list(dict.fromkeys(never_write)), notes
 
 
@@ -297,12 +385,12 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
     name = repo.name
     stack_label = " + ".join(_stack_label(s) for s in stacks) or "unknown"
     L = []
-    L.append(f"# Machine-readable orchestration contract for {name}.")
+    L.append(f"# Machine-readable orchestration contract for {_one_line(name)}.")
     L.append("# Consumed by the global og orchestrator agent. AGENTS.md remains the")
     L.append("# human-readable constitution and takes precedence on anything this file")
     L.append("# does not cover.")
     L.append("#")
-    L.append(f"# Generated by `og init` from a {stack_label} repo. Every value below was")
+    L.append(f"# Generated by `og init` from a {_one_line(stack_label)} repo. Every value below was")
     L.append("# detected or left as a TODO — nothing is inherited from another project.")
     L.append("# Review it: a wrong gate command is worse than a missing one, because the")
     L.append("# orchestrator quotes this contract back and runs exactly what it says.")
@@ -311,20 +399,21 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
     ib = branches["integration_base"]
     L.append(f"  # Where finished work lands. Workers branch from here and the batched")
     L.append(f"  # integration branch merges back into it.")
-    L.append(f"  integration_base: {ib or 'TODO'}")
+    L.append(f"  integration_base: {_yaml_scalar(ib or 'TODO')}")
     L.append("  # Never merged into by an agent; promotions are a human's job.")
     if branches["protected"]:
-        L.append(f"  protected: [{', '.join(branches['protected'])}]")
+        L.append("  protected: ["
+                 + ", ".join(_yaml_scalar(b) for b in branches["protected"]) + "]")
     else:
         # Falling back to [main] here would be actively wrong when main IS the
         # integration base: merge_gate DENYs merges into a protected branch, so
         # the contract would forbid the only merge it also mandates.
         L.append("  # No release branch found alongside the integration base, so nothing")
-        L.append(f"  # here is protected and agents may merge into `{ib}` directly.")
+        L.append(f"  # here is protected and agents may merge into `{_one_line(ib)}` directly.")
         L.append("  # If that is not what you want, add a `dev` branch and make it the")
-        L.append(f"  # integration_base, leaving `{ib}` protected below.")
+        L.append(f"  # integration_base, leaving `{_one_line(ib)}` protected below.")
         L.append("  protected: []")
-    L.append(f"  task_prefix: {branches['task_prefix']}")
+    L.append(f"  task_prefix: {_yaml_scalar(branches['task_prefix'])}")
     L.append("")
     L.append("gates:")
     L.append("  # scope: worker  -> runs in EACH implementer's worktree")
@@ -340,16 +429,16 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
         L.append("  # - {name: unit, run: make test, scope: worker}")
         L.append("  # - {name: e2e,  run: make e2e}          # no scope: integration only")
     for nm, cmd, scope in gates:
-        L.append(f"  - name: {nm}")
-        L.append(f"    run: {cmd}")
+        L.append(f"  - name: {_yaml_scalar(nm)}")
+        L.append(f"    run: {_yaml_scalar(cmd)}")
         if scope:
-            L.append(f"    scope: {scope}")
+            L.append(f"    scope: {_yaml_scalar(scope)}")
     L.append("")
     L.append("never_write:")
     L.append("  # Paths an implementer must never touch.")
     if never_write:
         for p in dict.fromkeys(never_write):
-            L.append(f'  - "{p}"')
+            L.append(f"  - {_yaml_quoted(p)}")
     else:
         # The empty case must still parse. A key with only comments beneath
         # it parses as `null`, and the first consumer that iterates it gets a
@@ -369,16 +458,16 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
     L.append("  # enabled: false means every merge is a human decision. That is the safe")
     L.append("  # starting point — turn it on once you trust the gates on real PRs.")
     L.append("  enabled: false")
-    L.append(f"  auto_merge_target: {ib or 'TODO'}")
+    L.append(f"  auto_merge_target: {_yaml_scalar(ib or 'TODO')}")
     L.append("  # Thresholds are a starting point; recalibrate from real PR history.")
     L.append("  max_diff_lines: 400")
     L.append("  max_diff_files: 15")
     L.append("  # Any path here forces the human gate regardless of gate results.")
     L.append("  high_risk_paths:")
     for p in dict.fromkeys(high_risk):
-        L.append(f'    - "{p}"')
+        L.append(f"    - {_yaml_quoted(p)}")
     for p, why in UNIVERSAL_HIGH_RISK:
-        L.append(f'    - "{p}"{" " * max(1, 26 - len(p))}# {why}')
+        L.append(f"    - {_yaml_quoted(p)}{' ' * max(1, 26 - len(p))}# {why}")
     L.append("  require_no_test_count_decrease: true")
     L.append("  # The gate cannot observe review itself (that is session state, not repo")
     L.append("  # state), so it reads the PR body: `cross-vendor-review: passed` permits")
@@ -388,7 +477,7 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
         L.append("")
         L.append("# og init could not verify these — check before relying on them:")
         for n in notes:
-            L.append(f"#   - {n}")
+            L.append(f"#   - {_one_line(n)}")
     L.append("")
     body = "\n".join(L)
     # Mechanism over prompt: validate the contract we just generated instead

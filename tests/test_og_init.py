@@ -12,6 +12,7 @@ Two failure modes are covered here, because both were silent:
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -100,7 +101,14 @@ def test_root_marker_keeps_unprefixed_command(tmp_path):
 
 
 def test_skipped_directory_is_not_detected(tmp_path):
+    """The walker must skip generated dirs AND still find a real nested one.
+
+    With only skipped markers present, the OLD root-only implementation also
+    returned [], so this test would have passed against the bug. The ordinary
+    nested marker is what distinguishes the two implementations.
+    """
     repo = tmp_path / "skips"
+    _write(repo / "app" / "Cargo.toml", "[package]\n")
     _write(repo / "node_modules" / "pkg" / "Cargo.toml", "[package]\n")
     _write(repo / "target" / "Cargo.toml", "[package]\n")
     _write(repo / "vendor" / "Cargo.toml", "[package]\n")
@@ -109,7 +117,8 @@ def test_skipped_directory_is_not_detected(tmp_path):
     _write(repo / ".venv" / "Cargo.toml", "[package]\n")
     _write(repo / "__pycache__" / "Cargo.toml", "[package]\n")
 
-    assert og_init.detect_stacks(repo) == []
+    found = og_init.detect_stacks(repo)
+    assert [(s["id"], s["dir"]) for s in found] == [("rust", "app")]
 
 
 def test_depth_beyond_bound_is_not_detected(tmp_path):
@@ -157,6 +166,7 @@ def test_everything_rendered_parses(tmp_path, case):
         _write(repo / "console" / "src-tauri" / "Cargo.toml", "[package]\n")
         _node_package(repo / "console" / "package.json")
     elif case == "skip":
+        _write(repo / "app" / "Cargo.toml", "[package]\n")
         _write(repo / "node_modules" / "pkg" / "Cargo.toml", "[package]\n")
     elif case == "deep":
         _write(repo / "a" / "b" / "c" / "d" / "Cargo.toml", "[package]\n")
@@ -165,3 +175,91 @@ def test_everything_rendered_parses(tmp_path, case):
     data = yaml.safe_load(body)
     assert isinstance(data, dict)
     assert "gates" in data and "never_write" in data and "merge_policy" in data
+
+
+# --- directory names are untrusted input -------------------------------------
+#
+# A directory name reaches the contract three ways: inside a shell command,
+# inside a path glob, and inside a gate name. All three have to survive a
+# name that is not a plain identifier.
+
+
+def test_directory_with_space_is_quoted_for_the_shell(tmp_path):
+    repo = tmp_path / "spaced"
+    _write(repo / "console app" / "Cargo.toml", "[package]\n")
+
+    body = _render(repo)
+    data = yaml.safe_load(body)
+
+    run = data["gates"][0]["run"]
+    # The shell must see ONE directory argument, not two.
+    assert shlex.split(run)[:2] == ["cd", "console app"], run
+    assert "cargo" in run
+
+
+def test_directory_with_double_quote_renders_and_parses(tmp_path):
+    repo = tmp_path / "quoted"
+    _write(repo / 'we"ird' / "Cargo.toml", "[package]\n")
+
+    body = _render(repo)
+    data = yaml.safe_load(body)
+
+    assert data["never_write"] == ['we"ird/target/**']
+    run = data["gates"][0]["run"]
+    assert shlex.split(run)[:2] == ["cd", 'we"ird'], run
+    assert "cargo" in run
+
+
+def test_directory_with_newline_cannot_inject_yaml(tmp_path):
+    repo = tmp_path / "newline"
+    _write(repo / "evil\nnever_write: ['/etc']" / "Cargo.toml", "[package]\n")
+
+    body = _render(repo)
+    data = yaml.safe_load(body)
+
+    assert data["never_write"] == ['evil\nnever_write: [\'/etc\']/target/**']
+    assert "never_write" in data
+
+
+def test_root_gate_name_is_unchanged(tmp_path):
+    repo = tmp_path / "flat"
+    _write(repo / "Cargo.toml", "[package]\n")
+
+    data = yaml.safe_load(_render(repo))
+    names = [g["name"] for g in data["gates"]]
+    assert "unit" in names
+    assert "build" in names
+    assert not any(n.startswith("unit-") for n in names), names
+
+
+def test_nested_gate_names_are_disambiguated(tmp_path):
+    repo = tmp_path / "both"
+    _node_package(repo / "package.json")
+    _node_package(repo / "console" / "package.json")
+
+    data = yaml.safe_load(_render(repo))
+    names = [g["name"] for g in data["gates"]]
+
+    # One name per command: the orchestrator quotes gates back by name.
+    assert len(names) == len(set(names)), names
+    assert "build" in names and "unit" in names
+    assert "build-console" in names and "unit-console" in names
+
+
+def test_nested_gate_name_slug_flattens_separators(tmp_path):
+    repo = tmp_path / "deep"
+    _write(repo / "console" / "src-tauri" / "Cargo.toml", "[package]\n")
+
+    data = yaml.safe_load(_render(repo))
+    names = [g["name"] for g in data["gates"]]
+    assert "unit-console-src-tauri" in names, names
+
+
+def test_render_refuses_to_write_invalid_yaml(monkeypatch):
+    """The guard is the mechanism protecting everything above it."""
+    def boom(_body):
+        raise ValueError("simulated parse failure")
+    monkeypatch.setattr(og_init.yaml, "safe_load", boom)
+
+    with pytest.raises(SystemExit):
+        og_init.render(Path("/tmp/x"), BRANCHES, [], [], [], [], [])
