@@ -145,6 +145,30 @@ check_orchestration_contract
 echo "START-CONTINUED rc=$?"
 '''
 
+# After the check returns, the shell's job table is the direct evidence of a
+# reader that outlived the offer: a background `read` the cleanup missed is
+# still a job here. `jobs -p` prints nothing when none survived.
+_READER_CHECK_DRIVER = r'''
+src="$0"; set --
+source "$src" >/dev/null 2>&1
+check_orchestration_contract
+echo "START-CONTINUED rc=$?"
+echo "LEFTOVER-JOBS=$(jobs -p | tr '\n' ' ')"
+'''
+
+# `og start` gets wrapped in other people's scripts. A caller using fd 3 must
+# still own it after the offer; the original implementation borrowed 3 and
+# closed it on the way out.
+_FD3_DRIVER = r'''
+src="$0"; set --
+source "$src" >/dev/null 2>&1
+exec 3> "$(pwd)/fd3-probe"
+check_orchestration_contract
+printf 'fd3-still-mine' >&3
+exec 3>&-
+echo "START-CONTINUED rc=$?"
+'''
+
 
 # The pty work runs in a FRESH Python interpreter, not in the pytest process.
 # `pty.fork()` from a multi-threaded process is explicitly deprecated (Python
@@ -200,8 +224,16 @@ while True:
             # A beat first: a human reads the prompt (or the interview) before
             # typing Ctrl-C, so the signal lands on a wait that is already in
             # progress rather than on a fork still setting itself up.
-            time.sleep(0.2)
-            os.killpg(pid, getattr(signal, action["signal"]))
+            time.sleep(action.get("delay", 0.2))
+            sig = getattr(signal, action["signal"])
+            if action.get("target") == "pid":
+                # Signal the shell ALONE, not its process group. This is the
+                # "wait interrupted while the reader keeps running" window: a
+                # group signal also kills the reader, which hides whether the
+                # cleanup reaped it.
+                os.kill(pid, sig)
+            else:
+                os.killpg(pid, sig)
     done, wstatus = os.waitpid(pid, os.WNOHANG)
     if done:
         status = wstatus
@@ -224,8 +256,19 @@ except OSError:
     pass
 code = (os.WEXITSTATUS(status) if os.WIFEXITED(status)
         else 128 + os.WTERMSIG(status))
+# The shell was the pty's session/process-group leader. Any process still in
+# that group after the shell is reaped — a live reader or an unreaped zombie —
+# means the offer leaked it. Reported for the reader test to assert on.
+try:
+    os.killpg(pid, 0)
+    group = "alive"
+except ProcessLookupError:
+    group = "gone"
+except PermissionError:
+    group = "alive"
 sys.stdout.write(captured.decode(errors="replace"))
-sys.stdout.write("\n__EXIT__ %d\n" % code)
+sys.stdout.write("\n__GROUP__ %s\n" % group)
+sys.stdout.write("__EXIT__ %d\n" % code)
 raise SystemExit(0 if code == 0 else 1)
 '''
 
@@ -307,6 +350,47 @@ def test_a_broken_parent_contract_is_replaced_in_place_not_shadowed(tmp_path):
     assert f"Replace {contract}" in text
     assert f"INIT-INTERVIEW --force {repo}\n" in text
     assert f"--force {child}" not in text
+
+
+def test_ctrl_c_during_the_wait_reaps_the_reader(tmp_path):
+    """The window the group signal hides: SIGINT to the SHELL ALONE interrupts
+    `wait`, but the reader keeps its own copy of the descriptor and stays
+    blocked on the terminal. If it is not killed and reaped it outlives the
+    offer and eats keystrokes meant for the server — invisibly. Assert both
+    that the shell has no leftover job and that nothing remains in its process
+    group after it exits (a zombie would still be there)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    result = _pty_run(
+        repo, tmp_path, _READER_CHECK_DRIVER,
+        [{"marker": "[y/N]", "signal": "SIGINT", "target": "pid",
+          "delay": 1.0}])
+    text = result.stdout.replace("\r\n", "\n")
+
+    assert result.returncode == 0, text
+    assert "START-CONTINUED rc=0" in text
+    assert "interrupted" in text
+    # No background job survived the offer...
+    assert "LEFTOVER-JOBS=\n" in text, text
+    # ...and the reader's process group is empty once the shell is gone, which
+    # a kill without a reaping wait would not achieve (the zombie keeps it).
+    assert "__GROUP__ gone" in text, text
+
+
+def test_the_offer_leaves_a_callers_fd_3_alone(tmp_path):
+    """A wrapper script may have fd 3 open. The offer must not replace it (the
+    old code read the terminal through fd 3 and then closed it), or the
+    caller's next write fails with a descriptor nobody can explain."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    result = _pty_run(
+        repo, tmp_path, _FD3_DRIVER,
+        [{"marker": "[y/N]", "write": "n\n"}])
+    text = result.stdout
+
+    assert result.returncode == 0, text
+    assert "START-CONTINUED rc=0" in text
+    assert (repo / "fd3-probe").read_text() == "fd3-still-mine"
 
 
 def test_ctrl_c_at_the_offer_does_not_take_the_start_down(tmp_path):

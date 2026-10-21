@@ -1713,28 +1713,48 @@ _offer_contract_init() {
   # bash then RESTARTS a blocking `read` (verified on bash 3.2 and 5.x), so the
   # operator sees a prompt that ignores Ctrl-C until they type something. `wait`
   # is interruptible instead: the reader runs in the background and inherits the
-  # signal, so Ctrl-C returns control at once. fd 3, not 0, because a
-  # non-interactive shell points a background job's stdin at /dev/null and
-  # `<&0` would read EOF immediately — accepting an empty answer.
-  exec 3<&0
+  # signal, so Ctrl-C returns control at once.
+  #
+  # fd 42, not 0 and not 3. 0 because a non-interactive shell points a
+  # background job's stdin at /dev/null and `<&0` would read EOF immediately —
+  # accepting an empty answer. Not 3 either: `og start` is wrapped in other
+  # people's scripts, and quietly replacing (then closing) a caller's fd 3 is a
+  # bug nobody can reproduce. Bash 3.2 has no `{fd}<&0` auto-allocation (that
+  # is bash 4+), so the choice is a numbered fd; 42 is outside the usual 3-9
+  # range this file itself uses (8 and 9 are the tunnel log). Whichever fd was
+  # picked could collide, but this one needs a deliberate 42 to do it.
+  exec 42<&0
   local accepted=0 read_rc=0 reader
   printf '%s' "$prompt" >&2
   # `interrupted` is re-checked on both sides of the spawn: Ctrl-C can land
   # between printing the prompt and entering `wait`, and a signal that arrives
   # before the wait starts leaves no pending wait to interrupt. If the handler
-  # already ran, do not start a reader (or kill the one just started) rather
-  # than block on a prompt the operator has already cancelled.
+  # already ran, do not start a reader rather than block on a prompt the
+  # operator has already cancelled.
   if [[ "$interrupted" -eq 0 ]]; then
-    ( read -r answer <&3
+    ( read -r answer <&42
       case "$answer" in [yY]|[yY][eE][sS]) exit 0 ;; *) exit 1 ;; esac ) &
     reader=$!
   fi
   if [[ "$interrupted" -eq 0 ]]; then
     wait "$reader" || read_rc=$?
-  elif [[ -n "$reader" ]]; then
-    kill "$reader" 2>/dev/null || true
   fi
-  exec 3<&-
+  # CLEANUP IS UNCONDITIONAL, and it runs on every path that started a reader:
+  # an answer, EOF, a signal before the wait, and — the case that matters — a
+  # signal that interrupted the wait itself. In that last case `wait` returned
+  # without reaping anything and the reader is still blocked on the terminal;
+  # left alone it outlives the offer and eats keystrokes meant for the server
+  # start, invisibly. `kill` alone is not enough either: an unreaped reader is
+  # a zombie for the rest of this long-lived process. The final `wait` reaps
+  # whatever the first one did not (a second wait on an already-reaped job is a
+  # harmless error, hence the redirect).
+  if [[ -n "$reader" ]]; then
+    if [[ "$interrupted" -eq 1 ]]; then
+      kill "$reader" 2>/dev/null || true
+    fi
+    wait "$reader" 2>/dev/null || true
+  fi
+  exec 42<&-
   if [[ "$read_rc" -eq 0 && "$interrupted" -eq 0 ]]; then
     accepted=1
   fi
