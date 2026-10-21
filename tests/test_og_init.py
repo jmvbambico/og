@@ -70,8 +70,8 @@ def test_nested_repo_detects_both_stacks_with_prefixed_gates(tmp_path):
     data = yaml.safe_load(body)
 
     runs = [g["run"] for g in data["gates"]]
-    assert any(r.startswith("cd console/src-tauri && ") for r in runs), runs
-    assert any(r.startswith("cd console && ") for r in runs), runs
+    assert any(r.startswith("cd -- console/src-tauri && ") for r in runs), runs
+    assert any(r.startswith("cd -- console && ") for r in runs), runs
     # The Rust crate is NOT the repo root, so its gates must be prefixed.
     assert "cargo test" in " ".join(runs)
     assert not any(r == "cargo test" for r in runs)
@@ -143,8 +143,8 @@ def test_same_stack_in_two_dirs_yields_two_gates(tmp_path):
 
     data = yaml.safe_load(_render(repo))
     runs = [g["run"] for g in data["gates"]]
-    assert "cd one && cargo test" in runs
-    assert "cd two && cargo test" in runs
+    assert "cd -- one && cargo test" in runs
+    assert "cd -- two && cargo test" in runs
 
 
 def test_never_write_entries_do_not_repeat(tmp_path):
@@ -193,7 +193,7 @@ def test_directory_with_space_is_quoted_for_the_shell(tmp_path):
 
     run = data["gates"][0]["run"]
     # The shell must see ONE directory argument, not two.
-    assert shlex.split(run)[:2] == ["cd", "console app"], run
+    assert shlex.split(run)[:3] == ["cd", "--", "console app"], run
     assert "cargo" in run
 
 
@@ -206,7 +206,7 @@ def test_directory_with_double_quote_renders_and_parses(tmp_path):
 
     assert data["never_write"] == ['we"ird/target/**']
     run = data["gates"][0]["run"]
-    assert shlex.split(run)[:2] == ["cd", 'we"ird'], run
+    assert shlex.split(run)[:3] == ["cd", "--", 'we"ird'], run
     assert "cargo" in run
 
 
@@ -263,3 +263,59 @@ def test_render_refuses_to_write_invalid_yaml(monkeypatch):
 
     with pytest.raises(SystemExit):
         og_init.render(Path("/tmp/x"), BRANCHES, [], [], [], [], [])
+
+
+# --- a value must round-trip as the same STRING -----------------------------
+#
+# YAML 1.1 coerces bare words and numbers: `no` is False, `123` is an int,
+# `2026-10-21` is a date. A contract whose `integration_base` is a boolean
+# is as broken as one that does not parse — the merge gate compares branch
+# names — so every value must come back out as the identical str.
+
+
+COERCING_VALUES = ["no", "yes", "on", "off", "true", "null", "123", "1.5",
+                    "0x1f", "2026-10-21", "main", "dev", "feature/", "y",
+                    "N", "FALSE", "~", "1:30", ".inf", "1_000"]
+
+
+@pytest.mark.parametrize("value", COERCING_VALUES)
+def test_scalar_helper_round_trips_as_string(value):
+    emitted = og_init._yaml_scalar(value)
+    loaded = yaml.safe_load(f"k: {emitted}")["k"]
+    assert loaded == value
+    assert isinstance(loaded, str)
+
+
+@pytest.mark.parametrize("value", COERCING_VALUES)
+def test_render_keeps_values_as_strings(value):
+    """The real render path, not just the helper."""
+    branches = {"integration_base": value, "protected": [value],
+                "task_prefix": value}
+    body = og_init.render(Path("/tmp/x"), branches, [], [], [], [], [])
+    data = yaml.safe_load(body)
+    assert data["branches"]["integration_base"] == value
+    assert data["branches"]["task_prefix"] == value
+    assert data["branches"]["protected"] == [value]
+    assert isinstance(data["branches"]["integration_base"], str)
+
+
+def test_leading_dash_directory_uses_double_dash(tmp_path):
+    """`cd -dash` would be read as an option by cd."""
+    repo = tmp_path / "dash"
+    _write(repo / "-dash" / "Cargo.toml", "[package]\n")
+
+    data = yaml.safe_load(_render(repo))
+    run = data["gates"][0]["run"]
+    assert "--" in run.split()
+    assert shlex.split(run)[:3] == ["cd", "--", "-dash"], run
+
+
+def test_control_characters_do_not_reach_a_comment(tmp_path):
+    """Comments get no quoting, so they must be stripped of control chars."""
+    repo = tmp_path / "ctrl"
+    _write(repo / "ev\x01il" / "Cargo.toml", "[package]\n")
+
+    body = _render(repo)
+    assert "\x01" not in body
+    data = yaml.safe_load(body)
+    assert "gates" in data

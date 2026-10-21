@@ -178,24 +178,32 @@ def _stack_label(st: dict) -> str:
 
 # A directory name read from the filesystem is now an untrusted input channel
 # into the contract: it ends up in a shell command, in a path glob, and in a
-# gate name. Any of those can carry characters that break YAML or the shell.
+# gate name. Any of those can break the contract in a way nobody notices.
 # The helpers below are the two places where that input is made safe.
 #
-# YAML plain scalars are only safe for a narrow character set, so anything
-# outside it is emitted as a JSON double-quoted string: JSON strings are a
-# strict subset of YAML's double-quoted scalar syntax (same escapes, same
+# Escaped scalars are emitted as JSON double-quoted strings: JSON strings are
+# a strict subset of YAML's double-quoted scalar syntax (same escapes, same
 # quoting), and `json.dumps` is stdlib, so this costs no dependency.
-_PLAIN_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/@+=~-]*\Z")
 
 
 def _yaml_scalar(value: str) -> str:
-    """Render a string as a YAML scalar, quoted only when it has to be.
+    """Render a string as a YAML scalar, quoted unless the plain form is exact.
 
-    Values that are safe as plain scalars come out byte-for-byte unchanged,
-    so the common case keeps the readable `run: cargo test` style; anything
-    else is escaped instead of being trusted.
+    The plain form is kept only when it loads back as THE SAME STRING, and
+    that is checked by handing it to the YAML parser rather than by a
+    hand-rolled character class. PyYAML's YAML 1.1 resolver coerces bare
+    words and numbers: `no` loads as False, `2026-10-21` as a date, `123` as
+    an int. A contract whose `integration_base` is a boolean is as broken as
+    one that does not parse — the merge gate compares branch names — and a
+    regex that tries to enumerate the resolver's cases will eventually
+    disagree with it. Verifying against the parser cannot drift.
     """
-    if _PLAIN_SAFE.match(value) and value == value.strip():
+    try:
+        loaded = yaml.safe_load(f"k: {value}")
+    except Exception:
+        loaded = None
+    if (isinstance(loaded, dict) and isinstance(loaded.get("k"), str)
+            and loaded["k"] == value):
         return value
     return json.dumps(value)
 
@@ -213,14 +221,21 @@ def _gate_slug(rel: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", rel).strip("-")
 
 
+# C0 control characters and DEL have no business in a YAML comment, and some
+# of them make the parser reject the whole document.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _one_line(value) -> str:
     """Flatten a value so it cannot break out of a YAML comment.
 
     A directory named `x\\nnever_write:` would otherwise inject a line of
     YAML into the middle of the generated comment block. Comments are the one
-    place in the file with no quoting, so the value is flattened instead.
+    place in the file with no quoting, so the value is flattened and stripped
+    of control characters instead.
     """
-    return " ".join(str(value).splitlines()).strip()
+    flat = " ".join(str(value).splitlines()).strip()
+    return _CONTROL_CHARS.sub("", flat)
 
 
 def node_pm(repo: Path) -> tuple:
@@ -300,8 +315,10 @@ def build_gates(repo: Path, stacks: list) -> tuple:
         # The directory name comes from the filesystem, so it is quoted for the
         # shell: `cd console app && ...` would be parsed as `cd` with two
         # arguments and fail at gate-run time — silently, because the
-        # contract itself still parses.
-        prefix = f"cd {shlex.quote(rel)} && " if rel else ""
+        # contract itself still parses. The `--` separator is there for the
+        # same reason: a directory named `-dash` would otherwise be read by
+        # `cd` as an option. Do not drop it.
+        prefix = f"cd -- {shlex.quote(rel)} && " if rel else ""
         # A gate name must identify ONE command, because the orchestrator
         # quotes gates back by name. Two directories each with a `unit` gate
         # would be ambiguous, so a nested gate is named after its directory.
@@ -368,10 +385,6 @@ def build_gates(repo: Path, stacks: list) -> tuple:
             continue
         seen.add(g)
         deduped.append(g)
-    # Nested gate names are uniquified where they are built (below), so that
-    # a name identifies exactly one command — the orchestrator quotes gates
-    # back by name. Root-level names are left exactly as they have always
-    # been.
     return deduped, list(dict.fromkeys(high_risk)), list(dict.fromkeys(never_write)), notes
 
 
@@ -402,8 +415,10 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
     L.append(f"  integration_base: {_yaml_scalar(ib or 'TODO')}")
     L.append("  # Never merged into by an agent; promotions are a human's job.")
     if branches["protected"]:
+        # A flow sequence has its own rules — a comma or a bracket inside an
+        # unquoted element splits it — so the elements are always quoted.
         L.append("  protected: ["
-                 + ", ".join(_yaml_scalar(b) for b in branches["protected"]) + "]")
+                 + ", ".join(_yaml_quoted(b) for b in branches["protected"]) + "]")
     else:
         # Falling back to [main] here would be actively wrong when main IS the
         # integration base: merge_gate DENYs merges into a protected branch, so
