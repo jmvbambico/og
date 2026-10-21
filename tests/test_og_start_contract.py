@@ -19,6 +19,7 @@ check has its own four-state machine to explain.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -121,6 +122,240 @@ def _write_contract(directory, text=VALID):
     contract = agents / "orchestration.yaml"
     contract.write_text(text)
     return contract
+
+
+# --------------------------------------------------------------------------
+# the offer -- only reachable on a terminal, so these need a pty
+# --------------------------------------------------------------------------
+_OFFER_DRIVER = r'''
+src="$0"; set --
+source "$src" >/dev/null 2>&1
+check_orchestration_contract
+echo "START-CONTINUED rc=$?"
+'''
+
+# The interview `og init` now runs is another process inside the subshell.
+# Stub it with a sleeper so a SIGINT lands there without touching the real
+# installer (which the other worker owns).
+_INTERVIEW_DRIVER = r'''
+src="$0"; set --
+source "$src" >/dev/null 2>&1
+cmd_init() { echo "INIT-INTERVIEW $*"; sleep 30; }
+check_orchestration_contract
+echo "START-CONTINUED rc=$?"
+'''
+
+
+# The pty work runs in a FRESH Python interpreter, not in the pytest process.
+# `pty.fork()` from a multi-threaded process is explicitly deprecated (Python
+# warns about deadlocks in the child), and earlier tests in the suite leave
+# daemon threads behind: run in-process, the Ctrl-C tests passed alone and
+# hung only in the full suite. A single-threaded child makes the behaviour
+# depend on bash's signal handling rather than on unrelated test residue.
+_PTY_HARNESS = r'''
+import json, os, pty, select, signal, sys, time
+
+workdir, driver, og, spec_json, timeout_s = sys.argv[1:6]
+
+# Do not inherit the runner's attitude to SIGINT. A blocked or ignored SIGINT
+# in this fresh process would survive exec into bash (the kernel keeps blocked
+# masks and ignored dispositions), and the Ctrl-C tests would hang while the
+# same tests pass outside a full-suite run. The operator's shell has INT at its
+# default disposition; this makes the harness match it.
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+pending = list(json.loads(spec_json))
+captured = b""
+status = None
+deadline = time.monotonic() + float(timeout_s)
+
+pid, fd = pty.fork()
+if pid == 0:  # pragma: no cover - child process
+    try:
+        os.chdir(workdir)
+        os.execvpe("bash", ["bash", "-c", driver, og], os.environ)
+    finally:
+        os._exit(127)
+
+while True:
+    if time.monotonic() > deadline:
+        os.killpg(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        sys.stdout.write(captured.decode(errors="replace"))
+        sys.stdout.write("\n__EXIT__ timeout\n")
+        raise SystemExit(3)
+    ready, _, _ = select.select([fd], [], [], 0.2)
+    if ready:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            chunk = b""
+        captured += chunk
+    while pending and pending[0]["marker"].encode() in captured:
+        action = pending.pop(0)
+        if "write" in action:
+            os.write(fd, action["write"].encode())
+        if "signal" in action:
+            # A beat first: a human reads the prompt (or the interview) before
+            # typing Ctrl-C, so the signal lands on a wait that is already in
+            # progress rather than on a fork still setting itself up.
+            time.sleep(0.2)
+            os.killpg(pid, getattr(signal, action["signal"]))
+    done, wstatus = os.waitpid(pid, os.WNOHANG)
+    if done:
+        status = wstatus
+        while True:  # drain anything written between the last read and exit
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                break
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            captured += chunk
+        break
+
+try:
+    os.close(fd)
+except OSError:
+    pass
+code = (os.WEXITSTATUS(status) if os.WIFEXITED(status)
+        else 128 + os.WTERMSIG(status))
+sys.stdout.write(captured.decode(errors="replace"))
+sys.stdout.write("\n__EXIT__ %d\n" % code)
+raise SystemExit(0 if code == 0 else 1)
+'''
+
+
+def _pty_run(workdir, tmp_path, driver, actions, timeout=20):
+    """Run `driver` on a real pty and fire marker-triggered actions.
+
+    A pty is the only way to reach `[[ -t 0 ]]`; faking a terminal for bash's
+    `test -t` is not portable. Returns the harness's CompletedProcess: exit 0
+    means the bash under test exited 0, and `stdout` is everything it wrote.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _PTY_HARNESS, str(workdir), driver,
+         str(OG), json.dumps(actions), str(timeout)],
+        capture_output=True, text=True, timeout=timeout + 10,
+        env=_env(tmp_path),
+    )
+    if result.returncode != 0 and "__EXIT__ timeout" in result.stdout:
+        pytest.fail("pty run timed out:\n" + result.stdout)
+    return result
+
+
+def test_the_broken_contract_offer_says_force_overwrites_and_names_the_file(
+        tmp_path):
+    """A prompt that hides a destructive flag is worse than no prompt. This is
+    the branch where the operator may be mid-edit on the very file that broke,
+    so the wording must name it and say it is replaced."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    contract = _write_contract(repo, "gates: [unclosed\n")
+    result = _pty_run(
+        repo, tmp_path, _OFFER_DRIVER,
+        [{"marker": "[y/N]", "write": "n\n"}])
+    text = result.stdout
+
+    assert result.returncode == 0, text
+    assert "Replace " in text
+    assert str(contract) in text
+    assert "overwrite" in text
+    assert "ask a few questions" in text
+    assert "START-CONTINUED rc=0" in text
+
+
+def test_the_no_contract_offer_does_not_borrow_the_overwrite_warning(tmp_path):
+    """Nothing is destroyed when no contract exists, so this prompt must not
+    inherit scary wording it has not earned — but it should still set the
+    expectation that og init asks questions."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    result = _pty_run(
+        repo, tmp_path, _OFFER_DRIVER,
+        [{"marker": "[y/N]", "write": "n\n"}])
+    text = result.stdout
+
+    assert result.returncode == 0, text
+    assert "Run 'og init'" in text
+    assert "ask a few questions" in text
+    assert "overwrite" not in text
+    assert "Replace " not in text
+    assert "START-CONTINUED rc=0" in text
+
+
+def test_a_broken_parent_contract_is_replaced_in_place_not_shadowed(tmp_path):
+    """The policy walks up, so a broken contract may live above the launch
+    directory. `og init --force` then has to run against THAT directory:
+    scaffolding one below it would only shadow the broken file, leaving it to
+    resurface for anything started from the parent."""
+    repo = tmp_path / "repo"
+    child = repo / "packages" / "worker"
+    child.mkdir(parents=True)
+    contract = _write_contract(repo, "gates: [unclosed\n")
+    result = _pty_run(
+        child, tmp_path, _INTERVIEW_DRIVER,
+        [{"marker": "[y/N]", "write": "y\n"},
+         {"marker": "INIT-INTERVIEW", "signal": "SIGINT"}])
+    text = result.stdout.replace("\r\n", "\n")
+
+    assert result.returncode == 0, text
+    assert f"Replace {contract}" in text
+    assert f"INIT-INTERVIEW --force {repo}\n" in text
+    assert f"--force {child}" not in text
+
+
+def test_ctrl_c_at_the_offer_does_not_take_the_start_down(tmp_path):
+    """SIGINT goes to the whole foreground process group, og included. The
+    offer is a kindness; it must not be able to kill the start."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    result = _pty_run(
+        repo, tmp_path, _OFFER_DRIVER,
+        [{"marker": "[y/N]", "signal": "SIGINT"}])
+    text = result.stdout
+
+    assert result.returncode == 0, text
+    assert "START-CONTINUED rc=0" in text
+    assert "interrupted" in text
+
+
+def test_eof_at_the_offer_declines_and_continues(tmp_path):
+    """Ctrl-D is not consent, and must not be read as one. Our own read sees
+    EOF, treats it as "no", and the start continues."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    result = _pty_run(
+        repo, tmp_path, _OFFER_DRIVER,
+        [{"marker": "[y/N]", "write": "\x04"}])
+    text = result.stdout
+
+    assert result.returncode == 0, text
+    assert "START-CONTINUED rc=0" in text
+    assert "running og init" not in text
+
+
+def test_ctrl_c_during_the_init_interview_does_not_take_the_start_down(
+        tmp_path):
+    """Accepting the offer now leads into an interview. A Ctrl-C there hits og
+    too; the scaffold is abandoned, not the start."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_contract(repo, "gates: [unclosed\n")
+    result = _pty_run(
+        repo, tmp_path, _INTERVIEW_DRIVER,
+        [{"marker": "[y/N]", "write": "y\n"},
+         {"marker": "INIT-INTERVIEW", "signal": "SIGINT"}])
+    text = result.stdout
+
+    assert result.returncode == 0, text
+    assert "INIT-INTERVIEW" in text
+    assert "START-CONTINUED rc=0" in text
+    assert "did not finish" in text or "interrupted" in text
 
 
 # --------------------------------------------------------------------------

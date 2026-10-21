@@ -1584,9 +1584,12 @@ PYEOF
 check_orchestration_contract() {
   [[ "${OG_START_CONTRACT_CHECK:-1}" == "1" ]] || return 0
 
-  local start="${OG_LAUNCH_DIR:-$PWD}" dir found="" py status detail answer
+  local start="${OG_LAUNCH_DIR:-$PWD}" dir found="" py status detail
   dir="$(cd "$start" 2>/dev/null && pwd -P)" || dir="$start"
   while :; do
+    # -f is deliberate: _load_contract uses p.is_file(), which is the same
+    # test. A directory here is skipped by BOTH and both keep walking upward,
+    # so `og start` still agrees with the policy on this edge.
     if [[ -f "$dir/.agents/orchestration.yaml" ]]; then
       found="$dir/.agents/orchestration.yaml"
       break
@@ -1655,12 +1658,12 @@ PYEOF
     notmap)
       warn "orchestration contract at $found is valid YAML but not a mapping."
       warn "  the policy ignores it: no gates, no protected branches, no integration base."
-      _offer_contract_init "$start" "--force"
+      _offer_contract_init "${found%/.agents/orchestration.yaml}" "--force" "$found"
       ;;
     *)
       warn "orchestration contract at $found does not parse: $detail"
       warn "  the policy falls back to its defaults: no gates, no protected branches beyond the always-protected set, no integration base."
-      _offer_contract_init "$start" "--force"
+      _offer_contract_init "${found%/.agents/orchestration.yaml}" "--force" "$found"
       ;;
   esac
   return 0
@@ -1668,27 +1671,89 @@ PYEOF
 
 # Ask once, only where someone can answer. A piped or CI start must never sit
 # waiting on a read that no human will type into, so without a terminal the
-# warning above is the whole interaction. `--force` for a contract that exists
-# but does not load: `og init` refuses an existing file, and that file is
-# exactly the one in the way. A subshell because cmd_init `exec`s python —
-# called directly it would replace this process and the start would never
-# happen.
+# warning above is the whole interaction.
+#
+# Two prompts, because the two states are not equally destructive. A repo with
+# no contract loses nothing by scaffolding one. A repo with a BROKEN contract
+# has that exact file in the way, so the fix is `og init --force` — which
+# REPLACES it, precisely when the operator may be mid-edit on the file that
+# broke. A prompt that hides a destructive flag is worse than no prompt; the
+# broken branch names the path and says it will be overwritten. `target_dir` is
+# the directory the found contract lives in (not necessarily the launch
+# directory: the policy walks up, so a broken parent contract is overwritten in
+# place rather than shadowed by a new file below it).
+#
+# `og init` now runs an interactive question flow behind that "y", so this is
+# no longer a quick scaffold. Both prompts say a few questions follow, and
+# SIGINT is trapped for the whole offer: a kindness must never be able to take
+# `og start` down with it. A subshell around cmd_init because it `exec`s
+# python — called directly it would replace this process and the start would
+# never happen.
 _offer_contract_init() {
-  local start="$1" force="${2:-}" answer
+  local target_dir="$1" force="${2:-}" existing="${3:-}" answer interrupted=0
   [[ -t 0 ]] || return 0
-  local -a args=()
-  [[ -n "$force" ]] && args=("$force")
-  read -r -p "Run 'og init${force:+ $force}' in $start now? [y/N] " answer || answer=""
-  case "$answer" in
-    [yY]|[yY][eE][sS])
-      info "running og init in $start"
-      # A failed scaffold must not abort the start: the offer was a kindness,
-      # and `set -e` is inherited from this script, so the subshell's status is
-      # caught here rather than propagating.
-      ( cmd_init "${args[@]+"${args[@]}"}" "$start" ) \
-        || warn "og init did not finish; starting anyway."
-      ;;
-  esac
+
+  # Ctrl-C goes to the whole foreground process group, `og` included, and a
+  # non-interactive bash dies on SIGINT. Catch it for the duration of the
+  # prompt and the interview; the child still receives it and exits, the
+  # parent treats that as "not finished" and continues the start. Restore
+  # whatever was there before (normally nothing) so the rest of the start is
+  # untouched.
+  local saved_int; saved_int="$(trap -p INT)"
+  trap 'interrupted=1' INT
+
+  local prompt
+  if [[ -n "$force" ]]; then
+    prompt="Replace $existing with a freshly generated contract? 'og init --force' will ask a few questions, then overwrite it. [y/N] "
+  else
+    prompt="Run 'og init' in $target_dir now? It will ask a few questions. [y/N] "
+  fi
+
+  # THE READ CANNOT STAY IN THIS SHELL. A trap handler does fire on SIGINT, but
+  # bash then RESTARTS a blocking `read` (verified on bash 3.2 and 5.x), so the
+  # operator sees a prompt that ignores Ctrl-C until they type something. `wait`
+  # is interruptible instead: the reader runs in the background and inherits the
+  # signal, so Ctrl-C returns control at once. fd 3, not 0, because a
+  # non-interactive shell points a background job's stdin at /dev/null and
+  # `<&0` would read EOF immediately — accepting an empty answer.
+  exec 3<&0
+  local accepted=0 read_rc=0 reader
+  printf '%s' "$prompt" >&2
+  # `interrupted` is re-checked on both sides of the spawn: Ctrl-C can land
+  # between printing the prompt and entering `wait`, and a signal that arrives
+  # before the wait starts leaves no pending wait to interrupt. If the handler
+  # already ran, do not start a reader (or kill the one just started) rather
+  # than block on a prompt the operator has already cancelled.
+  if [[ "$interrupted" -eq 0 ]]; then
+    ( read -r answer <&3
+      case "$answer" in [yY]|[yY][eE][sS]) exit 0 ;; *) exit 1 ;; esac ) &
+    reader=$!
+  fi
+  if [[ "$interrupted" -eq 0 ]]; then
+    wait "$reader" || read_rc=$?
+  elif [[ -n "$reader" ]]; then
+    kill "$reader" 2>/dev/null || true
+  fi
+  exec 3<&-
+  if [[ "$read_rc" -eq 0 && "$interrupted" -eq 0 ]]; then
+    accepted=1
+  fi
+
+  if [[ "$accepted" -eq 1 ]]; then
+    info "running og init in $target_dir"
+    local -a args=()
+    [[ -n "$force" ]] && args=("$force")
+    # A failed or interrupted scaffold must not abort the start: the offer was
+    # a kindness, and `set -e` is inherited from this script, so the subshell's
+    # status is caught here rather than propagating.
+    ( cmd_init "${args[@]+"${args[@]}"}" "$target_dir" ) \
+      || warn "og init did not finish; starting anyway."
+  fi
+
+  if [[ -n "$saved_int" ]]; then eval "$saved_int"; else trap - INT; fi
+  if [[ "$interrupted" -eq 1 ]]; then
+    warn "og init was interrupted; continuing the start without it."
+  fi
   return 0
 }
 

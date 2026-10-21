@@ -615,10 +615,12 @@ them, which looks like it is working.
 
 So `og start` warns (to stderr) when it cannot load the contract — missing,
 unparseable, not a mapping, or unreadable because PyYAML is absent. On a
-terminal it offers to run `og init` (`--force` when a broken file is in the
-way); everywhere else it warns and starts normally, never waiting for an
-answer. `--no-contract-check` silences the warning for a directory you know is
-not meant to be orchestrated.
+terminal it offers to run `og init` (which then asks a few questions); for a
+broken contract the offer names the file and says `--force` will overwrite it.
+Ctrl-C at the offer abandons the scaffold and the start continues. Everywhere
+else it warns and starts normally, never waiting for an answer.
+`--no-contract-check` silences the warning for a directory you know is not
+meant to be orchestrated.
 
 Run `og init` inside a repo to scaffold both files:
 
