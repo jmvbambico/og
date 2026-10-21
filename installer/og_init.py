@@ -613,6 +613,35 @@ def detect_branching_model(names: set):
     return None
 
 
+def branches_for_model(model: str, base: dict, names: set) -> dict:
+    """Recompute `protected` and the integration base for a branching model.
+
+    `protected` is what the merge gate DENYS on, so it is derived from the
+    model rather than guessed: a gitflow repo protects main and the release
+    branches while integrating on develop; github flow protects nothing
+    beyond the integration branch itself (which the contract refuses to list
+    as protected, because a branch that is both the merge target and
+    protected makes the gate forbid the only merge it mandates).
+    """
+    integ = base.get("integration_base")
+    task_prefix = base.get("task_prefix", "feature/")
+    if model == "gitflow":
+        integ = next((b for b in ("dev", "develop") if b in names), integ)
+        protected = sorted({b for b in names
+                            if b in ("main", "master", "staging", "production")
+                            or b.startswith("release")} - {integ})
+    elif model == "github-flow":
+        integ = next((b for b in ("main", "master") if b in names), integ)
+        protected = []
+    elif model == "trunk-release":
+        integ = next((b for b in ("main", "master") if b in names), integ)
+        protected = sorted({b for b in names if b.startswith("release")} - {integ})
+    else:
+        return dict(base)
+    return {"integration_base": integ, "protected": protected,
+            "task_prefix": task_prefix}
+
+
 # The marked block og is allowed to rewrite inside someone else's AGENTS.md.
 # Everything outside these markers belongs to the user, and og never touches
 # it — a rerun replaces the block, it does not append a second one.
@@ -889,6 +918,147 @@ def emit_questions(repo: Path, stacks, branches, gates, high_risk, never_write,
     print(json.dumps(payload, indent=2, default=str))
 
 
+# --- the interactive flow ---------------------------------------------------
+
+
+def _prompt(text: str, default: str = "") -> str:
+    try:
+        raw = input(text)
+    except EOFError:
+        return default
+    raw = raw.strip()
+    return raw or default
+
+
+def run_flow(gates, branches, names, ask=None) -> dict:
+    """Ask the three questions that are genuinely the user's to answer.
+
+    Everything og can measure is decided here and said out loud, not asked:
+    the branching model when the branch layout answers it, the task prefix,
+    the high-risk paths, the merge policy and the diff thresholds.
+    """
+    if ask is None:
+        ask = _prompt
+    answers = {}
+
+    model = detect_branching_model(names)
+    if model:
+        info(f"branching    {model} (detected from the branch layout) — not asking")
+    else:
+        print()
+        print("Branching model? This sets `protected`, which is what the merge "
+              "gate DENYS on.")
+        for i, m in enumerate(BRANCHING_MODELS, 1):
+            print(f"  {i}. {BRANCHING_LABELS[m]}")
+        default = "github-flow" if names & {"main", "master"} else "gitflow"
+        raw = ask(f"  Branching model [{default}]: ", default)
+        model = raw if raw in BRANCHING_MODELS else default
+        info(f"branching    {model}")
+    answers["branching_model"] = model
+
+    print()
+    print("Gate scope. A gate that touches a shared database, a fixed port, or the "
+          "network")
+    print("must be integration-only: parallel workers running it at the same time "
+          "corrupt each other.")
+    scoped = []
+    for name, cmd, scope in gates:
+        if scope:
+            ask_line = f"  {name}: {cmd}\n    shared database, fixed port, or network? [y/N] "
+            default = "n"
+        else:
+            ask_line = f"  {name}: {cmd}\n    shared database, fixed port, or network? [Y/n] "
+            default = "y"
+        raw = ask(ask_line, default)
+        shared = raw.strip().lower() in ("y", "yes")
+        scoped.append((name, cmd, None if shared else "worker"))
+
+    print()
+    print("Detected gates. A wrong gate command is worse than a missing one — the "
+          "orchestrator")
+    print("quotes the contract back and runs exactly what it says.")
+    for i, (name, cmd, scope) in enumerate(scoped, 1):
+        print(f"  {i}. {name}: {cmd}  [{scope or 'integration'}]")
+    raw = ask("  Which should be removed? (numbers, comma-separated, or none) ", "none")
+    removed = set()
+    for part in raw.replace(",", " ").split():
+        if part.isdigit():
+            removed.add(int(part))
+    kept = [g for i, g in enumerate(scoped, 1) if i not in removed]
+    answers["gates"] = [{"name": n, "run": c, "scope": s} for n, c, s in kept]
+    return answers
+
+
+def interactive() -> bool:
+    """True when a human is there to answer questions."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def load_plan(path: str) -> dict:
+    """Read the answers JSON written by `--questions` (or by hand).
+
+    The file may be the plan itself or a wrapper with an `answers` key, so a
+    caller that dumped the whole schema to a file can feed it back without
+    editing.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception as e:
+        die(f"could not read the plan {path}: {e}")
+    if not isinstance(data, dict):
+        die(f"the plan {path} must be a JSON object")
+    return data.get("answers") if isinstance(data.get("answers"), dict) else data
+
+
+def apply_answers(answers: dict, base_branches: dict, base_gates: list,
+                  names: set) -> tuple:
+    """Turn answers (from the flow or from `--plan`) into branches + gates."""
+    branches = dict(base_branches)
+    model = answers.get("branching_model")
+    if model and model != "custom":
+        branches = branches_for_model(model, base_branches, names)
+    override = answers.get("branches") or {}
+    for key in ("integration_base", "protected", "task_prefix"):
+        if override.get(key) is not None:
+            branches[key] = override[key]
+    gates = base_gates
+    gate_list = answers.get("gates")
+    if isinstance(gate_list, list):
+        kept = []
+        for g in gate_list:
+            if isinstance(g, str):
+                # A bare name keeps the detected gate as it is.
+                match = next((b for b in base_gates if b[0] == g), None)
+                if match:
+                    kept.append(match)
+                continue
+            scope = g.get("scope")
+            if scope in ("integration", "none", "null", True):
+                scope = None
+            elif scope in ("worker", False):
+                scope = "worker"
+            run = g.get("run")
+            if run is None:
+                # A gate named without a command keeps the detected command:
+                # a name og detected is worth more than a missing string.
+                match = next((b for b in base_gates if b[0] == g.get("name")), None)
+                run = match[1] if match else ""
+            kept.append((g["name"], run, scope))
+        gates = kept
+    # The scope question can also be answered on its own, as a map from gate
+    # name to scope — the shape the schema's `gate_scopes` question implies.
+    scopes = answers.get("gate_scopes")
+    if isinstance(scopes, dict):
+        rescoped = []
+        for n, c, s in gates:
+            if n in scopes:
+                v = scopes[n]
+                s = None if v in ("integration", "none", "null", True) else "worker"
+            rescoped.append((n, c, s))
+        gates = rescoped
+    return branches, gates
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="og init", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -898,6 +1068,10 @@ def main() -> None:
                     help="print the contract instead of writing it")
     ap.add_argument("--questions", action="store_true",
                     help="emit the decision schema as JSON (for an AI)")
+    ap.add_argument("--plan", metavar="FILE",
+                    help="apply answers from a JSON file instead of asking")
+    ap.add_argument("--no-prompt", action="store_true",
+                    help="use the detected defaults even on a TTY")
     ap.add_argument("--no-agents-md", action="store_true", help="skip the AGENTS.md stub")
     args = ap.parse_args()
 
@@ -941,6 +1115,22 @@ def main() -> None:
     if target.exists() and not args.force:
         die(f"{target.relative_to(repo)} already exists. Re-run with --force to replace it, "
             "or --print to see what would be generated.")
+
+    # The flow is additive: without a TTY, or with --plan, the detected
+    # defaults are used exactly as they were before this existed.
+    answers = None
+    if args.plan:
+        answers = load_plan(args.plan)
+    elif not args.no_prompt and interactive():
+        answers = run_flow(gates, branches, names)
+        roster = read_roster()
+        if roster and not roster["cross_vendor_review_possible"]:
+            warn("the installed roster holds a single vendor, so "
+                 "`require_cross_vendor_review: true` cannot be satisfied — "
+                 "a review will be same-vendor and must be labelled "
+                 "`degraded-review`.")
+    if answers:
+        branches, gates = apply_answers(answers, branches, gates, names)
 
     body = render(repo, branches, gates, high_risk, never_write, stacks, notes)
     target.parent.mkdir(parents=True, exist_ok=True)

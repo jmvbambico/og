@@ -530,3 +530,215 @@ def test_no_agents_md_suppresses_both_the_stub_and_the_block(tmp_path, monkeypat
     assert not (repo2 / "AGENTS.md").exists()
 
 
+# --- the question flow -----------------------------------------------------
+
+
+def test_no_tty_asks_nothing_and_writes_the_detected_contract(tmp_path, monkeypatch):
+    """Non-interactive must keep today's behaviour exactly."""
+    repo = _git_repo(tmp_path / "quiet")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    _no_prompt(monkeypatch)
+
+    _run_init(monkeypatch, str(repo))
+
+    stacks = og_init.detect_stacks(repo)
+    gates, high_risk, never_write, notes = og_init.build_gates(repo, stacks)
+    branches = og_init.detect_branches(repo)
+    expected = og_init.render(repo, branches, gates, high_risk, never_write,
+                              stacks, notes)
+    assert (repo / ".agents" / "orchestration.yaml").read_text() == expected
+
+
+def test_branching_detection_dev_proposes_gitflow(tmp_path):
+    repo = _git_repo(tmp_path / "flow", extra_branches=["dev"])
+    assert og_init.detect_branching_model(og_init.detect_branch_names(repo)) == "gitflow"
+
+
+def test_branching_detection_only_main_proposes_github_flow(tmp_path):
+    repo = _git_repo(tmp_path / "hub")
+    assert og_init.detect_branching_model(og_init.detect_branch_names(repo)) == "github-flow"
+
+
+def test_branching_detection_is_undecided_on_an_odd_layout(tmp_path):
+    repo = _git_repo(tmp_path / "odd", extra_branches=["release/1"])
+    assert og_init.detect_branching_model(og_init.detect_branch_names(repo)) is None
+
+
+def test_questions_report_the_detected_branching_model(tmp_path, monkeypatch, capsys):
+    repo = _git_repo(tmp_path / "flow", extra_branches=["dev"])
+    _run_init(monkeypatch, "--questions", str(repo))
+
+    payload = json.loads(capsys.readouterr().out)
+    q = payload["questions"][0]
+    assert q["default"] == "gitflow"
+    assert q["detected"] is True
+    assert payload["detected"]["branches"]["branching_model"] == "gitflow"
+
+
+def test_flow_does_not_ask_the_branching_model_when_it_is_detected():
+    asked = []
+
+    def ask(prompt, default=""):
+        asked.append(prompt)
+        return default
+
+    answers = og_init.run_flow([("unit", "pytest", "worker")],
+                               {"integration_base": "main", "protected": [],
+                                "task_prefix": "feature/"},
+                               {"main", "dev"}, ask=ask)
+    assert answers["branching_model"] == "gitflow"
+    assert len(asked) == 2, "only the scope and the gate confirmation remain"
+
+
+def test_flow_asks_the_branching_model_when_the_layout_is_unclear():
+    asked = []
+
+    def ask(prompt, default=""):
+        asked.append(prompt)
+        return default
+
+    answers = og_init.run_flow([], {"integration_base": "main", "protected": [],
+                                    "task_prefix": "feature/"},
+                               {"main", "release/1"}, ask=ask)
+    assert answers["branching_model"] == "github-flow"
+    assert any("Branching model" in p for p in asked)
+
+
+def test_flow_marks_a_shared_gate_integration_only():
+    def ask(prompt, default=""):
+        if "shared database" in prompt and "e2e" in prompt:
+            return "y"
+        return default
+
+    gates = [("unit", "pytest", "worker"), ("e2e", "docker compose up", None)]
+    answers = og_init.run_flow(gates, {"integration_base": "main", "protected": [],
+                                       "task_prefix": "feature/"},
+                               {"main"}, ask=ask)
+    by_name = {g["name"]: g for g in answers["gates"]}
+    assert by_name["unit"]["scope"] == "worker"
+    assert by_name["e2e"]["scope"] is None, "a shared gate is integration-only"
+
+
+def test_flow_can_delete_a_gate():
+    def ask(prompt, default=""):
+        if "Which should be removed" in prompt:
+            return "2"
+        return default
+
+    gates = [("unit", "pytest", "worker"), ("e2e", "npm run e2e", "worker")]
+    answers = og_init.run_flow(gates, {"integration_base": "main", "protected": [],
+                                       "task_prefix": "feature/"},
+                               {"main"}, ask=ask)
+    assert [g["name"] for g in answers["gates"]] == ["unit"]
+
+
+def test_answers_move_a_gate_to_integration_only():
+    base = [("unit", "pytest", "worker"), ("e2e", "npm run e2e", "worker")]
+    branches, gates = og_init.apply_answers(
+        {"gate_scopes": {"e2e": "integration"}},
+        {"integration_base": "main", "protected": [], "task_prefix": "feature/"},
+        base, {"main"})
+    assert ("e2e", "npm run e2e", None) in gates
+    assert ("unit", "pytest", "worker") in gates
+
+
+def test_answers_set_the_protected_branches_for_the_model():
+    names = {"main", "dev", "release/1"}
+    branches, _ = og_init.apply_answers(
+        {"branching_model": "gitflow"},
+        {"integration_base": "dev", "protected": [], "task_prefix": "feature/"},
+        [], names)
+    assert branches["integration_base"] == "dev"
+    assert "main" in branches["protected"]
+    assert "release/1" in branches["protected"]
+
+
+def test_plan_file_applies_without_asking(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "planned")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    plan = tmp_path / "answers.json"
+    plan.write_text(json.dumps({"branching_model": "github-flow",
+                                "gate_scopes": {"unit": "integration"}}))
+    _no_prompt(monkeypatch)
+
+    _run_init(monkeypatch, "--plan", str(plan), str(repo))
+
+    data = yaml.safe_load((repo / ".agents" / "orchestration.yaml").read_text())
+    unit = next(g for g in data["gates"] if g["name"] == "unit")
+    assert "scope" not in unit, "an integration-only gate carries no scope"
+
+
+def test_no_prompt_uses_the_defaults_even_on_a_tty(tmp_path, monkeypatch):
+    """`--no-prompt` is what automation on a TTY should pass."""
+    repo = _git_repo(tmp_path / "auto")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    monkeypatch.setattr(og_init, "interactive", lambda: True)
+    _no_prompt(monkeypatch)
+
+    _run_init(monkeypatch, "--no-prompt", str(repo))
+
+    assert (repo / ".agents" / "orchestration.yaml").exists()
+
+
+def test_a_tty_asks_the_questions(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "tty")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    monkeypatch.setattr(og_init, "interactive", lambda: True)
+    asked = []
+
+    def fake_input(prompt=""):
+        asked.append(prompt)
+        return ""
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    _run_init(monkeypatch, str(repo))
+
+    assert asked, "the flow must ask on a TTY"
+    data = yaml.safe_load((repo / ".agents" / "orchestration.yaml").read_text())
+    assert data["gates"]
+
+
+def test_roster_reports_a_single_vendor_roster(tmp_path, monkeypatch):
+    """`require_cross_vendor_review` is unenforceable on a one-vendor roster."""
+    home = tmp_path / "omnigent"
+    _write(home / "og-install.json", json.dumps({
+        "coders": [{"id": "freebuff", "model": "deepseek/deepseek-v4-flash"}],
+        "reviewer": [{"id": "opencode", "model": "opencode/deepseek-v4.1-flash-free"}],
+    }))
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+
+    roster = og_init.read_roster()
+    assert roster is not None
+    assert roster["vendors"] == ["deepseek"]
+    assert roster["cross_vendor_review_possible"] is False
+
+
+def test_roster_reports_a_cross_vendor_roster(tmp_path, monkeypatch):
+    home = tmp_path / "omnigent"
+    _write(home / "og-install.json", json.dumps({
+        "coders": [{"id": "freebuff", "model": "deepseek/deepseek-v4-flash"}],
+        "reviewer": [{"id": "codex", "model": "gpt-6-luna"}],
+    }))
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+
+    roster = og_init.read_roster()
+    assert roster["cross_vendor_review_possible"] is True
+    assert roster["vendors"] == ["deepseek", "openai"]
+
+
+def test_questions_warn_when_a_cross_vendor_review_is_impossible(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "omnigent"
+    _write(home / "og-install.json", json.dumps({
+        "coders": [{"id": "freebuff", "model": "deepseek/deepseek-v4-flash"}],
+        "reviewer": [{"id": "opencode", "model": "opencode/deepseek-v4.1-flash-free"}],
+    }))
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+    repo = _git_repo(tmp_path / "one")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+
+    _run_init(monkeypatch, "--questions", str(repo))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["roster"]["cross_vendor_review_possible"] is False
+    assert any("cross_vendor_review" in w for w in payload["warnings"])
