@@ -1263,12 +1263,97 @@ def test_the_block_is_never_appended_inside_an_open_fence():
 
 
 def test_a_signed_block_inside_a_fence_is_og_s_own():
-    """A signed block is og's block wherever it sits."""
+    """A signed block is og's block wherever it sits — when it is the only one.
+
+    A fence no longer hides og's block from og (that is what made the block
+    grow forever), so a lone signed block inside a fence is still og's and
+    is updated in place.
+    """
     doc = "# Mine\n\n```\n" + BLOCK + "```\n"
     out = og_init.upsert_agents_block(doc, BLOCK)
 
     assert out.count(og_init.BLOCK_BEGIN) == 1
     assert out.count(og_init.BLOCK_SIGNATURE) == 1
+
+
+# --- round 6: two signed blocks cannot be told apart, so say so --------------
+#
+# A pasted copy of og's block is byte-identical to the real one, so no rule
+# can tell them apart. og picks one deterministically, updates exactly that
+# one, leaves the others byte-identical, and WARNS — a stale block that
+# looks current is the failure this whole feature exists to end.
+
+REAL = og_init.orchestration_block({"integration_base": "main", "protected": []})
+COPY = og_init.orchestration_block({"integration_base": "dev", "protected": []})
+NEW = og_init.orchestration_block({"integration_base": "stage", "protected": []})
+# A block from an og that predates the signature, and therefore carries no
+# signature of its own.
+LEGACY = og_init.orchestration_block(
+    {"integration_base": "legacy", "protected": []}).replace(
+        og_init.BLOCK_SIGNATURE + "\n", "", 1)
+
+
+def test_a_pasted_unfenced_copy_does_not_win_over_og_s_own_block():
+    """The blocking case: the paste used to be the one og updated."""
+    doc = REAL + "\nHere is what og writes:\n\n" + COPY + "\nTAIL\n"
+    out = og_init.upsert_agents_block(doc, NEW)
+
+    assert out.count(og_init.BLOCK_BEGIN) == 2, "the copy is not deleted"
+    assert "TAIL" in out
+    assert "integration base `stage`" in out.split(og_init.BLOCK_BEGIN)[1], \
+        "og's OWN block is the one that is updated"
+    assert "integration base `dev`" in out.split(og_init.BLOCK_BEGIN)[2], \
+        "the pasted copy is left byte-identical"
+    assert og_init.upsert_agents_block(out, NEW) == out
+
+
+def test_a_pasted_fenced_copy_is_left_byte_identical():
+    doc = REAL + "\nExample:\n\n```\n" + COPY + "```\n\nTAIL\n"
+    out = og_init.upsert_agents_block(doc, NEW)
+
+    assert out.count(og_init.BLOCK_BEGIN) == 2
+    assert "TAIL" in out
+    assert "integration base `stage`" in out.split(og_init.BLOCK_BEGIN)[1]
+    assert "integration base `dev`" in out.split(og_init.BLOCK_BEGIN)[2]
+    assert og_init.upsert_agents_block(out, NEW) == out
+
+
+def test_an_unfenced_block_wins_over_a_fenced_one():
+    """The fenced case from round 4 still resolves the same way."""
+    doc = "```\n" + COPY + "```\n\n" + REAL
+    out = og_init.upsert_agents_block(doc, NEW)
+
+    assert "integration base `stage`" in out.split(og_init.BLOCK_BEGIN)[2], \
+        "the unfenced block is og's own"
+    assert "integration base `dev`" in out.split(og_init.BLOCK_BEGIN)[1]
+
+
+def test_the_ambiguity_is_reported():
+    warning = og_init.block_ambiguity(REAL + "\ncopy:\n" + COPY)
+    assert "2 og blocks" in warning
+    assert "the first one" in warning
+    assert "stale" in warning
+    assert og_init.block_ambiguity(REAL) == "", "one block is not ambiguous"
+
+
+def test_the_ambiguity_is_warned_about_on_the_write_path(tmp_path, capsys):
+    p = tmp_path / "AGENTS.md"
+    p.write_text(REAL + "\ncopy:\n" + COPY)
+
+    og_init.write_agents_block(p, NEW)
+
+    out = capsys.readouterr().out
+    assert "og blocks" in out, out
+    assert "stale" in out, out
+
+
+def test_no_warning_for_a_single_block(tmp_path, capsys):
+    p = tmp_path / "AGENTS.md"
+    p.write_text("# Mine\n")
+
+    og_init.write_agents_block(p, NEW)
+
+    assert "og blocks" not in capsys.readouterr().out
 
 
 # --- round 5: a signature alone is a quotation, not a block -----------------
@@ -1349,28 +1434,56 @@ def test_a_bare_signature_before_og_s_own_block_does_not_hide_it():
 # a second run changes nothing.
 _DOC_PIECES = {
     "pre": "# Mine\nSENTINEL PRE\n",
-    "signed_block": BLOCK,
-    "legacy_block": BLOCK.replace(og_init.BLOCK_SIGNATURE + "\n", "", 1),
+    "real_block": REAL,
+    "copy_block": COPY,
+    "legacy_block": LEGACY,
     "bare_signature": og_init.BLOCK_SIGNATURE + "\n",
     "quoted_pair": (og_init.BLOCK_BEGIN + "\nSENTINEL QUOTED\n"
                     + og_init.BLOCK_END + "\n"),
     "fingerprint_pair": (og_init.BLOCK_BEGIN + "\n\n## Orchestration\n\n"
-                         + og_init.BLOCK_FINGERPRINT + " and more\n"
+                         + og_init.BLOCK_FINGERPRINT + " FP COPY\n"
                          + og_init.BLOCK_END + "\n"),
     "open_fence": "```\n",
     "post": "SENTINEL POST\n",
 }
 
+# The marker each piece carries, so a test can tell WHICH piece og
+# rewrote — a count of blocks cannot: the old and the new block are both
+# one block.
+_PIECE_MARKERS = {
+    "real_block": "integration base `main`",
+    "copy_block": "integration base `dev`",
+    "legacy_block": "integration base `legacy`",
+    "quoted_pair": "SENTINEL QUOTED",
+    "fingerprint_pair": "FP COPY",
+}
 
+# Pieces may REPEAT: a document with two signed blocks — og's own and a
+# pasted copy of it — is exactly the case the permutations of distinct
+# pieces could not generate, and exactly the case that went wrong.
 @pytest.mark.parametrize("combo", sorted(
-    itertools.permutations(_DOC_PIECES, 3),
+    itertools.product(_DOC_PIECES, repeat=3),
     key=lambda c: (len(c), c)))
 def test_no_arrangement_loses_text_or_duplicates_the_block(combo):
     doc = "".join(_DOC_PIECES[c] for c in combo)
-    out = og_init.upsert_agents_block(doc, BLOCK)
+    out = og_init.upsert_agents_block(doc, NEW)
 
     for line in ("SENTINEL PRE", "SENTINEL POST", "SENTINEL QUOTED"):
         if line in doc:
             assert line in out, f"{combo} lost {line}"
-    assert out.count(BLOCK) <= 1, f"{combo} duplicated og's block"
-    assert og_init.upsert_agents_block(out, BLOCK) == out, f"{combo} is not idempotent"
+    # Exactly one live block: the one og wrote.
+    assert out.count("integration base `stage`") == 1, f"{combo} has no live block"
+    # At most one piece was rewritten, and the rest are byte-identical.
+    rewritten = [c for c, m in _PIECE_MARKERS.items()
+                 if out.count(m) < doc.count(m)]
+    assert len(rewritten) <= 1, f"{combo} rewrote {rewritten}"
+    assert og_init.upsert_agents_block(out, NEW) == out, f"{combo} is not idempotent"
+
+
+def test_a_document_with_two_signed_blocks_rewrites_the_first():
+    """og's own block is the first one; the pasted copy is left alone."""
+    doc = REAL + "\ncopy:\n" + COPY
+    out = og_init.upsert_agents_block(doc, NEW)
+
+    assert out.split(og_init.BLOCK_BEGIN)[1].count("integration base `stage`") == 1
+    assert out.split(og_init.BLOCK_BEGIN)[2].count("integration base `dev`") == 1

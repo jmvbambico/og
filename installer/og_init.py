@@ -842,34 +842,23 @@ def _is_column0_marker(content: str, marker: str) -> bool:
     return content.startswith(marker) and not content[len(marker):].strip()
 
 
-def _signed_block(lines: list):
-    """og's own block, found by its signature: (begin, end) or None.
+def _signed_blocks(lines: list) -> list:
+    """Every signed block in the document, in file order.
 
-    The signature is AUTHORITATIVE. It is not something a user types by
-    accident, so a block that carries it is og's block, wherever it sits —
-    inside a code fence, indented, at the end of the file. Fence-awareness
-    is deliberately NOT applied here: a fence that is never closed would
-    otherwise hide og's own block from og, and every run would append
-    another one.
+    A signature only counts as a block when a begin marker OF ITS OWN
+    precedes it: the begin marker says og wrote this, and the signature
+    says WHICH of them is og's. A signature with no begin marker is a
+    QUOTATION — somebody pasted the line — and is not a block at all.
 
-    An end index of None means the block was truncated — the end marker is
-    gone — and everything from the begin marker on was og's.
+    Each entry is (begin index, end index, inside a code fence). An end
+    index of None means the block was truncated: the end marker is gone,
+    and everything from the begin marker on was og's.
     """
-    sigs = [i for i, (c, _) in enumerate(lines) if c.strip() == BLOCK_SIGNATURE]
-    if not sigs:
-        return None
     inside, _ = _fence_state(lines)
-    # A document can hold two signed blocks only if the user pasted one
-    # somewhere. og's own is the one outside any fence; if every one of
-    # them is inside a fence (the document ends inside an open one), the
-    # last is taken.
-    unfenced = [s for s in sigs if s not in inside]
-    # A signature outside any fence is og's own first, but a signature that
-    # turns out to have no begin marker of its own must not hide a real
-    # block that happens to sit inside one — the document ending inside an
-    # open fence puts og's own block inside it.
-    for s in (list(reversed(unfenced))
-              + list(reversed([x for x in sigs if x in inside]))):
+    blocks = []
+    for s, (content, _) in enumerate(lines):
+        if content.strip() != BLOCK_SIGNATURE:
+            continue
         # The begin marker must belong to the SAME block. A begin marker
         # that sits before an already-closed block's end marker belongs to
         # that block, not to this signature.
@@ -878,21 +867,30 @@ def _signed_block(lines: list):
         begins = [i for i in range(s)
                   if lines[i][0].strip() == BLOCK_BEGIN and i > last_end]
         if not begins:
-            # A signature with no begin marker of its own is a QUOTATION,
-            # not a block: somebody pasted the line. Only a begin marker
-            # says og wrote this — without one, og appends its own block
-            # beside the quotation instead of replacing everything from
-            # that line to the end of the file, which would delete text
-            # og does not own.
             continue
         ends = [i for i in range(s + 1, len(lines))
                 if lines[i][0].strip() == BLOCK_END]
-        if ends:
-            return (begins[-1], ends[0])
-        # Truncated: the end marker is gone, so the block runs to the end
-        # of the file.
-        return (begins[-1], None)
-    return None
+        blocks.append((begins[-1], ends[0] if ends else None, s in inside))
+    return blocks
+
+
+def _find_block(lines: list):
+    """Locate og's own block: (begin index, end index) or None.
+
+    Two signed blocks in one document cannot be told apart — they are the
+    same text — so the choice is made by a rule and the ambiguity is
+    reported by the caller. The rule: the FIRST signed block that is not
+    inside a code fence (a block in a fence is a copy somebody pasted as an
+    example), and if every one of them is fenced, the first signed block.
+
+    Among several unfenced blocks, the first is og's: a copy is made FROM a
+    block that already existed, so the original comes first in the file.
+    """
+    blocks = _signed_blocks(lines)
+    if blocks:
+        unfenced = [b for b in blocks if not b[2]]
+        return (unfenced or blocks)[0][:2]
+    return _legacy_block(lines)
 
 
 def _legacy_block(lines: list):
@@ -924,19 +922,6 @@ def _legacy_block(lines: list):
         if BLOCK_FINGERPRINT in body:
             return (b, e)
     return None
-
-
-def _find_block(lines: list):
-    """Locate og's own block: (begin index, end index) or None.
-
-    The signature decides. Fence-awareness is only how a block written by a
-    pre-signature og is recognised, because that is the one case where the
-    markers are the only evidence there is.
-    """
-    signed = _signed_block(lines)
-    if signed:
-        return signed
-    return _legacy_block(lines)
 
 
 def upsert_agents_block(text: str, block: str, newline: str = None) -> str:
@@ -989,6 +974,30 @@ def upsert_agents_block(text: str, block: str, newline: str = None) -> str:
     return _join_lines(out + [[c, newline] for c in body])
 
 
+def block_ambiguity(text: str) -> str:
+    """The warning to raise when the document holds more than one og block.
+
+    Two signed blocks are the SAME text, so og cannot tell which one is the
+    live one. It updates one of them — deterministically — and says so: a
+    stale block that LOOKS current is the exact failure this whole feature
+    exists to end, and the user is the only one who can remove a copy.
+    """
+    lines = _split_lines(text)
+    blocks = _signed_blocks(lines)
+    if len(blocks) < 2:
+        return ""
+    chosen = _find_block(lines)
+    where = f"the first one (line {chosen[0] + 1})" if chosen else "the first one"
+    others = len(blocks) - 1
+    stale = ("the other is a copy that is now stale" if others == 1
+             else f"the other {others} are copies that are now stale")
+    return (f"AGENTS.md holds {len(blocks)} og blocks — og's signature appears "
+            f"{len(blocks)} times, and og cannot tell which one is the live one. "
+            f"og updated {where}; {stale}. Remove the "
+            f"{'copy' if others == 1 else 'copies'}, or the directives the "
+            f"orchestrator reads may be the stale one.")
+
+
 def write_agents_block(path: Path, block: str) -> str:
     """Update the marked block in an AGENTS.md without touching other bytes.
 
@@ -1001,6 +1010,9 @@ def write_agents_block(path: Path, block: str) -> str:
     text = raw.decode("utf-8", "surrogateescape")
     updated = upsert_agents_block(text, block)
     path.write_bytes(updated.encode("utf-8", "surrogateescape"))
+    warning = block_ambiguity(text)
+    if warning:
+        warn(warning)
     return updated
 
 
