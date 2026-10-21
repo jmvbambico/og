@@ -354,8 +354,10 @@ def build_gates(repo: Path, stacks: list) -> tuple:
             # Emitting `npm test` for it would hand the orchestrator a gate
             # that always fails, which is worse than having no gate.
             if not ({"build", "test"} & scripts):
-                notes.append("package.json has no build/test script — treated as "
-                             "tooling, not a stack; no Node gates emitted")
+                notes.append({"text": "package.json has no build/test script — "
+                                      "treated as tooling, not a stack; no Node "
+                                      "gates emitted",
+                              "gate": None})
                 continue
         for name, cmd, scope in st["gates"]:
             cmd = cmd.format(**subs) if subs else cmd
@@ -363,13 +365,19 @@ def build_gates(repo: Path, stacks: list) -> tuple:
             if st["id"] == "node" and name in ("build", "unit"):
                 key = "build" if name == "build" else "test"
                 if key not in scripts:
-                    notes.append(f"package.json has no `{key}` script — "
-                                 f"`{prefix}{cmd}` will fail")
+                    # A gate that is KNOWN to fail is a gate og is unsure
+                    # about, and the gate name rides along with the note so
+                    # the question flow can treat it as a gate to remove by
+                    # default rather than one to trust.
+                    notes.append({"text": f"package.json has no `{key}` script — "
+                                         f"`{prefix}{cmd}` will fail",
+                                  "gate": gname})
             gates.append((gname, prefix + cmd, scope))
         for name, cmd, scope, binary in st["optional"]:
             cmd = cmd.format(**subs) if subs else cmd
             if binary and not _which(binary):
-                notes.append(f"{binary} not installed — `{name}` gate omitted")
+                notes.append({"text": f"{binary} not installed — `{name}` gate omitted",
+                              "gate": None})
                 continue
             if st["id"] == "node" and name in ("lint", "typecheck") and name not in scripts:
                 continue
@@ -385,11 +393,19 @@ def build_gates(repo: Path, stacks: list) -> tuple:
     for d in ("tests/integration", "test/integration", "integration_tests",
               "tests/e2e", "e2e"):
         if (repo / d).is_dir():
-            notes.append(
-                f"{d}/ looks like a shared-state suite, but the worker-scoped gate "
-                f"above runs the whole tree. Split it: narrow the `unit` gate to the "
-                f"unit packages, and add a separate no-scope gate for {d}/ so it runs "
-                f"once on the integration branch instead of in every worktree.")
+            # The unit gate above runs the WHOLE tree, shared-state suite
+            # included, in every worktree. That is the same failure the
+            # scope question is about, so the gate it names is a gate og is
+            # unsure about: it is removed by default and shown as such.
+            unit_gate = next((g[0] for g in gates
+                              if g[0] == "unit" or g[0].startswith("unit-")), None)
+            notes.append({
+                "text": f"{d}/ looks like a shared-state suite, but the worker-scoped "
+                        f"gate above runs the whole tree. Split it: narrow the `unit` "
+                        f"gate to the unit packages, and add a separate no-scope gate "
+                        f"for {d}/ so it runs once on the integration branch instead "
+                        f"of in every worktree.",
+                "gate": unit_gate})
             break
     # Two stacks can describe the same command (the same marker in two
     # directories). Keep one entry per distinct command, but never collapse
@@ -508,7 +524,7 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
         L.append("")
         L.append("# og init could not verify these — check before relying on them:")
         for n in notes:
-            L.append(f"#   - {_one_line(n)}")
+            L.append(f"#   - {_one_line(n['text'] if isinstance(n, dict) else n)}")
     L.append("")
     body = "\n".join(L)
     # Mechanism over prompt: validate the contract we just generated instead
@@ -1067,7 +1083,11 @@ def emit_questions(repo: Path, stacks, branches, gates, high_risk, never_write,
             },
             "high_risk_paths": list(dict.fromkeys(high_risk)),
             "never_write": list(dict.fromkeys(never_write)),
-            "notes": notes,
+            "notes": [n["text"] if isinstance(n, dict) else n for n in notes],
+            # The gates og is UNSURE about, and why. These are the ones the
+            # question flow removes by default: a gate that is known to
+            # fail is worse than no gate at all.
+            "unsure_gates": {k: v for k, v in unsure_gates(notes).items()},
         },
         "current": read_current(repo),
         "questions": build_questions(gates, names),
@@ -1116,12 +1136,15 @@ def _prompt(text: str, default: str = "") -> str:
     return raw or default
 
 
-def run_flow(gates, branches, names, ask=None) -> dict:
+def run_flow(gates, branches, names, unsure=None, ask=None) -> dict:
     """Ask the three questions that are genuinely the user's to answer.
 
     Everything og can measure is decided here and said out loud, not asked:
     the branching model when the branch layout answers it, the task prefix,
     the high-risk paths, the merge policy and the diff thresholds.
+
+    `unsure` maps a gate name to the reason og does not trust it. Those
+    gates are the ones removed by default in the confirmation step.
     """
     if ask is None:
         ask = _prompt
@@ -1163,16 +1186,52 @@ def run_flow(gates, branches, names, ask=None) -> dict:
     print("Detected gates. A wrong gate command is worse than a missing one — the "
           "orchestrator")
     print("quotes the contract back and runs exactly what it says.")
+    uncertain = unsure or {}
     for i, (name, cmd, scope) in enumerate(scoped, 1):
-        print(f"  {i}. {name}: {cmd}  [{scope or 'integration'}]")
-    raw = ask("  Which should be removed? (numbers, comma-separated, or none) ", "none")
-    removed = set()
-    for part in raw.replace(",", " ").split():
-        if part.isdigit():
-            removed.add(int(part))
+        line = f"  {i}. {name}: {cmd}  [{scope or 'integration'}]"
+        if name in uncertain:
+            reasons = uncertain[name]
+            if isinstance(reasons, str):
+                reasons = [reasons]
+            line += (f"\n     likely wrong: {'; '.join(reasons)}"
+                     f"\n     -> removed unless you keep it")
+        print(line)
+    # "Default to fewer" applies where the uncertainty actually is. A gate
+    # og detected and can vouch for is kept; a gate og flagged as probably
+    # wrong — a command that will fail, or one that runs a shared-state
+    # suite in every worktree — is removed unless the user says otherwise.
+    # Discarding good detections to look cautious would be its own bug.
+    defaults = [i for i, (n, _, _) in enumerate(scoped, 1) if n in uncertain]
+    default = ",".join(str(i) for i in defaults) if defaults else "none"
+    raw = ask("  Which should be removed? (numbers, comma-separated — blank removes "
+              "the ones marked likely-wrong, 'none' keeps everything, an explicit "
+              f"list replaces the default) ", default)
+    if raw.strip().lower() == "none":
+        removed = set()
+    else:
+        removed = set()
+        for part in raw.replace(",", " ").split():
+            if part.isdigit():
+                removed.add(int(part))
     kept = [g for i, g in enumerate(scoped, 1) if i not in removed]
     answers["gates"] = [{"name": n, "run": c, "scope": s} for n, c, s in kept]
     return answers
+
+
+def unsure_gates(notes: list) -> dict:
+    """The gates a note says are probably wrong, and why.
+
+    A note that names a gate is a note about that gate: a command that will
+    fail, or one that runs a shared-state suite in every worktree. Those
+    are the gates the question flow removes by default. A gate can carry
+    more than one reason, so the reasons are a list.
+    """
+    out = {}
+    for n in notes:
+        if not isinstance(n, dict) or not n.get("gate"):
+            continue
+        out.setdefault(n["gate"], []).append(n["text"])
+    return out
 
 
 def interactive() -> bool:
@@ -1289,7 +1348,7 @@ def main() -> None:
     info(f"gates       {len(gates)} detected "
          f"({sum(1 for g in gates if g[2] == 'worker')} worker-scoped)")
     for n in notes:
-        warn(n)
+        warn(n["text"] if isinstance(n, dict) else n)
 
     if args.show:
         body = render(repo, branches, gates, high_risk, never_write, stacks, notes)
@@ -1308,7 +1367,7 @@ def main() -> None:
     if args.plan:
         answers = load_plan(args.plan)
     elif not args.no_prompt and interactive():
-        answers = run_flow(gates, branches, names)
+        answers = run_flow(gates, branches, names, unsure=unsure_gates(notes))
         roster = read_roster()
         if roster and not roster["cross_vendor_review_possible"]:
             warn("the installed roster holds a single vendor, so "

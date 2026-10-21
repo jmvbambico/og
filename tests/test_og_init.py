@@ -896,6 +896,93 @@ def test_crlf_run_through_main(tmp_path, monkeypatch):
 # is removed unless the user says otherwise.
 
 
+def test_a_gate_flagged_as_wrong_is_removed_by_default(capsys):
+    asked = []
+
+    def ask(prompt, default=""):
+        asked.append(prompt)
+        return default
+
+    gates = [("unit", "pytest -x -q", "worker"),
+             ("build", "npm run build", "worker")]
+    unsure = {"build": "package.json has no `build` script — `npm run build` will fail"}
+    answers = og_init.run_flow(gates, {"integration_base": "main", "protected": [],
+                                        "task_prefix": "feature/"},
+                               {"main"}, unsure=unsure, ask=ask)
+
+    assert [g["name"] for g in answers["gates"]] == ["unit"]
+    out = capsys.readouterr().out
+    assert "likely wrong" in out, out
+    assert "removed unless you keep it" in out, out
+
+
+def test_a_clean_gate_is_kept_by_default():
+    def ask(prompt, default=""):
+        return default
+
+    gates = [("unit", "pytest -x -q", "worker")]
+    answers = og_init.run_flow(gates, {"integration_base": "main", "protected": [],
+                                       "task_prefix": "feature/"},
+                               {"main"}, unsure={"build": "nope"}, ask=ask)
+
+    assert [g["name"] for g in answers["gates"]] == ["unit"]
+
+
+def test_none_keeps_every_gate():
+    def ask(prompt, default=""):
+        return "none"
+
+    gates = [("unit", "pytest -x -q", "worker"),
+             ("build", "npm run build", "worker")]
+    unsure = {"build": "will fail"}
+    answers = og_init.run_flow(gates, {"integration_base": "main", "protected": [],
+                                       "task_prefix": "feature/"},
+                               {"main"}, unsure=unsure, ask=ask)
+
+    assert [g["name"] for g in answers["gates"]] == ["unit", "build"]
+
+
+def test_an_explicit_list_replaces_the_default():
+    def ask(prompt, default=""):
+        return "1"
+
+    gates = [("unit", "pytest -x -q", "worker"),
+             ("build", "npm run build", "worker")]
+    unsure = {"build": "will fail"}
+    answers = og_init.run_flow(gates, {"integration_base": "main", "protected": [],
+                                       "task_prefix": "feature/"},
+                               {"main"}, unsure=unsure, ask=ask)
+
+    assert [g["name"] for g in answers["gates"]] == ["build"]
+
+
+def test_a_gate_whose_script_is_missing_is_flagged_unsure(tmp_path):
+    """The note about a failing command names the gate it is about."""
+    repo = tmp_path / "noscript"
+    _write(repo / "package.json", json.dumps({"name": "app", "scripts": {"build": "tsc"}}))
+
+    stacks = og_init.detect_stacks(repo)
+    gates, _, _, notes = og_init.build_gates(repo, stacks)
+    unsure = og_init.unsure_gates(notes)
+
+    assert "unit" in unsure
+    assert "build" not in unsure
+    assert any("will fail" in r for r in unsure["unit"])
+
+
+def test_a_shared_state_suite_flags_the_unit_gate(tmp_path):
+    repo = tmp_path / "shared"
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    (repo / "tests" / "integration").mkdir(parents=True)
+
+    stacks = og_init.detect_stacks(repo)
+    gates, _, _, notes = og_init.build_gates(repo, stacks)
+    unsure = og_init.unsure_gates(notes)
+
+    assert "unit" in unsure
+    assert any("shared-state suite" in r for r in unsure["unit"])
+
+
 def test_a_legacy_block_without_the_signature_is_still_replaced():
     """A block written by an og from before the signature existed."""
     legacy = ("# Mine\n\n" + og_init.BLOCK_BEGIN + "\n\n## Orchestration\n\n"
