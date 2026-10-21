@@ -613,6 +613,78 @@ def detect_branching_model(names: set):
     return None
 
 
+# The marked block og is allowed to rewrite inside someone else's AGENTS.md.
+# Everything outside these markers belongs to the user, and og never touches
+# it — a rerun replaces the block, it does not append a second one.
+BLOCK_BEGIN = "<!-- og:orchestration:begin -->"
+BLOCK_END = "<!-- og:orchestration:end -->"
+
+
+def orchestration_block(branches: dict) -> str:
+    """The orchestration directives injected into an existing AGENTS.md.
+
+    Short on purpose: this is appended to a document the user wrote, and a
+    long block is a long block of someone else's file. It carries only what
+    the orchestrator must know BEFORE deciding to read anything else.
+    """
+    integ = branches.get("integration_base") or "TODO"
+    protected = ", ".join(branches.get("protected") or []) or "none"
+    return f"""{BLOCK_BEGIN}
+
+## Orchestration
+
+`.agents/orchestration.yaml` is the machine-readable contract: the gates and
+their scope, the protected branches, the integration base, and the paths an
+implementer must not touch. Read it before planning, and run exactly the
+commands it names — a gate that looks wrong is fixed there, not improvised.
+
+AGENTS.md is authoritative: where this file and the contract disagree, this
+file wins.
+
+Detected: integration base `{integ}`, protected: {protected}.
+
+Gate scope decides WHO runs a gate. A gate marked `scope: worker` runs in
+EVERY implementer's worktree; a gate with no scope runs ONCE on the
+integration branch. Anything that touches a shared database, a fixed port, or
+the network belongs in the no-scope tier — parallel workers running it at the
+same time corrupt each other.
+{BLOCK_END}
+"""
+
+
+def upsert_agents_block(text: str, block: str) -> str:
+    """Return `text` with the marked block replaced, or the block appended.
+
+    The markers are the entire contract for what og may rewrite, so the
+    replacement is a single span: the bytes before it and the bytes after it
+    are copied through untouched. This is what makes the operation
+    idempotent — the rerunnable rule in AGENTS.md. A second `og init` finds
+    the markers and replaces the block in place instead of appending another.
+    """
+    # The trailing newline is part of the matched span, so a replacement
+    # reproduces the file byte for byte instead of growing one newline per
+    # run.
+    pattern = re.compile(re.escape(BLOCK_BEGIN) + r".*?" + re.escape(BLOCK_END)
+                         + r"\r?\n?", re.DOTALL)
+    m = pattern.search(text)
+    if m:
+        return text[:m.start()] + block + text[m.end():]
+    # A begin marker with no end marker means the block was truncated by
+    # something else. Replacing to the end of the file repairs it instead of
+    # leaving a half-block behind a second one.
+    m = re.search(re.escape(BLOCK_BEGIN), text)
+    if m:
+        return text[:m.start()] + block
+    if not text:
+        return block
+    if not text.endswith("\n"):
+        text += "\n"
+    # No blank line is inserted before the block: every byte outside the
+    # markers has to survive the write untouched, and a separator would be a
+    # byte og added to the user's document.
+    return text + block
+
+
 # --- the installed roster, for the cross-vendor review note ----------------
 #
 # `require_cross_vendor_review` is true in every generated contract, but the
@@ -878,7 +950,16 @@ def main() -> None:
     am = repo / "AGENTS.md"
     if not args.no_agents_md:
         if am.exists():
-            info("AGENTS.md exists — left untouched")
+            # A repo that already has a constitution gets the orchestration
+            # directives APPENDED inside a marked block, not an overwrite:
+            # the orchestrator reads AGENTS.md first, and "left untouched"
+            # meant it found nothing about orchestration at all. The markers
+            # are the whole contract for what og may rewrite, so the rerun
+            # replaces the block in place.
+            before = am.read_text()
+            block = orchestration_block(branches)
+            am.write_text(upsert_agents_block(before, block))
+            ok("updated the orchestration block in AGENTS.md")
         else:
             am.write_text(AGENTS_STUB.format(
                 name=repo.name,

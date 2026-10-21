@@ -444,3 +444,89 @@ def test_questions_states_what_it_decided_itself(tmp_path, monkeypatch, capsys):
     assert "branches.task_prefix" in decided
 
 
+# --- the marked AGENTS.md block ---------------------------------------------
+#
+# A repo with its own AGENTS.md used to print "left untouched" and never
+# received the orchestration directives at all, even though the orchestrator
+# reads AGENTS.md FIRST.
+
+
+def _init_with_agents_md(tmp_path, monkeypatch, agents_text, *args):
+    repo = _git_repo(tmp_path / "proj")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    if agents_text is not None:
+        _write(repo / "AGENTS.md", agents_text)
+    _no_prompt(monkeypatch)
+    _run_init(monkeypatch, *args, str(repo))
+    return repo
+
+
+def test_block_is_appended_to_an_existing_agents_md(tmp_path, monkeypatch):
+    repo = _init_with_agents_md(tmp_path, monkeypatch, "# Mine\n\nmine.\n")
+
+    text = (repo / "AGENTS.md").read_text()
+    assert text.startswith("# Mine\n\nmine.\n")
+    assert text.count(og_init.BLOCK_BEGIN) == 1
+    assert text.count(og_init.BLOCK_END) == 1
+    assert "## Orchestration" in text
+    assert ".agents/orchestration.yaml" in text
+
+
+def test_block_is_idempotent(tmp_path, monkeypatch):
+    """Re-running og init must UPDATE the block, never append a second one."""
+    repo = _init_with_agents_md(tmp_path, monkeypatch, "# Mine\n\nmine.\n")
+    first = (repo / "AGENTS.md").read_text()
+
+    _run_init(monkeypatch, "--force", str(repo))
+    second = (repo / "AGENTS.md").read_text()
+
+    assert second.count(og_init.BLOCK_BEGIN) == 1
+    assert second.count(og_init.BLOCK_END) == 1
+    assert second == first, "the block must be replaced in place, not appended"
+
+
+def test_block_leaves_the_rest_of_the_file_byte_identical(tmp_path, monkeypatch):
+    original = "# Mine\n\nkeep this exactly.\n\n## Notes\n\nand this.\n"
+    repo = _init_with_agents_md(tmp_path, monkeypatch, original)
+
+    _run_init(monkeypatch, "--force", str(repo))
+    text = (repo / "AGENTS.md").read_text()
+
+    before = text.split(og_init.BLOCK_BEGIN)[0]
+    after = text.split(og_init.BLOCK_END)[1]
+    assert before == original
+    # Nothing follows the block except its own line terminator.
+    assert after == "\n"
+
+
+def test_block_update_keeps_the_user_text_and_refreshes_the_block(tmp_path, monkeypatch):
+    repo = _init_with_agents_md(tmp_path, monkeypatch, "# Mine\n\nmine.\n")
+    (repo / "AGENTS.md").write_text(
+        (repo / "AGENTS.md").read_text() + "\nuser added this later.\n")
+
+    _run_init(monkeypatch, "--force", str(repo))
+    text = (repo / "AGENTS.md").read_text()
+
+    assert text.count(og_init.BLOCK_BEGIN) == 1
+    assert "user added this later." in text
+
+
+def test_stub_is_written_when_there_is_no_agents_md(tmp_path, monkeypatch):
+    repo = _init_with_agents_md(tmp_path, monkeypatch, None)
+    text = (repo / "AGENTS.md").read_text()
+    assert "Trigger Phrases" in text
+    assert og_init.BLOCK_BEGIN not in text
+
+
+def test_no_agents_md_suppresses_both_the_stub_and_the_block(tmp_path, monkeypatch):
+    repo = _init_with_agents_md(tmp_path, monkeypatch, "# Mine\n\nmine.\n",
+                                "--no-agents-md")
+    text = (repo / "AGENTS.md").read_text()
+    assert og_init.BLOCK_BEGIN not in text
+    assert text == "# Mine\n\nmine.\n"
+
+    repo2 = _init_with_agents_md(tmp_path / "second", monkeypatch, None,
+                                 "--no-agents-md")
+    assert not (repo2 / "AGENTS.md").exists()
+
+
