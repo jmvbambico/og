@@ -20,9 +20,15 @@ judges the batched diff. Policies, not prompts, enforce what may be merged.
 whichever CLIs you actually have.
 
 ```
-./install.sh        # pick your agents, write the config
-og start            # run it
+./install.sh              # once per machine: pick your agents, write the config
+cd ~/projects/your-repo
+og init                   # once per repo: scaffold its orchestration contract
+og start                  # run it
 ```
+
+`og init` is not optional ceremony. Without a contract the orchestrator has no
+gates to run, no protected branches to refuse, and no integration base to merge
+into — see [Per-project setup](#per-project-setup).
 
 ---
 
@@ -395,12 +401,18 @@ The installer will ask you to:
 10. whether `og start` should **auto-update** (default yes) — see
     [Updating](#updating). Off, it only warns when a newer og exists.
 
-Then:
+Then, in each repo you want orchestrated:
 
 ```bash
 cd ~/projects/your-repo   # this becomes the default workspace
+og init                   # once per repo — writes .agents/orchestration.yaml
 og start
 ```
+
+`og init` reads *that* repo and writes its contract; it is a separate,
+per-repo step from the installer, which is per-machine. Skipping it starts a
+server with nothing to enforce — details in
+[Per-project setup](#per-project-setup).
 
 ## Reconfigure
 
@@ -437,6 +449,7 @@ og start            serve on your LAN — QR points at this machine's network IP
 og start tunneled   start the tunnel first, then serve behind that public origin
                     --use ngrok|tunnl.gg overrides the configured provider
 og init [path]      scaffold a repo's orchestration contract
+                    run once per repo, before the first og start
 og stop             stop server, host daemons, tunnel
 og restart [mode]   og stop, then og start — same arguments as start
 og setup            re-run the installer: agents, models, reviewer
@@ -586,6 +599,17 @@ on stock Ubuntu images) or PowerShell interop; if neither is available, open the
 printed URL yourself.
 
 ## Per-project setup
+
+**Run `og init` once in every repo you want orchestrated, before `og start`.**
+The installer configures *this machine*; `og init` configures *this repo*. They
+are different steps and neither implies the other.
+
+A repo with no contract still starts — `og start` serves fine, and the merge
+policy fails closed, so nothing unguarded gets merged. What you lose is
+everything the contract supplies: the gates workers run before reporting, the
+protected branches a merge is refused against, the integration base, the paths
+implementers must not touch. The orchestrator will plan and delegate without
+them, which looks like it is working.
 
 Run `og init` inside a repo to scaffold both files:
 
