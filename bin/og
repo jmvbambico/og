@@ -715,6 +715,7 @@ try:
     cur = proj.get("config") or {}
     if any(cur.get(k) != v for k, v in want.items()):
         call(f"/v1/projects/{proj['id']}", "PATCH", {"config": {**cur, **want}})
+
     # `used` is the canonical name, except when a rename hit 409 and we had to
     # stay on the adopted project's own name — the URL must point at whichever
     # name the project actually has.
@@ -1049,10 +1050,15 @@ print(int(rec["expires_at"] - time.time()))
 PYEOF
 }
 
-# The agent a new session opens with. Registering a bundle (--agent) only makes
-# it AVAILABLE in the picker; `default_agent` is what makes it the one you land
-# on. Miss it and og reports the agent registered while every session quietly
-# opens the claude-native-ui shim: plain Claude Code, no roster, no merge gate.
+# The agent the CLI opens with -- `omnigent run` with no AGENT, which is what
+# `og chat` is built on.
+#
+# It does NOT govern the web UI. Every reader of `default_agent` lives in
+# omnigent's cli.py; the server never consults it (verified against 0.17.0), and
+# a session started from the UI's top-level composer binds claude-native-ui
+# whatever this says. What binds the agent in the UI is the PROJECT pin that
+# ensure_project writes, which is also why `og start` points its printed URL and
+# QR at /?project=<name>.
 #
 # Caveat: this reads the EFFECTIVE value, and a project-level
 # .omnigent/config.yaml in the cwd you launch from outranks the user-level one.
@@ -1129,6 +1135,33 @@ og_host_pid() {
 # Same shape as the server launch above: detached with nohup, pid in a file
 # og owns, so `og stop` can end it (omnigent's own registry records it as a
 # foreground daemon that `omnigent stop` does not necessarily reap).
+# Poll until a host registers as online, or the budget runs out.
+#
+# start_host_daemon's own loop exits 0 when the daemon is RUNNING but has not
+# registered yet, so a start can reach the project pin with no online host --
+# and the project's host_id pin -- which is the host a new session launches its
+# runner on -- needs one. This is the second chance that keeps `og start` a
+# guarantee instead of handing the operator a chore.
+wait_host_online() {
+  local secs="${1:-20}" i
+  for i in $(seq 1 $((secs * 2))); do
+    host_online && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Restart the host daemon once, for the case where it is alive but wedged --
+# registered under a stale id, or its websocket dropped -- which no amount of
+# further waiting will fix. Kills the pid in OUR pidfile only, so a second og on
+# another port is never touched.
+restart_host_daemon() {
+  local p; p="$(og_host_pid || true)"
+  [[ -n "$p" ]] && kill "$p" 2>/dev/null
+  rm -f "$HOST_PIDFILE"
+  start_host_daemon
+}
+
 start_host_daemon() {
   mkdir -p "$HOST_LOGDIR"
   local log="$HOST_LOGDIR/host-$(date +%Y%m%d-%H%M%S)-og.log"
@@ -1776,8 +1809,9 @@ cmd_start() {
 
   # Assert the registration rather than assume it. _preregister_agent echoes
   # "  agent: <name> (from <path>)" on success and a "has no name, skipping"
-  # warning on a nameless bundle -- and an unregistered agent is invisible until
-  # someone opens the picker on their phone and finds only claude-native-ui.
+  # warning on a nameless bundle. Registration is what lets the project pin
+  # resolve the agent at all; without it the pin silently falls back and the UI
+  # opens plain Claude Code.
   if grep -q "agent: $AGENT_NAME" "$server_log"; then
     ok "$AGENT_NAME registered as a template agent"
   else
@@ -1785,24 +1819,28 @@ cmd_start() {
     die "the server is up but did not register $AGENT_NAME (see log above)"
   fi
 
-  # Registration proves dev-lead is AVAILABLE; it does not make it the agent a
-  # new session opens with. If default_agent is unset, set it -- launching
-  # dev-lead is this script's entire purpose, so an unset default is an
+  # Registration proves the agent is AVAILABLE; it does not make it the one
+  # anything opens with. If default_agent is unset, set it -- launching the
+  # orchestrator is this script's entire purpose, so an unset default is an
   # omission, not a preference. If it points somewhere ELSE, say so and leave
   # it alone: that is a deliberate choice and silently overwriting it would be
   # worse than the problem.
+  #
+  # Scope: this covers `og chat` only. default_agent is read by omnigent's
+  # cli.py and nothing in the server, so it has no bearing on what the web UI
+  # binds -- the project pin below is what does that.
   local cur_default; cur_default="$(configured_default_agent)"
   if [[ -z "$cur_default" ]]; then
     info "default_agent was unset; pointing it at $AGENT_NAME"
     omnigent config set --global "default_agent=$AGENT_DIR" >/dev/null 2>&1 \
-      || info "could not set default_agent (sessions may open on the default shim)"
+      || info "could not set default_agent ('og chat' may open the wrong agent)"
   elif ! same_path "$cur_default" "$AGENT_DIR"; then
     printf '\033[0;33m!\033[0m default_agent points elsewhere:\n' >&2
     echo "    $cur_default" >&2
-    echo "    new sessions will NOT open on $AGENT_NAME. To change it:" >&2
+    echo "    'og chat' will NOT open $AGENT_NAME. To change it:" >&2
     echo "    omnigent config set --global default_agent=$AGENT_DIR" >&2
   else
-    ok "default_agent resolves to $AGENT_NAME"
+    ok "default_agent resolves to $AGENT_NAME (used by 'og chat')"
   fi
 
   # The server holds state and serves the UI; it does not run harnesses. That is
@@ -1871,6 +1909,23 @@ cmd_start() {
     cannot claim the host, run 'omnigent host reset-id' and 'og start' again."
   fi
 
+  # Do not walk into the pin with no online host. `og start` is supposed to
+  # leave a working way in, not a to-do: without a host the project's host_id is
+  # skipped, and a session created any way that does not ask for a host then
+  # gets no runner at all -- "The runner for this session is not available".
+  # start_host_daemon has already given it 20s; spend a little more, then
+  # restart it once, which is the only thing that clears a daemon that is alive
+  # but wedged.
+  if ! host_online; then
+    info "the host has not registered yet; waiting for it"
+    if ! wait_host_online 20; then
+      info "still not online — restarting the host daemon"
+      restart_host_daemon >/dev/null 2>&1 || true
+      wait_host_online 20 || true
+    fi
+    host_online && ok "host is online"
+  fi
+
   # Pin the project AFTER the host is attached, not before. ensure_project
   # records the online host in the project config, and that host_id is what a
   # new session launches its runner on. Pinned before the attach, no host is
@@ -1885,8 +1940,12 @@ cmd_start() {
     ok "project '$proj' pinned to $AGENT_NAME$(host_online && echo " on this host")"
     OG_PUBLIC_URL="${OG_PUBLIC_URL%%\?*}/?project=$proj"
   else
-    printf '\033[0;33m!\033[0m could not pin the project default; the composer will\n' >&2
-    echo "    open on Claude Code — pick $AGENT_NAME manually (the row with a tooltip)." >&2
+    printf '\033[0;33m!\033[0m could not pin the project default; a new session in\n' >&2
+    echo "    the composer will open on Claude Code, not $AGENT_NAME. The pin is" >&2
+    echo "    what binds the agent there, and the picker cannot stand in for it:" >&2
+    echo "    it lists built-in agents only, so $AGENT_NAME is shown as" >&2
+    echo "    \"Agent unavailable\" even when the pin is working. Re-run 'og start'," >&2
+    echo "    or use 'og chat', which runs the bundle by path." >&2
   fi
 
   echo
@@ -2366,14 +2425,17 @@ cmd_status() {
   fi
   if server_running; then
     local pj; pj="$(ensure_project 2>/dev/null || true)"
-    [[ -n "$pj" ]] && echo "    project:  '$pj' → $AGENT_NAME (web composer default)" \
-                   || echo "    project:  not pinned — web composer opens on Claude Code"
+    [[ -n "$pj" ]] && echo "    project:  '$pj' → $AGENT_NAME (what the web UI binds)" \
+                   || echo "    project:  not pinned — the web UI opens on Claude Code"
   fi
+  # Scoped to the CLI on purpose: default_agent is read only by omnigent's
+  # cli.py, so claiming it covers "sessions" would overstate it by exactly the
+  # path people actually get wrong -- the UI's top-level composer.
   local d; d="$(configured_default_agent)"
   if [[ -z "$d" ]]; then
-    echo "    agent:    default_agent UNSET — sessions open on the default shim"
+    echo "    agent:    default_agent UNSET — 'og chat' has no agent to open"
   elif same_path "$d" "$AGENT_DIR"; then
-    echo "    agent:    $AGENT_NAME (default)"
+    echo "    agent:    $AGENT_NAME (for 'og chat'; the UI uses the project pin)"
   else
     echo "    agent:    $d  (NOT $AGENT_NAME)"
   fi
