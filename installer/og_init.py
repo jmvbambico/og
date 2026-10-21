@@ -35,7 +35,20 @@ if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
 def ok(m): print(f"{C['g']}✓{C['x']} {m}")
 def info(m): print(f"{C['c']}→{C['x']} {m}")
 def warn(m): print(f"{C['y']}!{C['x']} {m}")
-def die(m): print(f"{C['r']}✗{C['x']} {m}", file=sys.stderr); raise SystemExit(1)
+# `code` defaults to 1 for a plain failure. The DECLINED case gets its own
+# code (2), so a caller can tell "the user did not answer" from "the command
+# broke" — the two call for different messages, and only one of them is
+# worth retrying.
+def die(m, code=1):
+    # The message goes to stderr, and a stderr that is itself broken (the
+    # terminal the user just closed) must not change the exit code: the
+    # code is the part a caller acts on.
+    try:
+        print(f"{C['r']}✗{C['x']} {m}", file=sys.stderr)
+        sys.stderr.flush()
+    except Exception:
+        pass
+    raise SystemExit(code)
 
 
 def run(args, cwd=None):
@@ -1128,10 +1141,15 @@ def emit_questions(repo: Path, stacks, branches, gates, high_risk, never_write,
 
 
 def _prompt(text: str, default: str = "") -> str:
-    try:
-        raw = input(text)
-    except EOFError:
-        return default
+    """Ask one question.
+
+    EOF is NOT a default. Input that ends is the user declining, and a
+    contract built from substituted defaults is one nobody chose: it fails
+    OPEN, where no contract at all fails closed and warns. The EOFError is
+    therefore left for the caller to turn into an abort — nothing is
+    written on that path.
+    """
+    raw = input(text)
     raw = raw.strip()
     return raw or default
 
@@ -1305,8 +1323,11 @@ def apply_answers(answers: dict, base_branches: dict, base_gates: list,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="og init", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        prog="og init", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="exit codes: 0 written, 1 error, 2 declined — the input ended "
+               "before the questions were answered, and NOTHING was written.")
     ap.add_argument("path", nargs="?", default=".", help="repo to initialise (default: cwd)")
     ap.add_argument("--force", action="store_true", help="overwrite an existing contract")
     ap.add_argument("--print", dest="show", action="store_true",
@@ -1319,7 +1340,6 @@ def main() -> None:
                     help="use the detected defaults even on a TTY")
     ap.add_argument("--no-agents-md", action="store_true", help="skip the AGENTS.md stub")
     args = ap.parse_args()
-
     repo = Path(args.path).resolve()
     top = run(["git", "rev-parse", "--show-toplevel"], repo)
     if not top:
@@ -1367,7 +1387,26 @@ def main() -> None:
     if args.plan:
         answers = load_plan(args.plan)
     elif not args.no_prompt and interactive():
-        answers = run_flow(gates, branches, names, unsure=unsure_gates(notes))
+        # The questions are asked BEFORE anything is written, so an abort
+        # here leaves the repo exactly as it was — including an existing
+        # contract that `--force` was about to replace.
+        try:
+            answers = run_flow(gates, branches, names, unsure=unsure_gates(notes))
+        except EOFError:
+            # Input ended. That is the user DECLINING, not consent to the
+            # defaults: a contract built from unanswered questions fails
+            # OPEN — the orchestrator quotes it back and runs gates nobody
+            # chose — while no contract at all fails closed and warns. So
+            # silence aborts, and the exit code says "declined" rather than
+            # "failed", because the two call for different messages.
+            die("input ended before the questions were answered, so NOTHING was "
+                "written. A contract from unanswered questions would fail open: "
+                "the orchestrator would run gates nobody chose. Re-run `og init` "
+                "and answer the questions, or pass --no-prompt to use the "
+                "detected defaults on purpose.", code=2)
+        except KeyboardInterrupt:
+            die("interrupted, so NOTHING was written. Re-run `og init` when you "
+                "are ready to answer the questions.", code=2)
         roster = read_roster()
         if roster and not roster["cross_vendor_review_possible"]:
             warn("the installed roster holds a single vendor, so "

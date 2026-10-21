@@ -1004,3 +1004,127 @@ def test_an_unfenced_unsigned_pair_is_not_replaced():
     assert "the user's own note" in out
     assert og_init.BLOCK_SIGNATURE in out, "og's block is appended, not merged"
     assert out.count(og_init.BLOCK_BEGIN) == 2
+
+
+# --- round 3: input that ends is a DECLINE, not consent --------------------
+#
+# A contract written from unanswered questions fails OPEN: the orchestrator
+# quotes it back and runs gates nobody chose, and the user believes they
+# answered. No contract at all fails closed and warns. So silence must
+# abort, not assent — and it must abort before anything is written.
+
+
+def _eof_input(monkeypatch, after=1):
+    """An input() that answers `after` times and then hits EOF."""
+    calls = []
+
+    def fake_input(prompt=""):
+        calls.append(prompt)
+        if len(calls) > after:
+            raise EOFError
+        return ""
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    return calls
+
+
+def test_eof_at_the_first_question_aborts_and_writes_nothing(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "eof")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    monkeypatch.setattr(og_init, "interactive", lambda: True)
+    _eof_input(monkeypatch, after=0)
+
+    with pytest.raises(SystemExit) as exc:
+        _run_init(monkeypatch, str(repo))
+
+    assert exc.value.code == 2, "declined is not the same as failed"
+    assert not (repo / ".agents").exists()
+    assert not (repo / "AGENTS.md").exists()
+
+
+def test_eof_at_the_last_question_aborts_and_writes_nothing(tmp_path, monkeypatch):
+    """Partial progress must not be committed."""
+    # An ambiguous branch layout asks the branching question too, so the
+    # flow asks three times: branching, scope, confirmation.
+    repo = _git_repo(tmp_path / "eof-last", extra_branches=["release/1"])
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    monkeypatch.setattr(og_init, "interactive", lambda: True)
+    calls = _eof_input(monkeypatch, after=2)
+
+    with pytest.raises(SystemExit) as exc:
+        _run_init(monkeypatch, str(repo))
+
+    assert exc.value.code == 2
+    assert len(calls) == 3, "the EOF arrived at the LAST question"
+    assert not (repo / ".agents").exists()
+    assert not (repo / "AGENTS.md").exists()
+
+
+def test_eof_under_force_leaves_the_existing_contract_intact(tmp_path, monkeypatch):
+    """The one that matters: `og start` offers `og init --force`."""
+    repo = _git_repo(tmp_path / "forced")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    _write(repo / "AGENTS.md", "# Mine\n\nuser prose.\n")
+
+    # The first run writes a contract (no TTY under pytest, so no prompts).
+    _run_init(monkeypatch, str(repo))
+    contract = repo / ".agents" / "orchestration.yaml"
+    before = contract.read_bytes()
+    agents_before = (repo / "AGENTS.md").read_bytes()
+    assert before
+
+    monkeypatch.setattr(og_init, "interactive", lambda: True)
+    _eof_input(monkeypatch, after=0)
+
+    with pytest.raises(SystemExit) as exc:
+        _run_init(monkeypatch, "--force", str(repo))
+
+    assert exc.value.code == 2
+    assert contract.read_bytes() == before, "the contract must survive the abort"
+    assert (repo / "AGENTS.md").read_bytes() == agents_before
+
+
+def test_no_tty_still_writes_the_detected_contract(tmp_path, monkeypatch):
+    """Never being asked is still the documented default behaviour."""
+    repo = _git_repo(tmp_path / "quiet")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    monkeypatch.setattr(og_init, "interactive", lambda: False)
+    _eof_input(monkeypatch, after=0)
+
+    _run_init(monkeypatch, str(repo))
+
+    assert (repo / ".agents" / "orchestration.yaml").exists()
+
+
+def test_a_plan_is_unaffected_by_stdin(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "planned")
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    plan = tmp_path / "answers.json"
+    plan.write_text(json.dumps({"branching_model": "github-flow"}))
+    monkeypatch.setattr(og_init, "interactive", lambda: True)
+    _eof_input(monkeypatch, after=0)
+
+    _run_init(monkeypatch, "--plan", str(plan), str(repo))
+
+    assert (repo / ".agents" / "orchestration.yaml").exists()
+
+
+def test_run_flow_raises_on_eof_rather_than_defaulting():
+    """The flow itself must not paper over the end of the input."""
+    def ask(prompt, default=""):
+        raise EOFError
+
+    with pytest.raises(EOFError):
+        og_init.run_flow([("unit", "pytest", "worker")],
+                         {"integration_base": "main", "protected": [],
+                          "task_prefix": "feature/"},
+                         {"main", "release/1"}, ask=ask)
+
+
+def test_prompt_does_not_substitute_a_default_on_eof(monkeypatch):
+    def boom(*a, **k):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", boom)
+    with pytest.raises(EOFError):
+        og_init._prompt("question: ", "default")
