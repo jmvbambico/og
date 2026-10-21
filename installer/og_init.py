@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import yaml
 from pathlib import Path
 
 C = {"dim": "\033[2m", "b": "\033[1m", "g": "\033[0;32m", "y": "\033[0;33m",
@@ -102,8 +103,75 @@ UNIVERSAL_HIGH_RISK = [
 ]
 
 
+# Directories that never contain a project we want to gate, and that are large
+# enough to make the walk expensive. `build`/`dist` are here because they are
+# generated output dirs (they are already in the Node stack's never_write);
+# `.venv`/`__pycache__` are the Python equivalents. `vendor` is Go's vendored
+# dependencies, not a project of its own.
+SKIP_DIRS = {"node_modules", "target", ".git", "vendor", "dist", "build",
+             ".venv", "__pycache__"}
+
+# How far below the repo root a marker may live. Monorepos and nested
+# layouts (a Rust crate under `console/src-tauri/`) are the common case that
+# a root-only search misses entirely.
+MAX_MARKER_DEPTH = 3
+
+
+def _walk_project_dirs(repo: Path, max_depth: int = MAX_MARKER_DEPTH):
+    """Yield (dir, relative_prefix) for the repo root and its subdirectories.
+
+    Hidden directories are skipped wholesale (that covers `.git`, `.github`,
+    `.agents` and `.venv`); symlinked directories are skipped too, so the walk
+    cannot loop on a cycle.
+    """
+    yield repo, ""
+    frontier = [(repo, "", 0)]
+    while frontier:
+        cur, rel, depth = frontier.pop(0)
+        if depth >= max_depth:
+            continue
+        try:
+            entries = sorted(cur.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for e in entries:
+            if e.is_symlink() or not e.is_dir():
+                continue
+            if e.name in SKIP_DIRS or e.name.startswith("."):
+                continue
+            child_rel = f"{rel}/{e.name}" if rel else e.name
+            yield e, child_rel
+            frontier.append((e, child_rel, depth + 1))
+
+
 def detect_stacks(repo: Path) -> list:
-    return [s for s in STACKS if (repo / s["marker"]).exists()]
+    """Find every stack marker in the repo, at any depth up to the bound.
+
+    A root-only search was the root cause of the empty-contract bug: a nested
+    project (`console/src-tauri/Cargo.toml`) detected no stack at all, which
+    left `never_write` empty, which made `render()` emit the invalid fallback
+    below. The two failures compound, so they are fixed together.
+
+    Each returned dict is the stack definition plus:
+      `dir`  the repo-relative directory the marker was found in ("" = root)
+      `root` the absolute directory the marker was found in
+    """
+    found = []
+    for base, rel in _walk_project_dirs(repo):
+        for s in STACKS:
+            if (base / s["marker"]).exists():
+                item = dict(s)
+                item["dir"] = rel
+                item["root"] = base
+                found.append(item)
+    found.sort(key=lambda s: (0 if not s["dir"] else 1, s["dir"], s["id"]))
+    return found
+
+
+def _stack_label(st: dict) -> str:
+    """Human label for a stack, disambiguated by directory when nested."""
+    d = st.get("dir") or ""
+    return f'{st["label"]} ({d})' if d else st["label"]
 
 
 def node_pm(repo: Path) -> tuple:
@@ -154,11 +222,18 @@ def detect_branches(repo: Path) -> dict:
 def build_gates(repo: Path, stacks: list) -> tuple:
     gates, high_risk, never_write, notes = [], [], [], []
     for st in stacks:
+        # A stack found in a subdirectory runs its commands THERE, so the
+        # emitted command is prefixed with a `cd` into that directory. A
+        # root-level stack keeps the exact command it has always had — no
+        # `cd ./ &&` prefix.
+        rel = st.get("dir") or ""
+        base = st.get("root") or repo
+        prefix = f"cd {rel} && " if rel else ""
         subs = {}
         if st["id"] == "node":
-            pm, lock = node_pm(repo)
+            pm, lock = node_pm(base)
             subs = {"pm": pm, "lockfile": lock}
-            scripts = node_scripts(repo)
+            scripts = node_scripts(base)
             # A package.json carrying neither `build` nor `test` is tooling
             # (a linter, a hook, a docs site), not an application stack.
             # Emitting `npm test` for it would hand the orchestrator a gate
@@ -173,7 +248,7 @@ def build_gates(repo: Path, stacks: list) -> tuple:
                 key = "build" if name == "build" else "test"
                 if key not in scripts:
                     notes.append(f"package.json has no `{key}` script — `{cmd}` will fail")
-            gates.append((name, cmd, scope))
+            gates.append((name, prefix + cmd, scope))
         for name, cmd, scope, binary in st["optional"]:
             cmd = cmd.format(**subs) if subs else cmd
             if binary and not _which(binary):
@@ -181,9 +256,12 @@ def build_gates(repo: Path, stacks: list) -> tuple:
                 continue
             if st["id"] == "node" and name in ("lint", "typecheck") and name not in scripts:
                 continue
-            gates.append((name, cmd, scope))
-        high_risk += [h.format(**subs) if subs else h for h in st["high_risk"]]
-        never_write += st["never_write"]
+            gates.append((name, prefix + cmd, scope))
+        for h in st["high_risk"]:
+            h = h.format(**subs) if subs else h
+            high_risk.append(f"{rel}/{h}" if rel else h)
+        for nw in st["never_write"]:
+            never_write.append(f"{rel}/{nw}" if rel else nw)
     # A suite that talks to a database or binds a port must run ONCE on the
     # integration branch, never per-worker. It cannot be detected reliably, but
     # a conventionally-named directory is a strong enough hint to ask about.
@@ -196,7 +274,17 @@ def build_gates(repo: Path, stacks: list) -> tuple:
                 f"unit packages, and add a separate no-scope gate for {d}/ so it runs "
                 f"once on the integration branch instead of in every worktree.")
             break
-    return gates, high_risk, never_write, notes
+    # Two stacks can describe the same command (the same marker in two
+    # directories). Keep one entry per distinct command, but never collapse
+    # different directories into one gate — each project needs its own run.
+    seen = set()
+    deduped = []
+    for g in gates:
+        if g in seen:
+            continue
+        seen.add(g)
+        deduped.append(g)
+    return deduped, list(dict.fromkeys(high_risk)), list(dict.fromkeys(never_write)), notes
 
 
 def _which(b):
@@ -207,7 +295,7 @@ def _which(b):
 def render(repo: Path, branches: dict, gates: list, high_risk: list,
            never_write: list, stacks: list, notes: list) -> str:
     name = repo.name
-    stack_label = " + ".join(s["label"] for s in stacks) or "unknown"
+    stack_label = " + ".join(_stack_label(s) for s in stacks) or "unknown"
     L = []
     L.append(f"# Machine-readable orchestration contract for {name}.")
     L.append("# Consumed by the global og orchestrator agent. AGENTS.md remains the")
@@ -259,8 +347,19 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
     L.append("")
     L.append("never_write:")
     L.append("  # Paths an implementer must never touch.")
-    for p in dict.fromkeys(never_write) or ["# - \"vendor/**\""]:
-        L.append(f'  - "{p}"')
+    if never_write:
+        for p in dict.fromkeys(never_write):
+            L.append(f'  - "{p}"')
+    else:
+        # The empty case must still parse. A key with only comments beneath
+        # it parses as `null`, and the first consumer that iterates it gets a
+        # TypeError; the `[]` makes it an empty list instead. Nothing reads
+        # `never_write` today — it is advisory, consumed by the orchestrator
+        # agent rather than by the merge-gate policy — so this is
+        # pre-emptive, but it costs one line and removes a whole class of
+        # failure.
+        L.append('  # e.g. - "vendor/**"')
+        L.append("  []")
     L.append("")
     L.append("merge_policy:")
     L.append("  # Enforced by the `merge_gate` policy, not by prompt text. ALLOW only when")
@@ -291,7 +390,19 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
         for n in notes:
             L.append(f"#   - {n}")
     L.append("")
-    return "\n".join(L)
+    body = "\n".join(L)
+    # Mechanism over prompt: validate the contract we just generated instead
+    # of trusting it. A single malformed byte here does not break one key —
+    # it breaks the WHOLE file. `policies/omnigent_local_policies.py`
+    # (`_load_contract`) catches the parse error and returns None, so every
+    # gate, protected branch and never_write rule is silently ignored: the
+    # user believes they have a contract, and they have none. Refusing loudly
+    # is the only honest outcome.
+    try:
+        yaml.safe_load(body)
+    except Exception as e:
+        die(f"og init generated invalid YAML ({e}); this is an og bug, please report it")
+    return body
 
 
 AGENTS_STUB = """# {name} Constitution
@@ -364,7 +475,7 @@ def main() -> None:
     gates, high_risk, never_write, notes = build_gates(repo, stacks)
 
     info(f"repo        {repo}")
-    info(f"stack       {', '.join(s['label'] for s in stacks) or 'none detected'}")
+    info(f"stack       {', '.join(_stack_label(s) for s in stacks) or 'none detected'}")
     info(f"integration {branches['integration_base'] or 'TODO'}"
          f"   protected: {', '.join(branches['protected']) or 'none found'}")
     info(f"gates       {len(gates)} detected "

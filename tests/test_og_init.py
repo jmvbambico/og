@@ -1,0 +1,167 @@
+"""Tests for installer/og_init.py — the orchestration contract generator.
+
+Two failure modes are covered here, because both were silent:
+
+  1. `never_write` with no entries used to render an unparseable YAML list,
+     which made the WHOLE contract file fail to load — so every gate and
+     protected branch was silently ignored.
+  2. Stack detection used to look at the repo root only, so a nested project
+     detected nothing at all — which is what emptied `never_write` and
+     triggered (1). The two compound, so they are tested together.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "installer"))
+import og_init  # noqa: E402
+
+BRANCHES = {"integration_base": "main", "protected": [], "task_prefix": "feature/"}
+
+
+def _render(repo: Path) -> str:
+    """Run the real detection + gate + render pipeline over a temp repo."""
+    stacks = og_init.detect_stacks(repo)
+    gates, high_risk, never_write, notes = og_init.build_gates(repo, stacks)
+    return og_init.render(repo, BRANCHES, gates, high_risk, never_write, stacks, notes)
+
+
+def _write(path: Path, text: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _node_package(path: Path, name: str = "app") -> None:
+    _write(path, json.dumps({"name": name, "scripts": {"build": "tsc", "test": "jest"}}))
+
+
+def test_zero_stacks_renders_parseable_yaml():
+    """Regression: the empty `never_write` fallback broke the whole file.
+
+    `policies/omnigent_local_policies.py::_load_contract` swallows the parse
+    error and returns None, so an unparseable contract means NO gate, NO
+    protected branch and NO never_write rule — silently.
+    """
+    body = og_init.render(Path("/tmp/x"), BRANCHES, [], [], [], [], [])
+    data = yaml.safe_load(body)
+    assert data["never_write"] == [], "never_write must be an empty list, not None"
+    assert data["gates"] is None or data["gates"] == []
+
+
+def test_zero_stacks_contract_keeps_its_other_keys():
+    body = og_init.render(Path("/tmp/x"), BRANCHES, [], [], [], [], [])
+    data = yaml.safe_load(body)
+    assert data["branches"]["integration_base"] == "main"
+    assert data["merge_policy"]["enabled"] is False
+
+
+def test_nested_repo_detects_both_stacks_with_prefixed_gates(tmp_path):
+    repo = tmp_path / "mops"
+    _write(repo / "console" / "src-tauri" / "Cargo.toml", "[package]\nname='x'\n")
+    _node_package(repo / "console" / "package.json")
+
+    body = _render(repo)
+    data = yaml.safe_load(body)
+
+    runs = [g["run"] for g in data["gates"]]
+    assert any(r.startswith("cd console/src-tauri && ") for r in runs), runs
+    assert any(r.startswith("cd console && ") for r in runs), runs
+    # The Rust crate is NOT the repo root, so its gates must be prefixed.
+    assert "cargo test" in " ".join(runs)
+    assert not any(r == "cargo test" for r in runs)
+
+    # never_write is prefixed too, and still parses.
+    nw = data["never_write"]
+    assert "console/src-tauri/target/**" in nw
+    assert "console/node_modules/**" in nw
+
+
+def test_root_marker_keeps_unprefixed_command(tmp_path):
+    """No regression: a root-level marker must produce exactly today's command."""
+    repo = tmp_path / "flat"
+    _write(repo / "Cargo.toml", "[package]\nname='x'\n")
+
+    stacks = og_init.detect_stacks(repo)
+    assert [s["id"] for s in stacks] == ["rust"]
+    assert stacks[0]["dir"] == ""
+
+    gates, _, _, _ = og_init.build_gates(repo, stacks)
+    runs = [g[1] for g in gates]
+    assert "cargo test" in runs
+    assert not any(r.startswith("cd ") for r in runs), runs
+
+    data = yaml.safe_load(_render(repo))
+    assert [g["run"] for g in data["gates"]] == runs
+
+
+def test_skipped_directory_is_not_detected(tmp_path):
+    repo = tmp_path / "skips"
+    _write(repo / "node_modules" / "pkg" / "Cargo.toml", "[package]\n")
+    _write(repo / "target" / "Cargo.toml", "[package]\n")
+    _write(repo / "vendor" / "Cargo.toml", "[package]\n")
+    _write(repo / "dist" / "Cargo.toml", "[package]\n")
+    _write(repo / "build" / "Cargo.toml", "[package]\n")
+    _write(repo / ".venv" / "Cargo.toml", "[package]\n")
+    _write(repo / "__pycache__" / "Cargo.toml", "[package]\n")
+
+    assert og_init.detect_stacks(repo) == []
+
+
+def test_depth_beyond_bound_is_not_detected(tmp_path):
+    repo = tmp_path / "deep"
+    _write(repo / "a" / "b" / "c" / "d" / "Cargo.toml", "[package]\n")
+
+    assert og_init.detect_stacks(repo) == []
+
+
+def test_within_bound_is_detected(tmp_path):
+    repo = tmp_path / "ok"
+    _write(repo / "a" / "b" / "c" / "Cargo.toml", "[package]\n")
+
+    stacks = og_init.detect_stacks(repo)
+    assert [(s["id"], s["dir"]) for s in stacks] == [("rust", "a/b/c")]
+
+
+def test_same_stack_in_two_dirs_yields_two_gates(tmp_path):
+    repo = tmp_path / "multi"
+    _write(repo / "one" / "Cargo.toml", "[package]\n")
+    _write(repo / "two" / "Cargo.toml", "[package]\n")
+
+    data = yaml.safe_load(_render(repo))
+    runs = [g["run"] for g in data["gates"]]
+    assert "cd one && cargo test" in runs
+    assert "cd two && cargo test" in runs
+
+
+def test_never_write_entries_do_not_repeat(tmp_path):
+    repo = tmp_path / "dup"
+    _write(repo / "pyproject.toml", "[project]\nname='x'\n")
+    _write(repo / "sub" / "pyproject.toml", "[project]\nname='y'\n")
+
+    data = yaml.safe_load(_render(repo))
+    nw = data["never_write"]
+    assert len(nw) == len(set(nw))
+
+
+@pytest.mark.parametrize("case", ["empty", "root", "nested", "skip", "deep"])
+def test_everything_rendered_parses(tmp_path, case):
+    repo = tmp_path / case
+    if case == "root":
+        _write(repo / "Cargo.toml", "[package]\n")
+    elif case == "nested":
+        _write(repo / "console" / "src-tauri" / "Cargo.toml", "[package]\n")
+        _node_package(repo / "console" / "package.json")
+    elif case == "skip":
+        _write(repo / "node_modules" / "pkg" / "Cargo.toml", "[package]\n")
+    elif case == "deep":
+        _write(repo / "a" / "b" / "c" / "d" / "Cargo.toml", "[package]\n")
+
+    body = _render(repo)
+    data = yaml.safe_load(body)
+    assert isinstance(data, dict)
+    assert "gates" in data and "never_write" in data and "merge_policy" in data
