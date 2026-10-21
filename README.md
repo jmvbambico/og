@@ -452,6 +452,8 @@ og start tunneled   start the tunnel first, then serve behind that public origin
                     --use ngrok|tunnl.gg overrides the configured provider
 og init [path]      scaffold a repo's orchestration contract
                     run once per repo, before the first og start
+og init --questions emit the decision schema as JSON (for an AI)
+                    reads the repo, writes nothing
 og stop             stop server, host daemons, tunnel
 og restart [mode]   og stop, then og start — same arguments as start
 og setup            re-run the installer: agents, models, reviewer
