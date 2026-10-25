@@ -102,6 +102,40 @@ def test_list_models_strips_kiro_style_table_row(monkeypatch):
     assert m.list_models(agent) == ["auto", "claude-sonnet-4"]
 
 
+def test_list_models_reads_the_model_column_from_pis_table(monkeypatch):
+    """Pi's table is provider-first, so the bare-id parser would keep the
+    provider ("Command Code", or "OpenAI" with an uppercase letter) and drop
+    every real model. `pi_table` reads the column under the `model` header.
+    """
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        _fake_run(
+            "provider      model                         context  max-out  thinking  images\n"
+            "Command Code  deepseek/deepseek-v4.1-flash  1.0M     16.4K    no        no    \n"
+            "OpenAI        gpt-5.3                       400K     128K     yes       yes   \n"
+        ),
+    )
+    agent = {"model": {"list_cmd": ["pi", "--list-models"], "list_parser": "pi_table"}}
+    assert m.list_models(agent) == ["deepseek/deepseek-v4.1-flash", "gpt-5.3"]
+
+
+def test_list_models_pi_table_requires_the_header(monkeypatch):
+    """A changed or failed Pi probe must yield no ids, not arbitrary cells."""
+    monkeypatch.setattr(
+        m.subprocess, "run",
+        _fake_run("Command Code  deepseek/deepseek-v4.1-flash  1.0M\n"),
+    )
+    agent = {"model": {"list_cmd": ["pi", "--list-models"], "list_parser": "pi_table"}}
+    assert m.list_models(agent) == []
+
+
+def test_list_models_unknown_parser_refuses_to_fabricate_a_listing(monkeypatch):
+    monkeypatch.setattr(m.subprocess, "run", _fake_run("anything\n"))
+    agent = {"model": {"list_cmd": ["whatever"], "list_parser": "not_a_parser"}}
+    assert m.list_models(agent) == []
+    assert "unknown list_parser" in m.LAST_LIST_ERROR
+
+
 def test_list_models_empty_on_nonzero_exit(monkeypatch):
     monkeypatch.setattr(m.subprocess, "run", _fake_run("ignored", returncode=1))
     assert m.list_models({"model": {"list_cmd": ["whatever"]}}) == []
@@ -2724,6 +2758,17 @@ def test_pick_model_offers_other_providers_by_number(monkeypatch):
     answers = iter(["99", "3"])  # out-of-range number is rejected, not stored
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: next(answers))
     assert m.pick_model(OPENCODE_AGENT, None) == "deepseek/deepseek-chat"
+
+
+def test_pick_model_offers_pis_listed_models(monkeypatch):
+    pi = m.agents_by_id()["pi"]
+    monkeypatch.setattr(m.subprocess, "run", _fake_run(
+        "provider      model                         context  max-out  thinking  images\n"
+        "Command Code  deepseek/deepseek-v4.1-flash  1.0M     16.4K    no        no    \n"
+        "Command Code  xiaomi/mimo-v2.6-pro          1.0M     16.4K    no        yes   \n"
+    ))
+    monkeypatch.setattr(m, "ask", lambda prompt, default=None: "2")
+    assert m.pick_model(pi, None) == "xiaomi/mimo-v2.6-pro"
 
 
 def test_pick_model_default_ignores_a_rotated_prefer(monkeypatch):
