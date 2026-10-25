@@ -928,6 +928,10 @@ _HARNESS_MARKS = {
                                  #   name the TOOL — `⌘` reads "Command" for acp:command-code.
                                  #   It survives by luck, not design: keyed to a
                                  #   provider vendor, so do NOT "fix" it into a Moonshot logo.
+    "multi": "\U0001D70B",       # 𝜋 mathematical italic small PI, for the Pi harness.
+                                 #   `multi` is the row's honest admission that Pi is
+                                 #   multi-model: its real vendor follows whichever model
+                                 #   Omnigent's provider serves, so the mark names the TOOL.
 }
 
 # The ANSI-256 foreground each vendor's mark is painted in, derived from the
@@ -1025,11 +1029,11 @@ _HARNESS_MARKS = {
 # `themes.json`, and `_role_colour` now asks the ACTIVE THEME for its `bg` before
 # it paints anything.
 #
-# THE TABLE ITSELF IS UNCHANGED AND MUST STAY THAT WAY. These fourteen indices are
+# THE TABLE ITSELF IS UNCHANGED AND MUST STAY THAT WAY. These fifteen indices are
 # the operator's logo colours and they ship byte-identical; a brand colour is not a
 # taste. What answers the light-terminal case is `readable_index` at PAINT time:
 # on a theme dark enough for a mark it returns the table index unchanged — all
-# fourteen, on dracula and on every other dark row — and only where a mark would
+# fifteen, on dracula and on every other dark row — and only where a mark would
 # be invisible does it walk that mark's HUE to a readable LIGHTNESS. It never
 # writes here.
 _VENDOR_COLOURS = {
@@ -1047,6 +1051,7 @@ _VENDOR_COLOURS = {
     "deepseek": 63,
     "cursor": 244,
     "moonshotai": 252,
+    "multi": 141,
 }
 
 # TODAY'S COLOURS, AS A THEME. `og` reproduces exactly what this pane painted
@@ -1143,7 +1148,7 @@ def state_role(state: str) -> str:
 #
 # THE SLOT MEASURES WITH THE WESTERN RULE (`_slot_width`): an Ambiguous glyph is
 # charged ONE column and padded exactly like a Narrow one. Every mark ships Narrow
-# now, so today that is simply glyph plus one space for all fourteen and the title
+# now, so today that is simply glyph plus one space for all fifteen and the title
 # starts in the same column on every row; the Ambiguous branch is HYPOTHETICAL,
 # kept for a future mark rather than any that ships. It was once the live case:
 # the three then-Ambiguous picks (kilo, cognition, z-ai, since replaced with

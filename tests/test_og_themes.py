@@ -11,7 +11,7 @@ recorded rather than against whatever the code happens to do:
     place. 144 is the CONVERTER's answer and NOT what the table ships -- the
     table overrides it with 108 on purpose -- so a test that asserted 108 here
     would be asserting the hand decision twice and the maths not at all.
-  * the GUARD is pinned on all fourteen marks being byte-identical on dracula,
+  * the GUARD is pinned on all catalog marks being byte-identical on dracula,
     and on hue holding (not exact lightness) when they move.
   * the OG ROUND TRIP is pinned on #87afaf -> 109, #00ff00 -> 46, #ffff00 ->
     226. If the converter does not reproduce the indices the pane already
@@ -728,7 +728,7 @@ def test_theme_for_falls_back_for_a_stale_slug_but_a_typed_slug_is_checked(tmp_p
 
 
 # ---------------------------------------------------------------------------
-# the readability guard: the fourteen logo colours survive
+# the readability guard: the catalog's logo colours survive
 # ---------------------------------------------------------------------------
 
 # How far a replacement's hue may sit from the original's. The same 12 the
@@ -746,7 +746,7 @@ def _gap(left, right):
     return min(abs(left - right), 360.0 - abs(left - right))
 
 
-def test_all_fourteen_marks_paint_exactly_their_table_index_on_dracula():
+def test_every_mark_paints_exactly_its_table_index_on_dracula():
     """THE OPERATOR'S LOGO COLOURS, UNCHANGED, ON THE DEFAULT THEME.
 
     `_VENDOR_COLOURS` carries eighty lines of recorded reasoning and ships
@@ -758,12 +758,12 @@ def test_all_fourteen_marks_paint_exactly_their_table_index_on_dracula():
     for vendor, index in a._VENDOR_COLOURS.items():
         assert a._role_colour(a.mark_role(vendor), theme) == index, (
             vendor, "the guard moved a mark on the default theme")
-    assert len(a._VENDOR_COLOURS) == 14
+    assert len(a._VENDOR_COLOURS) == 15
 
 
 def test_the_guard_is_a_no_op_when_the_background_is_the_terminals_own():
     """`bg` is `"default"` means this process cannot see the background, so there
-    is no contrast to compute. GUESSING would silently recolour fourteen logos on
+    is no contrast to compute. GUESSING would silently recolour every logo on
     the one theme that promises today's colours exactly -- which is the opposite
     of what the `og` row is for."""
     theme = th.load_catalog()["og"]

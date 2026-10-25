@@ -1066,13 +1066,13 @@ def test_every_harness_mark_fills_the_slot_and_every_title_starts_in_one_column(
     Ambiguous — a western terminal paints an Ambiguous glyph one cell wide but a
     CJK one paints it two — and the old slot once charged them two and left them
     unpadded, so their titles started one column LEFT of every other row's. That
-    is the shear this pins shut: one title column for all fourteen vendors, in the
+    is the shear this pins shut: one title column for every catalog vendor, in the
     locale the operator runs. The replacement glyphs are Narrow, so no row's width
     depends on the locale at all now — see `test_every_mark_and_the_node_are_narrow`.
     """
     harnesses = _harness_for_vendor()
     all_harnesses = [harnesses[vendor] for vendor in sorted(MARK)]
-    assert len(all_harnesses) == 14, all_harnesses
+    assert len(all_harnesses) == len(MARK), all_harnesses
 
     title_col = {}
     for harness in all_harnesses + ["totally-unknown", ""]:
@@ -1807,6 +1807,7 @@ MARK = {
     "cognition": "\u2316",
     "z-ai": "\U0001D5D9",
     "moonshotai": "\u2318",
+    "multi": "\U0001D70B",
 }
 
 
@@ -1846,7 +1847,7 @@ def test_every_vendor_resolves_to_its_mark_in_a_two_column_slot():
         # with the SLOT's ruler: the general `_display_width` would charge an
         # Ambiguous mark an extra column and so disagree with the slot's contract
         # on purpose (see `_slot_width`). No shipped mark is Ambiguous now, so the
-        # two rulers currently agree on all fourteen — but the slot still pins its
+        # two rulers currently agree on all fifteen — but the slot still pins its
         # own two-column promise against its own ruler.
         assert a._slot_width(got) == 2, (vendor, got)
 
@@ -4826,7 +4827,7 @@ def test_the_footer_roles_take_the_strip_background_under_a_theme():
 # ---------------------------------------------------------------------------
 #
 # The comment above `_VENDOR_COLOURS` said, in as many words: "That is a
-# background decision, not a fourteen-colour retune, so it is not made here." It
+# background decision, not a colour-table retune, so it is not made here." It
 # is made here. These tests pin the decision on both sides of it:
 #
 #   * under a real theme the theme's `bg` reaches `init_pair` as the SECOND

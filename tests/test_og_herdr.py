@@ -5131,6 +5131,18 @@ def test_an_acp_agents_tab_keeps_the_attach_repl(seams, _tmux_on_path,
         _typed_commands(client)
 
 
+def test_a_direct_harness_has_no_terminal_tab(seams, monkeypatch):
+    # `direct` is a first-class harness Omnigent drives itself (Pi), NOT a
+    # vendor TUI. Treating it as `native` would make a worker's tab chase a
+    # terminal that cannot exist; collapsing it into "unknown" would print the
+    # wrong reason. It answers False, exactly like an ACP child, so the tab
+    # keeps the Omnigent view.
+    assert m.harness_has_terminal("pi") is False
+    assert m.harness_has_terminal("claude-native") is True
+    assert m.harness_has_terminal("acp:cline") is False
+    assert m.harness_has_terminal("not-in-the-catalog") is None
+
+
 def test_an_unknown_harness_is_the_third_answer_not_either_branch(seams,
                                                                   _tmux_on_path,
                                                                   monkeypatch):

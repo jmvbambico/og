@@ -2795,6 +2795,73 @@ def test_vendor_of_falls_back_to_registry():
     assert m.vendor_of(OPENCODE_AGENT, {"id": "opencode", "model": "deepseek/deepseek-chat"}) == "deepseek"
 
 
+def test_pi_vendor_is_unknown_without_a_family_in_the_pin():
+    # Pi's provider lives in `omni setup`, invisible to og. `multi` is a mark
+    # key, not evidence of a distinct vendor: an unplaceable pin must return
+    # None so the review check warns instead of inventing a cross-vendor pair.
+    reg = m.agents_by_id()
+    assert m.vendor_of(reg["pi"], {"id": "pi", "model": None}) is None
+    assert m.vendor_of(reg["pi"], {"id": "pi", "model": "kilo/kilo-auto/free"}) is None
+    assert m.vendor_of(reg["pi"], {"id": "pi", "model": "gpt-5.3"}) is None
+    assert m.vendor_display(reg["pi"], {"id": "pi", "model": None}) == m.UNKNOWN_VENDOR
+    assert (m.vendor_of(reg["pi"], {"id": "pi",
+                                    "model": "deepseek/deepseek-v4-flash"})
+            == "deepseek")
+
+
+def test_validate_warns_unpinned_pi_reviewer_has_unknown_vendor():
+    plan = _base_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "deepseek/deepseek-chat"}],
+        reviewer={"id": "pi", "model": None},
+    )
+    warns = [msg for level, msg in m.validate(plan) if level == "warn"]
+    msg = next(msg for msg in warns if "cross-vendor review cannot be confirmed" in msg)
+    assert "reviewer `reviewer`" in msg
+    assert "no model pin" in msg
+    assert "degraded-review" in msg
+    # It must NOT claim a same-vendor pairing either: the true provider is
+    # unknown, so both "cross-vendor" and "shares a vendor" would be guesses.
+    assert not any("shares a vendor" in msg for msg in warns)
+
+
+def test_validate_warns_unpinned_pi_coder_leaves_review_unconfirmed():
+    plan = _base_plan(
+        coders=[{"id": "pi", "priority": 1, "model": None}],
+        reviewer={"id": "codex", "model": None},
+    )
+    warns = [msg for level, msg in m.validate(plan) if level == "warn"]
+    msg = next(msg for msg in warns if "cross-vendor review cannot be confirmed" in msg)
+    assert "provider family of `coder_pi` (Pi) is unknown" in msg
+    assert "`openai`" in msg
+
+
+def test_validate_pinned_pi_vendor_still_catches_a_same_vendor_reviewer():
+    plan = _base_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "deepseek/deepseek-chat"}],
+        reviewer={"id": "pi", "model": "deepseek/deepseek-v4-flash"},
+    )
+    warns = [msg for level, msg in m.validate(plan) if level == "warn"]
+    msg = next(msg for msg in warns if "shares a vendor" in msg)
+    assert "reviewer `reviewer`" in msg and "`deepseek`" in msg
+
+
+def test_pi_uses_direct_long_running_label_not_native():
+    reg = m.agents_by_id()
+    entry = {"id": "pi", "model": "deepseek/deepseek-v4-flash"}
+    assert m.long_running_facts(reg["pi"], entry)[1] == "direct paid pin"
+    assert "direct harness on a paid pin" in m.long_running_note(reg["pi"], entry)
+
+
+def test_vendor_map_names_an_unpinned_pi_as_unknown():
+    plan = _base_plan(
+        coders=[{"id": "pi", "priority": 1, "model": None}],
+        reviewer={"id": "pi", "model": None},
+    )
+    text = m.render_vendor_map(plan)
+    assert text.count(m.UNKNOWN_VENDOR) >= 2
+    assert "cross-vendor review cannot be confirmed" in text
+
+
 def test_validate_flags_same_vendor_through_a_reseller():
     """Zen's Claude reviewed by Claude Code is same-vendor review, however
     the bill reads."""

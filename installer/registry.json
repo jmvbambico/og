@@ -7,7 +7,10 @@
     "  label         what the picker shows",
     "  harness       the Omnigent harness id this agent runs on",
     "  binary        what `command -v` looks for during the scan",
-    "  kind          native      -> Omnigent has a first-class harness",
+    "  kind          native      -> Omnigent has a first-class harness with a",
+    "                               vendor TUI, hosted in a terminal pane",
+    "                direct      -> a first-class harness Omnigent drives itself",
+    "                               (headless, no vendor TUI and no terminal tab)",
     "                acp-builtin -> Omnigent ships an ACP row for it",
     "                acp-user    -> needs an `acp.agents` entry in",
     "                               ~/.omnigent/config.yaml (og writes it)",
@@ -35,6 +38,12 @@
     "                only — the field code reads is `unverified_roles`.",
     "  vendor        model family, used for the cross-vendor review check.",
     "                Two agents sharing a vendor cannot review each other.",
+    "  vendor_from_model_only  true when the provider family is knowable ONLY",
+    "                from the model pin. For a multi-model harness (Pi), an",
+    "                absent or unplaceable pin is treated as UNKNOWN, not as",
+    "                the row's `vendor` placeholder: it might share any",
+    "                provider, so the review check warns instead of claiming",
+    "                a cross-vendor pairing it cannot prove.",
     "  model.required  true when a dispatch MUST pin a model. Unpinned",
     "                  workers inherit the ORCHESTRATOR's model id, which",
     "                  most harnesses cannot resolve.",
@@ -224,6 +233,40 @@
       "prompt_delivery": "argv",
       "quota": {
         "probe": "codex-wham"
+      }
+    },
+    {
+      "id": "pi",
+      "label": "Pi",
+      "harness": "pi",
+      "binary": "pi",
+      "kind": "direct",
+      "kind_note": "`pi` is Omnigent's DIRECT Pi harness (not `pi-native`, the TUI wrap): Omnigent reports instruction_delivery COMPOSED_PER_TURN and subagents=False, so it receives every turn's prompt and is a leaf worker, never an orchestrator. `kind: direct` records that it has no vendor TUI — `og agents` Enter focuses its Omnigent view, not a CLI tab. The name is shared with the vendor binary on purpose; Omnigent resolves `pi` and `pi-native` from the same executable.",
+      "roles": [
+        "coder",
+        "reviewer",
+        "scout",
+        "integrator"
+      ],
+      "vendor": "multi",
+      "vendor_from_model_only": true,
+      "relay": false,
+      "silent_model_failure": false,
+      "model": {
+        "required": false,
+        "pin_path": "executor.model",
+        "note": "Pi is MULTI-MODEL: it runs on whichever provider `omni setup` configured, and Omnigent writes a managed `models.json` for the session. A blank pin is safe here (unlike agy) — Omnigent leaves HARNESS_PI_MODEL unset and Pi falls back to its own default. Pin an id THAT provider serves; `pi --list-models` reads Pi's own ambient catalog, not the Omnigent-managed provider, so the picker does not offer a live list and manual entry is intentional. Vendor follows the pin when the id names a family (e.g. `deepseek/...`); a blank or unplaceable pin is treated as UNKNOWN for the cross-vendor review check, because omni setup's provider is invisible to og. `multi` is only the mark/color key, never a claim that Pi is a distinct vendor."
+      },
+      "install": {
+        "npm": "npm i -g @earendil-works/pi-coding-agent"
+      },
+      "login": "omni setup",
+      "docs": "https://omnigent.ai/docs/build/harnesses/configuration#pi",
+      "unverified": true,
+      "prompt_delivery": "per_turn",
+      "quota": {
+        "probe": null,
+        "note": "Pi owns no quota of its own: it runs on the provider configured with `omni setup`, so capacity and exhaustion messages belong to that provider. `og stats` reports unknown for this row rather than guessing a pool."
       }
     },
     {

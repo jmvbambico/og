@@ -146,7 +146,8 @@ Add one row to `installer/registry.json`. No code change should be needed.
   "label": "New Agent",
   "harness": "acp:newagent",        // or a native harness id
   "binary": "newagent",             // what the PATH scan looks for
-  "kind": "acp-user",               // native | acp-builtin | acp-user
+  "kind": "acp-user",               // native (vendor TUI) | direct (headless,
+                                    //   no terminal tab) | acp-builtin | acp-user
   "acp_command": "newagent --acp",  // acp-user only
   "roles": ["coder"],               // informational only - no longer a picker gate
   "vendor": "somevendor",           // cross-vendor review depends on this
