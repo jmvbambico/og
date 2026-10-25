@@ -890,8 +890,10 @@ def pick_model(agent: dict, current: str | None, label: str | None = None) -> st
     default = current or spec.get("prefer") or ""
     got = ask("model id" + (" (REQUIRED)" if required else " (blank = harness default)"), default)
     if required and not got:
-        die(f"{agent['label']} requires a pinned model; an unpinned worker inherits the "
-            "orchestrator's model id and the dispatch fails.")
+        reason = spec.get("required_reason") or (
+            "an unpinned worker inherits the orchestrator's model id and the "
+            "dispatch fails.")
+        die(f"{agent['label']} requires a pinned model; {reason}")
     return got or None
 
 
@@ -1635,7 +1637,13 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
             # mechanism misdescribes some row. What is true for every shape is
             # that no usable review comes back, and the loss the user must weigh
             # before skipping the pin is the batch's independent review.
-            if r.role == "orchestrator":
+            # A row may explain its own reason (Pi has no model to inherit:
+            # Omnigent supplies none and Pi's fallback is first-authenticated,
+            # not deterministic). Prefer that over a generic shape.
+            reason = (agent.get("model") or {}).get("required_reason")
+            if reason:
+                tail = reason
+            elif r.role == "orchestrator":
                 tail = ("An unpinned orchestrator IS the session's brain: with no "
                         "model the harness launches on a default it may not serve, "
                         "so the very first conversation is faulty or empty.")

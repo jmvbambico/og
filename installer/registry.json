@@ -45,8 +45,11 @@
     "                provider, so the review check warns instead of claiming",
     "                a cross-vendor pairing it cannot prove.",
     "  model.required  true when a dispatch MUST pin a model. Unpinned",
-    "                  workers inherit the ORCHESTRATOR's model id, which",
-    "                  most harnesses cannot resolve.",
+    "                  workers usually inherit the ORCHESTRATOR's model id,",
+    "                  which most harnesses cannot resolve.",
+    "  model.required_reason  row-specific explanation for `required`, used",
+    "                  in the refusal when the pin is blank (e.g. Pi has no",
+    "                  model to inherit and its own fallback is not stable).",
     "  model.pin_path  where the pin goes in the sub-agent spec. Always",
     "                  executor.model — executor.config is a free-form dict",
     "                  and a model placed there is silently ignored.",
@@ -253,9 +256,10 @@
       "relay": false,
       "silent_model_failure": false,
       "model": {
-        "required": false,
+        "required": true,
+        "required_reason": "Omnigent supplies no model for Pi; without a pin it falls back to its own saved or first authenticated model, which is not deterministic across providers.",
         "pin_path": "executor.model",
-        "note": "Pi is MULTI-MODEL: it runs on whichever provider `omni setup` configured, and Omnigent writes a managed `models.json` for the session. A blank pin is safe here (unlike agy) — Omnigent leaves HARNESS_PI_MODEL unset and Pi falls back to its own default. Pin an id THAT provider serves; `pi --list-models` reads Pi's own ambient catalog, not the Omnigent-managed provider, so the picker does not offer a live list and manual entry is intentional. Vendor follows the pin when the id names a family (e.g. `deepseek/...`); a blank or unplaceable pin is treated as UNKNOWN for the cross-vendor review check, because omni setup's provider is invisible to og. `multi` is only the mark/color key, never a claim that Pi is a distinct vendor."
+        "note": "Pi is MULTI-MODEL: it runs on whichever provider `omni setup` configured. A pin is REQUIRED because Omnigent supplies no model when `executor.model` is absent; Pi then falls back to its own saved or first authenticated model, which is not deterministic across providers and can silently run the wrong one. Pin an id THAT provider serves; `pi --list-models` reads Pi's own ambient catalog, not the Omnigent-managed provider, so the picker does not offer a live list and manual entry is intentional. Vendor follows the pin when the id names a family (e.g. `deepseek/...`); an unplaceable pin is treated as UNKNOWN for the cross-vendor review check, because omni setup's provider is invisible to og. `multi` is only the mark/color key, never a claim that Pi is a distinct vendor."
       },
       "install": {
         "npm": "npm i -g @earendil-works/pi-coding-agent"

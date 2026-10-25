@@ -2809,24 +2809,37 @@ def test_pi_vendor_is_unknown_without_a_family_in_the_pin():
             == "deepseek")
 
 
-def test_validate_warns_unpinned_pi_reviewer_has_unknown_vendor():
+def test_validate_errors_when_pi_has_no_model_pin():
+    # Omnigent supplies no model for Pi; without a pin Pi picks its own saved
+    # or first authenticated model, which is not deterministic.
+    plan = _base_plan(
+        coders=[{"id": "pi", "priority": 1, "model": None}],
+        reviewer={"id": "codex", "model": None},
+    )
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    msg = next(msg for msg in errors if "requires a pinned model" in msg)
+    assert "first authenticated model" in msg
+    assert "not deterministic" in msg
+
+
+def test_validate_warns_bare_pi_reviewer_has_unknown_vendor():
     plan = _base_plan(
         coders=[{"id": "opencode", "priority": 1, "model": "deepseek/deepseek-chat"}],
-        reviewer={"id": "pi", "model": None},
+        reviewer={"id": "pi", "model": "gpt-5.3"},
     )
     warns = [msg for level, msg in m.validate(plan) if level == "warn"]
     msg = next(msg for msg in warns if "cross-vendor review cannot be confirmed" in msg)
     assert "reviewer `reviewer`" in msg
-    assert "no model pin" in msg
+    assert "its pin `gpt-5.3` does not name a provider family" in msg
     assert "degraded-review" in msg
     # It must NOT claim a same-vendor pairing either: the true provider is
     # unknown, so both "cross-vendor" and "shares a vendor" would be guesses.
     assert not any("shares a vendor" in msg for msg in warns)
 
 
-def test_validate_warns_unpinned_pi_coder_leaves_review_unconfirmed():
+def test_validate_warns_bare_pi_coder_leaves_review_unconfirmed():
     plan = _base_plan(
-        coders=[{"id": "pi", "priority": 1, "model": None}],
+        coders=[{"id": "pi", "priority": 1, "model": "gpt-5.3"}],
         reviewer={"id": "codex", "model": None},
     )
     warns = [msg for level, msg in m.validate(plan) if level == "warn"]
@@ -2852,10 +2865,10 @@ def test_pi_uses_direct_long_running_label_not_native():
     assert "direct harness on a paid pin" in m.long_running_note(reg["pi"], entry)
 
 
-def test_vendor_map_names_an_unpinned_pi_as_unknown():
+def test_vendor_map_names_a_bare_pi_pin_as_unknown():
     plan = _base_plan(
-        coders=[{"id": "pi", "priority": 1, "model": None}],
-        reviewer={"id": "pi", "model": None},
+        coders=[{"id": "pi", "priority": 1, "model": "gpt-5.3"}],
+        reviewer={"id": "pi", "model": "gpt-5.3"},
     )
     text = m.render_vendor_map(plan)
     assert text.count(m.UNKNOWN_VENDOR) >= 2
