@@ -102,16 +102,20 @@ def scan() -> dict:
 
 
 # --------------------------------------------------------------------------
-# sub-agent dispatch capability -- MEASURED from Omnigent, not the registry
+# sub-agent dispatch capability -- native support OR the sys_* relay
 # --------------------------------------------------------------------------
-# Whether a harness can dispatch sub-agents is a capability Omnigent reports on
-# its own harness object as `capabilities[<harness>].subagents`. The registry's
-# `relay` flag is a hand-maintained guess that was demonstrably WRONG for six
-# rows (agy, cursor, gemini, goose, hermes and grok each claimed `relay: true`
-# while their harness reports subagents=False). grok was even offered as an
-# orchestrator, so the installer would happily build a brain that could never
-# delegate. Measure when Omnigent is importable; fall back to the flag when it
-# is not -- Omnigent is a separate homebrew install
+# Omnigent's `capabilities[<harness>].subagents` flag covers NATIVE vendor
+# subagents: whether the vendor's own subagent calls are mirrored into Omnigent
+# child sessions. It is not a veto on the `sys_session_send` relay. Pi is the
+# proof (2026-10-25): `pi` reports native `subagents=False`, yet a live sandbox
+# turn called `sys_session_send`, the child ran, and its marker came back.
+#
+# So dispatch = native true OR the row declares it receives Omnigent's sys_*
+# tools (`relay: true`). The six rows that once claimed `relay: true` while
+# reporting subagents=False (agy, cursor, gemini, goose, hermes, grok) were
+# corrected to false: they do not get the relay. Measure native support when
+# Omnigent is importable; use `relay` as the second signal and as the fallback
+# when Omnigent is not. Omnigent is a separate homebrew install
 # (/opt/homebrew/Cellar/omnigent/<ver>/libexec) and is usually NOT importable
 # from the interpreter running this installer.
 _UNSET = object()
@@ -119,12 +123,15 @@ _SUBAGENT_CAPS: object = _UNSET
 
 
 def measured_subagent_caps() -> dict | None:
-    """{harness_id: bool} from Omnigent's capabilities, or None if unavailable.
+    """{harness_id: bool} for NATIVE vendor subagents, or None if unavailable.
 
-    Cached for the process -- the probe is asked once, never once per picker
-    row. Any failure (Omnigent absent, a capability shape change, anything) is
-    swallowed into None: a measurement that cannot be taken must never fail
-    setup. Callers then fall back to the registry's `relay` flag and say so.
+    This is only one of the two dispatch signals: `dispatch_capability` also
+    consults the row's `relay` flag, because a harness can receive the sys_*
+    relay without native subagents (Pi). Cached for the process -- the probe is
+    asked once, never once per picker row. Any failure (Omnigent absent, a
+    capability shape change, anything) is swallowed into None: a measurement
+    that cannot be taken must never fail setup. Callers then fall back to the
+    registry's `relay` flag and say so.
     """
     global _SUBAGENT_CAPS
     if _SUBAGENT_CAPS is not _UNSET:
@@ -142,7 +149,7 @@ def measured_subagent_caps() -> dict | None:
 
 class DispatchCapability(NamedTuple):
     can: bool
-    source: str              # 'measured' | 'registry-flag'
+    source: str              # 'measured' | 'measured+sys-relay' | 'registry-flag'
     harness: str
     shared_key: str | None   # the shared 'acp' key, when measured through it
 
@@ -154,15 +161,36 @@ def dispatch_capability(agent: dict) -> DispatchCapability:
     shared `acp` entry for the whole ACP transport, exactly as
     `configured_harnesses` does (see `preflight_key`) -- so the shared key is
     consulted before the registry flag. Every other harness keeps its own id.
+
+    Omnigent's `subagents` flag is NOT the whole answer. It reports whether the
+    vendor's own subagents become Omnigent child sessions; a harness can still
+    dispatch through the `sys_*` relay with that flag false. Pi is the proven
+    case (2026-10-25): `pi` reports `subagents=False`, yet a live sandbox turn
+    called `sys_session_send`, the child ran, and its marker came back. The
+    registry's `relay: true` is the second signal: it means this row receives
+    Omnigent's `sys_*` tools. A measured native false plus a relay true is
+    therefore dispatch-capable, and the source says both facts were consulted.
     """
     harness = agent.get("harness") or ""
     caps = measured_subagent_caps()
     if caps is not None:
         if harness in caps:
-            return DispatchCapability(caps[harness], "measured", harness, None)
+            native = caps[harness]
+            if native:
+                return DispatchCapability(True, "measured", harness, None)
+            if agent.get("relay") is True:
+                return DispatchCapability(True, "measured+sys-relay",
+                                          harness, None)
+            return DispatchCapability(False, "measured", harness, None)
         if harness.startswith("acp:") and "acp" in caps:
-            return DispatchCapability(caps["acp"], "measured", harness, "acp")
-    return DispatchCapability(agent.get("relay") is not False, "registry-flag",
+            native = caps["acp"]
+            if native:
+                return DispatchCapability(True, "measured", harness, "acp")
+            if agent.get("relay") is True:
+                return DispatchCapability(True, "measured+sys-relay",
+                                          harness, "acp")
+            return DispatchCapability(False, "measured", harness, "acp")
+    return DispatchCapability(agent.get("relay") is True, "registry-flag",
                               harness, None)
 
 
@@ -178,11 +206,12 @@ def capability_reason(cap: DispatchCapability) -> str:
 
 
 def orchestrator_capable_ids() -> list:
-    """Registry ids the probe says can actually orchestrate, in registry order.
+    """Registry ids the dispatch signals say can orchestrate, in registry order.
 
-    A capable harness that never receives its spec prompt cannot orchestrate
-    either, so `prompt_delivery: none` is excluded alongside the dispatch gate
-    -- otherwise the refusal would advertise a second dead end.
+    Dispatch is native subagents OR the sys_* relay, both measured/consulted by
+    `dispatch_capability`. A capable harness that never receives its spec prompt
+    cannot orchestrate either, so `prompt_delivery: none` is excluded alongside
+    the dispatch gate -- otherwise the refusal would advertise a second dead end.
     """
     return [a["id"] for a in REGISTRY["agents"]
             if dispatch_capability(a).can
@@ -194,15 +223,19 @@ def dispatch_note(agent: dict, role: str) -> str | None:
 
     Only the orchestrator role is killed by an inability to dispatch; every
     other role is a leaf worker by definition, so only it emits a note. The note
-    carries the BOOLEAN and the SOURCE (measured via Omnigent, or the registry
-    flag when it is not importable), so an AI installer driving its conversation
-    from --questions can see which agents can orchestrate without reading the
-    probe code -- and the picker shows the same caveat at selection time.
+    carries the BOOLEAN and the SOURCE (native measurement, native measurement
+    plus the sys_* relay, or the registry flag when Omnigent is not importable),
+    so an AI installer driving its conversation from --questions can see which
+    agents can orchestrate without reading the probe code -- and the picker
+    shows the same caveat at selection time.
     """
     if role != "orchestrator":
         return None
     cap = dispatch_capability(agent)
     if cap.can:
+        if cap.source == "measured+sys-relay":
+            return ("can dispatch sub-agents via Omnigent's `sys_session_send` "
+                    "(native subagents=False; registry relay:true).")
         return f"can dispatch sub-agents (source: {cap.source})."
     return (f"cannot dispatch sub-agents ({capability_reason(cap)}); "
             f"source: {cap.source}.")
@@ -2030,9 +2063,12 @@ def render_roster(plan: dict) -> str:
     for i, c in enumerate(plan["coders"]):
         a = reg[c["id"]]
         pin = f", pinned `{c['model']}`" if c.get("model") else ""
-        tags = [f"long-running: {long_running_tag(a, c)}"]
-        if a.get("relay") is False:
-            tags.append("leaf worker, cannot dispatch")
+        # Every generated coder is a leaf: coder.yaml.tmpl declares no
+        # `tools.agents`, so sys_session_send is absent even when the harness
+        # supports the relay (Pi). The ROW's dispatch capability is not the
+        # SLOT's; do not drop this cue just because a row can orchestrate.
+        tags = [f"long-running: {long_running_tag(a, c)}",
+                "leaf; cannot dispatch"]
         if a.get("silent_model_failure"):
             tags.append("FAILS SILENTLY on a bad model — empty transcript means "
                         "misconfig, not refusal; do not re-send")
@@ -2731,6 +2767,8 @@ def render_coder(plan: dict, c: dict, name: str | None = None) -> str:
         notes.append(f"# `acp.agents` as \"{a['label']}\", which Omnigent slugs to `{a['harness']}`.")
     if a.get("relay") is False:
         notes.append("# No sys_* tool relay: leaf worker only, cannot orchestrate or dispatch.")
+    else:
+        notes.append("# Leaf worker only: this generated coder declares no sub-agents, so it cannot dispatch.")
     if a.get("silent_model_failure"):
         notes.append("# Accepts a model id it cannot serve instead of rejecting it, so a wrong")
         notes.append("# pin yields an empty transcript and no error. Verify the first dispatch.")
