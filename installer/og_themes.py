@@ -4,9 +4,9 @@ THE BACKGROUND DECISION THIS FILE EXISTS TO MAKE. `og_agents` painted every colo
 with `init_pair(n, fg, -1)` — a coloured FOREGROUND on the TERMINAL'S OWN
 background. The `_VENDOR_COLOURS` comment block said what that costs, in as many
 words: "on a light terminal every entry here inverts into the very problem the
-floor exists to prevent ... That is a background decision, not a fourteen-colour
+floor exists to prevent ... That is a background decision, not a colour-table
 retune, so it is not made here." It is made here. A theme supplies a `bg`, the
-pane paints that background, and the fourteen logo colours keep their indices
+pane paints that background, and the catalog's logo colours keep their indices
 because the background they were chosen against is now the one they were picked
 for.
 
@@ -560,12 +560,13 @@ def readable_index(index: int, background: Optional[str],
                    floor: float = MARK_MIN_CONTRAST) -> int:
     """`index`, or the SAME-HUE index nearest it in lightness that reads on `background`.
 
-    THE LOGO COLOUR GUARD. `_VENDOR_COLOURS` is fourteen brand colours picked and
-    argued for against a DARK pane, and its own comment predicts the failure this
-    answers: on a light terminal 227 (kilo's lemon, the second-brightest mark in
-    the table) washes out against white. So the table is not edited — a brand
-    colour is not a taste, and thirteen of fourteen rows are right for the theme
-    they were chosen for — the PAINT-TIME ANSWER moves.
+    THE LOGO COLOUR GUARD. `_VENDOR_COLOURS` is the catalog's brand colours,
+    picked and argued for against a DARK pane, and its own comment predicts the
+    failure this answers: on a light terminal 227 (kilo's lemon, the
+    second-brightest mark in the table) washes out against white. So the table is
+    not edited — a brand colour is not a taste, and every row but the ones the
+    guard deliberately moves is right for the theme it was chosen for — the
+    PAINT-TIME ANSWER moves.
 
     HUE IS THE CHANNEL A BRAND MARK IS RECOGNISED BY, and that is the argument the
     z-ai row already makes in the table: at 144 the sage reads OLIVE, at 108 it
@@ -577,7 +578,7 @@ def readable_index(index: int, background: Optional[str],
 
     `background` None means the theme's `bg` is `"default"` — the terminal's own,
     which this process cannot know. It is a NO-OP there, deliberately: guessing
-    would recolour fourteen logos behind the operator's back on the one theme that
+    would recolour every logo behind the operator's back on the one theme that
     promises today's colours exactly.
 
     Falls back to `index` itself if nothing on the palette holds the hue and

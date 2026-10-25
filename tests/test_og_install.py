@@ -2795,6 +2795,86 @@ def test_vendor_of_falls_back_to_registry():
     assert m.vendor_of(OPENCODE_AGENT, {"id": "opencode", "model": "deepseek/deepseek-chat"}) == "deepseek"
 
 
+def test_pi_vendor_is_unknown_without_a_family_in_the_pin():
+    # Pi's provider lives in `omni setup`, invisible to og. `multi` is a mark
+    # key, not evidence of a distinct vendor: an unplaceable pin must return
+    # None so the review check warns instead of inventing a cross-vendor pair.
+    reg = m.agents_by_id()
+    assert m.vendor_of(reg["pi"], {"id": "pi", "model": None}) is None
+    assert m.vendor_of(reg["pi"], {"id": "pi", "model": "kilo/kilo-auto/free"}) is None
+    assert m.vendor_of(reg["pi"], {"id": "pi", "model": "gpt-5.3"}) is None
+    assert m.vendor_display(reg["pi"], {"id": "pi", "model": None}) == m.UNKNOWN_VENDOR
+    assert (m.vendor_of(reg["pi"], {"id": "pi",
+                                    "model": "deepseek/deepseek-v4-flash"})
+            == "deepseek")
+
+
+def test_validate_errors_when_pi_has_no_model_pin():
+    # Omnigent supplies no model for Pi; without a pin Pi picks its own saved
+    # or first authenticated model, which is not deterministic.
+    plan = _base_plan(
+        coders=[{"id": "pi", "priority": 1, "model": None}],
+        reviewer={"id": "codex", "model": None},
+    )
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    msg = next(msg for msg in errors if "requires a pinned model" in msg)
+    assert "first authenticated model" in msg
+    assert "not deterministic" in msg
+
+
+def test_validate_warns_bare_pi_reviewer_has_unknown_vendor():
+    plan = _base_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "deepseek/deepseek-chat"}],
+        reviewer={"id": "pi", "model": "gpt-5.3"},
+    )
+    warns = [msg for level, msg in m.validate(plan) if level == "warn"]
+    msg = next(msg for msg in warns if "cross-vendor review cannot be confirmed" in msg)
+    assert "reviewer `reviewer`" in msg
+    assert "its pin `gpt-5.3` does not name a provider family" in msg
+    assert "degraded-review" in msg
+    # It must NOT claim a same-vendor pairing either: the true provider is
+    # unknown, so both "cross-vendor" and "shares a vendor" would be guesses.
+    assert not any("shares a vendor" in msg for msg in warns)
+
+
+def test_validate_warns_bare_pi_coder_leaves_review_unconfirmed():
+    plan = _base_plan(
+        coders=[{"id": "pi", "priority": 1, "model": "gpt-5.3"}],
+        reviewer={"id": "codex", "model": None},
+    )
+    warns = [msg for level, msg in m.validate(plan) if level == "warn"]
+    msg = next(msg for msg in warns if "cross-vendor review cannot be confirmed" in msg)
+    assert "provider family of `coder_pi` (Pi) is unknown" in msg
+    assert "`openai`" in msg
+
+
+def test_validate_pinned_pi_vendor_still_catches_a_same_vendor_reviewer():
+    plan = _base_plan(
+        coders=[{"id": "opencode", "priority": 1, "model": "deepseek/deepseek-chat"}],
+        reviewer={"id": "pi", "model": "deepseek/deepseek-v4-flash"},
+    )
+    warns = [msg for level, msg in m.validate(plan) if level == "warn"]
+    msg = next(msg for msg in warns if "shares a vendor" in msg)
+    assert "reviewer `reviewer`" in msg and "`deepseek`" in msg
+
+
+def test_pi_uses_direct_long_running_label_not_native():
+    reg = m.agents_by_id()
+    entry = {"id": "pi", "model": "deepseek/deepseek-v4-flash"}
+    assert m.long_running_facts(reg["pi"], entry)[1] == "direct paid pin"
+    assert "direct harness on a paid pin" in m.long_running_note(reg["pi"], entry)
+
+
+def test_vendor_map_names_a_bare_pi_pin_as_unknown():
+    plan = _base_plan(
+        coders=[{"id": "pi", "priority": 1, "model": "gpt-5.3"}],
+        reviewer={"id": "pi", "model": "gpt-5.3"},
+    )
+    text = m.render_vendor_map(plan)
+    assert text.count(m.UNKNOWN_VENDOR) >= 2
+    assert "cross-vendor review cannot be confirmed" in text
+
+
 def test_validate_flags_same_vendor_through_a_reseller():
     """Zen's Claude reviewed by Claude Code is same-vendor review, however
     the bill reads."""

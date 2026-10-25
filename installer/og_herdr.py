@@ -566,26 +566,32 @@ def harness_kinds() -> dict[str, str]:
     return kinds
 
 
-# The registry kinds Omnigent hosts WITHOUT a pty: `acp-builtin` and `acp-user`
-# are plain stdio JSON-RPC children (see docs/HERDR.md), so there is no terminal
-# to attach to, by construction. Named as a set so the membership is stated once.
-ACP_KINDS = frozenset({"acp-builtin", "acp-user"})
+# The registry kinds Omnigent hosts WITHOUT a pty. `acp-builtin` and `acp-user`
+# are plain stdio JSON-RPC children (see docs/HERDR.md); `direct` is a
+# first-class harness Omnigent drives itself (e.g. `pi`) rather than a vendor
+# TUI. Neither has a terminal to attach to, by construction. Named as a set so
+# the membership is stated once.
+NO_TERMINAL_KINDS = frozenset({"acp-builtin", "acp-user", "direct"})
 
 
 def harness_has_terminal(harness: object) -> "bool | None":
     """Whether `harness` is one Omnigent hosts as a real terminal TUI.
 
-    True for a `native` registry kind, False for an ACP one, and None when the
-    harness is unknown (no id, or not in the catalog). None is a THIRD answer on
-    purpose: "I do not know this harness" must not be read as either "it has a
-    terminal" (which would try to attach to nothing) or "it is ACP" (which would
-    print the wrong reason to the operator). The caller reports the honest
-    "no terminal found" for None.
+    True for a `native` registry kind, False for an ACP or `direct` one, and
+    None when the harness is unknown (no id, or not in the catalog). None is a
+    THIRD answer on purpose: "I do not know this harness" must not be read as
+    either "it has a terminal" (which would try to attach to nothing) or "it is
+    ACP" (which would print the wrong reason to the operator). The caller
+    reports the honest "no terminal found" for None.
+
+    `direct` must NOT collapse into `native`: a direct harness has no vendor TUI
+    for a tab to attach to, so treating it as native would make `og agents`
+    Enter chase a terminal that cannot exist.
     """
     if not isinstance(harness, str) or not harness.strip():
         return None
     kind = harness_kinds().get(harness.strip())
-    if kind in ACP_KINDS:
+    if kind in NO_TERMINAL_KINDS:
         return False
     if kind == "native":
         return True

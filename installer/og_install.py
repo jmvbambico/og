@@ -653,10 +653,30 @@ def model_vendor(model_id: str | None) -> str | None:
     return None
 
 
-def vendor_of(agent: dict, entry: dict) -> str:
-    """The registry vendor, refined by the plan entry's model pin when that
-    pin names a vendor. Falls back to the registry when it does not."""
-    return model_vendor(entry.get("model")) or agent["vendor"]
+UNKNOWN_VENDOR = "unknown (pin does not name a provider family)"
+
+
+def vendor_of(agent: dict, entry: dict) -> str | None:
+    """The vendor the cross-vendor review check can actually rely on.
+
+    Usually the registry vendor, refined by the plan entry's model pin when
+    that pin names a vendor. A multi-model row (`vendor_from_model_only`) is
+    the exception: its configured provider is invisible to og, so an
+    unplaceable or absent pin is UNKNOWN, never the registry's placeholder.
+    Returning `multi` there would let an unpinned Pi reviewer look
+    cross-vendor against a coder on the same provider.
+    """
+    known = model_vendor(entry.get("model"))
+    if known:
+        return known
+    if agent.get("vendor_from_model_only"):
+        return None
+    return agent["vendor"]
+
+
+def vendor_display(agent: dict, entry: dict) -> str:
+    """`vendor_of` for generated prose, where `None` must not print as None."""
+    return vendor_of(agent, entry) or UNKNOWN_VENDOR
 
 
 def is_zen(model_id: str | None) -> bool:
@@ -719,9 +739,12 @@ def long_running_facts(agent: dict, entry: dict) -> tuple[str, str, str]:
                 "ACP; long steps time out",
                 "no — ACP kills a long single step ('Timeout waiting for ACP "
                 "response'); run long commands detached")
+    # `native` is a registry kind, not a synonym for "not ACP". Pi is
+    # `direct`: no vendor terminal, but the same long foreground step works.
+    transport = "direct" if agent.get("kind") == "direct" else "native"
     return ("yes",
-            "native paid pin",
-            "yes — native harness on a paid pin; this is the worker for long-running work")
+            f"{transport} paid pin",
+            f"yes — {transport} harness on a paid pin; this is the worker for long-running work")
 
 
 def long_running_tag(agent: dict, entry: dict) -> str:
@@ -867,8 +890,10 @@ def pick_model(agent: dict, current: str | None, label: str | None = None) -> st
     default = current or spec.get("prefer") or ""
     got = ask("model id" + (" (REQUIRED)" if required else " (blank = harness default)"), default)
     if required and not got:
-        die(f"{agent['label']} requires a pinned model; an unpinned worker inherits the "
-            "orchestrator's model id and the dispatch fails.")
+        reason = spec.get("required_reason") or (
+            "an unpinned worker inherits the orchestrator's model id and the "
+            "dispatch fails.")
+        die(f"{agent['label']} requires a pinned model; {reason}")
     return got or None
 
 
@@ -1612,7 +1637,13 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
             # mechanism misdescribes some row. What is true for every shape is
             # that no usable review comes back, and the loss the user must weigh
             # before skipping the pin is the batch's independent review.
-            if r.role == "orchestrator":
+            # A row may explain its own reason (Pi has no model to inherit:
+            # Omnigent supplies none and Pi's fallback is first-authenticated,
+            # not deterministic). Prefer that over a generic shape.
+            reason = (agent.get("model") or {}).get("required_reason")
+            if reason:
+                tail = reason
+            elif r.role == "orchestrator":
                 tail = ("An unpinned orchestrator IS the session's brain: with no "
                         "model the harness launches on a default it may not serve, "
                         "so the very first conversation is faulty or empty.")
@@ -1669,6 +1700,16 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
     coder_pins = list(zip(coder_names(plan), plan["coders"]))
     for i, (name, r) in enumerate(zip(reviewer_names(plan), reviewers)):
         rv = vendor_of(reg[r["id"]], r)
+        if rv is None:
+            pin_desc = (f"its pin `{r['model']}` does not name a provider family"
+                        if r.get("model") else "it has no model pin")
+            issues.append(("warn",
+                           f"reviewer `{name}` ({reg[r['id']]['label']}) is "
+                           f"multi-model and {pin_desc}, so cross-vendor review "
+                           "cannot be confirmed. Pin an id that names the family, "
+                           "or confirm the provider and label the PR "
+                           "`degraded-review`."))
+            continue
         colliding = [f"`{cname}` ({reg[c['id']]['label']})"
                      for cname, c in coder_pins if vendor_of(reg[c["id"]], c) == rv]
         if colliding:
@@ -1683,6 +1724,18 @@ def validate(plan: dict, rendered_prompt: str | None = None) -> list:
                            f"reviewer `{name}` ({reg[r['id']]['label']}) shares a vendor with "
                            f"{', '.join(colliding)}: all are `{rv}`. Review is meant to be "
                            + tail))
+            continue
+        unknown_coders = [f"`{cname}` ({reg[c['id']]['label']})"
+                          for cname, c in coder_pins
+                          if vendor_of(reg[c["id"]], c) is None]
+        if unknown_coders:
+            issues.append(("warn",
+                           "cross-vendor review cannot be confirmed: the provider "
+                           f"family of {', '.join(unknown_coders)} is unknown "
+                           "(multi-model with no family in the pin), so it may "
+                           f"share `{rv}` with reviewer `{name}`. Pin a "
+                           "family-bearing model id, or confirm the providers and "
+                           "label the PR `degraded-review`."))
 
     for o in orchestrators:
         a = reg[o["id"]]
@@ -1974,18 +2027,32 @@ def render_vendor_map(plan: dict) -> str:
     coder_pins = list(zip(coder_names(plan), plan["coders"]))
     lines = []
     for name, c in coder_pins:
-        lines.append(f"  - `{name}` is {vendor_of(reg[c['id']], c)}.")
+        lines.append(f"  - `{name}` is {vendor_display(reg[c['id']], c)}.")
     # The collision note sits on the REVIEWER line now: with a chain, the same
     # coder can be same-vendor with one reviewer and cross-vendor with the next,
     # so the pairing belongs to the reviewer being named (and matches the
     # `degraded-review` warning validate() raises for that entry).
     for name, e in zip(reviewer_names(plan), chain(plan, "reviewer")):
         rv = vendor_of(reg[e["id"]], e)
-        same = [f"`{cname}`" for cname, c in coder_pins
-                if vendor_of(reg[c["id"]], c) == rv]
-        note = (f" — same vendor as {', '.join(same)}; that pairing is "
-                "degraded-review" if same else "")
-        lines.append(f"  - `{name}` is {rv}{note}.")
+        if rv is None:
+            note = (", so cross-vendor review cannot be confirmed; pin a "
+                    "family-bearing id or label the PR `degraded-review`")
+        else:
+            same = [f"`{cname}`" for cname, c in coder_pins
+                    if vendor_of(reg[c["id"]], c) == rv]
+            unknown_coders = [f"`{cname}`" for cname, c in coder_pins
+                              if vendor_of(reg[c["id"]], c) is None]
+            if same:
+                note = (f" — same vendor as {', '.join(same)}; that pairing is "
+                        "degraded-review")
+            elif unknown_coders:
+                note = (" — cross-vendor review cannot be confirmed because the "
+                        f"provider family of {', '.join(unknown_coders)} is "
+                        "unknown; pin a family-bearing id or label the PR "
+                        "`degraded-review`")
+            else:
+                note = ""
+        lines.append(f"  - `{name}` is {vendor_display(reg[e['id']], e)}{note}.")
     return "\n".join(lines)
 
 
@@ -2144,7 +2211,7 @@ def render_roster_skill(plan: dict) -> str:
     for i, c in enumerate(plan["coders"], 1):
         a = reg[c["id"]]
         out += [f"## {i}. `{cod_names[i-1]}` — {a['label']}", "",
-                f"- harness `{a['harness']}`, vendor `{vendor_of(a, c)}`",
+                f"- harness `{a['harness']}`, vendor `{vendor_display(a, c)}`",
                 f"- model: {'pinned `' + c['model'] + '`' if c.get('model') else 'chosen by the harness'}",
                 f"- stats id: `{cod_ids[i-1]}` — use this exact id for `og stats --agent`, "
                 "`--mark` and `--clear`; the first instance keeps the bare agent id",
@@ -2209,23 +2276,41 @@ def render_roster_skill(plan: dict) -> str:
     # rather than a one-line mention.
     for name, e in zip(rev_names, rev_chain):
         rv = reg[e["id"]]
+        rv_vendor = vendor_of(rv, e)
         pin = f", pinned `{e['model']}`" if e.get("model") else ""
         out += [f"## `{name}` — {rv['label']}{pin}", "",
-                f"- harness `{rv['harness']}`, vendor `{vendor_of(rv, e)}`",
+                f"- harness `{rv['harness']}`, vendor `{vendor_display(rv, e)}`",
                 f"- **Long-running: {long_running_note(rv, e)}.**",
                 quota_line(rv), *quota_failure_lines(rv)]
         out += agy_completion_lines(rv)
         # The same collision validate() warns about at install time, carried
         # here so the orchestrator knows it at DISPATCH time too -- the moment
         # it is deciding which entry to use, long after the install scrolled by.
-        colliding = [f"`{cname}`" for cname, c in zip(cod_names, plan["coders"])
-                     if vendor_of(reg[c["id"]], c) == vendor_of(rv, e)]
-        if colliding:
-            out.append(f"- **Same-vendor review (`{vendor_of(rv, e)}`).** This reviewer shares "
-                       f"a vendor with {', '.join(colliding)}, so failing over to `{name}` "
-                       "produces a same-vendor review — it shares the blind spots that produced "
-                       "the diff. Use it only after saying so in chat, and label the PR "
-                       "`degraded-review`.")
+        if rv_vendor is None:
+            out.append("- **Cross-vendor review cannot be confirmed.** This "
+                       "reviewer is multi-model and its pin does not name a "
+                       "provider family, so it may share the implementer's "
+                       "provider. Pin a family-bearing id, or confirm the "
+                       "provider and label the PR `degraded-review`.")
+        else:
+            colliding = [f"`{cname}`" for cname, c in zip(cod_names, plan["coders"])
+                         if vendor_of(reg[c["id"]], c) == rv_vendor]
+            if colliding:
+                out.append(f"- **Same-vendor review (`{rv_vendor}`).** This reviewer shares "
+                           f"a vendor with {', '.join(colliding)}, so failing over to `{name}` "
+                           "produces a same-vendor review — it shares the blind spots that produced "
+                           "the diff. Use it only after saying so in chat, and label the PR "
+                           "`degraded-review`.")
+            else:
+                unknown_coders = [f"`{cname}`" for cname, c in zip(cod_names, plan["coders"])
+                                  if vendor_of(reg[c["id"]], c) is None]
+                if unknown_coders:
+                    out.append("- **Cross-vendor review cannot be confirmed.** The "
+                               f"provider family of {', '.join(unknown_coders)} is "
+                               "unknown (multi-model with no family in the pin), "
+                               f"so it may share `{rv_vendor}` with this reviewer. "
+                               "Pin a family-bearing id, or confirm the providers "
+                               "and label the PR `degraded-review`.")
         out += ["- Reviews only; never edits, never gets a worktree.",
                 "- Cross-vendor review is the point: never route a diff to a reviewer whose",
                 "  vendor matches the implementer's. If that is unavoidable, say so and label",
@@ -2281,7 +2366,7 @@ def render_roster_skill(plan: dict) -> str:
             sc = reg[e["id"]]
             pin = f", pinned `{e['model']}`" if e.get("model") else ""
             out += [f"## `{name}` — {sc['label']}{pin}", "",
-                    f"- harness `{sc['harness']}`, vendor `{vendor_of(sc, e)}`",
+                    f"- harness `{sc['harness']}`, vendor `{vendor_display(sc, e)}`",
                     f"- **Long-running: {long_running_note(sc, e)}.**",
                     quota_line(sc), *quota_failure_lines(sc),
                     "- **Read-only.** Never edits, creates or deletes a file, never",
@@ -2360,7 +2445,7 @@ def render_roster_skill(plan: dict) -> str:
             ig = reg[e["id"]]
             pin = f", pinned `{e['model']}`" if e.get("model") else ""
             out += [f"## `{name}` — {ig['label']}{pin}", "",
-                    f"- harness `{ig['harness']}`, vendor `{vendor_of(ig, e)}`",
+                    f"- harness `{ig['harness']}`, vendor `{vendor_display(ig, e)}`",
                     f"- **Long-running: {long_running_note(ig, e)}.**",
                     quota_line(ig), *quota_failure_lines(ig),
                     "- **Bounded result.** The verdict, the SHAs and branch names, and",

@@ -728,6 +728,52 @@ def test_roster_reports_a_cross_vendor_roster(tmp_path, monkeypatch):
     assert roster["vendors"] == ["deepseek", "openai"]
 
 
+def test_roster_treats_unpinned_pi_as_an_unknown_vendor(tmp_path, monkeypatch):
+    # `pi` runs on whatever provider `omni setup` configured; without a
+    # family-bearing pin there is no way to prove it differs from the
+    # reviewer, so cross-vendor review is NOT possible.
+    home = tmp_path / "omnigent"
+    _write(home / "og-install.json", json.dumps({
+        "coders": [{"id": "pi", "model": None}],
+        "reviewer": [{"id": "codex", "model": None}],
+    }))
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+
+    roster = og_init.read_roster()
+    assert roster["unknown_vendor"] is True
+    assert roster["cross_vendor_review_possible"] is False
+    assert roster["vendors"] == ["openai"]
+
+
+def test_roster_accepts_a_pinned_pi_family_for_cross_vendor_review(tmp_path, monkeypatch):
+    home = tmp_path / "omnigent"
+    _write(home / "og-install.json", json.dumps({
+        "coders": [{"id": "pi", "model": "deepseek/deepseek-v4-flash"}],
+        "reviewer": [{"id": "codex", "model": None}],
+    }))
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+
+    roster = og_init.read_roster()
+    assert roster["unknown_vendor"] is False
+    assert roster["cross_vendor_review_possible"] is True
+    assert roster["vendors"] == ["deepseek", "openai"]
+
+
+def test_roster_treats_a_bare_pi_pin_as_unknown(tmp_path, monkeypatch):
+    # A bare model name does not name the provider `omni setup` serves it
+    # from; only a provider-prefixed id proves the family.
+    home = tmp_path / "omnigent"
+    _write(home / "og-install.json", json.dumps({
+        "coders": [{"id": "pi", "model": "gpt-5.3"}],
+        "reviewer": [{"id": "codex", "model": None}],
+    }))
+    monkeypatch.setenv("OMNIGENT_HOME", str(home))
+
+    roster = og_init.read_roster()
+    assert roster["unknown_vendor"] is True
+    assert roster["cross_vendor_review_possible"] is False
+
+
 def test_questions_warn_when_a_cross_vendor_review_is_impossible(tmp_path, monkeypatch, capsys):
     home = tmp_path / "omnigent"
     _write(home / "og-install.json", json.dumps({

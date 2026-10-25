@@ -1100,19 +1100,33 @@ def read_roster():
             if not isinstance(e, dict):
                 continue
             reg = registry.get(e.get("id")) or {}
-            vendor = _model_vendor(e.get("model")) or reg.get("vendor")
+            model_id = e.get("model")
+            vendor = _model_vendor(model_id)
+            if reg.get("vendor_from_model_only"):
+                # Pi's managed ids are provider-prefixed (`deepseek/...`).
+                # A bare id names a model, not the provider `omni setup`
+                # serves it from, so it cannot prove a vendor family.
+                if "/" not in str(model_id or ""):
+                    vendor = None
+            elif vendor is None:
+                vendor = reg.get("vendor")
             entries.append({"role": role, "id": e.get("id"),
                             "model": e.get("model"), "vendor": vendor})
     coder_vendors = {e["vendor"] for e in entries
                      if e["role"] == "coder" and e["vendor"]}
     reviewer_vendors = {e["vendor"] for e in entries
                         if e["role"] == "reviewer" and e["vendor"]}
+    # A multi-model row with no family in its pin is UNKNOWN, not a vendor of
+    # its own: it may serve the same provider as anyone else, so no pairing can
+    # be called cross-vendor while it is in the roster.
+    unknown_vendor = any(e["vendor"] is None for e in entries)
     return {
         "state_file": str(state_path),
         "agents": entries,
         "vendors": sorted({e["vendor"] for e in entries if e["vendor"]}),
+        "unknown_vendor": unknown_vendor,
         "cross_vendor_review_possible": bool(coder_vendors)
-        and bool(reviewer_vendors - coder_vendors),
+        and bool(reviewer_vendors - coder_vendors) and not unknown_vendor,
     }
 
 
@@ -1187,6 +1201,18 @@ def build_questions(gates, names) -> list:
     ]
 
 
+def cross_vendor_warning(roster: dict) -> str:
+    """The one explanation for an unenforceable cross-vendor-review contract."""
+    if roster.get("unknown_vendor"):
+        return ("the installed roster includes a multi-model agent whose provider "
+                "family is unknown, so `require_cross_vendor_review: true` cannot "
+                "be satisfied — a review may be same-vendor and the PR must be "
+                "labelled `degraded-review`")
+    return ("the installed roster holds one vendor, so "
+            "`require_cross_vendor_review: true` cannot be satisfied — a review "
+            "will be same-vendor and the PR must be labelled `degraded-review`")
+
+
 def emit_questions(repo: Path, stacks, branches, gates, high_risk, never_write,
                    notes, names) -> None:
     """Print the decision schema as JSON. Read-only: nothing is written."""
@@ -1194,10 +1220,7 @@ def emit_questions(repo: Path, stacks, branches, gates, high_risk, never_write,
     roster = read_roster()
     warnings = []
     if roster is not None and not roster["cross_vendor_review_possible"]:
-        warnings.append(
-            "the installed roster holds one vendor, so `require_cross_vendor_review: "
-            "true` cannot be satisfied — a review will be same-vendor and the PR "
-            "must be labelled `degraded-review`")
+        warnings.append(cross_vendor_warning(roster))
     payload = {
         "repo": {"path": str(repo), "name": repo.name},
         "detected": {
@@ -1526,10 +1549,7 @@ def main() -> None:
                 "are ready to answer the questions.", code=2)
         roster = read_roster()
         if roster and not roster["cross_vendor_review_possible"]:
-            warn("the installed roster holds a single vendor, so "
-                 "`require_cross_vendor_review: true` cannot be satisfied — "
-                 "a review will be same-vendor and must be labelled "
-                 "`degraded-review`.")
+            warn(cross_vendor_warning(roster))
     if answers:
         branches, gates = apply_answers(answers, branches, gates, names)
 
