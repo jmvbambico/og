@@ -384,19 +384,52 @@ def test_validate_errors_when_orchestrator_cannot_relay():
     assert "Orchestrator-capable agents here:" in msg
 
 
+def test_validate_allows_pi_as_orchestrator_via_sys_relay(monkeypatch):
+    # Pi's native subagents=False is not a dispatch veto: the direct harness
+    # gets sys_session_send, and the live probe dispatched a child. The
+    # installer must build the brain instead of refusing it.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS",
+                        {"pi": False, "claude-native": True})
+    plan = _base_plan(
+        orchestrator={"id": "pi", "model": "deepseek/deepseek-v4.1-flash"})
+    errors = [msg for level, msg in m.validate(plan) if level == "error"]
+    assert not any("cannot be the orchestrator" in msg for msg in errors), errors
+
+
 # --------------------------------------------------------------------------
 # any agent, any role: the roles whitelist is gone; capability is MEASURED
 # --------------------------------------------------------------------------
 def test_dispatch_capability_measures_from_omnigent_caps(monkeypatch):
     # The authoritative source is Omnigent's own capabilities[<harness>].
-    # subagents; a measured False beats a stale registry `relay: true`.
+    # subagents; a measured False with no sys relay stays False.
     monkeypatch.setattr(m, "_SUBAGENT_CAPS",
                         {"claude-native": True, "grok": False, "acp": False})
     reg = m.agents_by_id()
-    grok = m.dispatch_capability(reg["grok"])       # relay still says true
+    grok = m.dispatch_capability(reg["grok"])
     assert grok.can is False and grok.source == "measured"
     claude = m.dispatch_capability(reg["claude"])
     assert claude.can is True and claude.source == "measured"
+
+
+def test_dispatch_capability_accepts_native_false_when_sys_relay_is_true(monkeypatch):
+    # Pi reports native subagents=False, but the direct harness receives the
+    # sys_* relay. A live sandbox turn (2026-10-25) proved sys_session_send
+    # dispatches a real child, so the measured native flag must not veto the
+    # relay. The source records that BOTH signals were consulted.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", {"pi": False})
+    pi = m.dispatch_capability(m.agents_by_id()["pi"])
+    assert pi.can is True
+    assert pi.source == "measured+sys-relay"
+    note = m.dispatch_note(m.agents_by_id()["pi"], "orchestrator")
+    assert "sys_session_send" in note
+    assert "native subagents=False" in note
+    # The same override must work through the shared ACP key: a relay-capable
+    # ACP row can dispatch even when Omnigent reports acp.subagents=False.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", {"acp": False})
+    acp = m.dispatch_capability({"harness": "acp:newagent", "relay": True})
+    assert acp.can is True
+    assert acp.source == "measured+sys-relay"
+    assert acp.shared_key == "acp"
 
 
 def test_dispatch_capability_falls_back_to_the_registry_flag(monkeypatch):
@@ -409,6 +442,19 @@ def test_dispatch_capability_falls_back_to_the_registry_flag(monkeypatch):
     assert claude.can is True and claude.source == "registry-flag"
     cline = m.dispatch_capability(reg["cline"])
     assert cline.can is False and cline.source == "registry-flag"
+    # Pi's relay is true now, so the fallback reaches the same verdict the
+    # measured probe does: the direct harness can dispatch via sys_*.
+    pi = m.dispatch_capability(reg["pi"])
+    assert pi.can is True and pi.source == "registry-flag"
+
+
+def test_dispatch_capability_requires_an_explicit_relay_when_unmeasured(monkeypatch):
+    # The registry docs define `relay: true` as the positive declaration. A row
+    # with the field absent is not relay-capable; treating "anything but false"
+    # as yes would silently bless a malformed row.
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS", None)
+    cap = m.dispatch_capability({"harness": "unknown"})
+    assert cap.can is False and cap.source == "registry-flag"
 
 
 def test_dispatch_capability_asks_the_shared_acp_key(monkeypatch):
@@ -450,7 +496,7 @@ def test_validate_refuses_a_dead_orchestrator_and_names_the_capable_agents(monke
     assert "omnigent reports harness 'acp:command-code'" in msg
     assert "via shared key 'acp'" in msg
     assert "cannot dispatch sub-agents" in msg
-    assert "Orchestrator-capable agents here: claude, opencode, codex, devin" in msg
+    assert "Orchestrator-capable agents here: claude, opencode, codex, pi, devin" in msg
 
 
 def test_validate_warns_not_refuses_for_a_non_orchestrator_role():
@@ -1199,6 +1245,18 @@ def test_render_orchestrator_pins_the_brain_model_at_executor_model():
     assert parsed["executor"]["config"]["harness"] == "opencode-native"
 
 
+def test_render_orchestrator_uses_pi_and_keeps_the_worker_roster():
+    # The Pi brain must render the direct `pi` harness (not pi-native), pin its
+    # model at executor.model, and retain tools.agents so Omnigent registers
+    # sys_session_send for the orchestrator.
+    plan = _base_plan(orchestrator=[{"id": "pi", "priority": 1,
+                                     "model": "deepseek/deepseek-v4.1-flash"}])
+    parsed = yaml.safe_load(m.render_orchestrator(plan))
+    assert parsed["executor"]["config"]["harness"] == "pi"
+    assert parsed["executor"]["model"] == "deepseek/deepseek-v4.1-flash"
+    assert parsed["tools"]["agents"] == ["coder_zen", "reviewer"]
+
+
 def test_render_orchestrator_omits_the_model_key_for_an_unpinned_brain():
     # claude is `pinnable: false`: pinning the brain would pin the routing
     # family and strand non-Claude workers, so the key must be ABSENT rather
@@ -1214,6 +1272,26 @@ def test_render_coder_is_valid_yaml_and_pins_the_model():
     parsed = yaml.safe_load(rendered)
     assert parsed["executor"]["model"] == "opencode/mimo-v2.5-free"
     assert parsed["executor"]["config"]["harness"] == "opencode-native"
+
+
+def test_render_roster_marks_a_relay_capable_coder_slot_as_leaf():
+    # Pi the ROW can orchestrate, but Pi the generated CODER has no
+    # tools.agents, so it is still a leaf. The orchestrator prompt must not
+    # lose that cue just because the registry row has relay: true.
+    plan = _base_plan(coders=[{"id": "pi", "priority": 1,
+                               "model": "deepseek/deepseek-v4.1-flash"}])
+    roster = m.render_roster(plan)
+    assert "leaf; cannot dispatch" in roster
+
+
+def test_render_coder_marks_a_relay_capable_coder_as_a_leaf():
+    # The generated coder spec says why relay support does not make it a
+    # dispatcher: coder.yaml.tmpl declares no sub-agents.
+    plan = _base_plan(coders=[{"id": "pi", "priority": 1,
+                               "model": "deepseek/deepseek-v4.1-flash"}])
+    text = m.render_coder(plan, plan["coders"][0])
+    assert "Leaf worker only" in text
+    assert "declares no sub-agents" in text
 
 
 def test_render_coder_acp_user_gets_permission_mode_or_not(monkeypatch):
@@ -3503,11 +3581,12 @@ def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
     # capability (boolean + source), so a dead orchestrator is visible before it
     # is chosen.
     monkeypatch.setattr(m, "scan", lambda: {"grok": "/bin/grok", "devin": "/bin/devin",
-                                            "claude": "/bin/claude"})
+                                            "claude": "/bin/claude", "pi": "/bin/pi"})
     monkeypatch.setattr(m, "load_state", lambda: {})
     # Pin the probe so the boolean AND the source are asserted, not left to
     # whether Omnigent happens to be importable from the test interpreter.
-    monkeypatch.setattr(m, "_SUBAGENT_CAPS", {"claude-native": True, "grok": False})
+    monkeypatch.setattr(m, "_SUBAGENT_CAPS",
+                        {"claude-native": True, "grok": False, "pi": False})
     m.emit_questions()
     out = capsys.readouterr().out
     q = json.loads(out[out.index("{"):])
@@ -3518,11 +3597,16 @@ def test_emit_questions_carries_the_per_role_caveat(monkeypatch, capsys):
     assert "cannot dispatch sub-agents" in orch_q["notes"]["grok"]
     assert "can dispatch sub-agents" in orch_q["notes"]["claude"]
     assert "source:" in orch_q["notes"]["claude"]
+    # Pi's native subagents=False is overridden by its sys_* relay; the note
+    # names the tool that actually dispatches.
+    assert "sys_session_send" in orch_q["notes"]["pi"]
     # The STRUCTURED sibling, machine-readable: id -> {can, source}. A capable
     # agent is true/measured, an incapable one false/measured -- and the prose
     # note still rides alongside it for the human reading the picker.
     assert orch_q["dispatch"]["claude"] == {"can": True, "source": "measured"}
     assert orch_q["dispatch"]["grok"] == {"can": False, "source": "measured"}
+    assert orch_q["dispatch"]["pi"] == {
+        "can": True, "source": "measured+sys-relay"}
     assert orch_q["dispatch"]["devin"]["source"] in ("measured", "registry-flag")
     # ...and the coder question carries nothing for them: verified in that role.
     coder_q = next(x for x in q["questions"] if x["key"] == "coders")
