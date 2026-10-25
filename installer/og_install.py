@@ -324,7 +324,7 @@ LAST_FREE_ERROR = ""
 def list_models(agent: dict) -> list:
     """Ask the vendor CLI what it can run. Empty list on any failure.
 
-    Two output shapes are tolerated, because the CLIs do not agree:
+    Three output shapes are tolerated, because the CLIs do not agree:
 
     * bare ids, one per line -- the shape every vendor CLI prints today and
       the shape og's `list_cmd` entries invoke (no `--json` flag anywhere in
@@ -343,6 +343,10 @@ def list_models(agent: dict) -> list:
       line and the probe reads as "the CLI printed nothing", which then
       falls through to the stale `choices`. Detecting the shape first is
       what makes a JSON-capable catalog reachable instead of decorative.
+
+    * a named table parser (`model.list_parser`), for a CLI whose useful id
+      is not the first column. Pi's provider-first table is the case that
+      made this a declared parser rather than another bare-id heuristic.
     """
     global LAST_LIST_ERROR
     LAST_LIST_ERROR = ""
@@ -362,6 +366,13 @@ def list_models(agent: dict) -> list:
         tail = [l for l in out.stderr.splitlines() if l.strip()][-3:]
         LAST_LIST_ERROR = f"exit {out.returncode}" + (": " + " | ".join(tail) if tail else "")
         return []
+    parser_name = (agent.get("model") or {}).get("list_parser")
+    if parser_name:
+        parser = _LIST_PARSERS.get(parser_name)
+        if parser is None:
+            LAST_LIST_ERROR = f"unknown list_parser {parser_name!r}"
+            return []
+        return parser(out.stdout)
     models = _parse_model_listing(out.stdout)
     if models is None:
         # Not JSON -- fall back to the bare-id rules.
@@ -436,6 +447,49 @@ def _parse_bare_ids(stdout: str) -> list:
         if model_id and " " not in model_id and model_id == model_id.lower():
             models.append(model_id)
     return models
+
+
+def _parse_pi_models(stdout: str) -> list:
+    """The MODEL column from Pi's `--list-models` table.
+
+    Pi prints a provider-first table:
+
+        provider      model                         context  max-out
+        Command Code  deepseek/deepseek-v4.1-flash  1.0M     16.4K
+
+    The generic bare-id parser takes the FIRST column, which is the provider
+    ("Command Code", often containing a space and an uppercase letter), so it
+    drops every row. The model is the column under the `model` header; parse
+    that header instead of hard-coding an index, and require the header so a
+    changed or failed probe falls back to manual entry rather than fabricating
+    ids from arbitrary table cells.
+    """
+    lines = stdout.splitlines()
+    header = None
+    model_col = None
+    for i, line in enumerate(lines):
+        cells = [c.strip() for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
+        if len(cells) >= 2 and cells[0].lower() == "provider":
+            lowered = [c.lower() for c in cells]
+            if "model" in lowered:
+                model_col = lowered.index("model")
+                header = i
+                break
+    if header is None or model_col is None:
+        return []
+    models = []
+    for line in lines[header + 1:]:
+        cells = [c.strip() for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
+        if len(cells) > model_col:
+            model_id = cells[model_col]
+            if model_id and " " not in model_id:
+                models.append(model_id)
+    return models
+
+
+_LIST_PARSERS = {
+    "pi_table": _parse_pi_models,
+}
 
 
 def list_free_models(agent: dict) -> list:
