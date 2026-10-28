@@ -5,16 +5,21 @@
 #
 # WRITTEN BY `og init`, THEN HAND-TUNED. `og init` refuses to replace an
 # existing contract without --force, so these values are the ones the
-# orchestrator actually runs; --force would regenerate the broken ones below.
+# orchestrator actually runs.
 #
-# Detection produced an empty `gates` list here, and that is worth recording
-# rather than quietly fixing: this repo's only Python marker is `conftest.py`
-# plus `tests/` (there is no pyproject.toml, setup.py or requirements.txt), and
-# no stack describes a repo whose product is a bash script. So detection saw no
-# toolchain and emitted "nothing verifies a worker's output". The gates below
-# are instead copied from `.github/workflows/tests.yml`, which is the check this
-# repo already trusts — a contract that drifts from CI verifies something CI
-# does not, which is worse than no contract.
+# The two shell gates are here BY HAND, and that is the reason this file is
+# hand-tuned: no stack describes a repo whose product is a bash script, so
+# `og init` emits neither. (When this file was first written, detection also
+# missed the Python stack entirely — the `python` marker was `pyproject.toml`
+# alone and this repo's is `conftest.py`. That gap is now fixed, so `--force`
+# yields the `unit` gate rather than an empty list, but it would still drop
+# `bash -n` and `shellcheck`.)
+#
+# All three gates are the commands from `.github/workflows/tests.yml`, which is
+# the check this repo already trusts — a contract that drifts from CI verifies
+# something CI does not, which is worse than no contract. The generator's
+# default is `pytest -x -q`; CI does not run `-x`, so that default is not used
+# here on purpose.
 #
 # Review it: a wrong gate command is worse than a missing one, because the
 # orchestrator quotes this contract back and runs exactly what it says.

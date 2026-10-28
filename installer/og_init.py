@@ -63,15 +63,19 @@ def run(args, cwd=None):
 # --------------------------------------------------------------------------
 # Toolchain detection.
 #
-# `marker` decides whether a stack is present. `gates` are the commands a
-# worker or the integration branch runs. `scope: worker` means every
-# implementer runs it in its own worktree; anything without a scope runs ONCE
-# on the integration branch — which is how a suite that shares a database or a
-# port avoids being run concurrently by parallel workers.
+# `markers` decides whether a stack is present — ANY one of them is enough.
+# A single marker per stack was the original shape, and it missed whole repos:
+# the Python stack keyed on `pyproject.toml` alone, so a pytest repo whose only
+# Python marker is `conftest.py` + `tests/` detected as "no toolchain" and
+# `og init` wrote a contract with NO gates while claiming a contract existed.
+# `gates` are the commands a worker or the integration branch runs. `scope:
+# worker` means every implementer runs it in its own worktree; anything without
+# a scope runs ONCE on the integration branch — which is how a suite that shares
+# a database or a port avoids being run concurrently by parallel workers.
 # --------------------------------------------------------------------------
 STACKS = [
     {
-        "id": "go", "label": "Go", "marker": "go.mod",
+        "id": "go", "label": "Go", "markers": ("go.mod",),
         "gates": [("vet", "go vet ./...", "worker"),
                   ("build", "go build ./...", "worker"),
                   ("unit", "go test -count=1 -failfast ./...", "worker")],
@@ -81,7 +85,7 @@ STACKS = [
         "never_write": ["vendor/**"],
     },
     {
-        "id": "node", "label": "Node / TypeScript", "marker": "package.json",
+        "id": "node", "label": "Node / TypeScript", "markers": ("package.json",),
         "gates": [("build", "{pm} run build", "worker"),
                   ("unit", "{pm} test", "worker")],
         "optional": [("lint", "{pm} run lint", None, None),
@@ -90,7 +94,15 @@ STACKS = [
         "never_write": ["node_modules/**", "dist/**", "build/**"],
     },
     {
-        "id": "python", "label": "Python", "marker": "pyproject.toml",
+        "id": "python", "label": "Python",
+        # Packaging markers first, the historical one first of all so an
+        # existing repo's detection cannot change. Then the ones that mean
+        # "this is a Python project" or "this is a pytest repo" without
+        # implying packaging: a bare `conftest.py` is the marker that was
+        # missing here, and `tox.ini`/`setup.cfg` are how a test runner gets
+        # configured in practice.
+        "markers": ("pyproject.toml", "setup.py", "setup.cfg", "tox.ini",
+                    "requirements.txt", "conftest.py"),
         "gates": [("unit", "pytest -x -q", "worker")],
         "optional": [("lint", "ruff check .", None, "ruff"),
                      ("typecheck", "mypy .", None, "mypy")],
@@ -98,7 +110,7 @@ STACKS = [
         "never_write": [".venv/**", "**/__pycache__/**"],
     },
     {
-        "id": "rust", "label": "Rust", "marker": "Cargo.toml",
+        "id": "rust", "label": "Rust", "markers": ("Cargo.toml",),
         "gates": [("build", "cargo build", "worker"),
                   ("unit", "cargo test", "worker")],
         "optional": [("lint", "cargo clippy -- -D warnings", None, "cargo")],
@@ -174,8 +186,13 @@ def detect_stacks(repo: Path) -> list:
     found = []
     for base, rel in _walk_project_dirs(repo):
         for s in STACKS:
-            if (base / s["marker"]).exists():
+            # The FIRST matching marker is recorded on the item, because a
+            # caller (and a reader of `--questions` JSON) wants to know which
+            # file made the detection, not just that one of them did.
+            hit = next((m for m in s["markers"] if (base / m).exists()), None)
+            if hit is not None:
                 item = dict(s)
+                item["marker"] = hit
                 item["dir"] = rel
                 item["root"] = base
                 found.append(item)
@@ -465,13 +482,24 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
         L.append("  protected: ["
                  + ", ".join(_yaml_quoted(b) for b in branches["protected"]) + "]")
     else:
-        # Falling back to [main] here would be actively wrong when main IS the
-        # integration base: merge_gate DENYs merges into a protected branch, so
-        # the contract would forbid the only merge it also mandates.
-        L.append("  # No release branch found alongside the integration base, so nothing")
-        L.append(f"  # here is protected and agents may merge into `{_one_line(ib)}` directly.")
-        L.append("  # If that is not what you want, add a `dev` branch and make it the")
-        L.append(f"  # integration_base, leaving `{_one_line(ib)}` protected below.")
+        # The rendered comment used to claim that an empty list means "nothing
+        # here is protected and agents may merge into <base> directly". That was
+        # FALSE, and it is worth spelling out because it is a promise about who
+        # may merge where: merge_gate unions this list with its own
+        # `_ALWAYS_PROTECTED` — {main, master, staging, production, prod,
+        # release} at policies/omnigent_local_policies.py:57 — so a merge or
+        # force-push that NAMES the base is DENY with or without this key. The
+        # contract's list can only ever ADD to that set.
+        #
+        # Emitting [base] here is still pointless rather than harmful, which is
+        # why the list stays empty: it would add the base to a set that already
+        # contains it. What actually stops an unattended merge is
+        # `merge_policy.enabled: false` below, which returns ASK.
+        L.append("  # Empty does NOT mean the integration base is unprotected: merge_gate")
+        L.append("  # unions this list with its own always-protected set (main, master,")
+        L.append("  # staging, production, prod, release), so a merge or force-push that")
+        L.append("  # names the base is denied either way. This list can only ADD to that")
+        L.append("  # set — so add release branches here, rather than the integration base.")
         L.append("  protected: []")
     L.append(f"  task_prefix: {_yaml_scalar(branches['task_prefix'])}")
     L.append("")
@@ -488,6 +516,12 @@ def render(repo: Path, branches: dict, gates: list, high_risk: list,
         L.append("  # merge is unguarded. Add your real commands, e.g.")
         L.append("  # - {name: unit, run: make test, scope: worker}")
         L.append("  # - {name: e2e,  run: make e2e}          # no scope: integration only")
+        # The empty case must still PARSE, exactly like `never_write` below. A
+        # key with only comments under it parses as `null`, and the consumer
+        # that iterates gates gets a TypeError instead of an empty contract —
+        # so the one repo that most needs the TODO read is the one whose
+        # contract fails to load. `[]` makes it an empty list.
+        L.append("  []")
     for nm, cmd, scope in gates:
         L.append(f"  - name: {_yaml_scalar(nm)}")
         L.append(f"    run: {_yaml_scalar(cmd)}")
