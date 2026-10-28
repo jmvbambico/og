@@ -483,7 +483,7 @@ def _parse_bare_ids(stdout: str) -> list:
 
 
 def _parse_pi_models(stdout: str) -> list:
-    """The MODEL column from Pi's `--list-models` table.
+    """Provider-qualified model refs from Pi's `--list-models` table.
 
     Pi prints a provider-first table:
 
@@ -496,15 +496,27 @@ def _parse_pi_models(stdout: str) -> list:
     that header instead of hard-coding an index, and require the header so a
     changed or failed probe falls back to manual entry rather than fabricating
     ids from arbitrary table cells.
+
+    Each entry is returned as ``provider/model``, not the bare model id. A
+    bare id is only resolvable while exactly one provider claims it, and Pi's
+    catalog routinely has two (`deepseek/deepseek-v4.1-flash` is both
+    OpenRouter's and Vercel's id). Pin the bare id and Pi launches with
+    ``Model "..." is ambiguous across providers: ... Use --provider or
+    provider/model`` and exits before the first turn — a session that dies on
+    every message with an error naming providers the user never configured.
+    The qualified form is Pi's own syntax and resolves whichever providers are
+    authenticated, so it is what the picker must hand back.
     """
     lines = stdout.splitlines()
     header = None
+    provider_col = None
     model_col = None
     for i, line in enumerate(lines):
         cells = [c.strip() for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
         if len(cells) >= 2 and cells[0].lower() == "provider":
             lowered = [c.lower() for c in cells]
             if "model" in lowered:
+                provider_col = lowered.index("provider")
                 model_col = lowered.index("model")
                 header = i
                 break
@@ -515,8 +527,12 @@ def _parse_pi_models(stdout: str) -> list:
         cells = [c.strip() for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
         if len(cells) > model_col:
             model_id = cells[model_col]
-            if model_id and " " not in model_id:
-                models.append(model_id)
+            if not model_id or " " in model_id:
+                continue
+            provider = ""
+            if provider_col is not None and len(cells) > provider_col:
+                provider = cells[provider_col]
+            models.append(f"{provider}/{model_id}" if provider else model_id)
     return models
 
 
@@ -726,13 +742,29 @@ MODEL_FAMILIES = [
 ]
 
 
+def _provider_key(provider: str) -> str:
+    """Normalize a pin's provider prefix for the aggregator comparison.
+
+    The same reseller reaches a pin by several spellings — the registry id
+    (`commandcode`), the label Pi prints in its table and uses as a provider
+    name (`Command Code`), a hyphenated variant — so compare on letters alone.
+    """
+    return re.sub(r"[^a-z0-9]", "", provider.lower())
+
+
 def model_vendor(model_id: str | None) -> str | None:
     """Vendor implied by a pinned model id, or None when it says nothing
     (no provider prefix, or an aggregator's own router like kilo-auto)."""
     if not model_id or "/" not in model_id:
         return None
     provider, name = model_id.split("/", 1)
-    if provider not in AGGREGATOR_PROVIDERS:
+    # A provider-qualified pin (`Command Code/deepseek/deepseek-v4.1-flash`, the
+    # form the picker now writes) must classify by the MODEL, not by the
+    # reseller that serves it: the prefix says who bills, and Command Code is an
+    # aggregator exactly like opencode/openrouter/kilo, so leaving it out would
+    # label a DeepSeek coder "Command Code" and make the cross-vendor review
+    # check compare the wrong pair.
+    if _provider_key(provider) not in AGGREGATOR_PROVIDERS:
         return provider
     for pat, vendor in MODEL_FAMILIES:
         if re.search(pat, name, re.IGNORECASE):

@@ -105,7 +105,10 @@ def test_list_models_strips_kiro_style_table_row(monkeypatch):
 def test_list_models_reads_the_model_column_from_pis_table(monkeypatch):
     """Pi's table is provider-first, so the bare-id parser would keep the
     provider ("Command Code", or "OpenAI" with an uppercase letter) and drop
-    every real model. `pi_table` reads the column under the `model` header.
+    every real model. `pi_table` reads the column under the `model` header and
+    returns each row PROVIDER-QUALIFIED, because a bare id is only resolvable
+    while one provider claims it (`deepseek/deepseek-v4.1-flash` is both
+    OpenRouter's and Vercel's id) and Pi refuses to launch an ambiguous pin.
     """
     monkeypatch.setattr(
         m.subprocess, "run",
@@ -116,7 +119,10 @@ def test_list_models_reads_the_model_column_from_pis_table(monkeypatch):
         ),
     )
     agent = {"model": {"list_cmd": ["pi", "--list-models"], "list_parser": "pi_table"}}
-    assert m.list_models(agent) == ["deepseek/deepseek-v4.1-flash", "gpt-5.3"]
+    assert m.list_models(agent) == [
+        "Command Code/deepseek/deepseek-v4.1-flash",
+        "OpenAI/gpt-5.3",
+    ]
 
 
 def test_list_models_pi_table_requires_the_header(monkeypatch):
@@ -2846,7 +2852,10 @@ def test_pick_model_offers_pis_listed_models(monkeypatch):
         "Command Code  xiaomi/mimo-v2.6-pro          1.0M     16.4K    no        yes   \n"
     ))
     monkeypatch.setattr(m, "ask", lambda prompt, default=None: "2")
-    assert m.pick_model(pi, None) == "xiaomi/mimo-v2.6-pro"
+    # The pin keeps Pi's provider scope: `xiaomi/mimo-v2.6-pro` alone is
+    # ambiguous the moment a second provider lists that id, and Pi then refuses
+    # to launch (`Model "..." is ambiguous across providers`).
+    assert m.pick_model(pi, None) == "Command Code/xiaomi/mimo-v2.6-pro"
 
 
 def test_pick_model_default_ignores_a_rotated_prefer(monkeypatch):
@@ -2907,6 +2916,12 @@ def test_pick_model_accepts_a_full_id_the_tool_listed(monkeypatch):
     ("opencode/big-pickle", None),
     ("kilo/kilo-auto/free", None),
     ("gpt-5.3-codex", None),
+    # A provider-qualified pin (what the pi picker now writes) names the
+    # reseller first; the vendor must still come from the model family.
+    ("Command Code/deepseek/deepseek-v4.1-flash", "deepseek"),
+    ("commandcode/deepseek/deepseek-v4.1-flash", "deepseek"),
+    ("Command Code/gpt-5.3", "openai"),
+    ("Command Code/mystery-1", None),
     (None, None),
 ])
 def test_model_vendor(model_id, vendor):
