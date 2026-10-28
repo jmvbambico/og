@@ -1,0 +1,103 @@
+# Machine-readable orchestration contract for og.
+# Consumed by the global og orchestrator agent. AGENTS.md remains the
+# human-readable constitution and takes precedence on anything this file
+# does not cover.
+#
+# WRITTEN BY `og init`, THEN HAND-TUNED. `og init` refuses to replace an
+# existing contract without --force, so these values are the ones the
+# orchestrator actually runs; --force would regenerate the broken ones below.
+#
+# Detection produced an empty `gates` list here, and that is worth recording
+# rather than quietly fixing: this repo's only Python marker is `conftest.py`
+# plus `tests/` (there is no pyproject.toml, setup.py or requirements.txt), and
+# no stack describes a repo whose product is a bash script. So detection saw no
+# toolchain and emitted "nothing verifies a worker's output". The gates below
+# are instead copied from `.github/workflows/tests.yml`, which is the check this
+# repo already trusts — a contract that drifts from CI verifies something CI
+# does not, which is worse than no contract.
+#
+# Review it: a wrong gate command is worse than a missing one, because the
+# orchestrator quotes this contract back and runs exactly what it says.
+
+branches:
+  # Where finished work lands. Workers branch from here and the batched
+  # integration branch merges back into it.
+  integration_base: main
+  # Never merged into by an agent; promotions are a human's job.
+  #
+  # Empty does NOT mean `main` is unprotected, even though the generator's
+  # comment says so. merge_gate unions this list with its own _ALWAYS_PROTECTED
+  # (main, master, staging, production, prod, release) at
+  # policies/omnigent_local_policies.py:57, so a merge or force-push that NAMES
+  # `main` is DENY with or without this key — the list can only ADD to that set.
+  # The check is a regex on the command string, so `gh pr merge 56` without
+  # `--base main` does not name it and is not caught there; what stops an
+  # unattended merge is merge_policy.enabled: false, which returns ASK.
+  protected: []
+  task_prefix: feature/
+
+gates:
+  # scope: worker  -> runs in EACH implementer's worktree
+  # no scope       -> runs ONCE on the integration branch.
+  #
+  # Put anything that shares state — a database, a fixed port, a seeded
+  # fixture — in the no-scope tier. Parallel workers running it at the same time
+  # would corrupt each other.
+  #
+  # Everything below is worker-scoped ON PURPOSE, and that was checked rather
+  # than assumed: the suite binds only ephemeral ports (`("0.0.0.0", 0)`) and
+  # AF_UNIX sockets under tmp_path, the tests that touch og's own state run with
+  # HOME pointed at a tmp_path sandbox, and conftest.py strips PYTHONPATH so the
+  # developer's real policies module cannot shadow a fixture's. Two worktrees
+  # cannot see each other.
+  #
+  # `unit` needs pytest and pyyaml — the same two packages CI installs. A
+  # worker without them fails this gate, which is the honest outcome: the
+  # installer imports yaml, so half the suite cannot run without it.
+  - {name: unit,  run: "pytest -q", scope: worker}
+  # The product is a 3000-line bash script and a bootstrap, so the shell gate is
+  # not optional here even though no stack emits it. Same two commands, and the
+  # same -S error threshold, as the `shell` job in tests.yml — `bin/og` carries
+  # pre-existing style findings (SC2034/SC2155/SC2012) that are not worth
+  # blocking on, but a real error must never merge.
+  - {name: syntax, run: "bash -n bin/og && bash -n install.sh", scope: worker}
+  - {name: lint,   run: "shellcheck -S error bin/og install.sh", scope: worker}
+
+never_write:
+  # Paths an implementer must never touch. These are generated or
+  # machine-local, so a worker editing one produces a diff that means nothing
+  # and conflicts with every other worktree.
+  - ".codegraph/**"      # machine-local index; only its .gitignore is committed
+  - ".pi/**"             # harness-local settings, not part of the product
+  - "**/__pycache__/**"
+  - ".venv/**"
+
+merge_policy:
+  # Enforced by the `merge_gate` policy, not by prompt text. ALLOW only when
+  # every condition holds; DENY for protected branches and force-pushes; ASK
+  # for everything else INCLUDING anything it cannot determine.
+  #
+  # enabled: false means every merge is a human decision. That is the safe
+  # starting point — turn it on once you trust the gates on real PRs.
+  enabled: false
+  auto_merge_target: main
+  # Thresholds are a starting point; recalibrate from real PR history.
+  max_diff_lines: 400
+  max_diff_files: 15
+  # Any path here forces the human gate regardless of gate results.
+  high_risk_paths:
+    - ".github/workflows/**"      # CI definition
+    - "**/migrations/**"          # schema changes are expensive to reverse
+    - "AGENTS.md"                 # the constitution itself
+    - ".agents/**"                # an agent must never weaken its own gate
+    - "bin/og"                    # the artifact every user runs, every day
+    - "install.sh"                # the bootstrap, and the first thing a new user touches
+    # `installer/**` is deliberately NOT listed. It is most of the Python in the
+    # repo, so listing it would make nearly every PR high-risk and turn the flag
+    # into noise. Those changes are already gated by `unit`, and merge_policy is
+    # off, so every merge is a human decision anyway.
+  require_no_test_count_decrease: true
+  # The gate cannot observe review itself (that is session state, not repo
+  # state), so it reads the PR body: `cross-vendor-review: passed` permits
+  # auto-merge; `degraded-review` always forces the human gate.
+  require_cross_vendor_review: true
