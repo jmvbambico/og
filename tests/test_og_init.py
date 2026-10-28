@@ -142,6 +142,120 @@ def test_within_bound_is_detected(tmp_path):
     assert [(s["id"], s["dir"]) for s in stacks] == [("rust", "a/b/c")]
 
 
+# --------------------------------------------------------------------------
+# Python detection: one marker was not enough
+# --------------------------------------------------------------------------
+# The Python stack keyed on `pyproject.toml` ALONE. A pytest repo whose only
+# Python marker is `conftest.py` + `tests/` therefore detected as "no
+# toolchain", and `og init` wrote a contract with `gates: []` and a TODO saying
+# nothing was gateable — a contract that says it exists while verifying
+# nothing, which is worse than no contract, because the orchestrator quotes it
+# back and runs exactly what it says.
+#
+# Measured on og's own repo, before this fix: `--print` reported
+# `stack none detected`, `gates 0 detected`.
+_PYTHON_MARKERS = [
+    # the historical marker, first and unchanged
+    ("pyproject.toml", "[project]\nname='x'\n"),
+    # the ones that were missing
+    ("setup.py", "from setuptools import setup\n"),
+    ("setup.cfg", "[metadata]\nname = x\n"),
+    ("tox.ini", "[tox]\nenvlist = py312\n"),
+    ("requirements.txt", "pytest\n"),
+    ("conftest.py", "import sys\n"),
+]
+
+
+@pytest.mark.parametrize("marker,body", _PYTHON_MARKERS,
+                         ids=[m for m, _ in _PYTHON_MARKERS])
+def test_each_python_marker_alone_detects_a_gate(tmp_path, marker, body):
+    """ANY one of these means Python, and one is all a repo needs. Before this,
+    five of the six detected nothing at all."""
+    repo = tmp_path / "py"
+    _write(repo / marker, body)
+
+    stacks = og_init.detect_stacks(repo)
+    assert [s["id"] for s in stacks] == ["python"]
+    # The matched marker is recorded, not just the fact that one matched: a
+    # reader of `--questions` JSON has no other way to know why a stack fired.
+    assert stacks[0]["marker"] == marker
+
+    data = yaml.safe_load(_render(repo))
+    # `in`, not `==`, because a stack's OPTIONAL gates are emitted when the
+    # binary happens to be on PATH — an assertion on the whole list would pass
+    # or fail depending on whether ruff and mypy are installed.
+    assert "pytest -x -q" in [g["run"] for g in data["gates"]]
+
+
+def test_conftest_alone_detection_does_not_invent_more_than_the_unit_gate(tmp_path):
+    """The wider net must not turn into noise: a bare `conftest.py` earns the
+    pytest gate and the Python `never_write` entries, and nothing else."""
+    repo = tmp_path / "pytestonly"
+    _write(repo / "conftest.py", "")
+    _write(repo / "tests" / "test_a.py", "def test_a(): pass\n")
+
+    data = yaml.safe_load(_render(repo))
+    names = [g["name"] for g in data["gates"]]
+    assert "unit" in names
+    # Only the Python stack fired: no other stack's gate may appear.
+    assert "build" not in names and "vet" not in names
+    assert ".venv/**" in data["never_write"]
+    # The stack's high-risk paths are emitted from the STACK, not from which
+    # marker matched, so an absent pyproject.toml changes nothing here.
+    assert "pyproject.toml" in data["merge_policy"]["high_risk_paths"]
+
+
+def test_a_repo_with_no_marker_still_reports_no_gates(tmp_path):
+    """The zero-stack path must stay reachable and stay honest — the fix is a
+    wider net for real markers, not a default gate for everything."""
+    repo = tmp_path / "empty"
+    repo.mkdir()
+    _write(repo / "README.md", "# nothing here\n")
+
+    assert og_init.detect_stacks(repo) == []
+    body = _render(repo)
+    assert "no toolchain was detected" in body
+    assert yaml.safe_load(body)["gates"] == []
+
+
+# --------------------------------------------------------------------------
+# The protected-branches comment: it claimed the opposite of the truth
+# --------------------------------------------------------------------------
+# The rendered comment said an empty `protected` list means "nothing here is
+# protected and agents may merge into <base> directly". `merge_gate` unions the
+# contract's list with its own `_ALWAYS_PROTECTED`, which already contains
+# `main`, so a merge or force-push that NAMES the base is DENY either way.
+# A promise about who may merge where is exactly the kind of claim that must not
+# be wrong: an operator reads it and skips the review they were told to skip.
+
+def test_empty_protected_comment_does_not_claim_the_base_is_open(tmp_path):
+    repo = tmp_path / "open"
+    repo.mkdir()
+    body = _render(repo)
+
+    assert "may merge into" not in body
+    assert "No release branch found alongside" not in body
+    # The replacement says the true thing, and names the policy that does it.
+    assert "does NOT mean the integration base is unprotected" in body
+    assert "merge_gate" in body
+    # And the parse is unchanged: this is a comment fix, not a policy change.
+    assert yaml.safe_load(body)["branches"]["protected"] == []
+
+
+def test_a_named_protected_branch_still_renders_as_a_list(tmp_path):
+    """The non-empty arm must be untouched by the comment fix."""
+    repo = tmp_path / "named"
+    repo.mkdir()
+    branches = dict(BRANCHES, protected=["main", "staging"])
+    stacks = og_init.detect_stacks(repo)
+    gates, high_risk, never_write, notes = og_init.build_gates(repo, stacks)
+    body = og_init.render(repo, branches, gates, high_risk, never_write,
+                          stacks, notes)
+
+    assert yaml.safe_load(body)["branches"]["protected"] == ["main", "staging"]
+    assert "does NOT mean the integration base is unprotected" not in body
+
+
 def test_same_stack_in_two_dirs_yields_two_gates(tmp_path):
     repo = tmp_path / "multi"
     _write(repo / "one" / "Cargo.toml", "[package]\n")

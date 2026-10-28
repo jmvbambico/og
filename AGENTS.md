@@ -252,11 +252,10 @@ AGENTS.md is authoritative: where this file and the contract disagree, this
 file wins.
 
 The gates in that file are hand-copied from `.github/workflows/tests.yml` and
-must stay identical to it. `og init` detected no toolchain here — this repo's
-only Python marker is `conftest.py` (no `pyproject.toml`), and no stack
-describes a repo whose product is a bash script — so `og init --force` would
-regenerate a contract with **no gates at all** and lose the shell gate entirely.
-Re-add them before you commit anything it writes.
+must stay identical to it. Two of the three are there by hand: no stack
+describes a repo whose product is a bash script, so `og init --force` would
+regenerate the contract without `bash -n` or `shellcheck`. Re-add them before
+you commit anything it writes.
 
 Detected: integration base `main`; protected: none in this file. That does not
 leave `main` open — `merge_gate` unions this list with its own always-protected
