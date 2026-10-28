@@ -258,6 +258,14 @@ Every option below exists for a failure that is otherwise silent or hanging:
   output with no versioned contract. A tunnl.gg redesign breaks the scrape. Keep
   the regex loose, and fail with "could not find a URL in tunnl's output" plus
   the captured log rather than a bare timeout.
+- **A bare argument is a domain, so a mistyped MODE is a domain too.** The
+  back-compat arm (Phase 2: "Preserve the bare-argument back-compat") cannot
+  tell `tunneled` from `tunelled`, so the misspelling used to surface as
+  "an ngrok reserved domain, which provider 'tunnl' does not support" — a
+  true sentence about the wrong problem, and one an operator reads as *tunnl*
+  refusing them. `mode_typo_of` now names the mode within 3 edits; see
+  TROUBLESHOOTING.md. Any future mode keyword inherits the hazard until the
+  arm is retired, so add it to `START_MODES` when you add the arm.
 
 ## Proposal
 

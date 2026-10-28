@@ -328,6 +328,71 @@ normalize_tunnel_provider() {
   esac
 }
 
+# Levenshtein distance between two short strings.
+#
+# WHY THIS EXISTS: `og start tunelled` — a doubled L, which is how the word is
+# spelled in British English — is not the `tunneled` case arm in
+# parse_start_args, so it fell through to the bare-argument arm and was
+# reported as "an ngrok reserved domain, which provider 'tunnl' does not
+# support". Every clause of that is true and none of it is the problem: the
+# operator misspelled a mode by one character and the message never mentioned
+# the mode. Measured on a real report: the operator then tried tunnl, then
+# ngrok, then tunnl again, and concluded both providers were broken.
+#
+# bash 3.2 (macOS) has no ${x,,} and no associative arrays, and an empty array
+# is "unbound" under `set -u` — so this is two rolling rows over indexed
+# arrays, comparing one character at a time.
+lev_distance() {
+  local a="$1" b="$2" la=${#1} lb=${#2} i j cost best
+  local -a prev cur
+  for ((i = 0; i <= la; i++)); do prev[i]=$i; done
+  for ((j = 1; j <= lb; j++)); do
+    cur[0]=$j
+    for ((i = 1; i <= la; i++)); do
+      if [[ "${a:i-1:1}" == "${b:j-1:1}" ]]; then cost=0; else cost=1; fi
+      best=$(( prev[i] + 1 ))
+      if (( cur[i-1] + 1 < best )); then best=$(( cur[i-1] + 1 )); fi
+      if (( prev[i-1] + cost < best )); then best=$(( prev[i-1] + cost )); fi
+      cur[i]=$best
+    done
+    prev=("${cur[@]}")
+  done
+  printf '%s' "${prev[la]}"
+}
+
+# Print the mode keyword $1 is a near-miss of, or nothing.
+#
+# The threshold is 3, and it is a MEASURED boundary, not a round number. Below
+# it sit the slips that actually get typed: `tunelled`/`Tunnelled` (2), `tunnel`
+# (2), `tunneld`/`tunnled` (1), and the dropped-double-letter pair `tunel` and
+# `tunnl` (3 — the second one is the provider's own name, which is a mode only
+# in the operator's head). Above it sit words a person would plausibly mint as
+# a domain: `tunnel-abc` and `tunneled-dev` are 4, `mydomain` is 8. Nothing in
+# that 3|4 gap is a typo of a mode and nothing below 4 is a real name.
+#
+# The wider net is safe because of where it can fire. Under tunnl a bare
+# positional is ALREADY fatal (it can only ever mean an ngrok reserved domain,
+# which tunnl does not sell), so a false positive costs nothing new there. Under
+# ngrok it only prints a warning and the command still runs, so a domain that
+# really is within 3 edits of a mode — `tunnel`, `vocal`, `total` — gets one
+# extra line, not a refusal.
+#
+# Only the mode keywords are guessed at. A mistyped multiplexer id is left
+# alone deliberately: mux ids come from a registry (`mux_ids`), that set is not
+# fixed, and a word close to one is far more plausibly a domain.
+START_MODES="local tunneled"
+mode_typo_of() {
+  local word m d
+  # Fold case FIRST: `Tunneled` differs from `tunneled` only by case, and a
+  # case-sensitive comparison would silently let it through as a domain.
+  word="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  for m in $START_MODES; do
+    d="$(lev_distance "$word" "$m")"
+    if (( d <= 3 )); then printf '%s' "$m"; return 0; fi
+  done
+  return 1
+}
+
 # Strip SGR colour escapes. tunnl wraps its banner and URL in them; they must go
 # before the URL regex runs.
 strip_sgr() { sed -E $'s/\033\\[[0-9;]*[A-Za-z]//g'; }
@@ -1311,7 +1376,7 @@ parse_start_args() {
   # og has no flag parser anywhere else, but --use consumes a value so it cannot
   # be one more positional case arm (see docs/TUNNEL-PROVIDERS.md): collect
   # positionals and flags in one pass.
-  local use="" provider mux="" mode="" domain="" ids a no_probe=0
+  local use="" provider mux="" mode="" domain="" ids a no_probe=0 hint=""
   local no_contract_check=0
   local -a pos=() rest=() mux_args=()
   while [[ $# -gt 0 ]]; do
@@ -1386,11 +1451,30 @@ parse_start_args() {
     tunneled) mode="tunneled"; domain="${rest[1]:-}" ;;
     "")       mode="${OG_DEFAULT_MODE:-local}" ;;
     *)        mode="tunneled"; domain="${rest[0]}"
+              # A misspelled mode keyword is the one bare argument that is never
+              # meant as a domain, and the two diagnostics below say nothing
+              # about it (see mode_typo_of for the report that produced this).
+              hint="$(mode_typo_of "$domain" || true)"
+              if [[ -n "$hint" ]]; then
+                if [[ "$provider" != "ngrok" ]]; then
+                  die "'og start $domain' is not a mode — did you mean 'og start $hint'?
+    '$domain' would be an ngrok reserved domain, and provider '$provider' has no reserved names to offer.
+    Reserved names on tunnl.gg are a Pro feature; 'og start $hint' is the free stable@ URL."
+                fi
+                # Non-fatal under ngrok, because the word COULD be a reserved
+                # domain the operator really did buy. Warn and carry on rather
+                # than refuse a working command.
+                warn "'$domain' is not a mode; reading it as an ngrok reserved domain. Did you mean 'og start $hint'?"
+              fi
               if [[ "$provider" != "ngrok" ]]; then
                 die "'og start $domain' means an ngrok reserved domain, which provider '$provider' does not support.
     Reserved names on tunnl.gg are a Pro feature. Run 'og start tunneled' for a free stable@ URL, or '--use ngrok'."
               fi
-              info "a bare argument is read as an ngrok domain; this is 'og start tunneled $domain'" ;;
+              # The bare-argument disclaimer is only news when the word was
+              # NOT already reported as a suspected typo.
+              if [[ -z "$hint" ]]; then
+                info "a bare argument is read as an ngrok domain; this is 'og start tunneled $domain'"
+              fi ;;
   esac
   OG_START_MODE="$mode" OG_START_DOMAIN="$domain"
   OG_START_PROVIDER="$provider" OG_START_MUX="$mux"

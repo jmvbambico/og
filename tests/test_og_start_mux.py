@@ -136,6 +136,151 @@ def test_a_non_mux_bare_argument_is_still_a_domain(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# a MISSPELLED MODE — `og start tunelled`
+# --------------------------------------------------------------------------
+# The report: "my ngrok free tier is used up, and re-using tunnl.gg refuses
+# now". Neither provider was broken. `tunelled` (doubled L, the British
+# spelling) is not the `tunneled` case arm, so it landed in the bare-argument
+# arm, and under a tunnl og.env that arm's refusal is about ngrok reserved
+# domains — true, unrelated, and silent about the one-character difference.
+# The operator read it as tunnl refusing them and went back to a dead ngrok.
+#
+# So the wording is the bug, and these tests pin the wording: a word within two
+# edits of a mode keyword must be named as a misspelling of THAT MODE, while a
+# real domain keeps the old path untouched.
+_MISSPELLED_MODES = [
+    # the reported one, plus the other slips the measured 3-edit threshold
+    # exists to cover: doubled consonants both ways, a dropped letter, a
+    # dropped doubled letter, and case-only slips.
+    ("tunelled", "tunneled"),
+    ("tunneld", "tunneled"),
+    ("tunnled", "tunneled"),
+    ("tunel", "tunneled"),
+    ("tunnel", "tunneled"),
+    # the provider's own name typed where a MODE belongs — `og start tunnl`
+    ("tunnl", "tunneled"),
+    ("Tunneled", "tunneled"),
+    ("TUNNELED", "tunneled"),
+    # `local` is a mode too, and mistaking it for a bare argument is the
+    # worst of these: the operator asked for LAN-only and would have got a
+    # PUBLIC tunnel. Lowercase `local` cannot be listed here — it matches the
+    # real `local)` arm and exits 0 — so these are the case slips that miss it.
+    ("Local", "local"),
+]
+
+
+def _parse_with_og_env(tmp_path, argv, provider):
+    """The same seam as _source_and_parse, but with the provider arriving via
+    the sandbox og.env the way a real install carries it rather than via
+    `--use`. Both paths reach the same case arm, and the report came through
+    THIS one (`OG_TUNNEL_PROVIDER=tunnl` in ~/.omnigent/og.env)."""
+    conf = tmp_path / ".omnigent"
+    conf.mkdir(parents=True, exist_ok=True)
+    (conf / "og.env").write_text(f"OG_TUNNEL_PROVIDER={provider}\n")
+    return subprocess.run(
+        ["bash", "-c", _PARSE_DRIVER, str(OG), *argv],
+        capture_output=True, text=True, timeout=30,
+        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
+             "OG_REPO": str(REPO)},
+    )
+
+
+@pytest.mark.parametrize("typed,hint", _MISSPELLED_MODES,
+                         ids=[c[0] for c in _MISSPELLED_MODES])
+@pytest.mark.parametrize("argv",
+                         [["{word}"], ["{word}", "--use", "tunnl"]],
+                         ids=["og.env-tunnl", "--use-tunnl"])
+def test_misspelled_mode_names_the_mode_not_ngrok(tmp_path, typed, hint, argv):
+    """Under tunnl a bare word can never be a domain, so this is already
+    fatal — the fix is only that it now says WHICH mode was meant. The ngrok
+    reserved-domain refusal must not appear either, because it is what sent the
+    operator to a provider with no bandwidth left."""
+    argv = [a.replace("{word}", typed) for a in argv]
+    result = _parse_with_og_env(tmp_path, argv, "tunnl")
+    assert result.returncode == 1, result.stdout
+    assert f"did you mean 'og start {hint}'" in result.stderr
+    assert "is not a mode" in result.stderr
+    # The old message, verbatim, is what must be gone.
+    assert f"'og start {typed}' means an ngrok reserved domain" not in result.stderr
+    # Not parsed into a domain: the failure is before OG_START_* is set.
+    assert "mode=tunneled" not in result.stdout
+
+
+@pytest.mark.parametrize("typed", ["tunelled", "tunnel", "Tunneled"])
+def test_misspelled_mode_under_ngrok_warns_and_still_parses(tmp_path, typed):
+    """Under ngrok the word COULD be a reserved domain someone really bought,
+    so this must never be fatal — a warning, and the old parse stands. The
+    bare-argument disclaimer is suppressed because it would be the second
+    message about the same word."""
+    result = _source_and_parse(tmp_path, [typed])
+    assert result.returncode == 0, result.stderr
+    assert _vars(result) == {"mux": "", "mode": "tunneled",
+                             "domain": typed, "provider": "ngrok"}
+    assert "is not a mode" in result.stderr
+    assert "Did you mean 'og start tunneled'?" in result.stderr
+    assert "a bare argument is read as an ngrok domain" not in result.stdout
+
+
+@pytest.mark.parametrize("domain", ["mydomain", "tunnel-abc",
+                                    "tunelled-inc"])
+def test_a_real_domain_is_never_offered_a_mode(tmp_path, domain):
+    """The near-miss check must not fire on anything a person would actually
+    reserve: the shortest of these is 4 edits from `tunneled`, and `mydomain`
+    is 8. A false "did you mean" on a working command is its own bug."""
+    result = _source_and_parse(tmp_path, [domain])
+    assert result.returncode == 0, result.stderr
+    assert _vars(result) == {"mux": "", "mode": "tunneled",
+                             "domain": domain, "provider": "ngrok"}
+    assert "is not a mode" not in result.stderr
+    assert "a bare argument is read as an ngrok domain" in result.stdout
+
+
+_HINT_DRIVER = r'''
+src="$0"; word="$1"
+set --
+source "$src" >/dev/null 2>&1
+printf 'lev=%s\nhint=%s\n' "$(lev_distance "$word" tunneled)" \
+  "$(mode_typo_of "$word" || true)"
+'''
+
+
+@pytest.mark.parametrize("word,lev,hint", [
+    # The 3|4 boundary, measured against the implementation rather than
+    # assumed: 3 is the widest edit distance this accepts, and the nearest
+    # domain-shaped words are 4. lev_distance is CASE-SENSITIVE by design
+    # (mode_typo_of does the folding), which is why TUNNELED reads 8 here and
+    # still has a hint.
+    ("tunneled", 0, "tunneled"),
+    ("tunnelled", 1, "tunneled"),
+    ("tunnled", 1, "tunneled"),
+    ("tunnel", 2, "tunneled"),
+    ("tunelled", 2, "tunneled"),
+    ("tunel", 3, "tunneled"),   # the last accepted distance
+    ("tunnl", 3, "tunneled"),   # ...the provider name dressed as a mode
+    ("tunnel-abc", 4, ""),      # the first rejected one
+    ("mydomain", 8, ""),
+    ("TUNNELED", 8, "tunneled"),  # folds to a hint despite the raw distance
+    # `local` is the other mode keyword, and folds to an exact match
+    ("Local", 7, "local"),
+    ("total", 6, "local"),       # 2 edits: warns under ngrok, never refuses
+    ("vocal", 7, "local"),
+])
+def test_mode_typo_of_reports_the_distance_it_used(tmp_path, word, lev, hint):
+    """Pins the threshold rather than just its outcome: a future widening of
+    `<= 2` has to change these numbers, and a widening is exactly how this
+    would start refusing real domains."""
+    result = subprocess.run(
+        ["bash", "-c", _HINT_DRIVER, str(OG), word],
+        capture_output=True, text=True, timeout=30,
+        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
+             "OG_REPO": str(REPO)},
+    )
+    assert result.returncode == 0, result.stderr
+    got = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    assert got == {"lev": str(lev), "hint": hint}
+
+
+# --------------------------------------------------------------------------
 # the launcher's OWN flags — `og start herdr --once`
 # --------------------------------------------------------------------------
 # `--once` is the launcher's documented diagnostic (it does the work, prints it,

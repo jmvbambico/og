@@ -290,6 +290,45 @@ when it asks and suggests a free one if the default is taken.
 
 ---
 
+## `og start` says my provider "does not support" a reserved domain
+
+```
+error: 'og start tunelled' means an ngrok reserved domain, which provider 'tunnl' does not support.
+    Reserved names on tunnl.gg are a Pro feature. Run 'og start tunneled' for a free stable@ URL, or '--use ngrok'.
+```
+
+**Cause.** A misspelled mode keyword — `tunelled` with a doubled L, which is
+how the word is spelled in British English. `og start` accepts exactly
+`tunneled` and `local`; anything else is read as an ngrok reserved **domain**,
+because that is what a bare argument has always meant. Under a tunnl
+`OG_TUNNEL_PROVIDER` that reading is fatal, so the message is about reserved
+domains even though no domain was ever intended.
+
+Nothing is wrong with tunnl, and nothing is wrong with ngrok's quota. Both
+look broken from that message: operators who hit it tend to try `--use ngrok`
+next, get an exhausted free tier, and conclude both providers are down.
+
+**Fix.** Spell it with one L: `og start tunneled`. Current `og` names the mode
+instead of the provider when the word is within 3 edits of one:
+
+```
+error: 'og start tunelled' is not a mode — did you mean 'og start tunneled'?
+    'tunelled' would be an ngrok reserved domain, and provider 'tunnl' has no reserved names to offer.
+    Reserved names on tunnl.gg are a Pro feature; 'og start tunneled' is the free stable@ URL.
+```
+
+Under ngrok the same near-miss is only a warning, because the word could be a
+domain you really reserved — the command still runs:
+
+```
+! 'tunelled' is not a mode; reading it as an ngrok reserved domain. Did you mean 'og start tunneled'?
+```
+
+If you genuinely reserved a domain, ignore it; the parse does not change. The
+threshold and the words it covers are in `mode_typo_of` (`bin/og`).
+
+---
+
 ## `og login` fails with `security: command not found`
 
 ```
