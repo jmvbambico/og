@@ -256,6 +256,137 @@ def test_a_named_protected_branch_still_renders_as_a_list(tmp_path):
     assert "does NOT mean the integration base is unprotected" not in body
 
 
+# --------------------------------------------------------------------------
+# Shell: a repo whose product IS a script
+# --------------------------------------------------------------------------
+# No stack described one, so `bash -n` and `shellcheck` had to be added by
+# hand to any such repo's contract — and og is exactly such a repo (`bin/og`,
+# 3000 lines of bash, no extension at all). The marker is a GLOB, because
+# there is no conventional filename to key on.
+
+def test_a_shell_script_alone_detects_the_stack(tmp_path):
+    repo = tmp_path / "sh"
+    _write(repo / "install.sh", "#!/usr/bin/env bash\nset -euo pipefail\n")
+
+    stacks = og_init.detect_stacks(repo)
+    assert [(s["id"], s["marker"]) for s in stacks] == [("shell", "*.sh")]
+
+
+def test_an_extensionless_bash_script_is_found_by_its_shebang(tmp_path):
+    """`bin/og` is bash with no suffix. Keying on `*.sh` alone would miss the
+    one file the project exists for."""
+    repo = tmp_path / "shebang"
+    _write(repo / "install.sh", "#!/usr/bin/env bash\n")
+    _write(repo / "bin" / "tool", "#!/bin/bash\necho hi\n")
+
+    assert og_init.shell_files(repo) == ["bin/tool", "install.sh"]
+
+
+def test_an_extensionless_non_shell_script_is_not_found(tmp_path):
+    """The shebang check must discriminate: a `bin/` full of Python entry
+    points is not a shell stack."""
+    repo = tmp_path / "noshebang"
+    _write(repo / "install.sh", "#!/usr/bin/env bash\n")
+    _write(repo / "bin" / "tool", "#!/usr/bin/env python3\nprint('hi')\n")
+    _write(repo / "bin" / "README", "no shebang at all\n")
+
+    assert og_init.shell_files(repo) == ["install.sh"]
+
+
+def test_syntax_gate_chains_bash_n_instead_of_listing_files(tmp_path):
+    """`bash -n a b` is NOT two files — bash treats extra operands as $1/$2 for
+    the script and checks only `a`. A gate written that way passes while
+    checking half of what it names, which is the worst kind of green."""
+    repo = tmp_path / "chain"
+    _write(repo / "install.sh", "#!/usr/bin/env bash\n")
+    _write(repo / "build.sh", "#!/usr/bin/env bash\n")
+
+    data = yaml.safe_load(_render(repo))
+    cmd = next(g["run"] for g in data["gates"] if g["name"] == "syntax")
+    assert cmd == "bash -n build.sh && bash -n install.sh"
+    # shellcheck DOES take several files, so lint stays one command
+    lint = [g for g in data["gates"] if g["name"] == "lint"]
+    assert lint and lint[0]["run"] == "shellcheck -S error build.sh install.sh"
+
+
+def test_a_script_name_with_a_space_is_quoted(tmp_path):
+    """The name comes from the filesystem and ends up in a shell command."""
+    repo = tmp_path / "spaces"
+    _write(repo / "my script.sh", "#!/usr/bin/env bash\n")
+
+    data = yaml.safe_load(_render(repo))
+    cmd = next(g["run"] for g in data["gates"] if g["name"] == "syntax")
+    assert cmd == "bash -n 'my script.sh'"
+
+
+def test_a_nested_shell_script_gates_in_its_own_directory(tmp_path):
+    repo = tmp_path / "nested"
+    _write(repo / "scripts" / "deploy.sh", "#!/usr/bin/env bash\n")
+
+    data = yaml.safe_load(_render(repo))
+    syntax = next(g for g in data["gates"] if g["name"] == "syntax-scripts")
+    assert syntax["run"] == "cd -- scripts && bash -n deploy.sh"
+
+
+def test_a_symlinked_script_is_skipped_rather_than_double_gated(tmp_path, monkeypatch):
+    """A symlink pointing at a script that is already found elsewhere would be
+    gated twice under two names. When nothing else is left the stack emits no
+    gate at all rather than `syntax: ""`, which would be a gate that always
+    passes while claiming to check something."""
+    # Optional gates are emitted only when the binary is installed, so their
+    # presence would make this assertion depend on the reviewer's PATH. Forced
+    # off: what is under test is the symlink rule, not ruff.
+    monkeypatch.setattr(og_init, "_which", lambda b: False)
+    repo = tmp_path / "link"
+    _write(repo / "real" / "tool.sh", "#!/usr/bin/env bash\n")
+    (repo / "tool.sh").symlink_to(repo / "real" / "tool.sh")
+
+    stacks = og_init.detect_stacks(repo)
+    # root matched the glob, real/ is its own stack
+    assert [(s["id"], s["dir"]) for s in stacks] == [("shell", ""), ("shell", "real")]
+    assert og_init.shell_files(repo) == []
+
+    gates, _, _, notes = og_init.build_gates(repo, stacks)
+    assert [g[0] for g in gates] == ["syntax-real"]
+    assert any("no shell gate emitted" in n["text"] for n in notes)
+
+
+# --------------------------------------------------------------------------
+# Gate names are unique, including at the repo root
+# --------------------------------------------------------------------------
+# The orchestrator quotes a gate back BY NAME. `gate_name` protected that for
+# nested stacks (`unit-console`) and assumed a root-level name was unique. It
+# is not: Python and Shell side by side at the root both contribute `lint`, and
+# that is the ordinary shape of a repo that is a package AND a script.
+
+def test_two_root_stacks_do_not_share_a_gate_name(tmp_path, monkeypatch):
+    """Deterministic pair: Go and Rust both emit `build` and `unit`. Optional
+    gates are forced OFF so the expected list is the same on every machine."""
+    monkeypatch.setattr(og_init, "_which", lambda b: False)
+    repo = tmp_path / "both"
+    _write(repo / "go.mod", "module x\n")
+    _write(repo / "Cargo.toml", "[package]\nname='x'\n")
+
+    data = yaml.safe_load(_render(repo))
+    names = [g["name"] for g in data["gates"]]
+    assert len(names) == len(set(names)), names
+    assert names == ["vet", "build", "unit", "build-rust", "unit-rust"]
+
+
+def test_python_and_shell_at_the_root_disambiguate_lint(tmp_path, monkeypatch):
+    """The case that produced the fix. The optional binaries are forced present
+    so the assertion does not depend on the reviewer's PATH."""
+    monkeypatch.setattr(og_init, "_which", lambda b: True)
+    repo = tmp_path / "pyandsh"
+    _write(repo / "conftest.py", "")
+    _write(repo / "install.sh", "#!/usr/bin/env bash\n")
+
+    data = yaml.safe_load(_render(repo))
+    names = [g["name"] for g in data["gates"]]
+    assert len(names) == len(set(names)), names
+    assert "lint" in names and "lint-shell" in names
+
+
 def test_same_stack_in_two_dirs_yields_two_gates(tmp_path):
     repo = tmp_path / "multi"
     _write(repo / "one" / "Cargo.toml", "[package]\n")

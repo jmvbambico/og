@@ -117,6 +117,26 @@ STACKS = [
         "high_risk": ["Cargo.toml", "Cargo.lock"],
         "never_write": ["target/**"],
     },
+    {
+        "id": "shell", "label": "Shell",
+        # A GLOB marker: a shell repo is a repo with shell scripts, and there is
+        # no single conventional filename to key on (og itself is `bin/og` with
+        # no extension at all, plus `install.sh`). `_marker_present` resolves a
+        # wildcard marker as "any path matching this", which is what makes a
+        # repo whose PRODUCT is a bash script detectable at all — until this
+        # existed, `og init` emitted no shell gate and every such repo had to
+        # add `bash -n`/`shellcheck` by hand.
+        "markers": ("*.sh",),
+        # `{files}` and `{syntax}` are built per-repo by `shell_files`, for the
+        # same reason `{pm}` is for node: the right command depends on what is
+        # actually there. `bash -n a b` is NOT two files — bash treats extra
+        # operands as $1/$2 for the script — so syntax is chained with `&&`.
+        # shellcheck does take several files, so lint is one command.
+        "gates": [("syntax", "{syntax}", "worker")],
+        "optional": [("lint", "shellcheck -S error {files}", "worker", "shellcheck")],
+        "high_risk": [],
+        "never_write": [],
+    },
 ]
 
 # Paths that are high-risk in ANY repo, for reasons that do not depend on the
@@ -171,6 +191,61 @@ def _walk_project_dirs(repo: Path, max_depth: int = MAX_MARKER_DEPTH):
             frontier.append((e, child_rel, depth + 1))
 
 
+def _marker_present(base: Path, marker: str) -> bool:
+    """Is *marker* present in *base*? A wildcard marker means "any match".
+
+    Most markers are one exact filename. The Shell stack has no such name to
+    key on — there is no conventional "this is a shell project" file — so its
+    marker is `*.sh`, and this is the one place that understands a glob. Kept
+    deliberately tiny: an exact name never takes the glob path, because
+    `glob` on a name with no wildcard is an `exists` with extra disk work.
+    """
+    if any(c in marker for c in "*?["):
+        return any(base.glob(marker))
+    return (base / marker).exists()
+
+
+# A shebang that runs a shell, matched on the first line as BYTES: a script
+# that is not valid UTF-8 is still a script, and `.read_text()` would raise.
+_SHELL_SHEBANG = re.compile(rb"^#![^\n]*\b(?:ba|da|k|z)?sh\b")
+
+
+def shell_files(base: Path) -> list:
+    """Repo-relative paths of the shell scripts in *base* and directly in `bin/`.
+
+    Deliberately shallow and deterministic. Shallow, because a recursive sweep
+    finds vendored and generated scripts that are not this project's to gate;
+    deterministic, because a gate command whose file order changes between two
+    runs is a contract diff nobody asked for.
+
+    Two ways in, because a shell script does not have to be named `*.sh`: og's
+    own `bin/og` is 3000 lines of bash with no extension, and keying on the
+    suffix alone would miss the one file the project exists for. The shebang
+    check runs only for extensionless files, so it costs one `open` per
+    candidate in two directories.
+    """
+    found = set()
+    for d in (base, base / "bin"):
+        try:
+            entries = sorted(d.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for p in entries:
+            if not p.is_file() or p.is_symlink():
+                continue
+            if p.suffix == ".sh" or (not p.suffix and _has_shell_shebang(p)):
+                found.add(p.relative_to(base).as_posix())
+    return sorted(found)
+
+
+def _has_shell_shebang(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return bool(_SHELL_SHEBANG.match(fh.readline()))
+    except OSError:
+        return False
+
+
 def detect_stacks(repo: Path) -> list:
     """Find every stack marker in the repo, at any depth up to the bound.
 
@@ -189,7 +264,7 @@ def detect_stacks(repo: Path) -> list:
             # The FIRST matching marker is recorded on the item, because a
             # caller (and a reader of `--questions` JSON) wants to know which
             # file made the detection, not just that one of them did.
-            hit = next((m for m in s["markers"] if (base / m).exists()), None)
+            hit = next((m for m in s["markers"] if _marker_present(base, m)), None)
             if hit is not None:
                 item = dict(s)
                 item["marker"] = hit
@@ -332,20 +407,28 @@ def build_gates(repo: Path, stacks: list) -> tuple:
     gates, high_risk, never_write, notes = [], [], [], []
     used_names = set()
 
-    def gate_name(base: str, slug: str) -> str:
+    def gate_name(base: str, slug: str, ident: str = "stack") -> str:
         """A gate name that identifies exactly one command.
 
         A nested gate is named after its directory (`unit-console`), because
         the orchestrator quotes gates back by name and two `unit` gates are
         ambiguous. A root-level gate keeps its original name.
+
+        Root-level is not automatically unique, which this used to assume: two
+        stacks side by side at the repo root can both contribute `lint` —
+        Python's ruff and Shell's shellcheck, which is the ordinary shape of a
+        repo that is a Python package *and* a script. Two gates named `lint` is
+        exactly the ambiguity this function exists to prevent, so the second is
+        qualified by its stack (`lint-shell`) rather than by a number, because
+        a number says nothing about which is which.
         """
-        if not slug:
-            used_names.add(base)
-            return base
-        candidate = f"{base}-{slug}"
+        candidate = f"{base}-{slug}" if slug else base
+        if candidate in used_names and not slug:
+            candidate = f"{base}-{ident}"
         n = 2
+        stem = candidate
         while candidate in used_names:
-            candidate = f"{base}-{slug}-{n}"
+            candidate = f"{stem}-{n}"
             n += 1
         used_names.add(candidate)
         return candidate
@@ -375,6 +458,21 @@ def build_gates(repo: Path, stacks: list) -> tuple:
             # root-level one.
             slug = "dir"
         subs = {}
+        if st["id"] == "shell":
+            files = shell_files(base)
+            if not files:
+                # The glob marker matched, so a `.sh` exists somewhere — but
+                # not in the two directories this stack gates (it was nested
+                # deeper). A gate naming no file would be `syntax: ""`, which
+                # is a gate that always passes while claiming to check
+                # something. Skip the stack and say so instead.
+                notes.append({"text": f"shell scripts found under {rel or '.'} but not "
+                                      "beside it or in its bin/ — no shell gate emitted",
+                              "gate": None})
+                continue
+            quoted = [shlex.quote(f) for f in files]
+            subs = {"files": " ".join(quoted),
+                    "syntax": " && ".join(f"bash -n {q}" for q in quoted)}
         if st["id"] == "node":
             pm, lock = node_pm(base)
             subs = {"pm": pm, "lockfile": lock}
@@ -391,7 +489,7 @@ def build_gates(repo: Path, stacks: list) -> tuple:
                 continue
         for name, cmd, scope in st["gates"]:
             cmd = cmd.format(**subs) if subs else cmd
-            gname = gate_name(name, slug)
+            gname = gate_name(name, slug, st["id"])
             if st["id"] == "node" and name in ("build", "unit"):
                 key = "build" if name == "build" else "test"
                 if key not in scripts:
@@ -411,7 +509,7 @@ def build_gates(repo: Path, stacks: list) -> tuple:
                 continue
             if st["id"] == "node" and name in ("lint", "typecheck") and name not in scripts:
                 continue
-            gates.append((gate_name(name, slug), prefix + cmd, scope))
+            gates.append((gate_name(name, slug, st["id"]), prefix + cmd, scope))
         for h in st["high_risk"]:
             h = h.format(**subs) if subs else h
             high_risk.append(f"{rel}/{h}" if rel else h)

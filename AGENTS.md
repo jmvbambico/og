@@ -252,10 +252,10 @@ AGENTS.md is authoritative: where this file and the contract disagree, this
 file wins.
 
 The gates in that file are hand-copied from `.github/workflows/tests.yml` and
-must stay identical to it. Two of the three are there by hand: no stack
-describes a repo whose product is a bash script, so `og init --force` would
-regenerate the contract without `bash -n` or `shellcheck`. Re-add them before
-you commit anything it writes.
+must stay identical to it. Detection now finds both stacks here, so
+`og init --force` reproduces the `syntax` and `lint-shell` gates — but it also
+adds `ruff` and `mypy` gates, which CI does not run, and switches `pytest -q`
+to the fail-fast `pytest -x -q`. Re-apply those two deltas if you regenerate.
 
 Detected: integration base `main`; protected: none in this file. That does not
 leave `main` open — `merge_gate` unions this list with its own always-protected
