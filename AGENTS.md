@@ -238,3 +238,33 @@ top-level docs.
   the source of truth; generated YAML is disposable.
 - Validation should **refuse** impossible configs rather than emit something
   that fails later at launch. A loud refusal beats a silent breakage.
+<!-- og:orchestration:begin -->
+<!-- og:orchestration:signature:v1 -->
+
+## Orchestration
+
+`.agents/orchestration.yaml` is the machine-readable contract: the gates and
+their scope, the protected branches, the integration base, and the paths an
+implementer must not touch. Read it before planning, and run exactly the
+commands it names — a gate that looks wrong is fixed there, not improvised.
+
+AGENTS.md is authoritative: where this file and the contract disagree, this
+file wins.
+
+The gates in that file are hand-copied from `.github/workflows/tests.yml` and
+must stay identical to it. `og init` detected no toolchain here — this repo's
+only Python marker is `conftest.py` (no `pyproject.toml`), and no stack
+describes a repo whose product is a bash script — so `og init --force` would
+regenerate a contract with **no gates at all** and lose the shell gate entirely.
+Re-add them before you commit anything it writes.
+
+Detected: integration base `main`; protected: none in this file. That does not
+leave `main` open — `merge_gate` unions this list with its own always-protected
+set, which already contains `main` (`policies/omnigent_local_policies.py:57`).
+
+Gate scope decides WHO runs a gate. A gate marked `scope: worker` runs in
+EVERY implementer's worktree; a gate with no scope runs ONCE on the
+integration branch. Anything that touches a shared database, a fixed port, or
+the network belongs in the no-scope tier — parallel workers running it at the
+same time corrupt each other.
+<!-- og:orchestration:end -->
